@@ -103,9 +103,12 @@ where
 
     let genesis = chain.genesis();
     let hash = chain.genesis_hash();
+    let genesis_block_number = genesis.number.unwrap_or(0);
+
+    info!(target: "reth::storage", "Genesis block number: {}", genesis_block_number);
 
     // Check if we already have the genesis header or if we have the wrong one.
-    match factory.block_hash(0) {
+    match factory.block_hash(genesis_block_number) {
         Ok(None) | Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, 0)) => {}
         Ok(Some(block_hash)) => {
             if block_hash == hash {
@@ -139,12 +142,12 @@ where
     // use transaction to insert genesis header
     let provider_rw = factory.database_provider_rw()?;
     insert_genesis_hashes(&provider_rw, alloc.iter())?;
-    insert_genesis_history(&provider_rw, alloc.iter())?;
+    insert_genesis_history(&provider_rw, alloc.iter(), genesis_block_number)?;
 
     // Insert header
     insert_genesis_header(&provider_rw, &chain)?;
 
-    insert_genesis_state(&provider_rw, alloc.iter())?;
+    insert_genesis_state(&provider_rw, alloc.iter(), genesis_block_number)?;
 
     // compute state root to populate trie tables
     compute_state_root(&provider_rw, None)?;
@@ -157,10 +160,10 @@ where
     let static_file_provider = provider_rw.static_file_provider();
     // Static file segments start empty, so we need to initialize the genesis block.
     let segment = StaticFileSegment::Receipts;
-    static_file_provider.latest_writer(segment)?.increment_block(0)?;
+    static_file_provider.latest_writer(segment)?.increment_block(genesis_block_number)?;
 
     let segment = StaticFileSegment::Transactions;
-    static_file_provider.latest_writer(segment)?.increment_block(0)?;
+    static_file_provider.latest_writer(segment)?.increment_block(genesis_block_number)?;
 
     // `commit_unwind`` will first commit the DB and then the static file provider, which is
     // necessary on `init_genesis`.
@@ -173,6 +176,7 @@ where
 pub fn insert_genesis_state<'a, 'b, Provider>(
     provider: &Provider,
     alloc: impl Iterator<Item = (&'a Address, &'b GenesisAccount)>,
+    block: u64,
 ) -> ProviderResult<()>
 where
     Provider: StaticFileProviderFactory
@@ -181,7 +185,7 @@ where
         + StateWriter
         + AsRef<Provider>,
 {
-    insert_state(provider, alloc, 0)
+    insert_state(provider, alloc, block)
 }
 
 /// Inserts state at given block into database.
@@ -306,11 +310,12 @@ where
 pub fn insert_genesis_history<'a, 'b, Provider>(
     provider: &Provider,
     alloc: impl Iterator<Item = (&'a Address, &'b GenesisAccount)> + Clone,
+    block: u64,
 ) -> ProviderResult<()>
 where
     Provider: DBProvider<Tx: DbTxMut> + HistoryWriter,
 {
-    insert_history(provider, alloc, 0)
+    insert_history(provider, alloc, block)
 }
 
 /// Inserts history indices for genesis accounts and storage.
