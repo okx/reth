@@ -109,7 +109,7 @@ where
 
     // Check if we already have the genesis header or if we have the wrong one.
     match factory.block_hash(genesis_block_number) {
-        Ok(None) | Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, 0)) => {}
+        Ok(None) | Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, _)) => {}
         Ok(Some(block_hash)) => {
             if block_hash == hash {
                 // Some users will at times attempt to re-sync from scratch by just deleting the
@@ -145,7 +145,7 @@ where
     insert_genesis_history(&provider_rw, alloc.iter(), genesis_block_number)?;
 
     // Insert header
-    insert_genesis_header(&provider_rw, &chain)?;
+    insert_genesis_header(&provider_rw, &chain, genesis_block_number)?;
 
     insert_genesis_state(&provider_rw, alloc.iter(), genesis_block_number)?;
 
@@ -346,6 +346,7 @@ where
 pub fn insert_genesis_header<Provider, Spec>(
     provider: &Provider,
     chain: &Spec,
+    block: u64,
 ) -> ProviderResult<()>
 where
     Provider: StaticFileProviderFactory<Primitives: NodePrimitives<BlockHeader: Compact>>
@@ -355,8 +356,8 @@ where
     let (header, block_hash) = (chain.genesis_header(), chain.genesis_hash());
     let static_file_provider = provider.static_file_provider();
 
-    match static_file_provider.block_hash(0) {
-        Ok(None) | Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, 0)) => {
+    match static_file_provider.block_hash(block) {
+        Ok(None) | Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, _)) => {
             let (difficulty, hash) = (header.difficulty(), block_hash);
             let mut writer = static_file_provider.latest_writer(StaticFileSegment::Headers)?;
             writer.append_header(header, difficulty, &hash)?;

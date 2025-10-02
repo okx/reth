@@ -76,7 +76,7 @@ impl<C: ChainSpecParser> Command<C> {
                 tx.clear::<tables::HeaderNumbers>()?;
                 reset_stage_checkpoint(tx, StageId::Headers)?;
 
-                insert_genesis_header(&provider_rw, &self.env.chain)?;
+                insert_genesis_header(&provider_rw, &self.env.chain, 0)?;
             }
             StageEnum::Bodies => {
                 tx.clear::<tables::BlockBodyIndices>()?;
@@ -88,7 +88,7 @@ impl<C: ChainSpecParser> Command<C> {
                 tx.clear::<tables::BlockWithdrawals>()?;
                 reset_stage_checkpoint(tx, StageId::Bodies)?;
 
-                insert_genesis_header(&provider_rw, &self.env.chain)?;
+                insert_genesis_header(&provider_rw, &self.env.chain, 0)?;
             }
             StageEnum::Senders => {
                 tx.clear::<tables::TransactionSenders>()?;
@@ -154,7 +154,7 @@ impl<C: ChainSpecParser> Command<C> {
                 reset_prune_checkpoint(tx, PruneSegment::TransactionLookup)?;
 
                 reset_stage_checkpoint(tx, StageId::TransactionLookup)?;
-                insert_genesis_header(&provider_rw, &self.env.chain)?;
+                insert_genesis_header(&provider_rw, &self.env.chain, 0)?;
             }
         }
 
