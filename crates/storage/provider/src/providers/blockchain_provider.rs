@@ -20,7 +20,7 @@ use reth_chain_state::{
     BlockState, CanonicalInMemoryState, ForkChoiceNotifications, ForkChoiceSubscriptions,
     MemoryOverlayStateProvider,
 };
-use reth_chainspec::{ChainInfo, EthereumHardforks};
+use reth_chainspec::{ChainInfo, EthChainSpec, EthereumHardforks};
 use reth_db_api::{
     models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices},
     transaction::DbTx,
@@ -76,7 +76,16 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
     /// header from the database to initialize the provider.
     pub fn new(storage: ProviderFactory<N>) -> ProviderResult<Self> {
         let provider = storage.provider()?;
-        let best = provider.chain_info()?;
+        let mut best = provider.chain_info()?;
+        // If the best number is 0, then we are using the genesis info (and genesis number may not be 0)
+        if best.best_number == 0 {
+            let genesis_number = provider.chain_spec().genesis().number.unwrap_or(0);
+            let genesis_hash = provider.chain_spec().genesis_hash();
+            best = ChainInfo {
+                best_hash: genesis_hash,
+                best_number: genesis_number,
+            };
+        }
         match provider.header_by_number(best.best_number)? {
             Some(header) => {
                 drop(provider);

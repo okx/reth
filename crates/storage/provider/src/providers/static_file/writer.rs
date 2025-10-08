@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Weak},
     time::Instant,
 };
-use tracing::debug;
+use tracing::{debug};
 
 /// Static file writers for every known [`StaticFileSegment`].
 ///
@@ -353,6 +353,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
+    /// Sets the block number for the static file.
+    pub fn set_block_number(&mut self, block_number: u64) -> ProviderResult<()> {
+        self.writer.user_header_mut().set_block_range(block_number, block_number);
+        Ok(())
+    }
+
     /// Returns a block number that is one next to the current tip of static files.
     pub fn next_block_number(&self) -> u64 {
         // The next static file block number can be found by checking the one after block_end.
@@ -528,6 +534,39 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         debug_assert!(self.writer.user_header().segment() == StaticFileSegment::Headers);
 
         self.increment_block(header.number())?;
+
+        self.append_column(header)?;
+        self.append_column(CompactU256::from(total_difficulty))?;
+        self.append_column(hash)?;
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operation(
+                StaticFileSegment::Headers,
+                StaticFileProviderOperation::Append,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Appends header to static file with a specific block number.
+    pub fn append_header_with_number(
+        &mut self,
+        header: &N::BlockHeader,
+        total_difficulty: U256,
+        hash: &BlockHash,
+        number: u64,
+    ) -> ProviderResult<()>
+    where
+        N::BlockHeader: Compact,
+    {
+        let start = Instant::now();
+        self.ensure_no_queued_prune()?;
+
+        debug_assert!(self.writer.user_header().segment() == StaticFileSegment::Headers);
+
+        self.set_block_number(number)?;
 
         self.append_column(header)?;
         self.append_column(CompactU256::from(total_difficulty))?;

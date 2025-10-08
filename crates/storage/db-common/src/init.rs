@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::io::BufRead;
 use tracing::{debug, error, info, trace};
 
+
 /// Default soft limit for number of bytes to read from state dump file, before inserting into
 /// database.
 ///
@@ -160,10 +161,10 @@ where
     let static_file_provider = provider_rw.static_file_provider();
     // Static file segments start empty, so we need to initialize the genesis block.
     let segment = StaticFileSegment::Receipts;
-    static_file_provider.latest_writer(segment)?.increment_block(genesis_block_number)?;
+    static_file_provider.latest_writer(segment)?.set_block_number(genesis_block_number)?;
 
     let segment = StaticFileSegment::Transactions;
-    static_file_provider.latest_writer(segment)?.increment_block(genesis_block_number)?;
+    static_file_provider.latest_writer(segment)?.set_block_number(genesis_block_number)?;
 
     // `commit_unwind`` will first commit the DB and then the static file provider, which is
     // necessary on `init_genesis`.
@@ -360,14 +361,14 @@ where
         Ok(None) | Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, _)) => {
             let (difficulty, hash) = (header.difficulty(), block_hash);
             let mut writer = static_file_provider.latest_writer(StaticFileSegment::Headers)?;
-            writer.append_header(header, difficulty, &hash)?;
+            writer.append_header_with_number(header, difficulty, &hash, block)?;
         }
         Ok(Some(_)) => {}
         Err(e) => return Err(e),
     }
 
-    provider.tx_ref().put::<tables::HeaderNumbers>(block_hash, 0)?;
-    provider.tx_ref().put::<tables::BlockBodyIndices>(0, Default::default())?;
+    provider.tx_ref().put::<tables::HeaderNumbers>(block_hash, block)?;
+    provider.tx_ref().put::<tables::BlockBodyIndices>(block, Default::default())?;
 
     Ok(())
 }
