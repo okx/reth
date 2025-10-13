@@ -111,8 +111,7 @@ where
 
     // Check if we already have the genesis header or if we have the wrong one.
     match factory.block_hash(genesis_block_number) {
-        Ok(None) => {}
-        Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, _)) => {}
+        Ok(None) | Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, _)) => {}
         Ok(Some(block_hash)) => {
             if block_hash == hash {
                 // Some users will at times attempt to re-sync from scratch by just deleting the
@@ -380,18 +379,10 @@ where
             // to ensure the genesis block is stored in the correct static file range.
             let mut writer = static_file_provider.get_writer(genesis_block_number, StaticFileSegment::Headers)?;
 
-            // For non-zero genesis blocks, we need to write empty headers for blocks 0 to genesis_block_number-1
+            // For non-zero genesis blocks, we need to set block range to genesis_block_number and append header without increment block
             if genesis_block_number > 0 {
-                for _ in 0..genesis_block_number {
-                    let empty_header = <Provider::Primitives as NodePrimitives>::BlockHeader::default();
-                    let empty_difficulty = U256::ZERO;
-                    let empty_hash = BlockHash::ZERO;
-                    writer.append_header_direct(&empty_header, empty_difficulty, &empty_hash)?;
-                }
-                // Store the actual genesis header
+                writer.user_header_mut().set_block_range(genesis_block_number, genesis_block_number);
                 writer.append_header_direct(header, difficulty, &hash)?;
-                // Manually set the block_range to include all blocks from 0 to genesis_block_number
-                writer.user_header_mut().set_block_range(0, genesis_block_number);
             } else {
                 // For zero genesis blocks, use normal append_header
                 writer.append_header(header, difficulty, &hash)?;

@@ -304,7 +304,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             .as_ref()
             .map(|block_range| block_range.end())
             .or_else(|| {
-                (expected_block_start > 0)
+                (expected_block_start > 8593920)
                     .then(|| expected_block_start - 1)
             });
 

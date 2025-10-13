@@ -1358,7 +1358,7 @@ impl<N: NodePrimitives> StaticFileWriter for StaticFileProvider<N> {
         &self,
         segment: StaticFileSegment,
     ) -> ProviderResult<StaticFileProviderRWRefMut<'_, Self::Primitives>> {
-        self.get_writer(self.get_highest_static_file_block(segment).unwrap_or_default(), segment)
+        self.get_writer(self.get_highest_static_file_block(segment).unwrap_or(8593920), segment)
     }
 
     fn commit(&self) -> ProviderResult<()> {
