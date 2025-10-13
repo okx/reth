@@ -68,7 +68,7 @@ pub fn make_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Hea
 
     Header {
         number: genesis.number.unwrap_or(0),
-        parent_hash: B256::ZERO, // TODO by xzavier: add parent hash in Genesis
+        parent_hash: genesis.parent_hash.unwrap_or_default(),
         gas_limit: genesis.gas_limit,
         difficulty: genesis.difficulty,
         nonce: genesis.nonce.into(),
