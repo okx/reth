@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'op-reth'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=op-reth",
+                    "--package=op-reth"
+                ],
+                "filter": {
+                    "name": "op-reth",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "node",
+                "--datadir=datadir",
+                "--chain=genesis.json",
+                "--http",
+                "--http.corsdomain=*",
+                "--http.port=8545",
+                "--http.addr=0.0.0.0",
+                "--http.api=web3,debug,eth,txpool,net,miner"
+            ],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "rmdatadir"
+        },
+    ]
+}
