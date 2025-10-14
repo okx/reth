@@ -322,15 +322,17 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     /// Fetches the head block from the database.
     ///
     /// If the database is empty, returns the genesis block.
-    pub fn lookup_head<Factory>(&self, factory: &Factory) -> ProviderResult<Head>
+    pub fn lookup_head<Factory>(&self, factory: &Factory, genesis_block_number: u64) -> ProviderResult<Head>
     where
         Factory: DatabaseProviderFactory<
             Provider: HeaderProvider + StageCheckpointReader + BlockHashReader,
         >,
     {
         let provider = factory.database_provider_ro()?;
-
-        let head = provider.get_stage_checkpoint(StageId::Finish)?.unwrap_or_default().block_number;
+        let mut head = provider.get_stage_checkpoint(StageId::Finish)?.unwrap_or_default().block_number;
+        if head < genesis_block_number {
+            head = genesis_block_number;
+        }
 
         let header = provider
             .header_by_number(head)?

@@ -207,11 +207,11 @@ fn run_case(case: &BlockchainTest) -> Result<(), Error> {
         .map_err(|err| Error::block_failed(0, err))?;
 
     let genesis_state = case.pre.clone().into_genesis_state();
-    insert_genesis_state(&provider, genesis_state.iter())
+    insert_genesis_state(&provider, genesis_state.iter(), genesis_block.number)
         .map_err(|err| Error::block_failed(0, err))?;
     insert_genesis_hashes(&provider, genesis_state.iter())
         .map_err(|err| Error::block_failed(0, err))?;
-    insert_genesis_history(&provider, genesis_state.iter())
+    insert_genesis_history(&provider, genesis_state.iter(), genesis_block.number)
         .map_err(|err| Error::block_failed(0, err))?;
 
     // Decode blocks

@@ -76,7 +76,7 @@ impl<C: ChainSpecParser> Command<C> {
                 tx.clear::<tables::HeaderNumbers>()?;
                 reset_stage_checkpoint(tx, StageId::Headers)?;
 
-                insert_genesis_header(&provider_rw, &self.env.chain)?;
+                insert_genesis_header(&provider_rw, &self.env.chain, 0)?;
             }
             StageEnum::Bodies => {
                 tx.clear::<tables::BlockBodyIndices>()?;
@@ -88,7 +88,7 @@ impl<C: ChainSpecParser> Command<C> {
                 tx.clear::<tables::BlockWithdrawals>()?;
                 reset_stage_checkpoint(tx, StageId::Bodies)?;
 
-                insert_genesis_header(&provider_rw, &self.env.chain)?;
+                insert_genesis_header(&provider_rw, &self.env.chain, 0)?;
             }
             StageEnum::Senders => {
                 tx.clear::<tables::TransactionSenders>()?;
@@ -109,7 +109,7 @@ impl<C: ChainSpecParser> Command<C> {
                 reset_stage_checkpoint(tx, StageId::Execution)?;
 
                 let alloc = &self.env.chain.genesis().alloc;
-                insert_genesis_state(&provider_rw, alloc.iter())?;
+                insert_genesis_state(&provider_rw, alloc.iter(), 0)?;
             }
             StageEnum::AccountHashing => {
                 tx.clear::<tables::HashedAccounts>()?;
@@ -147,14 +147,14 @@ impl<C: ChainSpecParser> Command<C> {
                 reset_stage_checkpoint(tx, StageId::IndexAccountHistory)?;
                 reset_stage_checkpoint(tx, StageId::IndexStorageHistory)?;
 
-                insert_genesis_history(&provider_rw, self.env.chain.genesis().alloc.iter())?;
+                insert_genesis_history(&provider_rw, self.env.chain.genesis().alloc.iter(), 0)?;
             }
             StageEnum::TxLookup => {
                 tx.clear::<tables::TransactionHashNumbers>()?;
                 reset_prune_checkpoint(tx, PruneSegment::TransactionLookup)?;
 
                 reset_stage_checkpoint(tx, StageId::TransactionLookup)?;
-                insert_genesis_header(&provider_rw, &self.env.chain)?;
+                insert_genesis_header(&provider_rw, &self.env.chain, 0)?;
             }
         }
 

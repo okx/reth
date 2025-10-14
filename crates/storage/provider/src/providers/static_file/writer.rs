@@ -353,6 +353,19 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
+    /// Sets the block number for the static file.
+    pub fn set_custom_block_number(&mut self, block_number: u64) -> ProviderResult<()> {
+        let segment = self.writer.user_header().segment();
+        let (writer, data_path) =
+            Self::open(segment, block_number, self.reader.clone(), self.metrics.clone())?;
+        self.writer = writer;
+        self.data_path = data_path;
+        *self.writer.user_header_mut() =
+            SegmentHeader::new(self.reader().find_fixed_range(block_number), None, None, segment);
+        self.writer.user_header_mut().set_block_range(block_number, block_number);
+        Ok(())
+    }
+
     /// Returns a block number that is one next to the current tip of static files.
     pub fn next_block_number(&self) -> u64 {
         // The next static file block number can be found by checking the one after block_end.
@@ -375,7 +388,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 self.writer.user_header().segment(),
                 expected_block_number,
                 next_static_file_block,
-            ))
+            ));
         }
         Ok(())
     }
@@ -407,15 +420,15 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 // * it's a tx-based segment AND `last_block` is lower than the first block of this
                 //   file's block range. Otherwise, having no rows simply means that this block
                 //   range has no transactions, but the file should remain.
-                if block_start != 0 &&
-                    (segment.is_headers() || last_block.is_some_and(|b| b < block_start))
+                if block_start != 0
+                    && (segment.is_headers() || last_block.is_some_and(|b| b < block_start))
                 {
                     self.delete_current_and_open_previous()?;
                 } else {
                     // Update `SegmentHeader`
                     self.writer.user_header_mut().prune(len);
                     self.writer.prune_rows(len as usize).map_err(ProviderError::other)?;
-                    break
+                    break;
                 }
 
                 remaining_rows -= len;
@@ -495,7 +508,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                     self.writer.user_header().segment(),
                     tx_num,
                     next_tx,
-                ))
+                ));
             }
             self.writer.user_header_mut().increment_tx();
         } else {
@@ -528,6 +541,39 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         debug_assert!(self.writer.user_header().segment() == StaticFileSegment::Headers);
 
         self.increment_block(header.number())?;
+
+        self.append_column(header)?;
+        self.append_column(CompactU256::from(total_difficulty))?;
+        self.append_column(hash)?;
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operation(
+                StaticFileSegment::Headers,
+                StaticFileProviderOperation::Append,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Appends header to static file with a specific block number.
+    pub fn append_header_with_number(
+        &mut self,
+        header: &N::BlockHeader,
+        total_difficulty: U256,
+        hash: &BlockHash,
+        number: u64,
+    ) -> ProviderResult<()>
+    where
+        N::BlockHeader: Compact,
+    {
+        let start = Instant::now();
+        self.ensure_no_queued_prune()?;
+
+        debug_assert!(self.writer.user_header().segment() == StaticFileSegment::Headers);
+
+        self.set_custom_block_number(number)?;
 
         self.append_column(header)?;
         self.append_column(CompactU256::from(total_difficulty))?;
