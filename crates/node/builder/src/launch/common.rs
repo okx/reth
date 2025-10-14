@@ -65,7 +65,12 @@ use reth_node_metrics::{
     server::{MetricServer, MetricServerConfig},
     version::VersionInfo,
 };
-use reth_provider::{providers::{NodeTypesForProvider, ProviderNodeTypes, StaticFileProvider}, set_genesis_block_number, BlockHashReader, BlockNumReader, BlockReaderIdExt, ChainSpecProvider, ProviderError, ProviderFactory, ProviderResult, StageCheckpointReader, StateProviderFactory, StaticFileProviderFactory};
+use reth_provider::{
+    providers::{NodeTypesForProvider, ProviderNodeTypes, StaticFileProvider},
+    BlockHashReader, BlockNumReader, BlockReaderIdExt, ChainSpecProvider, ProviderError,
+    ProviderFactory, ProviderResult, StageCheckpointReader, StateProviderFactory,
+    StaticFileProviderFactory, set_genesis_block_number
+};
 use reth_prune::{PruneModes, PrunerBuilder};
 use reth_rpc_builder::config::RethRpcServerConfig;
 use reth_rpc_layer::JwtSecret;
