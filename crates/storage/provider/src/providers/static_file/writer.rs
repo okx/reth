@@ -296,19 +296,18 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         //
         // If that expected block start is 0, then it means that there's no actual block data, and
         // there's no block data in static files.
-        let segment = self.writer.user_header().segment();
-        let block_range = self.writer.user_header().block_range();
-        let expected_block_start = self.writer.user_header().expected_block_start();
-
-        let segment_max_block = block_range
+        let segment_max_block = self
+            .writer
+            .user_header()
+            .block_range()
             .as_ref()
             .map(|block_range| block_range.end())
             .or_else(|| {
-                (expected_block_start > 8593920)
-                    .then(|| expected_block_start - 1)
+                (self.writer.user_header().expected_block_start() > 8593920)
+                    .then(|| self.writer.user_header().expected_block_start() - 1)
             });
 
-        self.reader().update_index(segment, segment_max_block)
+        self.reader().update_index(self.writer.user_header().segment(), segment_max_block)
     }
 
     /// Allows to increment the [`SegmentHeader`] end block. It will commit the current static file,
@@ -319,15 +318,6 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         let segment = self.writer.user_header().segment();
 
         self.check_next_block_number(expected_block_number)?;
-
-        let a = self.writer.user_header().block_end().unwrap_or_default();
-        let b = self.writer.user_header().expected_block_end();
-        debug!(
-            target: "provider::static_file",
-            end = ?a,
-            expected = ?b,
-            "Check next block number"
-        );
 
         let start = Instant::now();
         if let Some(last_block) = self.writer.user_header().block_end() {
@@ -380,19 +370,13 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     fn check_next_block_number(&self, expected_block_number: u64) -> ProviderResult<()> {
         let next_static_file_block = self.next_block_number();
 
-        debug!(
-            target: "provider::static_file",
-            ?next_static_file_block,
-            "Check next block number"
-        );
-
-        // if next_static_file_block != 0 && expected_block_number != next_static_file_block {
-        //     return Err(ProviderError::UnexpectedStaticFileBlockNumber(
-        //         self.writer.user_header().segment(),
-        //         expected_block_number,
-        //         next_static_file_block,
-        //     ))
-        // }
+        if expected_block_number != next_static_file_block {
+            return Err(ProviderError::UnexpectedStaticFileBlockNumber(
+                self.writer.user_header().segment(),
+                expected_block_number,
+                next_static_file_block,
+            ))
+        }
         Ok(())
     }
 

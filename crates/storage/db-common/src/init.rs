@@ -170,10 +170,12 @@ where
     // For genesis blocks with non-zero block numbers, we need to use get_writer() instead of
     // latest_writer() to ensure the genesis block is stored in the correct static file range.
     let segment = StaticFileSegment::Receipts;
-    static_file_provider.get_writer(genesis_block_number, segment)?.increment_block(genesis_block_number)?;
+    static_file_provider.get_writer(genesis_block_number, segment)?
+        .user_header_mut().set_block_range(genesis_block_number, genesis_block_number);
 
     let segment = StaticFileSegment::Transactions;
-    static_file_provider.get_writer(genesis_block_number, segment)?.increment_block(genesis_block_number)?;
+    static_file_provider.get_writer(genesis_block_number, segment)?
+        .user_header_mut().set_block_range(genesis_block_number, genesis_block_number);
 
     // `commit_unwind`` will first commit the DB and then the static file provider, which is
     // necessary on `init_genesis`.
@@ -371,7 +373,6 @@ where
 
     match static_file_provider.block_hash(genesis_block_number) {
         Ok(None) | Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, _)) => {
-            info!(target: "reth::cli", "Genesis header missing");
             let (difficulty, hash) = (header.difficulty(), block_hash);
 
             // For genesis blocks with non-zero block numbers, we need to ensure they are stored
