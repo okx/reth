@@ -65,12 +65,7 @@ use reth_node_metrics::{
     server::{MetricServer, MetricServerConfig},
     version::VersionInfo,
 };
-use reth_provider::{
-    providers::{NodeTypesForProvider, ProviderNodeTypes, StaticFileProvider},
-    BlockHashReader, BlockNumReader, BlockReaderIdExt, ChainSpecProvider, ProviderError,
-    ProviderFactory, ProviderResult, StageCheckpointReader, StateProviderFactory,
-    StaticFileProviderFactory,
-};
+use reth_provider::{providers::{NodeTypesForProvider, ProviderNodeTypes, StaticFileProvider}, set_genesis_block_number, BlockHashReader, BlockNumReader, BlockReaderIdExt, ChainSpecProvider, ProviderError, ProviderFactory, ProviderResult, StageCheckpointReader, StateProviderFactory, StaticFileProviderFactory};
 use reth_prune::{PruneModes, PrunerBuilder};
 use reth_rpc_builder::config::RethRpcServerConfig;
 use reth_rpc_layer::JwtSecret;
@@ -474,6 +469,8 @@ where
         )
         .with_prune_modes(self.prune_modes())
         .with_static_files_metrics();
+
+        set_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default());
 
         let has_receipt_pruning =
             self.toml_config().prune.as_ref().is_some_and(|a| a.has_receipts_pruning());
