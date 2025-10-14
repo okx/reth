@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Weak},
     time::Instant,
 };
-use tracing::{debug};
+use tracing::debug;
 
 /// Static file writers for every known [`StaticFileSegment`].
 ///
@@ -354,7 +354,14 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     }
 
     /// Sets the block number for the static file.
-    pub fn set_block_number(&mut self, block_number: u64) -> ProviderResult<()> {
+    pub fn set_custom_block_number(&mut self, block_number: u64) -> ProviderResult<()> {
+        let segment = self.writer.user_header().segment();
+        let (writer, data_path) =
+            Self::open(segment, block_number, self.reader.clone(), self.metrics.clone())?;
+        self.writer = writer;
+        self.data_path = data_path;
+        *self.writer.user_header_mut() =
+            SegmentHeader::new(self.reader().find_fixed_range(block_number), None, None, segment);
         self.writer.user_header_mut().set_block_range(block_number, block_number);
         Ok(())
     }
@@ -381,7 +388,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 self.writer.user_header().segment(),
                 expected_block_number,
                 next_static_file_block,
-            ))
+            ));
         }
         Ok(())
     }
@@ -413,15 +420,15 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 // * it's a tx-based segment AND `last_block` is lower than the first block of this
                 //   file's block range. Otherwise, having no rows simply means that this block
                 //   range has no transactions, but the file should remain.
-                if block_start != 0 &&
-                    (segment.is_headers() || last_block.is_some_and(|b| b < block_start))
+                if block_start != 0
+                    && (segment.is_headers() || last_block.is_some_and(|b| b < block_start))
                 {
                     self.delete_current_and_open_previous()?;
                 } else {
                     // Update `SegmentHeader`
                     self.writer.user_header_mut().prune(len);
                     self.writer.prune_rows(len as usize).map_err(ProviderError::other)?;
-                    break
+                    break;
                 }
 
                 remaining_rows -= len;
@@ -501,7 +508,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                     self.writer.user_header().segment(),
                     tx_num,
                     next_tx,
-                ))
+                ));
             }
             self.writer.user_header_mut().increment_tx();
         } else {
@@ -566,7 +573,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
         debug_assert!(self.writer.user_header().segment() == StaticFileSegment::Headers);
 
-        self.set_block_number(number)?;
+        self.set_custom_block_number(number)?;
 
         self.append_column(header)?;
         self.append_column(CompactU256::from(total_difficulty))?;
