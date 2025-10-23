@@ -1,6 +1,6 @@
 //! Genesis block number initialization utilities for static file providers.
 
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::debug;
 
 static GENESIS_BLOCK_NUMBER: AtomicU64 = AtomicU64::new(0);
@@ -16,7 +16,9 @@ pub fn set_genesis_block_number(block_number: u64) {
 /// Get global genesis block number, NEVER call this before calling `set_genesis_block_number`
 pub fn get_genesis_block_number() -> u64 {
     if !IS_INITIALIZED.load(Ordering::SeqCst) {
-        eprintln!("ERROR: Genesis block number not initialized! Call set_genesis_block_number() first.");
+        eprintln!(
+            "ERROR: Genesis block number not initialized! Call set_genesis_block_number() first."
+        );
         eprintln!("Stack trace:");
         let backtrace = std::backtrace::Backtrace::capture();
         eprintln!("{}", backtrace);

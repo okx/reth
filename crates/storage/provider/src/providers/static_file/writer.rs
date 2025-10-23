@@ -1,8 +1,9 @@
 use super::{
     manager::StaticFileProviderInner, metrics::StaticFileProviderMetrics, StaticFileProvider,
 };
-use crate::providers::static_file::metrics::StaticFileProviderOperation;
-use crate::get_genesis_block_number;
+use crate::{
+    get_genesis_block_number, providers::static_file::metrics::StaticFileProviderOperation,
+};
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockHash, BlockNumber, TxNumber, U256};
 use parking_lot::{lock_api::RwLockWriteGuard, RawRwLock, RwLock};
