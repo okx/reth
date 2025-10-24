@@ -475,9 +475,9 @@ where
         .with_prune_modes(self.prune_modes())
         .with_static_files_metrics();
 
-        // For XLayer: the genesis block number is the legacy XLayer block number
-        if self.chain_spec().genesis().legacy_x_layer_block.is_some() {
-            set_genesis_block_number(self.chain_spec().genesis().legacy_x_layer_block.unwrap());
+        // For XLayer: the genesis block number is the legacy XLayer block number if it is set
+        if self.chain_spec().genesis().config.legacy_x_layer_block.is_some() {
+            set_genesis_block_number(self.chain_spec().genesis().config.legacy_x_layer_block.unwrap());
         } else {
             set_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default());
         }
