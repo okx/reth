@@ -1,14 +1,14 @@
 //! Genesis block number initialization utilities for static file providers.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tracing::debug;
+use tracing::{debug, info};
 
 static GENESIS_BLOCK_NUMBER: AtomicU64 = AtomicU64::new(0);
 static IS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Set global genesis block number at the beginning for global usage
 pub fn set_genesis_block_number(block_number: u64) {
-    debug!("Setting genesis block number to {}", block_number);
+    info!("Setting genesis block number to {}", block_number);
     GENESIS_BLOCK_NUMBER.store(block_number, Ordering::SeqCst);
     IS_INITIALIZED.store(true, Ordering::SeqCst);
 }

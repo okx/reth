@@ -11,11 +11,12 @@ use reth_etl::Collector;
 use reth_execution_errors::StateRootError;
 use reth_primitives_traits::{Account, Bytecode, GotExpected, NodePrimitives, StorageEntry};
 use reth_provider::{
-    errors::provider::ProviderResult, providers::StaticFileWriter, writer::UnifiedStorageWriter,
-    BlockHashReader, BlockNumReader, BundleStateInit, ChainSpecProvider, DBProvider,
-    DatabaseProviderFactory, ExecutionOutcome, HashingWriter, HeaderProvider, HistoryWriter,
-    OriginalValuesKnown, ProviderError, RevertsInit, StageCheckpointReader, StageCheckpointWriter,
-    StateWriter, StaticFileProviderFactory, StorageLocation, TrieWriter,
+    errors::provider::ProviderResult, get_genesis_block_number, providers::StaticFileWriter,
+    writer::UnifiedStorageWriter, BlockHashReader, BlockNumReader, BundleStateInit,
+    ChainSpecProvider, DBProvider, DatabaseProviderFactory, ExecutionOutcome, HashingWriter,
+    HeaderProvider, HistoryWriter, OriginalValuesKnown, ProviderError, RevertsInit,
+    StageCheckpointReader, StageCheckpointWriter, StateWriter, StaticFileProviderFactory,
+    StorageLocation, TrieWriter,
 };
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
@@ -106,7 +107,7 @@ where
     let hash = chain.genesis_hash();
 
     // Get the genesis block number from the chain spec
-    let genesis_block_number = chain.genesis_header().number();
+    let genesis_block_number = get_genesis_block_number();
 
     // Check if we already have the genesis header or if we have the wrong one.
     match factory.block_hash(genesis_block_number) {
@@ -195,7 +196,7 @@ where
         + ChainSpecProvider
         + AsRef<Provider>,
 {
-    let genesis_block_number = provider.chain_spec().genesis_header().number();
+    let genesis_block_number = get_genesis_block_number();
     insert_state(provider, alloc, genesis_block_number)
 }
 
@@ -367,7 +368,7 @@ where
     let static_file_provider = provider.static_file_provider();
 
     // Get the actual genesis block number from the header
-    let genesis_block_number = header.number();
+    let genesis_block_number = get_genesis_block_number();
 
     match static_file_provider.block_hash(genesis_block_number) {
         Ok(None) | Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, _)) => {
