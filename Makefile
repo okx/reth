@@ -92,6 +92,13 @@ build-reproducible: ## Build the reth binary into `target` directory with reprod
 build-debug: ## Build the reth binary into `target/debug` directory.
 	cargo build --bin reth --features "$(FEATURES)"
 
+.PHONY: build-docker
+build-docker: ## Build a local Docker image for development/debugging (no git tag required).
+	docker build -t reth:local \
+		--build-arg FEATURES="$(FEATURES)" \
+		--build-arg BUILD_PROFILE="$(PROFILE)" \
+		-f Dockerfile .
+
 .PHONY: build-op
 build-op: ## Build the op-reth binary into `target` directory.
 	cargo build --bin op-reth --features "$(FEATURES)" --profile "$(PROFILE)" --manifest-path crates/optimism/bin/Cargo.toml
