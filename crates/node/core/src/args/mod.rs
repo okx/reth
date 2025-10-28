@@ -70,3 +70,6 @@ pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
 
 mod error;
 pub mod types;
+
+mod apollo_xlayer;
+pub use apollo_xlayer::{ApolloArgs, ApolloSourceArgs, DefaultApolloHost};

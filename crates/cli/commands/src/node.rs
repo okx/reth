@@ -10,8 +10,8 @@ use reth_db::init_db;
 use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, NetworkArgs,
-        PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs,
+        ApolloArgs, DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs,
+        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -116,6 +116,10 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     /// Additional cli arguments
     #[command(flatten, next_help_heading = "Extension")]
     pub ext: Ext,
+
+    /// For X Layer- All Apollo related arguments with --apollo prefix
+    #[command(flatten, next_help_heading = "Apollo")]
+    pub apollo: ApolloArgs,
 }
 
 impl<C: ChainSpecParser> NodeCommand<C> {
@@ -168,6 +172,7 @@ where
             ext,
             engine,
             era,
+            apollo,
         } = self;
 
         // set up node config
@@ -187,6 +192,7 @@ where
             pruning,
             engine,
             era,
+            apollo,
         };
 
         let data_dir = node_config.datadir();
