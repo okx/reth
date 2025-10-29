@@ -390,7 +390,7 @@ impl<T>
         RpcHeader<T::NetworkTypes>,
     > for T
 where
-    T: FullEthApi,
+    T: FullEthApi + crate::helpers::LegacyRpc,
     jsonrpsee_types::error::ErrorObject<'static>: From<T::Error>,
 {
     /// Handler for: `eth_protocolVersion`
@@ -436,8 +436,24 @@ where
         hash: B256,
         full: bool,
     ) -> RpcResult<Option<RpcBlock<T::NetworkTypes>>> {
+        use crate::helpers::{convert_option_via_serde, boxed_err_to_rpc};
+
         trace!(target: "rpc::eth", ?hash, ?full, "Serving eth_getBlockByHash");
-        Ok(EthBlocks::rpc_block(self, hash.into(), full).await?)
+
+        // Try local first
+        let local_result = EthBlocks::rpc_block(self, hash.into(), full).await?;
+        if local_result.is_some() {
+            return Ok(local_result);
+        }
+
+        // Fallback to legacy if not found locally
+        if let Some(legacy_client) = self.legacy_rpc_client() {
+            trace!(target: "rpc::eth", ?hash, "Not found locally, trying legacy RPC");
+            let result = legacy_client.get_block_by_hash(hash, full).await.map_err(boxed_err_to_rpc)?;
+            return convert_option_via_serde(result);
+        }
+
+        Ok(None)
     }
 
     /// Handler for: `eth_getBlockByNumber`
@@ -447,13 +463,47 @@ where
         full: bool,
     ) -> RpcResult<Option<RpcBlock<T::NetworkTypes>>> {
         trace!(target: "rpc::eth", ?number, ?full, "Serving eth_getBlockByNumber");
+
+        // Route to legacy RPC if configured and block is below cutoff
+        if let Some(legacy_client) = self.legacy_rpc_client() {
+            if let BlockNumberOrTag::Number(n) = number {
+                if n < legacy_client.cutoff_block() {
+                    trace!(target: "rpc::eth", ?number, "Routing to legacy RPC");
+                    match legacy_client.get_block_by_number(number, full).await {
+                        Ok(block_opt) => {
+                            // Convert via serde to handle type system differences
+                            let converted = block_opt
+                                .map(|b| serde_json::from_value(serde_json::to_value(b).unwrap()).unwrap());
+                            return Ok(converted);
+                        }
+                        Err(e) => return Err(internal_rpc_err(e.to_string())),
+                    }
+                }
+            }
+        }
+
         Ok(EthBlocks::rpc_block(self, number.into(), full).await?)
     }
 
     /// Handler for: `eth_getBlockTransactionCountByHash`
     async fn block_transaction_count_by_hash(&self, hash: B256) -> RpcResult<Option<U256>> {
+        use crate::helpers::boxed_err_to_rpc;
+
         trace!(target: "rpc::eth", ?hash, "Serving eth_getBlockTransactionCountByHash");
-        Ok(EthBlocks::block_transaction_count(self, hash.into()).await?.map(U256::from))
+
+        // Try local first
+        let local_result = EthBlocks::block_transaction_count(self, hash.into()).await?.map(U256::from);
+        if local_result.is_some() {
+            return Ok(local_result);
+        }
+
+        // Fallback to legacy if not found locally
+        if let Some(legacy_client) = self.legacy_rpc_client() {
+            trace!(target: "rpc::eth", ?hash, "Not found locally, trying legacy RPC");
+            return legacy_client.get_block_transaction_count_by_hash(hash).await.map_err(boxed_err_to_rpc);
+        }
+
+        Ok(None)
     }
 
     /// Handler for: `eth_getBlockTransactionCountByNumber`
@@ -462,6 +512,20 @@ where
         number: BlockNumberOrTag,
     ) -> RpcResult<Option<U256>> {
         trace!(target: "rpc::eth", ?number, "Serving eth_getBlockTransactionCountByNumber");
+
+        // Route to legacy RPC if configured and block is below cutoff
+        if let Some(legacy_client) = self.legacy_rpc_client() {
+            if let BlockNumberOrTag::Number(n) = number {
+                if n < legacy_client.cutoff_block() {
+                    trace!(target: "rpc::eth", ?number, "Routing to legacy RPC");
+                    return legacy_client
+                        .get_block_transaction_count_by_number(number)
+                        .await
+                        .map_err(|e| internal_rpc_err(e.to_string()));
+                }
+            }
+        }
+
         Ok(EthBlocks::block_transaction_count(self, number.into()).await?.map(U256::from))
     }
 
@@ -483,6 +547,19 @@ where
     ) -> RpcResult<Option<U256>> {
         trace!(target: "rpc::eth", ?number, "Serving eth_getUncleCountByBlockNumber");
 
+        // Route to legacy RPC if configured and block is below cutoff
+        if let Some(legacy_client) = self.legacy_rpc_client() {
+            if let BlockNumberOrTag::Number(n) = number {
+                if n < legacy_client.cutoff_block() {
+                    trace!(target: "rpc::eth", ?number, "Routing to legacy RPC");
+                    return legacy_client
+                        .get_uncle_count_by_block_number(number)
+                        .await
+                        .map_err(|e| internal_rpc_err(e.to_string()));
+                }
+            }
+        }
+
         if let Some(block) = self.block_by_number(number, false).await? {
             Ok(Some(U256::from(block.uncles.len())))
         } else {
@@ -495,7 +572,18 @@ where
         &self,
         block_id: BlockId,
     ) -> RpcResult<Option<Vec<RpcReceipt<T::NetworkTypes>>>> {
+        use crate::helpers::{should_route_block_id_to_legacy, convert_option_via_serde, boxed_err_to_rpc};
+
         trace!(target: "rpc::eth", ?block_id, "Serving eth_getBlockReceipts");
+
+        // Route to legacy if block is below cutoff
+        if should_route_block_id_to_legacy(self.legacy_rpc_client(), Some(block_id)) {
+            trace!(target: "rpc::eth", ?block_id, "Routing to legacy RPC");
+            let result = self.legacy_rpc_client().unwrap()
+                .get_block_receipts(block_id).await.map_err(boxed_err_to_rpc)?;
+            return convert_option_via_serde(result);
+        }
+
         Ok(EthBlocks::block_receipts(self, block_id).await?)
     }
 
@@ -505,8 +593,24 @@ where
         hash: B256,
         index: Index,
     ) -> RpcResult<Option<RpcBlock<T::NetworkTypes>>> {
+        use crate::helpers::{convert_option_via_serde, boxed_err_to_rpc};
+
         trace!(target: "rpc::eth", ?hash, ?index, "Serving eth_getUncleByBlockHashAndIndex");
-        Ok(EthBlocks::ommer_by_block_and_index(self, hash.into(), index).await?)
+
+        // Try local first
+        let local_result = EthBlocks::ommer_by_block_and_index(self, hash.into(), index).await?;
+        if local_result.is_some() {
+            return Ok(local_result);
+        }
+
+        // Fallback to legacy if not found locally
+        if let Some(legacy_client) = self.legacy_rpc_client() {
+            trace!(target: "rpc::eth", ?hash, "Not found locally, trying legacy RPC");
+            let result = legacy_client.get_uncle_by_block_hash_and_index(hash, index).await.map_err(boxed_err_to_rpc)?;
+            return convert_option_via_serde(result);
+        }
+
+        Ok(None)
     }
 
     /// Handler for: `eth_getUncleByBlockNumberAndIndex`
@@ -515,7 +619,18 @@ where
         number: BlockNumberOrTag,
         index: Index,
     ) -> RpcResult<Option<RpcBlock<T::NetworkTypes>>> {
+        use crate::helpers::{should_route_to_legacy, convert_option_via_serde, boxed_err_to_rpc};
+
         trace!(target: "rpc::eth", ?number, ?index, "Serving eth_getUncleByBlockNumberAndIndex");
+
+        // Route to legacy if block is below cutoff
+        if should_route_to_legacy(self.legacy_rpc_client(), number) {
+            trace!(target: "rpc::eth", ?number, "Routing to legacy RPC");
+            let result = self.legacy_rpc_client().unwrap()
+                .get_uncle_by_block_number_and_index(number, index).await.map_err(boxed_err_to_rpc)?;
+            return convert_option_via_serde(result);
+        }
+
         Ok(EthBlocks::ommer_by_block_and_index(self, number.into(), index).await?)
     }
 
@@ -531,10 +646,30 @@ where
         hash: B256,
     ) -> RpcResult<Option<RpcTransaction<T::NetworkTypes>>> {
         trace!(target: "rpc::eth", ?hash, "Serving eth_getTransactionByHash");
-        Ok(EthTransactions::transaction_by_hash(self, hash)
+
+        // Try local first
+        let local_result = EthTransactions::transaction_by_hash(self, hash)
             .await?
             .map(|tx| tx.into_transaction(self.tx_resp_builder()))
-            .transpose()?)
+            .transpose()?;
+
+        // If not found locally and legacy client is configured, try legacy
+        if local_result.is_none() {
+            if let Some(legacy_client) = self.legacy_rpc_client() {
+                trace!(target: "rpc::eth", ?hash, "Not found locally, trying legacy RPC");
+                match legacy_client.get_transaction_by_hash(hash).await {
+                    Ok(tx_opt) => {
+                        // Convert via serde to handle type system differences
+                        let converted = tx_opt
+                            .map(|tx| serde_json::from_value(serde_json::to_value(tx).unwrap()).unwrap());
+                        return Ok(converted);
+                    }
+                    Err(e) => return Err(internal_rpc_err(e.to_string())),
+                }
+            }
+        }
+
+        Ok(local_result)
     }
 
     /// Handler for: `eth_getRawTransactionByBlockHashAndIndex`
@@ -554,9 +689,24 @@ where
         hash: B256,
         index: Index,
     ) -> RpcResult<Option<RpcTransaction<T::NetworkTypes>>> {
+        use crate::helpers::{convert_option_via_serde, boxed_err_to_rpc};
+
         trace!(target: "rpc::eth", ?hash, ?index, "Serving eth_getTransactionByBlockHashAndIndex");
-        Ok(EthTransactions::transaction_by_block_and_tx_index(self, hash.into(), index.into())
-            .await?)
+
+        // Try local first
+        let local_result = EthTransactions::transaction_by_block_and_tx_index(self, hash.into(), index.into()).await?;
+        if local_result.is_some() {
+            return Ok(local_result);
+        }
+
+        // Fallback to legacy if not found locally
+        if let Some(legacy_client) = self.legacy_rpc_client() {
+            trace!(target: "rpc::eth", ?hash, "Not found locally, trying legacy RPC");
+            let result = legacy_client.get_transaction_by_block_hash_and_index(hash, index).await.map_err(boxed_err_to_rpc)?;
+            return convert_option_via_serde(result);
+        }
+
+        Ok(None)
     }
 
     /// Handler for: `eth_getRawTransactionByBlockNumberAndIndex`
@@ -580,7 +730,18 @@ where
         number: BlockNumberOrTag,
         index: Index,
     ) -> RpcResult<Option<RpcTransaction<T::NetworkTypes>>> {
+        use crate::helpers::{should_route_to_legacy, convert_option_via_serde, boxed_err_to_rpc};
+
         trace!(target: "rpc::eth", ?number, ?index, "Serving eth_getTransactionByBlockNumberAndIndex");
+
+        // Route to legacy if block is below cutoff
+        if should_route_to_legacy(self.legacy_rpc_client(), number) {
+            trace!(target: "rpc::eth", ?number, "Routing to legacy RPC");
+            let result = self.legacy_rpc_client().unwrap()
+                .get_transaction_by_block_number_and_index(number, index).await.map_err(boxed_err_to_rpc)?;
+            return convert_option_via_serde(result);
+        }
+
         Ok(EthTransactions::transaction_by_block_and_tx_index(self, number.into(), index.into())
             .await?)
     }
@@ -602,12 +763,42 @@ where
         hash: B256,
     ) -> RpcResult<Option<RpcReceipt<T::NetworkTypes>>> {
         trace!(target: "rpc::eth", ?hash, "Serving eth_getTransactionReceipt");
-        Ok(EthTransactions::transaction_receipt(self, hash).await?)
+
+        // Try local first
+        let local_result = EthTransactions::transaction_receipt(self, hash).await?;
+
+        // If not found locally and legacy client is configured, try legacy
+        if local_result.is_none() {
+            if let Some(legacy_client) = self.legacy_rpc_client() {
+                trace!(target: "rpc::eth", ?hash, "Not found locally, trying legacy RPC");
+                match legacy_client.get_transaction_receipt(hash).await {
+                    Ok(receipt_opt) => {
+                        // Convert via serde to handle type system differences
+                        let converted = receipt_opt
+                            .map(|r| serde_json::from_value(serde_json::to_value(r).unwrap()).unwrap());
+                        return Ok(converted);
+                    }
+                    Err(e) => return Err(internal_rpc_err(e.to_string())),
+                }
+            }
+        }
+
+        Ok(local_result)
     }
 
     /// Handler for: `eth_getBalance`
     async fn balance(&self, address: Address, block_number: Option<BlockId>) -> RpcResult<U256> {
+        use crate::helpers::{should_route_block_id_to_legacy, boxed_err_to_rpc};
+
         trace!(target: "rpc::eth", ?address, ?block_number, "Serving eth_getBalance");
+
+        // Route to legacy if block is below cutoff
+        if should_route_block_id_to_legacy(self.legacy_rpc_client(), block_number) {
+            trace!(target: "rpc::eth", ?block_number, "Routing to legacy RPC");
+            return self.legacy_rpc_client().unwrap()
+                .get_balance(address, block_number).await.map_err(boxed_err_to_rpc);
+        }
+
         Ok(EthState::balance(self, address, block_number).await?)
     }
 
@@ -618,7 +809,17 @@ where
         index: JsonStorageKey,
         block_number: Option<BlockId>,
     ) -> RpcResult<B256> {
+        use crate::helpers::{should_route_block_id_to_legacy, boxed_err_to_rpc};
+
         trace!(target: "rpc::eth", ?address, ?block_number, "Serving eth_getStorageAt");
+
+        // Route to legacy if block is below cutoff
+        if should_route_block_id_to_legacy(self.legacy_rpc_client(), block_number) {
+            trace!(target: "rpc::eth", ?block_number, "Routing to legacy RPC");
+            return self.legacy_rpc_client().unwrap()
+                .get_storage_at(address, index, block_number).await.map_err(boxed_err_to_rpc);
+        }
+
         Ok(EthState::storage_at(self, address, index, block_number).await?)
     }
 
@@ -628,13 +829,33 @@ where
         address: Address,
         block_number: Option<BlockId>,
     ) -> RpcResult<U256> {
+        use crate::helpers::{should_route_block_id_to_legacy, boxed_err_to_rpc};
+
         trace!(target: "rpc::eth", ?address, ?block_number, "Serving eth_getTransactionCount");
+
+        // Route to legacy if block is below cutoff
+        if should_route_block_id_to_legacy(self.legacy_rpc_client(), block_number) {
+            trace!(target: "rpc::eth", ?block_number, "Routing to legacy RPC");
+            return self.legacy_rpc_client().unwrap()
+                .get_transaction_count(address, block_number).await.map_err(boxed_err_to_rpc);
+        }
+
         Ok(EthState::transaction_count(self, address, block_number).await?)
     }
 
     /// Handler for: `eth_getCode`
     async fn get_code(&self, address: Address, block_number: Option<BlockId>) -> RpcResult<Bytes> {
+        use crate::helpers::{should_route_block_id_to_legacy, boxed_err_to_rpc};
+
         trace!(target: "rpc::eth", ?address, ?block_number, "Serving eth_getCode");
+
+        // Route to legacy if block is below cutoff
+        if should_route_block_id_to_legacy(self.legacy_rpc_client(), block_number) {
+            trace!(target: "rpc::eth", ?block_number, "Routing to legacy RPC");
+            return self.legacy_rpc_client().unwrap()
+                .get_code(address, block_number).await.map_err(boxed_err_to_rpc);
+        }
+
         Ok(EthState::get_code(self, address, block_number).await?)
     }
 
@@ -672,7 +893,21 @@ where
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<Bytes> {
+        use crate::helpers::{should_route_block_id_to_legacy, boxed_err_to_rpc, convert_via_serde};
+
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_overrides, ?block_overrides, "Serving eth_call");
+
+        // Only route to legacy if no overrides (legacy RPC may not support overrides)
+        if state_overrides.is_none() && block_overrides.is_none() {
+            if should_route_block_id_to_legacy(self.legacy_rpc_client(), block_number) {
+                trace!(target: "rpc::eth", ?block_number, "Routing to legacy RPC");
+                // Convert RpcTxReq to TransactionRequest (both from alloy_rpc_types_eth)
+                let tx_req = convert_via_serde(request)?;
+                return self.legacy_rpc_client().unwrap()
+                    .call(tx_req, block_number).await.map_err(boxed_err_to_rpc);
+            }
+        }
+
         Ok(EthCall::call(
             self,
             request,
@@ -711,7 +946,20 @@ where
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
     ) -> RpcResult<U256> {
+        use crate::helpers::{should_route_block_id_to_legacy, boxed_err_to_rpc, convert_via_serde};
+
         trace!(target: "rpc::eth", ?request, ?block_number, "Serving eth_estimateGas");
+
+        // Only route to legacy if no state override
+        if state_override.is_none() {
+            if should_route_block_id_to_legacy(self.legacy_rpc_client(), block_number) {
+                trace!(target: "rpc::eth", ?block_number, "Routing to legacy RPC");
+                let tx_req = convert_via_serde(request)?;
+                return self.legacy_rpc_client().unwrap()
+                    .estimate_gas(tx_req, block_number).await.map_err(boxed_err_to_rpc);
+            }
+        }
+
         Ok(EthCall::estimate_gas_at(
             self,
             request,

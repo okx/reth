@@ -332,7 +332,7 @@ where
         RpcRegistryInner<Provider, Pool, Network, EthApi, EvmConfig, Consensus>,
     )
     where
-        EthApi: FullEthApiServer<Provider = Provider, Pool = Pool>,
+        EthApi: FullEthApiServer<Provider = Provider, Pool = Pool> + reth_rpc_eth_api::helpers::LegacyRpc,
     {
         let Self { provider, pool, network, executor, consensus, evm_config, .. } = self;
 
@@ -359,7 +359,7 @@ where
         eth: EthApi,
     ) -> RpcRegistryInner<Provider, Pool, Network, EthApi, EvmConfig, Consensus>
     where
-        EthApi: EthApiTypes + 'static,
+        EthApi: EthApiTypes + reth_rpc_eth_api::helpers::LegacyRpc + 'static,
     {
         let Self { provider, pool, network, executor, consensus, evm_config, .. } = self;
         RpcRegistryInner::new(provider, pool, network, executor, consensus, config, evm_config, eth)
@@ -373,7 +373,7 @@ where
         eth: EthApi,
     ) -> TransportRpcModules<()>
     where
-        EthApi: FullEthApiServer<Provider = Provider, Pool = Pool>,
+        EthApi: FullEthApiServer<Provider = Provider, Pool = Pool> + reth_rpc_eth_api::helpers::LegacyRpc,
     {
         let mut modules = TransportRpcModules::default();
 
@@ -527,7 +527,7 @@ where
         + 'static,
     Pool: Send + Sync + Clone + 'static,
     Network: Clone + 'static,
-    EthApi: EthApiTypes + 'static,
+    EthApi: EthApiTypes + reth_rpc_eth_api::helpers::LegacyRpc + 'static,
     EvmConfig: ConfigureEvm<Primitives = N>,
 {
     /// Creates a new, empty instance.
@@ -568,7 +568,7 @@ impl<Provider, Pool, Network, EthApi, BlockExecutor, Consensus>
     RpcRegistryInner<Provider, Pool, Network, EthApi, BlockExecutor, Consensus>
 where
     Provider: BlockReader,
-    EthApi: EthApiTypes,
+    EthApi: EthApiTypes + reth_rpc_eth_api::helpers::LegacyRpc,
 {
     /// Returns a reference to the installed [`EthApi`].
     pub const fn eth_api(&self) -> &EthApi {
@@ -614,7 +614,7 @@ impl<Provider, Pool, Network, EthApi, EvmConfig, Consensus>
     RpcRegistryInner<Provider, Pool, Network, EthApi, EvmConfig, Consensus>
 where
     Network: NetworkInfo + Clone + 'static,
-    EthApi: EthApiTypes,
+    EthApi: EthApiTypes + reth_rpc_eth_api::helpers::LegacyRpc,
     Provider: BlockReader + ChainSpecProvider<ChainSpec: EthereumHardforks>,
     EvmConfig: ConfigureEvm,
 {
@@ -668,7 +668,8 @@ where
             RpcBlock<EthApi::NetworkTypes>,
             RpcReceipt<EthApi::NetworkTypes>,
             RpcHeader<EthApi::NetworkTypes>,
-        > + EthApiTypes,
+        > + EthApiTypes
+        + reth_rpc_eth_api::helpers::LegacyRpc,
     EvmConfig: ConfigureEvm<Primitives = N> + 'static,
 {
     /// Register Eth Namespace
@@ -777,7 +778,7 @@ where
         > + AccountReader
         + ChangeSetReader,
     Network: NetworkInfo + Peers + Clone + 'static,
-    EthApi: EthApiTypes,
+    EthApi: EthApiTypes + reth_rpc_eth_api::helpers::LegacyRpc,
     EvmConfig: ConfigureEvm<Primitives = N>,
 {
     /// Instantiates `TraceApi`
@@ -844,7 +845,7 @@ where
         + ChangeSetReader,
     Pool: TransactionPool + 'static,
     Network: NetworkInfo + Peers + Clone + 'static,
-    EthApi: FullEthApiServer,
+    EthApi: FullEthApiServer + reth_rpc_eth_api::helpers::LegacyRpc,
     EvmConfig: ConfigureEvm<Primitives = N> + 'static,
     Consensus: FullConsensus<N, Error = ConsensusError> + Clone + 'static,
 {

@@ -43,6 +43,7 @@ pub struct EthApiBuilder<N: RpcNodeCore, Rpc, NextEnv = ()> {
     max_batch_size: usize,
     pending_block_kind: PendingBlockKind,
     raw_tx_forwarder: ForwardConfig,
+    legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
 }
 
 impl<Provider, Pool, Network, EvmConfig, ChainSpec>
@@ -84,6 +85,7 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
         } = self;
         EthApiBuilder {
             components,
@@ -103,6 +105,7 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
         }
     }
 }
@@ -133,6 +136,7 @@ where
             max_batch_size: 1,
             pending_block_kind: PendingBlockKind::Full,
             raw_tx_forwarder: ForwardConfig::default(),
+            legacy_rpc_config: None,
         }
     }
 }
@@ -144,6 +148,15 @@ where
     /// Configures the task spawner used to spawn additional tasks.
     pub fn task_spawner(mut self, spawner: impl TaskSpawner + 'static) -> Self {
         self.task_spawner = Box::new(spawner);
+        self
+    }
+
+    /// Configures legacy RPC support for routing historical data.
+    pub fn with_legacy_rpc_config(
+        mut self,
+        config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
+    ) -> Self {
+        self.legacy_rpc_config = config;
         self
     }
 
@@ -170,6 +183,7 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
         } = self;
         EthApiBuilder {
             components,
@@ -189,6 +203,7 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
         }
     }
 
@@ -215,6 +230,7 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
         } = self;
         EthApiBuilder {
             components,
@@ -234,6 +250,7 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
         }
     }
 
@@ -354,6 +371,7 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
         } = self;
 
         let provider = components.provider().clone();
@@ -393,6 +411,7 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder.forwarder_client(),
+            legacy_rpc_config,
         )
     }
 

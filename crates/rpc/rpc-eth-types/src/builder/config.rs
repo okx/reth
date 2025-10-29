@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::{
     EthStateCacheConfig, FeeHistoryCacheConfig, ForwardConfig, GasPriceOracleConfig,
-    RPC_DEFAULT_GAS_CAP,
+    LegacyRpcConfig, RPC_DEFAULT_GAS_CAP,
 };
 use reqwest::Url;
 use reth_rpc_server_types::constants::{
@@ -93,6 +93,8 @@ pub struct EthConfig {
     pub pending_block_kind: PendingBlockKind,
     /// The raw transaction forwarder.
     pub raw_tx_forwarder: ForwardConfig,
+    /// Legacy RPC configuration for routing historical data
+    pub legacy_rpc_config: Option<LegacyRpcConfig>,
 }
 
 impl EthConfig {
@@ -123,11 +125,18 @@ impl Default for EthConfig {
             max_batch_size: 1,
             pending_block_kind: PendingBlockKind::Full,
             raw_tx_forwarder: ForwardConfig::default(),
+            legacy_rpc_config: None,
         }
     }
 }
 
 impl EthConfig {
+    /// Configures legacy RPC routing
+    pub fn with_legacy_rpc(mut self, legacy_rpc_config: Option<LegacyRpcConfig>) -> Self {
+        self.legacy_rpc_config = legacy_rpc_config;
+        self
+    }
+
     /// Configures the caching layer settings
     pub const fn state_cache(mut self, cache: EthStateCacheConfig) -> Self {
         self.cache = cache;

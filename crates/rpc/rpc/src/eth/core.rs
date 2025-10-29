@@ -154,6 +154,7 @@ where
         max_batch_size: usize,
         pending_block_kind: PendingBlockKind,
         raw_tx_forwarder: ForwardConfig,
+        legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
     ) -> Self {
         let inner = EthApiInner::new(
             components,
@@ -171,6 +172,7 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder.forwarder_client(),
+            legacy_rpc_config,
         );
 
         Self { inner: Arc::new(inner) }
@@ -237,6 +239,22 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EthApi").finish_non_exhaustive()
+    }
+}
+
+impl<N, Rpc> reth_rpc_eth_api::helpers::LegacyRpc for EthApi<N, Rpc>
+where
+    N: RpcNodeCore,
+    Rpc: RpcConvert,
+{
+    fn legacy_rpc_client(&self) -> Option<&Arc<reth_rpc_eth_types::LegacyRpcClient>> {
+        self.inner.legacy_rpc_client()
+    }
+
+    fn legacy_filter_manager(
+        &self,
+    ) -> Option<&Arc<reth_rpc_eth_types::CrossBoundaryFilterManager>> {
+        self.inner.legacy_filter_manager()
     }
 }
 
@@ -310,6 +328,12 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
 
     /// Configuration for pending block construction.
     pending_block_kind: PendingBlockKind,
+
+    /// Optional legacy RPC client for routing historical data.
+    legacy_rpc_client: Option<Arc<reth_rpc_eth_types::LegacyRpcClient>>,
+
+    /// Optional filter manager for cross-boundary filters.
+    legacy_filter_manager: Option<Arc<reth_rpc_eth_types::CrossBoundaryFilterManager>>,
 }
 
 impl<N, Rpc> EthApiInner<N, Rpc>
@@ -335,6 +359,7 @@ where
         max_batch_size: usize,
         pending_block_kind: PendingBlockKind,
         raw_tx_forwarder: Option<RpcClient>,
+        legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
     ) -> Self {
         let signers = parking_lot::RwLock::new(Default::default());
         // get the block number of the latest block
@@ -354,6 +379,23 @@ where
         let (processor, tx_batch_sender) =
             BatchTxProcessor::new(components.pool().clone(), max_batch_size);
         task_spawner.spawn_critical("tx-batcher", Box::pin(processor));
+
+        // Initialize legacy RPC client and filter manager if config is provided
+        let (legacy_rpc_client, legacy_filter_manager) = if let Some(config) = legacy_rpc_config {
+            match reth_rpc_eth_types::LegacyRpcClient::from_config(&config) {
+                Ok(client) => {
+                    let filter_mgr =
+                        reth_rpc_eth_types::CrossBoundaryFilterManager::new(config.cutoff_block);
+                    (Some(Arc::new(client)), Some(Arc::new(filter_mgr)))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize legacy RPC client: {}", e);
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
 
         Self {
             components,
@@ -375,6 +417,8 @@ where
             next_env_builder: Box::new(next_env),
             tx_batch_sender,
             pending_block_kind,
+            legacy_rpc_client,
+            legacy_filter_manager,
         }
     }
 }
@@ -425,6 +469,20 @@ where
     #[inline]
     pub const fn blocking_task_pool(&self) -> &BlockingTaskPool {
         &self.blocking_task_pool
+    }
+
+    /// Returns the legacy RPC client if configured.
+    #[inline]
+    pub fn legacy_rpc_client(&self) -> Option<&Arc<reth_rpc_eth_types::LegacyRpcClient>> {
+        self.legacy_rpc_client.as_ref()
+    }
+
+    /// Returns the legacy filter manager if configured.
+    #[inline]
+    pub fn legacy_filter_manager(
+        &self,
+    ) -> Option<&Arc<reth_rpc_eth_types::CrossBoundaryFilterManager>> {
+        self.legacy_filter_manager.as_ref()
     }
 
     /// Returns a handle to the EVM config.
