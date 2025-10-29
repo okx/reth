@@ -756,3 +756,31 @@ vergen-git2 = "1.0.5"
 # jsonrpsee-server = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 # jsonrpsee-http-client = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 # jsonrpsee-types = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
+
+[patch.crates-io]
+alloy-genesis = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-eips = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-consensus = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-serde = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-network = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-network-primitives = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-signer-local = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-signer = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-provider = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-rpc-types-eth = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-json-rpc = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+alloy-transport = { git = "https://github.com/okx/alloy", rev = "65707b1" }
+
+#[patch.crates-io]
+#alloy-genesis = { path = "../alloy-okx/crates/genesis" }
+#alloy-eips = { path = "../alloy-okx/crates/eips" }
+#alloy-consensus = { path = "../alloy-okx/crates/consensus" }
+#alloy-serde = { path = "../alloy-okx/crates/serde" }
+#alloy-network = { path = "../alloy-okx/crates/network" }
+#alloy-network-primitives = { path = "../alloy-okx/crates/network-primitives" }
+#alloy-signer-local = { path = "../alloy-okx/crates/signer-local" }
+#alloy-signer = { path = "../alloy-okx/crates/signer" }
+#alloy-provider = { path = "../alloy-okx/crates/provider" }
+#alloy-rpc-types-eth = { path = "../alloy-okx/crates/rpc-types-eth" }
+#alloy-json-rpc = { path = "../alloy-okx/crates/json-rpc" }
+#alloy-transport = { path = "../alloy-okx/crates/transport" }
