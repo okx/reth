@@ -560,3 +560,336 @@ impl CrossBoundaryFilterManager {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_rpc_types_eth::FilterBlockOption;
+
+    // ========================================
+    // Phase 1.3: Filter 管理单元测试
+    // ========================================
+
+    #[test]
+    fn test_filter_manager_creation() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+        assert_eq!(manager.cutoff_block, 1000000);
+    }
+
+    #[test]
+    fn test_classify_filter_pure_legacy() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        // Filter with to_block < cutoff
+        let filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Number(100)),
+                to_block: Some(BlockNumberOrTag::Number(999999)),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        let result = manager.classify_filter(&filter).unwrap();
+        assert_eq!(result, FilterType::PureLegacy);
+    }
+
+    #[test]
+    fn test_classify_filter_pure_local() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        // Filter with from_block >= cutoff
+        let filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Number(1000000)),
+                to_block: Some(BlockNumberOrTag::Number(2000000)),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        let result = manager.classify_filter(&filter).unwrap();
+        assert_eq!(result, FilterType::PureLocal);
+    }
+
+    #[test]
+    fn test_classify_filter_hybrid() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        // Filter that spans the cutoff
+        let filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Number(999000)),
+                to_block: Some(BlockNumberOrTag::Number(1001000)),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        let result = manager.classify_filter(&filter).unwrap();
+        assert_eq!(result, FilterType::Hybrid);
+    }
+
+    #[test]
+    fn test_classify_filter_edge_cases() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        // Exactly at cutoff boundary
+        let filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Number(999999)),
+                to_block: Some(BlockNumberOrTag::Number(1000000)),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        let result = manager.classify_filter(&filter).unwrap();
+        assert_eq!(result, FilterType::Hybrid);
+    }
+
+    #[test]
+    fn test_classify_filter_with_latest() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        // Filter with "latest" - should be treated as local
+        let filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Latest),
+                to_block: Some(BlockNumberOrTag::Latest),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        let result = manager.classify_filter(&filter).unwrap();
+        assert_eq!(result, FilterType::PureLocal);
+    }
+
+    #[test]
+    fn test_split_filter() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        let original_filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Number(999000)),
+                to_block: Some(BlockNumberOrTag::Number(1001000)),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        let (legacy, local) = manager.split_filter(&original_filter);
+
+        // Legacy filter should end at cutoff - 1
+        if let FilterBlockOption::Range { to_block, .. } = legacy.block_option {
+            assert_eq!(to_block, Some(BlockNumberOrTag::Number(999999)));
+        } else {
+            panic!("Expected Range filter option");
+        }
+
+        // Local filter should start at cutoff
+        if let FilterBlockOption::Range { from_block, .. } = local.block_option {
+            assert_eq!(from_block, Some(BlockNumberOrTag::Number(1000000)));
+        } else {
+            panic!("Expected Range filter option");
+        }
+    }
+
+    #[test]
+    fn test_register_and_get_filter() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        let filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Number(100)),
+                to_block: Some(BlockNumberOrTag::Number(200)),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        let legacy_id = FilterId::from(999u64);
+        let local_id = FilterId::from(1000u64);
+
+        let id = manager.register_filter(
+            filter.clone(),
+            FilterType::Hybrid,
+            Some(legacy_id.clone()),
+            Some(local_id.clone()),
+        );
+
+        let metadata = manager.get_filter(&id).unwrap();
+        assert_eq!(metadata.filter_type, FilterType::Hybrid);
+        assert_eq!(metadata.legacy_id, Some(legacy_id));
+        assert_eq!(metadata.local_id, Some(local_id));
+    }
+
+    #[test]
+    fn test_remove_filter() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        let filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Number(100)),
+                to_block: Some(BlockNumberOrTag::Number(200)),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        let id = manager.register_filter(filter, FilterType::PureLegacy, None, None);
+
+        // Filter should exist
+        assert!(manager.get_filter(&id).is_some());
+
+        // Remove filter
+        let removed = manager.remove_filter(&id);
+        assert!(removed.is_some());
+
+        // Filter should no longer exist
+        assert!(manager.get_filter(&id).is_none());
+    }
+
+    #[test]
+    fn test_merge_logs_sorting() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        // Create logs with different block numbers
+        let legacy_log1 = Log {
+            block_number: Some(100),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            ..Default::default()
+        };
+
+        let legacy_log2 = Log {
+            block_number: Some(500),
+            transaction_index: Some(1),
+            log_index: Some(0),
+            ..Default::default()
+        };
+
+        let local_log1 = Log {
+            block_number: Some(1000000),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            ..Default::default()
+        };
+
+        let local_log2 = Log {
+            block_number: Some(1000001),
+            transaction_index: Some(2),
+            log_index: Some(1),
+            ..Default::default()
+        };
+
+        let legacy_logs = vec![legacy_log2.clone(), legacy_log1.clone()]; // Wrong order
+        let local_logs = vec![local_log2.clone(), local_log1.clone()]; // Wrong order
+
+        let merged = manager.merge_logs(legacy_logs, local_logs);
+
+        // Should be sorted correctly
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0].block_number, Some(100));
+        assert_eq!(merged[1].block_number, Some(500));
+        assert_eq!(merged[2].block_number, Some(1000000));
+        assert_eq!(merged[3].block_number, Some(1000001));
+    }
+
+    #[test]
+    fn test_merge_logs_within_same_block() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        // Logs in the same block should be sorted by transaction index and log index
+        let log1 = Log {
+            block_number: Some(100),
+            transaction_index: Some(1),
+            log_index: Some(0),
+            ..Default::default()
+        };
+
+        let log2 = Log {
+            block_number: Some(100),
+            transaction_index: Some(0),
+            log_index: Some(1),
+            ..Default::default()
+        };
+
+        let log3 = Log {
+            block_number: Some(100),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            ..Default::default()
+        };
+
+        let merged = manager.merge_logs(vec![log1.clone()], vec![log2.clone(), log3.clone()]);
+
+        assert_eq!(merged.len(), 3);
+        // Should be sorted by tx_index then log_index
+        assert_eq!(merged[0].transaction_index, Some(0));
+        assert_eq!(merged[0].log_index, Some(0));
+        assert_eq!(merged[1].transaction_index, Some(0));
+        assert_eq!(merged[1].log_index, Some(1));
+        assert_eq!(merged[2].transaction_index, Some(1));
+        assert_eq!(merged[2].log_index, Some(0));
+    }
+
+    #[test]
+    fn test_parse_block_range_explicit_numbers() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        let filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Number(100)),
+                to_block: Some(BlockNumberOrTag::Number(200)),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        let (from, to) = manager.parse_block_range(&filter).unwrap();
+        assert_eq!(from, 100);
+        assert_eq!(to, 200);
+    }
+
+    #[test]
+    fn test_parse_block_range_earliest() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        let filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Earliest),
+                to_block: Some(BlockNumberOrTag::Number(200)),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        let (from, to) = manager.parse_block_range(&filter).unwrap();
+        assert_eq!(from, 0);
+        assert_eq!(to, 200);
+    }
+
+    #[test]
+    fn test_filter_id_generation_unique() {
+        let manager = CrossBoundaryFilterManager::new(1000000);
+
+        let filter = Filter {
+            block_option: FilterBlockOption::Range {
+                from_block: Some(BlockNumberOrTag::Number(100)),
+                to_block: Some(BlockNumberOrTag::Number(200)),
+            },
+            address: Default::default(),
+            topics: Default::default(),
+        };
+
+        // Generate multiple filter IDs - should be unique
+        let id1 = manager.register_filter(filter.clone(), FilterType::PureLegacy, None, None);
+        let id2 = manager.register_filter(filter.clone(), FilterType::PureLegacy, None, None);
+        let id3 = manager.register_filter(filter, FilterType::PureLegacy, None, None);
+
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+    }
+}

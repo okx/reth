@@ -1164,6 +1164,7 @@ pub trait EthApiBuilder<N: FullNodeComponents>: Default + Send + 'static {
     type EthApi: EthApiTypes
         + FullEthApiServer<Provider = N::Provider, Pool = N::Pool>
         + AddDevSigners
+        + reth_rpc_eth_api::helpers::LegacyRpc
         + Unpin
         + 'static;
 
