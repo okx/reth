@@ -144,7 +144,7 @@ async fn create_mock_legacy_server() -> (ServerHandle, SocketAddr) {
 }
 
 // ========================================
-// Phase 1.4: 基本路由集成测试
+// Phase 1.4: Basic Routing Integration Tests
 // ========================================
 
 #[tokio::test]
@@ -209,7 +209,7 @@ async fn test_legacy_client_get_transaction_by_hash() {
 }
 
 // ========================================
-// Phase 1.5: 跨边界 getLogs 集成测试
+// Phase 1.5: Cross-boundary getLogs Integration Tests
 // ========================================
 
 #[tokio::test]
@@ -365,7 +365,7 @@ async fn test_filter_classification() {
 }
 
 // ========================================
-// Phase 2.3: Hash-based fallback 测试
+// Phase 2.3: Hash-based Fallback Tests
 // ========================================
 
 #[tokio::test]
@@ -390,7 +390,7 @@ async fn test_hash_based_query_fallback() {
 }
 
 // ========================================
-// Phase 2.1: 错误处理测试
+// Phase 2.1: Error Handling Tests
 // ========================================
 
 #[tokio::test]
