@@ -79,6 +79,107 @@ pub fn boxed_err_to_rpc(e: Box<dyn std::error::Error + Send + Sync>) -> ErrorObj
     internal_rpc_err(e.to_string())
 }
 
+// ========================================
+// Routing Macros (Experimental)
+// ========================================
+
+/// Route a request by BlockNumberOrTag to legacy RPC if below cutoff
+#[macro_export]
+macro_rules! route_by_number {
+    ($self:ident, $number:ident, $legacy_call:expr, $local_expr:expr) => {{
+        if $crate::helpers::should_route_to_legacy($self.legacy_rpc_client(), $number) {
+            tracing::trace!(target: "rpc::eth", ?$number, "Routing to legacy RPC");
+            let result = $legacy_call
+                .await
+                .map_err($crate::helpers::boxed_err_to_rpc)?;
+            $crate::helpers::convert_option_via_serde(result)
+        } else {
+            $local_expr
+        }
+    }};
+}
+
+/// Route a request by BlockId to legacy RPC if below cutoff
+#[macro_export]
+macro_rules! route_by_block_id {
+    ($self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
+        if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), Some($block_id)) {
+            tracing::trace!(target: "rpc::eth", ?$block_id, "Routing to legacy RPC");
+            let result = $legacy_call
+                .await
+                .map_err($crate::helpers::boxed_err_to_rpc)?;
+            $crate::helpers::convert_option_via_serde(result)
+        } else {
+            $local_expr
+        }
+    }};
+}
+
+/// Route by optional BlockId (for state queries)
+#[macro_export]
+macro_rules! route_by_block_id_opt {
+    ($self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
+        if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), $block_id) {
+            tracing::trace!(target: "rpc::eth", ?$block_id, "Routing to legacy RPC");
+            $legacy_call
+                .await
+                .map_err($crate::helpers::boxed_err_to_rpc)
+        } else {
+            $local_expr
+        }
+    }};
+}
+
+/// Try local first, then fallback to legacy (for hash-based queries)
+#[macro_export]
+macro_rules! try_local_then_legacy {
+    ($self:ident, $key:ident, $local_expr:expr, $legacy_call:expr) => {{
+        let local_result = $local_expr;
+        if local_result.is_none() {
+            if let Some(_legacy_client) = $self.legacy_rpc_client() {
+                tracing::trace!(target: "rpc::eth", ?$key, "Not found locally, trying legacy RPC");
+                let result = $legacy_call
+                    .await
+                    .map_err($crate::helpers::boxed_err_to_rpc)?;
+                return $crate::helpers::convert_option_via_serde(result);
+            }
+        }
+        Ok(local_result)
+    }};
+}
+
+/// Route to legacy if configured, otherwise use local (for stateless queries)
+#[macro_export]
+macro_rules! route_if_legacy_configured {
+    ($self:ident, $legacy_call:expr, $local_expr:expr) => {{
+        if let Some(_legacy_client) = $self.legacy_rpc_client() {
+            tracing::trace!(target: "rpc::eth", "Routing to legacy RPC");
+            return $legacy_call
+                .await
+                .map_err($crate::helpers::boxed_err_to_rpc);
+        }
+        $local_expr
+    }};
+}
+
+/// Conditional route by block_id with type conversion (for eth_call, eth_estimateGas, etc.)
+#[macro_export]
+macro_rules! route_conditional_with_convert {
+    ($self:ident, $condition:expr, $block_id:ident, $request:ident, $legacy_method:ident, $local_expr:expr) => {{
+        if $condition {
+            if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), $block_id) {
+                tracing::trace!(target: "rpc::eth", ?$block_id, "Routing to legacy RPC");
+                let tx_req = $crate::helpers::convert_via_serde($request)?;
+                return $self.legacy_rpc_client().unwrap()
+                    .$legacy_method(tx_req, $block_id)
+                    .await
+                    .map_err($crate::helpers::boxed_err_to_rpc);
+            }
+        }
+        $local_expr
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -380,22 +380,9 @@ where
             BatchTxProcessor::new(components.pool().clone(), max_batch_size);
         task_spawner.spawn_critical("tx-batcher", Box::pin(processor));
 
-        // Initialize legacy RPC client and filter manager if config is provided
-        let (legacy_rpc_client, legacy_filter_manager) = if let Some(config) = legacy_rpc_config {
-            match reth_rpc_eth_types::LegacyRpcClient::from_config(&config) {
-                Ok(client) => {
-                    let filter_mgr =
-                        reth_rpc_eth_types::CrossBoundaryFilterManager::new(config.cutoff_block);
-                    (Some(Arc::new(client)), Some(Arc::new(filter_mgr)))
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to initialize legacy RPC client: {}", e);
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
+        // Initialize legacy RPC components (encapsulated for minimal intrusion)
+        let legacy = reth_rpc_eth_types::init_legacy_rpc_components(legacy_rpc_config);
+        let (legacy_rpc_client, legacy_filter_manager) = (legacy.client, legacy.filter_manager);
 
         Self {
             components,
