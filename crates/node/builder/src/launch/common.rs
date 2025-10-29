@@ -67,8 +67,8 @@ use reth_node_metrics::{
 };
 use reth_provider::{
     providers::{NodeTypesForProvider, ProviderNodeTypes, StaticFileProvider},
-    set_genesis_block_number, BlockHashReader, BlockNumReader, BlockReaderIdExt, ChainSpecProvider,
-    ProviderError, ProviderFactory, ProviderResult, StageCheckpointReader, StateProviderFactory,
+    BlockHashReader, BlockNumReader, BlockReaderIdExt, ChainSpecProvider, ProviderError,
+    ProviderFactory, ProviderResult, StageCheckpointReader, StateProviderFactory,
     StaticFileProviderFactory,
 };
 use reth_prune::{PruneModes, PrunerBuilder};
@@ -474,15 +474,6 @@ where
         )
         .with_prune_modes(self.prune_modes())
         .with_static_files_metrics();
-
-        // For XLayer: the genesis block number is the legacy XLayer block number if it is set
-        if self.chain_spec().genesis().config.legacy_x_layer_block.is_some() {
-            set_genesis_block_number(
-                self.chain_spec().genesis().config.legacy_x_layer_block.unwrap(),
-            );
-        } else {
-            set_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default());
-        }
 
         let has_receipt_pruning =
             self.toml_config().prune.as_ref().is_some_and(|a| a.has_receipts_pruning());
