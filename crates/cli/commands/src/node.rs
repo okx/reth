@@ -220,12 +220,9 @@ where
             tracing::info!(target: "reth::apollo", "[Apollo] Creating Apollo config");
 
             // Initialize Apollo singleton
+            tracing::info!(target: "reth::apollo", "[Apollo] Before listening starts");
             let apollo_client = ApolloClient::get_instance(apollo_config, flags).await?;
-
-            // Create handler with shared NodeConfig
-            let handler = Arc::new(RethConfigHandler::new(Arc::clone(&node_config)));
-            apollo_client.add_handler(handler);
-            apollo_client.load_config().await?;
+            apollo_client.start_listening().await?;
         }
 
         let data_dir = node_config.datadir();
