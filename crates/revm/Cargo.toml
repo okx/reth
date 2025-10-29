@@ -29,6 +29,9 @@ reth-trie.workspace = true
 reth-ethereum-forks.workspace = true
 alloy-consensus.workspace = true
 
+reth-chainspec.workspace = true
+reth-evm-ethereum.workspace = true
+
 [features]
 default = ["std"]
 std = [
@@ -68,3 +71,4 @@ optional-checks = [
     "optional-eip3607",
     "optional-no-base-fee",
 ]
+inner-tx = []
