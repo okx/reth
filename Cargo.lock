@@ -7715,6 +7715,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.16",
  "tokio",
+ "tracing",
  "url",
 ]
 
@@ -7869,6 +7870,7 @@ dependencies = [
  "proptest-arbitrary-interop",
  "ratatui",
  "reqwest 0.12.23",
+ "reth-apollo",
  "reth-chainspec",
  "reth-cli",
  "reth-cli-runner",

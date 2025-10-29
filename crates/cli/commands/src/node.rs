@@ -2,6 +2,7 @@
 
 use crate::launcher::Launcher;
 use clap::{value_parser, Args, Parser};
+use reth_apollo::{ApolloClient, ApolloConfig};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_runner::CliContext;
@@ -118,7 +119,7 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     pub ext: Ext,
 
     /// For X Layer- All Apollo related arguments with --apollo prefix
-    #[command(flatten, next_help_heading = "Apollo")]
+    #[command(flatten)]
     pub apollo: ApolloArgs,
 }
 
@@ -195,6 +196,38 @@ where
             apollo,
         };
 
+        // For X Layer
+        if node_config.apollo.enabled {
+            // Convert NodeConfig to HashMap for Apollo
+            let flags = Self::node_config_to_flags(&node_config);
+
+            tracing::info!(target: "reth::apollo", "[Apollo] Flags: {:?}", flags);
+            tracing::info!(target: "reth::apollo", "[Apollo] Apollo enabled: {:?}", node_config.apollo.enabled);
+            tracing::info!(target: "reth::apollo", "[Apollo] Apollo app ID: {:?}", node_config.apollo.apollo_app_id);
+            tracing::info!(target: "reth::apollo", "[Apollo] Apollo IP: {:?}", node_config.apollo.apollo_ip);
+            tracing::info!(target: "reth::apollo", "[Apollo] Apollo cluster: {:?}", node_config.apollo.apollo_cluster);
+            tracing::info!(target: "reth::apollo", "[Apollo] Apollo namespace: {:?}", node_config.apollo.apollo_namespace);
+
+            // Create Apollo config from args
+            let apollo_config = ApolloConfig {
+                meta_server: vec![node_config.apollo.apollo_ip.to_string()],
+                app_id: node_config.apollo.apollo_app_id.to_string(),
+                cluster_name: node_config.apollo.apollo_cluster.to_string(),
+                namespaces: Some(vec![node_config.apollo.apollo_namespace.to_string()]),
+                secret: None,
+            };
+
+            tracing::info!(target: "reth::apollo", "[Apollo] Creating Apollo config");
+
+            // Initialize Apollo singleton
+            let apollo_client = ApolloClient::get_instance(apollo_config, flags).await?;
+
+            // Create handler with shared NodeConfig
+            let handler = Arc::new(RethConfigHandler::new(Arc::clone(&node_config)));
+            apollo_client.add_handler(handler);
+            apollo_client.load_config().await?;
+        }
+
         let data_dir = node_config.datadir();
         let db_path = data_dir.db();
 
@@ -217,6 +250,45 @@ impl<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> NodeCommand<C, Ext> {
     /// Returns the underlying chain being used to run this command
     pub fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
         Some(&self.chain)
+    }
+
+    /// Convert NodeConfig to HashMap for Apollo flags
+    fn node_config_to_flags(
+        config: &NodeConfig<C::ChainSpec>,
+    ) -> std::collections::HashMap<String, serde_json::Value> {
+        use serde_json::Value as JsonValue;
+        use std::collections::HashMap;
+
+        let mut flags = HashMap::new();
+
+        // Direct fields
+        if let Some(config_path) = &config.config {
+            flags.insert(
+                "config".to_string(),
+                JsonValue::String(config_path.to_string_lossy().to_string()),
+            );
+        }
+
+        // Network args - extract key fields
+        flags.insert("network.port".to_string(), JsonValue::Number(config.network.port.into()));
+        flags
+            .insert("network.addr".to_string(), JsonValue::String(config.network.addr.to_string()));
+        flags.insert(
+            "network.discovery.port".to_string(),
+            JsonValue::Number(config.network.discovery.port.into()),
+        );
+        flags.insert(
+            "network.discovery.addr".to_string(),
+            JsonValue::String(config.network.discovery.addr.to_string()),
+        );
+
+        // RPC args - extract key fields
+        flags.insert("rpc.http_port".to_string(), JsonValue::Number(config.rpc.http_port.into()));
+        flags.insert("rpc.ws_port".to_string(), JsonValue::Number(config.rpc.ws_port.into()));
+        flags.insert("rpc.auth_port".to_string(), JsonValue::Number(config.rpc.auth_port.into()));
+        flags.insert("rpc.ipcpath".to_string(), JsonValue::String(config.rpc.ipcpath.clone()));
+
+        flags
     }
 }
 /// No Additional arguments

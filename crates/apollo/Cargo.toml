@@ -35,3 +35,6 @@ url = { workspace = true }
 
 # async singleton
 async-once-cell = "0.5.4"
+
+# tracing
+tracing = { workspace = true }

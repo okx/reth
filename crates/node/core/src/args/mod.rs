@@ -72,4 +72,4 @@ mod error;
 pub mod types;
 
 mod apollo_xlayer;
-pub use apollo_xlayer::{ApolloArgs, ApolloSourceArgs, DefaultApolloHost};
+pub use apollo_xlayer::ApolloArgs;

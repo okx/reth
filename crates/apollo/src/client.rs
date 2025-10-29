@@ -2,10 +2,10 @@ use crate::handler::ApolloHandler;
 use crate::types::{ApolloConfig, ApolloError};
 use apollo_sdk::client::apollo_config_client::ApolloConfigClient;
 use async_once_cell::OnceCell;
-use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+use tracing::info;
 
 /// Apollo client wrapper for reth
 #[derive(Clone)]
@@ -22,12 +22,24 @@ pub struct ApolloClient {
 /// Singleton instance
 static INSTANCE: OnceCell<ApolloClient> = OnceCell::new();
 
+impl std::fmt::Debug for ApolloClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApolloClient")
+            .field("config", &self.config)
+            .field("namespace_map", &self.namespace_map)
+            .field("flags", &self.flags)
+            .field("handler", &self.handler.is_some())
+            .finish()
+    }
+}
+
 impl ApolloClient {
     /// Get singleton instance
     pub async fn get_instance(
         config: ApolloConfig,
         flags: HashMap<String, JsonValue>,
     ) -> Result<ApolloClient, ApolloError> {
+        info!(target: "reth::apollo", "[Apollo] Getting Apollo client");
         INSTANCE
             .get_or_try_init(Self::new_instance(config, flags))
             .await
@@ -39,6 +51,7 @@ impl ApolloClient {
         config: ApolloConfig,
         flags: HashMap<String, JsonValue>,
     ) -> Result<ApolloClient, ApolloError> {
+        info!(target: "reth::apollo", "[Apollo] Creating new instance");
         // Validate configuration
         if config.app_id.is_empty()
             || config.meta_server.is_empty()
@@ -49,6 +62,11 @@ impl ApolloClient {
             ));
         }
 
+        info!(target: "reth::apollo", "[Apollo] Connecting to meta_server: {:?}", config.meta_server);
+        info!(target: "reth::apollo", "[Apollo] App ID: {}", config.app_id);
+        info!(target: "reth::apollo", "[Apollo] Cluster: {}", config.cluster_name);
+        info!(target: "reth::apollo", "[Apollo] Namespaces: {:?}", config.namespaces);
+
         let client: ApolloConfigClient = apollo_sdk::client::apollo_config_client::new(
             config.meta_server.iter().map(|s| s.as_str()).collect(),
             &config.app_id,
@@ -57,7 +75,10 @@ impl ApolloClient {
             config.secret.as_deref(),
         )
         .await
-        .map_err(|e| ApolloError::ClientInit(e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(target: "reth::apollo", "[Apollo] Failed to create client: {:?}", e);
+            ApolloError::ClientInit(format!("Failed to connect to Apollo: {}. Check if Apollo service is accessible and configuration is correct.", e))
+        })?;
 
         // Create namespace map
         let mut namespace_map = HashMap::new();
@@ -74,6 +95,7 @@ impl ApolloClient {
             }
         }
 
+        info!(target: "reth::apollo", "[Apollo] New instance created");
         Ok(ApolloClient {
             inner: Arc::new(RwLock::new(client)),
             config,

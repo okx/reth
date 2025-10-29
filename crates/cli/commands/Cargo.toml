@@ -11,6 +11,7 @@ repository.workspace = true
 
 [dependencies]
 # reth
+reth-apollo.workspace = true
 reth-chainspec.workspace = true
 reth-cli.workspace = true
 reth-cli-runner.workspace = true
