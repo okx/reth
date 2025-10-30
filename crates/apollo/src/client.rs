@@ -36,7 +36,7 @@ pub struct ListenerState {
 }
 
 /// Singleton instance
-static INSTANCE: OnceCell<ApolloClient> = OnceCell::new();
+static INSTANCE: OnceCell<Arc<RwLock<ApolloClient>>> = OnceCell::new();
 const POLL_INTERVAL_SECS: u64 = 30;
 
 impl std::fmt::Debug for ApolloClient {
@@ -64,19 +64,20 @@ impl Clone for ApolloClient {
 
 impl ApolloClient {
     /// Get singleton instance
-    pub async fn new(config: ApolloConfig) -> Result<ApolloClient, ApolloError> {
+    pub async fn new(config: ApolloConfig) -> Result<Arc<RwLock<ApolloClient>>, ApolloError> {
         info!(target: "reth::apollo", "[Apollo] Getting Apollo client");
-        let client = INSTANCE
-            .get_or_try_init(Self::new_instance(config))
-            .await
-            .map(|client| client.clone())?;
+
+        let instance = INSTANCE
+            .get_or_try_init(async {
+                let client = Self::new_instance(config).await?;
+                Ok(Arc::new(RwLock::new(client)))
+            })
+            .await?;
 
         // Start listening on the singleton instance
-        if let Some(singleton) = INSTANCE.get() {
-            singleton.start_listening().await?;
-        }
+        instance.read().await.start_listening().await?;
 
-        Ok(client)
+        Ok(instance.clone())
     }
 
     /// Create new instance
@@ -104,7 +105,7 @@ impl ApolloClient {
         .await
         .map_err(|e| {
             error!(target: "reth::apollo", "[Apollo] Failed to create client: {:?}", e);
-            ApolloError::ClientInit(format!("Failed to connect to Apollo: {}. Check if Apollo service is accessible and configuration is correct.", e))
+            ApolloError::ClientInit(format!("Failed to connect to Apollo: Check if Apollo service is accessible or whether Apollo configuration for desired namespace is released."))
         })?;
 
         // Create namespace map
@@ -138,7 +139,7 @@ impl ApolloClient {
     }
 
     /// Get singleton instance
-    pub fn get_instance() -> Result<ApolloClient, ApolloError> {
+    pub fn get_instance() -> Result<Arc<RwLock<ApolloClient>>, ApolloError> {
         INSTANCE
             .get()
             .cloned()
@@ -271,7 +272,7 @@ impl ApolloClient {
                 // DEBUG: Collect all cache entries for logging
                 let mut cache_contents = HashMap::new();
                 for (key, value) in cache.iter() {
-                    cache_contents.insert(key.clone(), value.clone());
+                    cache_contents.insert(format!("{}:{}", namespace, key), value.clone());
                 }
                 info!(target: "reth::apollo", "[Apollo] Cache updated for namespace {}, cache contents: {:?}", namespace, cache_contents);
             }
@@ -298,8 +299,8 @@ impl ApolloClient {
 
     /// Query cached configurations
     pub async fn get_cached_config(&self, namespace: &str, key: &str) -> Option<JsonValue> {
-        info!(target: "reth::apollo", "[Apollo] Getting cached config for namespace {}: key: {:?}", namespace, key);
-        self.cache.get(key)
+        info!(target: "reth::apollo", "[Apollo] Getting cached config for namespace {}: key: {:?}", namespace, format!("{}:{}", namespace, key));
+        self.cache.get(&format!("{}:{}", namespace, key))
     }
 
     /// Get all cached configs for a namespace
