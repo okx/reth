@@ -218,7 +218,6 @@ where
             tracing::info!(target: "reth::apollo", "[Apollo] Creating Apollo config");
 
             // Initialize Apollo singleton
-            tracing::info!(target: "reth::apollo", "[Apollo] Before listening starts");
             match ApolloClient::new(apollo_config).await {
                 Ok(_) => {
                     tracing::info!(target: "reth::apollo", "[Apollo] Apollo initialized successfully")
