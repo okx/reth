@@ -53,10 +53,7 @@ impl Clone for ApolloClient {
 
 impl ApolloClient {
     /// Get singleton instance
-    pub async fn new(
-        config: ApolloConfig,
-        flags: HashMap<String, JsonValue>,
-    ) -> Result<ApolloClient, ApolloError> {
+    pub async fn new(config: ApolloConfig) -> Result<ApolloClient, ApolloError> {
         info!(target: "reth::apollo", "[Apollo] Getting Apollo client");
         let client = INSTANCE
             .get_or_try_init(Self::new_instance(config, flags))
