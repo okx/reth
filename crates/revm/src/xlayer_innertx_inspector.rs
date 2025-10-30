@@ -172,19 +172,19 @@ where
         let _ = context;
     }
 
-    // Ingore
+    // Ignore
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         let _ = interp;
         let _ = context;
     }
 
-    // Ingore
+    // Ignore
     fn step_end(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         let _ = interp;
         let _ = context;
     }
 
-    // Ingore
+    // Ignore
     fn log(&mut self, interp: &mut Interpreter, context: &mut CTX, log: Log) {
         let _ = interp;
         let _ = context;
@@ -344,75 +344,5 @@ where
             None,
             Bytes::new(),
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-
-    use alloy_primitives::{address, U256};
-    // use reth_chainspec::{Chain, ChainSpec};
-    use reth_evm::{ConfigureEvm, EvmEnvFor};
-    use reth_evm_ethereum::EthEvmConfig;
-    // use revm::context::{BlockEnv, CfgEnv};
-    use revm::database::CacheDB;
-
-    use crate::interpreter::{CallInput, CallScheme, InstructionResult};
-    // use revm::context_interface::{ContextError, ContextTr};
-    // use revm::database::Database;
-    // use revm::Context;
-
-    #[test]
-    fn test_inner_tx_depth_tracking() {
-        // Setup: Create EVM config and database
-        let evm_config = EthEvmConfig::mainnet();
-
-        // Create a simple in-memory database
-        let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
-
-        // Setup accounts
-        let caller = address!("1000000000000000000000000000000000000001");
-        // let contract_a = address!("2000000000000000000000000000000000000002");
-        let contract_b = address!("3000000000000000000000000000000000000003");
-        // let contract_c = address!("4000000000000000000000000000000000000004");
-
-        let evm_env = EvmEnvFor::<reth_evm_ethereum::EthEvmConfig>::default();
-
-        // Create inspector
-        let mut inspector = InnerTxInspector::new();
-
-        // Create EVM with inspector
-        let _evm =
-            evm_config.evm_with_env_and_inspector(&mut cache_db, evm_env.clone(), &mut inspector);
-
-        // Simulate depth changes manually by calling inspector hooks
-        // (Since we're testing the inspector logic, not executing real bytecode)
-
-        // Initial depth (top-level transaction)
-        // assert_eq!(inspector.current_depth, 0, "Initial depth should be 0");
-
-        // Simulate: Contract A calls Contract B (CALL)
-        let mut _call_inputs_1 = CallInputs {
-            input: CallInput::default(),
-            gas_limit: 100_000,
-            bytecode_address: contract_b,
-            target_address: contract_b,
-            caller,
-            value: revm::interpreter::CallValue::Transfer(U256::ZERO),
-            scheme: CallScheme::Call,
-            is_static: false,
-            return_memory_offset: 0..0,
-        };
-
-        // inspector.call(&mut mock_context, &mut call_inputs_1);
-        // assert_eq!(inspector.current_depth, 1, "Depth after first CALL should be 1");
-    }
-
-    #[test]
-    #[ignore]
-    fn foobar() {
-        println!("{:?}", InstructionResult::OutOfGas);
     }
 }
