@@ -10005,10 +10005,7 @@ version = "1.7.0"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
- "reth-chainspec",
  "reth-ethereum-forks",
- "reth-evm",
- "reth-evm-ethereum",
  "reth-primitives-traits",
  "reth-storage-api",
  "reth-storage-errors",

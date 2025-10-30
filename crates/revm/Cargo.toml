@@ -29,10 +29,6 @@ reth-trie.workspace = true
 reth-ethereum-forks.workspace = true
 alloy-consensus.workspace = true
 
-reth-chainspec.workspace = true
-reth-evm-ethereum.workspace = true
-reth-evm = { workspace = true, features = ["test-utils"] }
-
 [features]
 default = ["std"]
 std = [
