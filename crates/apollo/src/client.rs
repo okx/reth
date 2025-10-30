@@ -64,7 +64,7 @@ impl Clone for ApolloClient {
 
 impl ApolloClient {
     /// Get singleton instance
-    pub async fn new(config: ApolloConfig) -> Result<Arc<ApolloClient>, ApolloError> {
+    pub async fn initialize(config: ApolloConfig) -> Result<Arc<ApolloClient>, ApolloError> {
         let instance = INSTANCE
             .get_or_try_init(async {
                 let client = Self::new_instance(config).await?;
@@ -144,6 +144,7 @@ impl ApolloClient {
             let config = client
                 .get_config_from_namespace("content", namespace)
                 .map(|c| c.config_value.clone());
+            drop(client);
             if let Some(config) = config {
                 // Get config cache for namespace
                 Self::update_cache_from_config(&self.cache, namespace, &config);
@@ -236,6 +237,7 @@ impl ApolloClient {
             let config = client_read
                 .get_config_from_namespace("content", full_namespace)
                 .map(|c| c.config_value.clone());
+            drop(client_read);
 
             if let Some(config) = config {
                 Self::update_cache_from_config(&cache, namespace, &config);
