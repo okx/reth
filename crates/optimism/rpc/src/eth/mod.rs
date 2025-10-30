@@ -304,6 +304,22 @@ where
     }
 }
 
+impl<N, Rpc> reth_rpc_eth_api::helpers::LegacyRpc for OpEthApi<N, Rpc>
+where
+    N: RpcNodeCore,
+    Rpc: RpcConvert,
+{
+    fn legacy_rpc_client(&self) -> Option<&Arc<reth_rpc_eth_types::LegacyRpcClient>> {
+        self.inner.eth_api.legacy_rpc_client()
+    }
+
+    fn legacy_filter_manager(
+        &self,
+    ) -> Option<&Arc<reth_rpc_eth_types::CrossBoundaryFilterManager>> {
+        self.inner.eth_api.legacy_filter_manager()
+    }
+}
+
 impl<N: RpcNodeCore, Rpc: RpcConvert> fmt::Debug for OpEthApi<N, Rpc> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpEthApi").finish_non_exhaustive()
