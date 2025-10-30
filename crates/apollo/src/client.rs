@@ -56,7 +56,7 @@ impl ApolloClient {
     pub async fn new(config: ApolloConfig) -> Result<ApolloClient, ApolloError> {
         info!(target: "reth::apollo", "[Apollo] Getting Apollo client");
         let client = INSTANCE
-            .get_or_try_init(Self::new_instance(config, flags))
+            .get_or_try_init(Self::new_instance(config))
             .await
             .map(|client| client.clone())?;
 
@@ -69,10 +69,7 @@ impl ApolloClient {
     }
 
     /// Create new instance
-    async fn new_instance(
-        config: ApolloConfig,
-        flags: HashMap<String, JsonValue>,
-    ) -> Result<ApolloClient, ApolloError> {
+    async fn new_instance(config: ApolloConfig) -> Result<ApolloClient, ApolloError> {
         info!(target: "reth::apollo", "[Apollo] Creating new instance");
         // Validate configuration
         if config.app_id.is_empty()
