@@ -1,3 +1,29 @@
+//! XLayer inner-transaction inspector.
+//!
+//! This module defines `InnerTxInspector`, a custom inspector built on top of
+//! `revm`'s `Inspector` trait that records inner transactions (calls and
+//! creates) observed during EVM execution. It tracks:
+//!
+//! - Call/create depth and ordering
+//! - Trace addresses (per-depth indices) similar to Erigon's `InnerTx`
+//! - Call type (call, delegatecall, staticcall, callcode, create, create2)
+//! - From/to/code addresses, input/output, gas and gas used
+//! - Error propagation for failing subcalls
+//!
+//! The collected entries are exposed via `get_inner_txs()` for downstream use
+//! (e.g., RPC trace-like responses or analytics).
+//!
+//! Integration notes:
+//! - Reth uses `alloy-evm` as a higher-level facade but executes via `revm`.
+//!   This inspector can be provided when constructing the EVM using
+//!   `evm_with_env_and_inspector(...)` so it runs during transaction and block
+//!   execution.
+//! - See `examples/custom-inspector` for an example of wiring an inspector into
+//!   RPC execution paths.
+//!
+//! This implementation mirrors parts of xlayer-erigon's inner-tx semantics to
+//! ease compatibility with existing tooling.
+
 use alloy_primitives::{Address, Bytes, U256};
 use revm::{
     context::CreateScheme,
