@@ -38,3 +38,6 @@ async-once-cell = "0.5.4"
 
 # tracing
 tracing = { workspace = true }
+
+# cache
+moka =  "0.12.11"

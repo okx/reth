@@ -6079,20 +6079,19 @@ dependencies = [
 
 [[package]]
 name = "moka"
-version = "0.12.10"
+version = "0.12.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9321642ca94a4282428e6ea4af8cc2ca4eac48ac7a6a4ea8f33f76d0ce70926"
+checksum = "8261cd88c312e0004c1d51baad2980c66528dfdb2bee62003e643a4d8f86b077"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-epoch",
  "crossbeam-utils",
- "loom",
+ "equivalent",
  "parking_lot",
  "portable-atomic",
  "rustc_version 0.4.1",
  "smallvec",
  "tagptr",
- "thiserror 1.0.69",
  "uuid",
 ]
 
@@ -7708,6 +7707,7 @@ dependencies = [
  "apollo-sdk",
  "async-once-cell",
  "eyre",
+ "moka",
  "reth-config",
  "reth-tracing",
  "serde",
@@ -9534,6 +9534,7 @@ dependencies = [
  "futures",
  "humantime",
  "pin-project",
+ "reth-apollo",
  "reth-engine-primitives",
  "reth-network-api",
  "reth-primitives-traits",

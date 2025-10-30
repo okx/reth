@@ -221,8 +221,7 @@ where
 
             // Initialize Apollo singleton
             tracing::info!(target: "reth::apollo", "[Apollo] Before listening starts");
-            let apollo_client = ApolloClient::get_instance(apollo_config, flags).await?;
-            apollo_client.start_listening().await?;
+            ApolloClient::new(apollo_config).await?;
         }
 
         let data_dir = node_config.datadir();
