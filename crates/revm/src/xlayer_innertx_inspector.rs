@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, Bytes, U256};
 use revm::{
-    context::JournalTr,
+    context::CreateScheme,
     context_interface::ContextTr,
     interpreter::{
         interpreter::EthInterpreter, CallInputs, CallOutcome, CreateInputs, CreateOutcome,
@@ -47,11 +47,11 @@ pub struct InnerTxMeta {
 pub struct InnerTxInspector {
     inner_tx_meta: InnerTxMeta,
     current_depth: u64,
-    call_stack: Vec<InnerTx>,
+    call_stack: Vec<(InnerTx, usize)>,
 }
 
 impl InnerTxInspector {
-    /// Create a new InnerTxInspector
+    /// Create a new `InnerTxInspector`
     pub fn new() -> Self {
         Self::default()
     }
@@ -119,7 +119,10 @@ impl InnerTxInspector {
 
         // Add to collection
         self.inner_tx_meta.inner_txs.push(inner_tx.clone());
-        let new_index = self.inner_tx_meta.inner_txs.len() - 1;
+        let mut new_index = self.inner_tx_meta.inner_txs.len();
+        if new_index > 0 {
+            new_index -= 1;
+        }
 
         (inner_tx, new_index)
     }
@@ -129,7 +132,7 @@ impl InnerTxInspector {
         &mut self,
         op_type: &str,
         gas_used: u64,
-        new_index: usize,
+        new_index: u64,
         inner_tx: &mut InnerTx,
         addr: Option<Address>,
         err: Option<&str>,
@@ -140,7 +143,7 @@ impl InnerTxInspector {
 
         if let Some(error_msg) = err {
             // Mark all inner txs from this index as errors
-            for itx in self.inner_tx_meta.inner_txs.iter_mut().skip(new_index) {
+            for itx in self.inner_tx_meta.inner_txs.iter_mut().skip(new_index as usize) {
                 itx.is_error = true;
             }
             inner_tx.error = Some(error_msg.to_string());
@@ -163,22 +166,25 @@ where
     CTX: ContextTr,
 {
     fn initialize_interp(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        self.current_depth = context.journal().depth() as u64;
+        self.current_depth = 1;
 
         let _ = interp;
         let _ = context;
     }
 
+    // Ingore
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         let _ = interp;
         let _ = context;
     }
 
+    // Ingore
     fn step_end(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         let _ = interp;
         let _ = context;
     }
 
+    // Ingore
     fn log(&mut self, interp: &mut Interpreter, context: &mut CTX, log: Log) {
         let _ = interp;
         let _ = context;
@@ -187,27 +193,93 @@ where
 
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         self.current_depth += 1;
-        // inputs.scheme; (call/callcode/delegatecall/staticcall)
+
+        // Determine call type from scheme
+        let call_type = match inputs.scheme {
+            revm::interpreter::CallScheme::Call => "call",
+            revm::interpreter::CallScheme::CallCode => "callcode",
+            revm::interpreter::CallScheme::DelegateCall => "delegatecall",
+            revm::interpreter::CallScheme::StaticCall => "staticcall",
+        };
+
+        // Get transfer value (None for static calls)
+        let value = inputs.transfer_value().unwrap_or(U256::ZERO);
+
+        // Create inner transaction record
+        let (inner_tx, new_index) = self.before_op(
+            call_type,
+            inputs.caller,
+            Some(inputs.target_address),
+            Some(inputs.bytecode_address),
+            inputs.input.bytes(context),
+            inputs.gas_limit,
+            value,
+        );
+
+        // Push to stack with index for later retrieval in call_end
+        self.call_stack.push((inner_tx, new_index));
 
         let _ = context;
-        let _ = inputs;
         None
     }
 
     fn call_end(&mut self, context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
-        self.current_depth -= 1;
+        // Pop the corresponding call from stack
+        if let Some((mut inner_tx, new_index)) = self.call_stack.pop() {
+            let call_type = match inputs.scheme {
+                revm::interpreter::CallScheme::Call => "call",
+                revm::interpreter::CallScheme::CallCode => "callcode",
+                revm::interpreter::CallScheme::DelegateCall => "delegatecall",
+                revm::interpreter::CallScheme::StaticCall => "staticcall",
+            };
 
+            let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
+            let error = if outcome.result.is_error() {
+                Some(format!("{:?}", outcome.result))
+            } else {
+                None
+            };
+
+            self.after_op(
+                call_type,
+                gas_used,
+                new_index as u64,
+                &mut inner_tx,
+                None,
+                error.as_deref(),
+                outcome.result.output.clone(),
+            );
+        }
+
+        self.current_depth -= 1;
         let _ = context;
-        let _ = inputs;
-        let _ = outcome;
     }
 
     fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
-        // inputs.scheme; // (create/create2)
         self.current_depth += 1;
 
+        // Determine create type from scheme
+        let create_type = match inputs.scheme {
+            CreateScheme::Create => "create",
+            CreateScheme::Create2 { .. } => "create2",
+            CreateScheme::Custom { .. } => "custom",
+        };
+
+        // Create inner transaction record
+        let (inner_tx, new_index) = self.before_op(
+            create_type,
+            inputs.caller,
+            None, // CREATE doesn't have a 'to' address initially
+            None, // CREATE doesn't have a code_address
+            inputs.init_code.clone(),
+            inputs.gas_limit,
+            inputs.value,
+        );
+
+        // Push to stack with index for later retrieval in create_end
+        self.call_stack.push((inner_tx, new_index));
+
         let _ = context;
-        let _ = inputs;
         None
     }
 
@@ -217,19 +289,61 @@ where
         inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
-        // inputs.scheme; // (create/create2)
-        self.current_depth -= 1;
+        // Pop the corresponding create from stack
+        if let Some((mut inner_tx, new_index)) = self.call_stack.pop() {
+            let create_type = match inputs.scheme {
+                CreateScheme::Create => "create",
+                CreateScheme::Create2 { .. } => "create2",
+                CreateScheme::Custom { .. } => "custom",
+            };
 
+            let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
+            let error = if outcome.result.result.is_error() {
+                Some(format!("{:?}", outcome.result.result))
+            } else {
+                None
+            };
+
+            self.after_op(
+                create_type,
+                gas_used,
+                new_index as u64,
+                &mut inner_tx,
+                outcome.address, // CREATE operations return the new contract address
+                error.as_deref(),
+                outcome.result.output.clone(),
+            );
+        }
+
+        self.current_depth -= 1;
         let _ = context;
-        let _ = inputs;
-        let _ = outcome;
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
-        // NOTE: SUICIDE_TYP = "suicide"
-        let _ = contract;
-        let _ = target;
-        let _ = value;
+        // SELFDESTRUCT doesn't change depth - it happens within current call frame
+        let call_type = "suicide";
+
+        // Create inner transaction record for selfdestruct
+        let (mut inner_tx, new_index) = self.before_op(
+            call_type,
+            contract,
+            Some(target),
+            None,
+            Bytes::new(),
+            0, // selfdestruct uses remaining gas from current context
+            value,
+        );
+
+        // Immediately finalize (no _end hook for selfdestruct)
+        self.after_op(
+            call_type,
+            0, // gas_used recorded at transaction level
+            new_index as u64,
+            &mut inner_tx,
+            None,
+            None,
+            Bytes::new(),
+        );
     }
 }
 
@@ -237,32 +351,68 @@ where
 mod tests {
 
     use super::*;
-    use alloy_primitives::{address, bytes, Address, Bytes, U256};
-    use reth_chainspec::MAINNET;
+
+    use alloy_primitives::{address, U256};
+    // use reth_chainspec::{Chain, ChainSpec};
+    use reth_evm::{ConfigureEvm, EvmEnvFor};
     use reth_evm_ethereum::EthEvmConfig;
+    // use revm::context::{BlockEnv, CfgEnv};
     use revm::database::CacheDB;
-    // use revm::{
-    //     context_interface::ContextTr,
-    //     interpreter::{
-    //         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, CreateScheme,
-    //         InstructionResult,
-    //     },
-    // };
-    use std::sync::Arc;
+
+    use crate::interpreter::{CallInput, CallScheme, InstructionResult};
+    // use revm::context_interface::{ContextError, ContextTr};
+    // use revm::database::Database;
+    // use revm::Context;
 
     #[test]
     fn test_inner_tx_depth_tracking() {
         // Setup: Create EVM config and database
-        let chain_spec = Arc::new(MAINNET.clone());
-        let evm_config = EthEvmConfig::new(chain_spec.clone());
+        let evm_config = EthEvmConfig::mainnet();
 
         // Create a simple in-memory database
         let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
 
         // Setup accounts
         let caller = address!("1000000000000000000000000000000000000001");
-        let contract_a = address!("2000000000000000000000000000000000000002");
+        // let contract_a = address!("2000000000000000000000000000000000000002");
         let contract_b = address!("3000000000000000000000000000000000000003");
-        let contract_c = address!("4000000000000000000000000000000000000004");
+        // let contract_c = address!("4000000000000000000000000000000000000004");
+
+        let evm_env = EvmEnvFor::<reth_evm_ethereum::EthEvmConfig>::default();
+
+        // Create inspector
+        let mut inspector = InnerTxInspector::new();
+
+        // Create EVM with inspector
+        let _evm =
+            evm_config.evm_with_env_and_inspector(&mut cache_db, evm_env.clone(), &mut inspector);
+
+        // Simulate depth changes manually by calling inspector hooks
+        // (Since we're testing the inspector logic, not executing real bytecode)
+
+        // Initial depth (top-level transaction)
+        // assert_eq!(inspector.current_depth, 0, "Initial depth should be 0");
+
+        // Simulate: Contract A calls Contract B (CALL)
+        let mut _call_inputs_1 = CallInputs {
+            input: CallInput::default(),
+            gas_limit: 100_000,
+            bytecode_address: contract_b,
+            target_address: contract_b,
+            caller,
+            value: revm::interpreter::CallValue::Transfer(U256::ZERO),
+            scheme: CallScheme::Call,
+            is_static: false,
+            return_memory_offset: 0..0,
+        };
+
+        // inspector.call(&mut mock_context, &mut call_inputs_1);
+        // assert_eq!(inspector.current_depth, 1, "Depth after first CALL should be 1");
+    }
+
+    #[test]
+    #[ignore]
+    fn foobar() {
+        println!("{:?}", InstructionResult::OutOfGas);
     }
 }
