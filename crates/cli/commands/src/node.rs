@@ -219,7 +219,15 @@ where
 
             // Initialize Apollo singleton
             tracing::info!(target: "reth::apollo", "[Apollo] Before listening starts");
-            ApolloClient::new(apollo_config).await?;
+            match ApolloClient::new(apollo_config).await {
+                Ok(_) => {
+                    tracing::info!(target: "reth::apollo", "[Apollo] Apollo initialized successfully")
+                }
+                Err(e) => {
+                    tracing::error!(target: "reth::apollo", "[Apollo] Failed to initialize Apollo: {:?}; Proceeding with node launch without Apollo", e);
+                    node_config.apollo.enabled = false;
+                }
+            }
         }
 
         let data_dir = node_config.datadir();

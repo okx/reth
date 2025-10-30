@@ -2,7 +2,7 @@
 /// Component name prefixes for validation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Component {
-    /// OpGeth component
+    /// OpReth component
     OpReth,
 }
 

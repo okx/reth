@@ -148,13 +148,15 @@ impl ApolloClient {
 
     /// Load config from Apollo
     pub async fn load_config(&self) -> Result<bool, ApolloError> {
-        let client = self.inner.read().await;
         for (_, namespace) in &self.namespace_map {
-            let config = client.get_config_from_namespace("content", namespace);
+            let client = self.inner.read().await;
+            let config = client
+                .get_config_from_namespace("content", namespace)
+                .map(|c| c.config_value.clone());
+            drop(client);
             if let Some(config) = config {
                 // Get config cache for namespace
-                Self::update_cache_from_config(self.cache.clone(), namespace, &config.config_value)
-                    .await;
+                Self::update_cache_from_config(self.cache.clone(), namespace, &config);
             } else {
                 warn!(target: "reth::apollo", "[Apollo] No config found for namespace {}", namespace);
             }
@@ -183,9 +185,8 @@ impl ApolloClient {
         // Start listening to all namespaces
         let client_read = client.read().await;
         for (_prefix, namespace) in &namespace_map {
-            let listen_res = client_read.listen_namespace(namespace).await;
-            if listen_res.is_some() {
-                error!(target: "reth::apollo", "[Apollo] Failed to listen to namespace {}: {:?}", namespace, listen_res.unwrap());
+            if let Some(err) = client_read.listen_namespace(namespace).await {
+                warn!(target: "reth::apollo", "[Apollo] Failed to listen to namespace {}: {:?}", namespace, err);
             }
         }
         drop(client_read);
@@ -228,9 +229,9 @@ impl ApolloClient {
                 _ = async {
                     // Check for change events
                     let client_read = client.read().await;
-                    for (_, namespace) in &namespace_map {
+                    for (prefix, _) in &namespace_map {
                         if let Some(change_event) = client_read.fetch_change_event() {
-                            info!(target: "reth::apollo", "[Apollo] Configuration change detected for namespace {}: {:?}", namespace, change_event);
+                            info!(target: "reth::apollo", "[Apollo] Configuration change detected for namespace prefix {}: {:?}", prefix, change_event);
                             Self::fetch_and_update_configs(&client, &cache, &namespace_map).await;
                             break;
                         }
@@ -245,12 +246,15 @@ impl ApolloClient {
         cache: &Arc<Cache<String, JsonValue>>,
         namespace_map: &HashMap<String, String>,
     ) {
-        let client_read = client.read().await;
-        for (_, namespace) in namespace_map {
-            if let Some(config) = client_read.get_config_from_namespace("content", namespace) {
-                info!(target: "reth::apollo", "[Apollo] Fetched config for namespace {}: config_key={}", namespace, config.config_key);
-                Self::update_cache_from_config(cache.clone(), namespace, &config.config_value)
-                    .await;
+        for (prefix, namespace) in namespace_map {
+            let client_read = client.read().await;
+            let config = client_read
+                .get_config_from_namespace("content", namespace)
+                .map(|c| c.config_value.clone());
+            drop(client_read);
+
+            if let Some(config) = config {
+                Self::update_cache_from_config(cache.clone(), prefix, &config);
             } else {
                 warn!(target: "reth::apollo", "[Apollo] get_config returned None for namespace {}. This may happen if the namespace format doesn't match.", namespace);
             }
@@ -258,26 +262,19 @@ impl ApolloClient {
     }
 
     /// Parse YAML config and update cache with individual keys
-    async fn update_cache_from_config(
+    fn update_cache_from_config(
         cache: Arc<Cache<String, JsonValue>>,
-        namespace: &str,
+        prefix: &str,
         config_value: &str,
     ) {
         match serde_yaml::from_str::<HashMap<String, JsonValue>>(config_value) {
             Ok(parsed_config) => {
-                info!(target: "reth::apollo", "[Apollo] Writing to cache for namespace {}: parsed {} keys", namespace, parsed_config.len());
                 for (key, value) in parsed_config {
-                    cache.insert(key, value);
+                    cache.insert(format!("{}:{}", prefix, key), value);
                 }
-                // DEBUG: Collect all cache entries for logging
-                let mut cache_contents = HashMap::new();
-                for (key, value) in cache.iter() {
-                    cache_contents.insert(format!("{}:{}", namespace, key), value.clone());
-                }
-                info!(target: "reth::apollo", "[Apollo] Cache updated for namespace {}, cache contents: {:?}", namespace, cache_contents);
             }
             Err(e) => {
-                error!(target: "reth::apollo", "[Apollo] Failed to parse YAML for namespace {}: {}", namespace, e);
+                error!(target: "reth::apollo", "[Apollo] Failed to parse YAML for namespace prefix {}: {}", prefix, e);
             }
         }
     }
