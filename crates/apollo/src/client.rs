@@ -286,7 +286,7 @@ impl ApolloClient {
     }
 
     /// Query cached configurations
-    pub async fn get_cached_config(&self, namespace: &str, key: &str) -> Option<JsonValue> {
+    pub fn get_cached_config(&self, namespace: &str, key: &str) -> Option<JsonValue> {
         debug!(target: "reth::apollo", "[Apollo] Getting cached config for namespace {}: key: {:?}", namespace, make_cache_key(namespace, key));
         self.cache.get(&make_cache_key(namespace, key))
     }
