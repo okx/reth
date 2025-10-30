@@ -18,6 +18,18 @@ impl FromJsonValue for i64 {
     }
 }
 
+impl FromJsonValue for i32 {
+    fn from_json_value(value: &JsonValue) -> Option<Self> {
+        value.as_i64().and_then(|n| n.try_into().ok())
+    }
+}
+
+impl FromJsonValue for u32 {
+    fn from_json_value(value: &JsonValue) -> Option<Self> {
+        value.as_u64().and_then(|n| n.try_into().ok())
+    }
+}
+
 impl FromJsonValue for f64 {
     fn from_json_value(value: &JsonValue) -> Option<Self> {
         value.as_f64()

@@ -144,7 +144,6 @@ impl ApolloClient {
             let config = client
                 .get_config_from_namespace("content", namespace)
                 .map(|c| c.config_value.clone());
-            drop(client);
             if let Some(config) = config {
                 // Get config cache for namespace
                 Self::update_cache_from_config(&self.cache, namespace, &config);
@@ -154,11 +153,6 @@ impl ApolloClient {
         }
 
         Ok(())
-    }
-
-    /// Check if instance is initialized
-    pub fn is_initialized() -> bool {
-        INSTANCE.get().is_some()
     }
 
     /// Start continuous listening
@@ -242,7 +236,6 @@ impl ApolloClient {
             let config = client_read
                 .get_config_from_namespace("content", full_namespace)
                 .map(|c| c.config_value.clone());
-            drop(client_read);
 
             if let Some(config) = config {
                 Self::update_cache_from_config(&cache, namespace, &config);
