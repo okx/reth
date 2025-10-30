@@ -1,3 +1,50 @@
+use serde_json::Value as JsonValue;
+
+/// Trait for converting from JsonValue to concrete types
+pub trait FromJsonValue: Sized {
+    /// Convert from JsonValue to concrete type
+    fn from_json_value(value: &JsonValue) -> Option<Self>;
+}
+
+impl FromJsonValue for u64 {
+    fn from_json_value(value: &JsonValue) -> Option<Self> {
+        value.as_u64()
+    }
+}
+
+impl FromJsonValue for i64 {
+    fn from_json_value(value: &JsonValue) -> Option<Self> {
+        value.as_i64()
+    }
+}
+
+impl FromJsonValue for f64 {
+    fn from_json_value(value: &JsonValue) -> Option<Self> {
+        value.as_f64()
+    }
+}
+
+impl FromJsonValue for bool {
+    fn from_json_value(value: &JsonValue) -> Option<Self> {
+        value.as_bool()
+    }
+}
+
+impl FromJsonValue for String {
+    fn from_json_value(value: &JsonValue) -> Option<Self> {
+        value.as_str().map(|s| s.to_string())
+    }
+}
+
+impl<T> FromJsonValue for Vec<T>
+where
+    T: FromJsonValue,
+{
+    fn from_json_value(value: &JsonValue) -> Option<Self> {
+        value.as_array()?.iter().map(|v| T::from_json_value(v)).collect()
+    }
+}
+
 /// Apollo-specific configuration that complements reth's config
 #[derive(Debug, Clone)]
 pub struct ApolloConfig {

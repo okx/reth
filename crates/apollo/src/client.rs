@@ -1,3 +1,5 @@
+//! Apollo configuration client for dynamic configuration management.
+
 use crate::types::{ApolloConfig, ApolloError};
 use apollo_sdk::client::apollo_config_client::ApolloConfigClient;
 use async_once_cell::OnceCell;
@@ -12,15 +14,24 @@ use tracing::{error, info, warn};
 const CACHE_EXPIRATION: Duration = Duration::from_secs(60);
 /// Apollo client wrapper for reth
 pub struct ApolloClient {
+    /// Inner Apollo SDK client
     pub inner: Arc<RwLock<ApolloConfigClient>>,
+    /// Apollo configuration
     pub config: ApolloConfig,
+    /// Map of namespace prefixes to full namespace names
     pub namespace_map: HashMap<String, String>,
+    /// Configuration cache with TTL
     pub cache: Arc<Cache<String, JsonValue>>,
+    /// Background listener task state
     pub listener_state: Arc<Mutex<ListenerState>>,
 }
 
+/// State for the background listener task
+#[derive(Debug)]
 pub struct ListenerState {
+    /// Background task handle
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Shutdown signal sender
     shutdown_tx: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
@@ -126,6 +137,7 @@ impl ApolloClient {
         })
     }
 
+    /// Get singleton instance
     pub fn get_instance() -> Result<ApolloClient, ApolloError> {
         INSTANCE
             .get()
@@ -155,11 +167,11 @@ impl ApolloClient {
         INSTANCE.get().is_some()
     }
 
-    // Start continuous listening
+    /// Start continuous listening
     pub async fn start_listening(&self) -> Result<(), ApolloError> {
         let mut state = self.listener_state.lock().await;
         if state.task.is_some() {
-            return Ok(()); // Already listening
+            return Ok(());
         }
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -269,7 +281,7 @@ impl ApolloClient {
         }
     }
 
-    // Stop listening and cleanup
+    /// Stop listening and cleanup
     pub async fn stop_listening(&self) -> Result<(), ApolloError> {
         let mut state = self.listener_state.lock().await;
         if let Some(tx) = state.shutdown_tx.take() {
@@ -284,13 +296,13 @@ impl ApolloClient {
         Ok(())
     }
 
-    // Query cached configurations
+    /// Query cached configurations
     pub async fn get_cached_config(&self, namespace: &str, key: &str) -> Option<JsonValue> {
         info!(target: "reth::apollo", "[Apollo] Getting cached config for namespace {}: key: {:?}", namespace, key);
         self.cache.get(key)
     }
 
-    // Get all cached configs for a namespace
+    /// Get all cached configs for a namespace
     pub async fn get_namespace_configs(&self, namespace: &str) -> HashMap<String, JsonValue> {
         self.cache
             .iter()
