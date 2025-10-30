@@ -147,7 +147,7 @@ impl ApolloClient {
             drop(client);
             if let Some(config) = config {
                 // Get config cache for namespace
-                Self::update_cache_from_config(self.cache.clone(), namespace, &config);
+                Self::update_cache_from_config(&self.cache, namespace, &config);
             } else {
                 warn!(target: "reth::apollo", "[Apollo] No config found for namespace {}", namespace);
             }
@@ -245,7 +245,7 @@ impl ApolloClient {
             drop(client_read);
 
             if let Some(config) = config {
-                Self::update_cache_from_config(cache.clone(), namespace, &config);
+                Self::update_cache_from_config(&cache, namespace, &config);
             } else {
                 warn!(target: "reth::apollo", "[Apollo] get_config returned None for namespace {}. This may happen if the namespace format doesn't match.", namespace);
             }
@@ -254,7 +254,7 @@ impl ApolloClient {
 
     /// Parse YAML config and update cache with individual keys
     fn update_cache_from_config(
-        cache: Cache<String, JsonValue>,
+        cache: &Cache<String, JsonValue>,
         namespace: &str,
         config_value: &str,
     ) {
