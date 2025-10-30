@@ -20,6 +20,8 @@ pub mod call;
 pub mod config;
 pub mod estimate;
 pub mod fee;
+pub mod legacy;
+pub mod legacy_router;
 pub mod pending_block;
 pub mod receipt;
 pub mod signer;
@@ -32,6 +34,11 @@ pub use block::{EthBlocks, LoadBlock};
 pub use blocking_task::SpawnBlocking;
 pub use call::{Call, EthCall};
 pub use fee::{EthFees, LoadFee};
+pub use legacy::LegacyRpc;
+pub use legacy_router::{
+    boxed_err_to_rpc, convert_option_via_serde, convert_via_serde, internal_rpc_err,
+    should_route_block_id_to_legacy, should_route_to_legacy,
+};
 pub use pending_block::LoadPendingBlock;
 pub use receipt::LoadReceipt;
 pub use signer::{AddDevSigners, EthSigner};

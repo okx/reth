@@ -14,6 +14,8 @@ pub mod error;
 pub mod fee_history;
 pub mod gas_oracle;
 pub mod id_provider;
+pub mod legacy;
+pub mod legacy_init;
 pub mod logs_utils;
 pub mod pending_block;
 pub mod receipt;
@@ -33,6 +35,8 @@ pub use gas_oracle::{
     GasCap, GasPriceOracle, GasPriceOracleConfig, GasPriceOracleResult, RPC_DEFAULT_GAS_CAP,
 };
 pub use id_provider::EthSubscriptionIdProvider;
+pub use legacy::{CrossBoundaryFilterManager, LegacyRpcClient, LegacyRpcConfig};
+pub use legacy_init::{init_legacy_rpc_components, LegacyRpcComponents};
 pub use pending_block::{PendingBlock, PendingBlockEnv, PendingBlockEnvOrigin};
 pub use transaction::TransactionSource;
 pub use tx_forward::ForwardConfig;

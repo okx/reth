@@ -244,6 +244,26 @@ pub struct RpcServerArgs {
     /// Gas price oracle configuration.
     #[command(flatten)]
     pub gas_price_oracle: GasPriceOracleArgs,
+
+    /// Legacy RPC endpoint URL for routing historical data
+    ///
+    /// When specified, requests for blocks below --legacy-cutoff-block will be forwarded to this endpoint.
+    /// This is useful when migrating from another client (e.g., Erigon) and needing to access historical data.
+    #[arg(long = "legacy-rpc-url", value_name = "URL")]
+    pub legacy_rpc_url: Option<String>,
+
+    /// Block number below which requests are routed to legacy RPC
+    ///
+    /// Requests for blocks < cutoff are forwarded to --legacy-rpc-url.
+    /// Requests for blocks >= cutoff are handled locally by Reth.
+    #[arg(long = "legacy-cutoff-block", value_name = "NUMBER", requires = "legacy_rpc_url")]
+    pub legacy_cutoff_block: Option<u64>,
+
+    /// Timeout for legacy RPC requests
+    ///
+    /// Specifies how long to wait for responses from the legacy RPC endpoint.
+    #[arg(long = "legacy-rpc-timeout", value_name = "DURATION", default_value = "30s", requires = "legacy_rpc_url")]
+    pub legacy_rpc_timeout: Option<String>,
 }
 
 impl RpcServerArgs {
@@ -403,6 +423,9 @@ impl Default for RpcServerArgs {
             rpc_proof_permits: constants::DEFAULT_PROOF_PERMITS,
             rpc_forwarder: None,
             builder_disallow: Default::default(),
+            legacy_rpc_url: None,
+            legacy_cutoff_block: None,
+            legacy_rpc_timeout: None,
         }
     }
 }
