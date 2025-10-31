@@ -101,6 +101,7 @@ pub struct InnerTxInspector {
     call_stack: Vec<(InnerTx, usize)>,
 }
 
+// Public
 impl InnerTxInspector {
     /// Create a new `InnerTxInspector`
     pub fn new() -> Self {
@@ -111,7 +112,10 @@ impl InnerTxInspector {
     pub fn get_inner_txs(&self) -> &[InnerTx] {
         &self.inner_tx_meta.inner_txs
     }
+}
 
+// Private
+impl InnerTxInspector {
     /// beforeOp equivalent - called before EVM operations
     #[allow(clippy::too_many_arguments)]
     fn before_op(
