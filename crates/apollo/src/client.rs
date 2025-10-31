@@ -6,6 +6,7 @@ use apollo_sdk::client::apollo_config_client::ApolloConfigClient;
 use async_once_cell::OnceCell;
 use moka::sync::Cache;
 use serde_json::Value as JsonValue;
+use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -29,13 +30,10 @@ pub struct ApolloService {
 pub struct ListenerState {
     /// Background task handle
     task: Option<tokio::task::JoinHandle<()>>,
-    /// Shutdown signal sender
-    shutdown_tx: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 /// Singleton instance
 static INSTANCE: OnceCell<Arc<ApolloService>> = OnceCell::new();
-const POLL_INTERVAL_SECS: u64 = 30;
 
 impl std::fmt::Debug for ApolloService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -123,7 +121,7 @@ impl ApolloService {
             config,
             namespace_map,
             cache: Cache::builder().max_capacity(1000).build(),
-            listener_state: Arc::new(Mutex::new(ListenerState { task: None, shutdown_tx: None })),
+            listener_state: Arc::new(Mutex::new(ListenerState { task: None })),
         })
     }
 
@@ -160,7 +158,6 @@ impl ApolloService {
             return Ok(());
         }
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
         let client = self.inner.clone();
         let cache = self.cache.clone();
         let namespace_map = self.namespace_map.clone();
@@ -177,11 +174,10 @@ impl ApolloService {
 
         // Spawn background listener task
         let task = tokio::spawn(async move {
-            Self::listener_task(client, cache, namespace_map, shutdown_rx).await;
+            Self::listener_task(client, cache, namespace_map).await;
         });
 
         state.task = Some(task);
-        state.shutdown_tx = Some(shutdown_tx);
 
         info!(target: "reth::apollo", "[Apollo] Started listening to configuration changes");
         Ok(())
@@ -192,24 +188,14 @@ impl ApolloService {
         client: Arc<ApolloConfigClient>,
         cache: Cache<String, ConfigValue>,
         namespace_map: HashMap<String, String>,
-        mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     ) {
+        let mut interval = tokio::time::interval(Duration::from_millis(1000));
         loop {
-            tokio::select! {
-                _ = shutdown_rx.recv() => {
-                    info!(target: "reth::apollo", "[Apollo] Stopping listener task");
-                    break;
-                }
-                _ = async {
-                    // Check for change events
-                    for (namespace, _) in &namespace_map {
-                        if let Some(change_event) = client.fetch_change_event() {
-                            info!(target: "reth::apollo", "[Apollo] Configuration change detected for namespace {}: {:?}", namespace, change_event);
-                            Self::fetch_and_update_configs(&client, &cache, &namespace_map).await;
-                            break;
-                        }
-                    }
-                } => {}
+            interval.tick().await;
+
+            if let Some(change_event) = client.fetch_change_event() {
+                info!(target: "reth::apollo", "[Apollo] Configuration change detected: {:?}", change_event);
+                Self::fetch_and_update_configs(&client, &cache, &namespace_map).await;
             }
         }
     }
