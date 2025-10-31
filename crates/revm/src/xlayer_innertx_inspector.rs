@@ -1,4 +1,4 @@
-//! XLayer inner-transaction inspector.
+//! `XLayer` inner-transaction inspector.
 //!
 //! This module defines `InnerTxInspector`, a custom inspector built on top of
 //! `revm`'s `Inspector` trait that records inner transactions (calls and
@@ -88,6 +88,7 @@ impl InnerTxInspector {
     }
 
     /// beforeOp equivalent - called before EVM operations
+    #[allow(clippy::too_many_arguments)]
     fn before_op(
         &mut self,
         call_type: &str,
@@ -132,6 +133,7 @@ impl InnerTxInspector {
             self.inner_tx_meta.index_map.insert(self.current_depth, 0);
             self.inner_tx_meta.last_depth = self.current_depth;
         }
+        inner_tx.internal_index = self.inner_tx_meta.index;
 
         // Build trace address and name
         for i in 1..=self.inner_tx_meta.last_depth {
@@ -141,19 +143,16 @@ impl InnerTxInspector {
             }
         }
         inner_tx.name = format!("{}{}", call_type, inner_tx.name);
-        inner_tx.internal_index = self.inner_tx_meta.index;
 
-        // Add to collection
+        let new_index = self.inner_tx_meta.inner_txs.len().checked_sub(1).map_or(0, |x| x);
+
         self.inner_tx_meta.inner_txs.push(inner_tx.clone());
-        let mut new_index = self.inner_tx_meta.inner_txs.len();
-        if new_index > 0 {
-            new_index -= 1;
-        }
 
         (inner_tx, new_index)
     }
 
     /// afterOp equivalent - called after EVM operations
+    #[allow(clippy::too_many_arguments)]
     fn after_op(
         &mut self,
         op_type: &str,
@@ -260,11 +259,7 @@ where
             };
 
             let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
-            let error = if outcome.result.is_error() {
-                Some(format!("{:?}", outcome.result))
-            } else {
-                None
-            };
+            let error = outcome.result.is_error().then(|| format!("{:?}", outcome.result));
 
             self.after_op(
                 call_type,
@@ -324,11 +319,8 @@ where
             };
 
             let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
-            let error = if outcome.result.result.is_error() {
-                Some(format!("{:?}", outcome.result.result))
-            } else {
-                None
-            };
+            let error =
+                outcome.result.result.is_error().then(|| format!("{:?}", outcome.result.result));
 
             self.after_op(
                 create_type,
