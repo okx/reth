@@ -14,12 +14,11 @@
 //! (e.g., RPC trace-like responses or analytics).
 //!
 //! Integration notes:
-//! - Reth uses `alloy-evm` as a higher-level facade but executes via `revm`.
-//!   This inspector can be provided when constructing the EVM using
-//!   `evm_with_env_and_inspector(...)` so it runs during transaction and block
-//!   execution.
-//! - See `examples/custom-inspector` for an example of wiring an inspector into
-//!   RPC execution paths.
+//! - Reth uses `alloy-evm` as a higher-level facade but executes via `revm`. This inspector can be
+//!   provided when constructing the EVM using `evm_with_env_and_inspector(...)` so it runs during
+//!   transaction and block execution.
+//! - See `examples/custom-inspector` for an example of wiring an inspector into RPC execution
+//!   paths.
 //!
 //! This implementation mirrors parts of xlayer-erigon's inner-tx semantics to
 //! ease compatibility with existing tooling.
@@ -29,8 +28,8 @@ use revm::{
     context::CreateScheme,
     context_interface::ContextTr,
     interpreter::{
-        interpreter::EthInterpreter, CallInputs, CallOutcome, CreateInputs, CreateOutcome,
-        Interpreter,
+        interpreter::EthInterpreter, CallInputs, CallOutcome, CallScheme, CreateInputs,
+        CreateOutcome, Interpreter,
     },
     primitives::Log,
     Inspector,
@@ -221,10 +220,10 @@ where
 
         // Determine call type from scheme
         let call_type = match inputs.scheme {
-            revm::interpreter::CallScheme::Call => "call",
-            revm::interpreter::CallScheme::CallCode => "callcode",
-            revm::interpreter::CallScheme::DelegateCall => "delegatecall",
-            revm::interpreter::CallScheme::StaticCall => "staticcall",
+            CallScheme::Call => "call",
+            CallScheme::CallCode => "callcode",
+            CallScheme::DelegateCall => "delegatecall",
+            CallScheme::StaticCall => "staticcall",
         };
 
         // Get transfer value (None for static calls)
@@ -252,10 +251,10 @@ where
         // Pop the corresponding call from stack
         if let Some((mut inner_tx, new_index)) = self.call_stack.pop() {
             let call_type = match inputs.scheme {
-                revm::interpreter::CallScheme::Call => "call",
-                revm::interpreter::CallScheme::CallCode => "callcode",
-                revm::interpreter::CallScheme::DelegateCall => "delegatecall",
-                revm::interpreter::CallScheme::StaticCall => "staticcall",
+                CallScheme::Call => "call",
+                CallScheme::CallCode => "callcode",
+                CallScheme::DelegateCall => "delegatecall",
+                CallScheme::StaticCall => "staticcall",
             };
 
             let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
