@@ -36,6 +36,32 @@ use revm::{
 };
 use std::collections::HashMap;
 
+/// Trait for converting call/create schemes to their string representation.
+trait AsSchemeStr {
+    fn as_str(&self) -> &'static str;
+}
+
+impl AsSchemeStr for CallScheme {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::CallCode => "callcode",
+            Self::DelegateCall => "delegatecall",
+            Self::StaticCall => "staticcall",
+        }
+    }
+}
+
+impl AsSchemeStr for CreateScheme {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Create2 { .. } => "create2",
+            Self::Custom { .. } => "custom",
+        }
+    }
+}
+
 /// Inner transaction data structure (equivalent to xlayer-erigon's `InnerTx`)
 #[derive(Debug, Clone)]
 pub struct InnerTx {
@@ -219,13 +245,7 @@ where
         self.current_depth += 1;
 
         // Determine call type from scheme
-        let call_type = match inputs.scheme {
-            CallScheme::Call => "call",
-            CallScheme::CallCode => "callcode",
-            CallScheme::DelegateCall => "delegatecall",
-            CallScheme::StaticCall => "staticcall",
-        };
-
+        let call_type = inputs.scheme.as_str();
         // Get transfer value (None for static calls)
         let value = inputs.transfer_value().unwrap_or(U256::ZERO);
 
@@ -250,13 +270,7 @@ where
     fn call_end(&mut self, context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
         // Pop the corresponding call from stack
         if let Some((mut inner_tx, new_index)) = self.call_stack.pop() {
-            let call_type = match inputs.scheme {
-                CallScheme::Call => "call",
-                CallScheme::CallCode => "callcode",
-                CallScheme::DelegateCall => "delegatecall",
-                CallScheme::StaticCall => "staticcall",
-            };
-
+            let call_type = inputs.scheme.as_str();
             let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
             let error = outcome.result.is_error().then(|| format!("{:?}", outcome.result));
 
@@ -279,11 +293,7 @@ where
         self.current_depth += 1;
 
         // Determine create type from scheme
-        let create_type = match inputs.scheme {
-            CreateScheme::Create => "create",
-            CreateScheme::Create2 { .. } => "create2",
-            CreateScheme::Custom { .. } => "custom",
-        };
+        let create_type = inputs.scheme.as_str();
 
         // Create inner transaction record
         let (inner_tx, new_index) = self.before_op(
@@ -311,12 +321,7 @@ where
     ) {
         // Pop the corresponding create from stack
         if let Some((mut inner_tx, new_index)) = self.call_stack.pop() {
-            let create_type = match inputs.scheme {
-                CreateScheme::Create => "create",
-                CreateScheme::Create2 { .. } => "create2",
-                CreateScheme::Custom { .. } => "custom",
-            };
-
+            let create_type = inputs.scheme.as_str();
             let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
             let error =
                 outcome.result.result.is_error().then(|| format!("{:?}", outcome.result.result));
