@@ -2,7 +2,7 @@
 
 use crate::launcher::Launcher;
 use clap::{value_parser, Args, Parser};
-use reth_apollo::{ApolloClient, ApolloConfig};
+use reth_apollo::{ApolloConfig, ApolloService};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_runner::CliContext;
@@ -218,7 +218,7 @@ where
             tracing::info!(target: "reth::apollo", "[Apollo] Creating Apollo config");
 
             // Initialize Apollo singleton
-            match ApolloClient::initialize(apollo_config).await {
+            match ApolloService::initialize(apollo_config).await {
                 Ok(_) => {
                     tracing::info!(target: "reth::apollo", "[Apollo] Apollo initialized successfully")
                 }

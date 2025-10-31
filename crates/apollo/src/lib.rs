@@ -14,7 +14,7 @@ macro_rules! apollo_config_or {
         let ns = $namespace;  // Bind to extend lifetime
         let ns_ref: &str = &ns;
 
-        let result =$crate::client::ApolloClient::get_instance()
+        let result =$crate::client::ApolloService::get_instance()
             .ok()
             .and_then(|apollo| apollo.get_cached_config(ns_ref, $key))
             .and_then(|v| $crate::types::FromJsonValue::from_json_value(&v));
@@ -35,5 +35,5 @@ macro_rules! apollo_config_or {
     }};
 }
 
-pub use client::ApolloClient;
+pub use client::ApolloService;
 pub use types::ApolloConfig;

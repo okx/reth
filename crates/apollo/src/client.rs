@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 const CACHE_EXPIRATION: Duration = Duration::from_secs(60);
 /// Apollo client wrapper for reth
-pub struct ApolloClient {
+pub struct ApolloService {
     /// Inner Apollo SDK client
     pub inner: Arc<ApolloConfigClient>,
     /// Apollo configuration
@@ -35,12 +35,12 @@ pub struct ListenerState {
 }
 
 /// Singleton instance
-static INSTANCE: OnceCell<Arc<ApolloClient>> = OnceCell::new();
+static INSTANCE: OnceCell<Arc<ApolloService>> = OnceCell::new();
 const POLL_INTERVAL_SECS: u64 = 30;
 
-impl std::fmt::Debug for ApolloClient {
+impl std::fmt::Debug for ApolloService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ApolloClient")
+        f.debug_struct("ApolloService")
             .field("config", &self.config)
             .field("namespace_map", &self.namespace_map)
             .field("cache", &self.cache)
@@ -49,7 +49,7 @@ impl std::fmt::Debug for ApolloClient {
     }
 }
 
-impl Clone for ApolloClient {
+impl Clone for ApolloService {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -61,9 +61,9 @@ impl Clone for ApolloClient {
     }
 }
 
-impl ApolloClient {
+impl ApolloService {
     /// Get singleton instance
-    pub async fn initialize(config: ApolloConfig) -> Result<Arc<ApolloClient>, ApolloError> {
+    pub async fn initialize(config: ApolloConfig) -> Result<Arc<ApolloService>, ApolloError> {
         let instance = INSTANCE
             .get_or_try_init(async {
                 let client = Self::new_instance(config).await?;
@@ -78,7 +78,7 @@ impl ApolloClient {
     }
 
     /// Create new instance
-    async fn new_instance(config: ApolloConfig) -> Result<ApolloClient, ApolloError> {
+    async fn new_instance(config: ApolloConfig) -> Result<ApolloService, ApolloError> {
         // Validate configuration
         if config.app_id.is_empty()
             || config.meta_server.is_empty()
@@ -119,7 +119,7 @@ impl ApolloClient {
             }
         }
 
-        Ok(ApolloClient {
+        Ok(ApolloService {
             inner: Arc::new(client),
             config,
             namespace_map,
@@ -129,7 +129,7 @@ impl ApolloClient {
     }
 
     /// Get singleton instance
-    pub fn get_instance() -> Result<Arc<ApolloClient>, ApolloError> {
+    pub fn get_instance() -> Result<Arc<ApolloService>, ApolloError> {
         INSTANCE
             .get()
             .cloned()
