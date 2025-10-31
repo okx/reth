@@ -17,7 +17,7 @@ macro_rules! apollo_config_or {
         let result =$crate::client::ApolloService::get_instance()
             .ok()
             .and_then(|apollo| apollo.get_cached_config(ns_ref, $key))
-            .and_then(|v| $crate::types::FromJsonValue::from_json_value(&v));
+            .and_then(|v| $crate::types::FromConfigValue::from_config_value(&v));
 
         match result {
             Some(value) => value,
@@ -27,7 +27,7 @@ macro_rules! apollo_config_or {
                     namespace = ns_ref,
                     key = $key,
                     default = ?$default,
-                    "Using default config (client not initialized, key missing, or type mismatch)"
+                    "[Apollo] Using default config (client not initialized, key missing, or type mismatch)"
                 );
                 $default
             }

@@ -1,16 +1,15 @@
 //! Apollo configuration client for dynamic configuration management.
 
+use crate::types::ConfigValue;
 use crate::types::{ApolloConfig, ApolloError};
 use apollo_sdk::client::apollo_config_client::ApolloConfigClient;
 use async_once_cell::OnceCell;
 use moka::sync::Cache;
 use serde_json::Value as JsonValue;
-use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-const CACHE_EXPIRATION: Duration = Duration::from_secs(60);
 /// Apollo client wrapper for reth
 pub struct ApolloService {
     /// Inner Apollo SDK client
@@ -19,8 +18,8 @@ pub struct ApolloService {
     pub config: ApolloConfig,
     /// Map of namespaces to full namespace names
     pub namespace_map: HashMap<String, String>,
-    /// Configuration cache with TTL
-    pub cache: Cache<String, JsonValue>,
+    /// Configuration cache
+    pub cache: Cache<String, ConfigValue>,
     /// Background listener task state
     pub listener_state: Arc<Mutex<ListenerState>>,
 }
@@ -123,7 +122,7 @@ impl ApolloService {
             inner: Arc::new(client),
             config,
             namespace_map,
-            cache: Cache::builder().max_capacity(1000).time_to_live(CACHE_EXPIRATION).build(),
+            cache: Cache::builder().max_capacity(1000).build(),
             listener_state: Arc::new(Mutex::new(ListenerState { task: None, shutdown_tx: None })),
         })
     }
@@ -191,22 +190,15 @@ impl ApolloService {
     // Background listener task
     async fn listener_task(
         client: Arc<ApolloConfigClient>,
-        cache: Cache<String, JsonValue>,
+        cache: Cache<String, ConfigValue>,
         namespace_map: HashMap<String, String>,
         mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     ) {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(POLL_INTERVAL_SECS));
-
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     info!(target: "reth::apollo", "[Apollo] Stopping listener task");
                     break;
-                }
-                _ = interval.tick() => {
-                    // Fetch config on every interval
-                    Self::fetch_and_update_configs(&client, &cache, &namespace_map).await;
                 }
                 _ = async {
                     // Check for change events
@@ -224,7 +216,7 @@ impl ApolloService {
 
     async fn fetch_and_update_configs(
         client: &Arc<ApolloConfigClient>,
-        cache: &Cache<String, JsonValue>,
+        cache: &Cache<String, ConfigValue>,
         namespace_map: &HashMap<String, String>,
     ) {
         for (namespace, full_namespace) in namespace_map {
@@ -242,14 +234,18 @@ impl ApolloService {
 
     /// Parse YAML config and update cache with individual keys
     fn update_cache_from_config(
-        cache: &Cache<String, JsonValue>,
+        cache: &Cache<String, ConfigValue>,
         namespace: &str,
         config_value: &str,
     ) {
         match serde_yaml::from_str::<HashMap<String, JsonValue>>(config_value) {
             Ok(parsed_config) => {
                 for (key, value) in parsed_config {
-                    cache.insert(make_cache_key(namespace, key.as_str()), value);
+                    cache.insert(
+                        make_cache_key(namespace, key.as_str()),
+                        ConfigValue::from_json(&value)
+                            .unwrap_or_else(|| ConfigValue::String(value.to_string())),
+                    );
                 }
             }
             Err(e) => {
@@ -259,7 +255,7 @@ impl ApolloService {
     }
 
     /// Query cached configurations
-    pub fn get_cached_config(&self, namespace: &str, key: &str) -> Option<JsonValue> {
+    pub fn get_cached_config(&self, namespace: &str, key: &str) -> Option<ConfigValue> {
         let cache_key = make_cache_key(namespace, key);
         debug!(target: "reth::apollo", "[Apollo] Getting cached config for namespace {}: key: {:?}", namespace, cache_key);
         self.cache.get(&cache_key)
