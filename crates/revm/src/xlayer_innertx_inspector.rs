@@ -213,6 +213,116 @@ impl InnerTxInspector {
             _ => {}
         }
     }
+
+    fn call(&mut self, inputs: &CallInputs, input_bytes: Bytes) {
+        // Determine call type from scheme
+        let call_type = inputs.scheme.as_str();
+        // Get transfer value (None for static calls)
+        let value = inputs.transfer_value().unwrap_or(U256::ZERO);
+        // Create inner transaction record
+        let (inner_tx, new_index) = self.before_op(
+            call_type,
+            inputs.caller,
+            Some(inputs.target_address),
+            Some(inputs.bytecode_address),
+            input_bytes,
+            inputs.gas_limit,
+            value,
+        );
+        // Push to stack with index for later retrieval in call_end
+        self.call_stack.push((inner_tx, new_index));
+    }
+
+    fn call_end(&mut self, inputs: &CallInputs, outcome: &CallOutcome) {
+        // Pop the corresponding call from stack
+        if let Some((mut inner_tx, new_index)) = self.call_stack.pop() {
+            let call_type = inputs.scheme.as_str();
+            let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
+            let error = outcome.result.is_error().then(|| format!("{:?}", outcome.result));
+
+            self.after_op(
+                call_type,
+                gas_used,
+                new_index as u64,
+                &mut inner_tx,
+                None,
+                error.as_deref(),
+                outcome.result.output.clone(),
+            );
+        }
+
+        self.current_depth -= 1;
+    }
+
+    fn create(&mut self, inputs: &CreateInputs) {
+        self.current_depth += 1;
+
+        // Determine create type from scheme
+        let create_type = inputs.scheme.as_str();
+
+        // Create inner transaction record
+        let (inner_tx, new_index) = self.before_op(
+            create_type,
+            inputs.caller,
+            None, // CREATE doesn't have a 'to' address initially
+            None, // CREATE doesn't have a code_address
+            inputs.init_code.clone(),
+            inputs.gas_limit,
+            inputs.value,
+        );
+
+        // Push to stack with index for later retrieval in create_end
+        self.call_stack.push((inner_tx, new_index));
+    }
+
+    fn create_end(&mut self, inputs: &CreateInputs, outcome: &CreateOutcome) {
+        // Pop the corresponding create from stack
+        if let Some((mut inner_tx, new_index)) = self.call_stack.pop() {
+            let create_type = inputs.scheme.as_str();
+            let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
+            let error =
+                outcome.result.result.is_error().then(|| format!("{:?}", outcome.result.result));
+
+            self.after_op(
+                create_type,
+                gas_used,
+                new_index as u64,
+                &mut inner_tx,
+                outcome.address, // CREATE operations return the new contract address
+                error.as_deref(),
+                outcome.result.output.clone(),
+            );
+        }
+
+        self.current_depth -= 1;
+    }
+
+    fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
+        // SELFDESTRUCT doesn't change depth - it happens within current call frame
+        let call_type = "suicide";
+
+        // Create inner transaction record for selfdestruct
+        let (mut inner_tx, new_index) = self.before_op(
+            call_type,
+            contract,
+            Some(target),
+            None,
+            Bytes::new(),
+            0, // selfdestruct uses remaining gas from current context
+            value,
+        );
+
+        // Immediately finalize (no _end hook for selfdestruct)
+        self.after_op(
+            call_type,
+            0, // gas_used recorded at transaction level
+            new_index as u64,
+            &mut inner_tx,
+            None,
+            None,
+            Bytes::new(),
+        );
+    }
 }
 
 impl<CTX> Inspector<CTX, EthInterpreter> for InnerTxInspector
@@ -247,71 +357,20 @@ where
 
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         self.current_depth += 1;
+        let input_bytes = inputs.input.bytes(context);
+        self.call(inputs, input_bytes);
 
-        // Determine call type from scheme
-        let call_type = inputs.scheme.as_str();
-        // Get transfer value (None for static calls)
-        let value = inputs.transfer_value().unwrap_or(U256::ZERO);
-
-        // Create inner transaction record
-        let (inner_tx, new_index) = self.before_op(
-            call_type,
-            inputs.caller,
-            Some(inputs.target_address),
-            Some(inputs.bytecode_address),
-            inputs.input.bytes(context),
-            inputs.gas_limit,
-            value,
-        );
-
-        // Push to stack with index for later retrieval in call_end
-        self.call_stack.push((inner_tx, new_index));
-
-        let _ = context;
         None
     }
 
     fn call_end(&mut self, context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
-        // Pop the corresponding call from stack
-        if let Some((mut inner_tx, new_index)) = self.call_stack.pop() {
-            let call_type = inputs.scheme.as_str();
-            let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
-            let error = outcome.result.is_error().then(|| format!("{:?}", outcome.result));
+        self.call_end(inputs, outcome);
 
-            self.after_op(
-                call_type,
-                gas_used,
-                new_index as u64,
-                &mut inner_tx,
-                None,
-                error.as_deref(),
-                outcome.result.output.clone(),
-            );
-        }
-
-        self.current_depth -= 1;
         let _ = context;
     }
 
     fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
-        self.current_depth += 1;
-
-        // Determine create type from scheme
-        let create_type = inputs.scheme.as_str();
-
-        // Create inner transaction record
-        let (inner_tx, new_index) = self.before_op(
-            create_type,
-            inputs.caller,
-            None, // CREATE doesn't have a 'to' address initially
-            None, // CREATE doesn't have a code_address
-            inputs.init_code.clone(),
-            inputs.gas_limit,
-            inputs.value,
-        );
-
-        // Push to stack with index for later retrieval in create_end
-        self.call_stack.push((inner_tx, new_index));
+        self.create(inputs);
 
         let _ = context;
         None
@@ -323,52 +382,11 @@ where
         inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
-        // Pop the corresponding create from stack
-        if let Some((mut inner_tx, new_index)) = self.call_stack.pop() {
-            let create_type = inputs.scheme.as_str();
-            let gas_used = inputs.gas_limit - outcome.result.gas.remaining();
-            let error =
-                outcome.result.result.is_error().then(|| format!("{:?}", outcome.result.result));
-
-            self.after_op(
-                create_type,
-                gas_used,
-                new_index as u64,
-                &mut inner_tx,
-                outcome.address, // CREATE operations return the new contract address
-                error.as_deref(),
-                outcome.result.output.clone(),
-            );
-        }
-
-        self.current_depth -= 1;
+        self.create_end(inputs, outcome);
         let _ = context;
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
-        // SELFDESTRUCT doesn't change depth - it happens within current call frame
-        let call_type = "suicide";
-
-        // Create inner transaction record for selfdestruct
-        let (mut inner_tx, new_index) = self.before_op(
-            call_type,
-            contract,
-            Some(target),
-            None,
-            Bytes::new(),
-            0, // selfdestruct uses remaining gas from current context
-            value,
-        );
-
-        // Immediately finalize (no _end hook for selfdestruct)
-        self.after_op(
-            call_type,
-            0, // gas_used recorded at transaction level
-            new_index as u64,
-            &mut inner_tx,
-            None,
-            None,
-            Bytes::new(),
-        );
+        self.selfdestruct(contract, target, value);
     }
 }
