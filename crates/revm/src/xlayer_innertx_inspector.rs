@@ -65,39 +65,63 @@ impl AsSchemeStr for CreateScheme {
 /// Inner transaction data structure (equivalent to xlayer-erigon's `InnerTx`)
 #[derive(Debug, Clone)]
 pub struct InnerTx {
+    /// Call depth in the execution stack (0 = top-level transaction)
     pub depth: u64,
+    /// Internal index within the current depth level
     pub internal_index: u64,
+    /// Type of call/create operation (e.g., "call", "delegatecall", "create", "create2")
     pub call_type: String,
+    /// Human-readable name constructed from call type and trace address indices
     pub name: String,
+    /// Trace address representing the path in the execution tree
     pub trace_address: Vec<u64>,
+    /// Address of the code being executed (may differ from `to` for delegatecall)
     pub code_address: Option<Address>,
+    /// Sender address of the inner transaction
     pub from: Address,
+    /// Recipient address (None for CREATE operations until address is known)
     pub to: Option<Address>,
+    /// Input data passed to the call/create
     pub input: Bytes,
+    /// Output data returned from the call/create
     pub output: Bytes,
+    /// Whether the operation resulted in an error
     pub is_error: bool,
+    /// Gas limit allocated for the operation
     pub gas: u64,
+    /// Actual gas used by the operation
     pub gas_used: u64,
+    /// Value transferred (in wei)
     pub value: U256,
+    /// Value transferred as a decimal string
     pub value_wei: String,
+    /// Call value as a hexadecimal string with 0x prefix
     pub call_value_wei: String,
+    /// Error message if the operation failed, None otherwise
     pub error: Option<String>,
 }
 
 /// Metadata for tracking inner transactions
 #[derive(Debug, Default)]
 pub struct InnerTxMeta {
+    /// Current index counter for tracking inner transactions at each depth
     pub index: u64,
+    /// The deepest call depth encountered so far
     pub last_depth: u64,
+    /// Mapping of depth level to its current index counter
     pub index_map: HashMap<u64, u64>,
+    /// Collected inner transactions in execution order
     pub inner_txs: Vec<InnerTx>,
 }
 
 /// Custom inspector that implements beforeOp/afterOp functionality
 #[derive(Debug, Default)]
 pub struct InnerTxInspector {
+    /// Metadata for tracking and indexing inner transactions
     inner_tx_meta: InnerTxMeta,
+    /// Current call depth in the execution stack
     current_depth: u64,
+    /// Stack of pending inner transactions with their collection indices
     call_stack: Vec<(InnerTx, usize)>,
 }
 
@@ -389,10 +413,4 @@ where
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
         self.handle_selfdestruct(contract, target, value);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn foobar() {}
 }
