@@ -1,6 +1,6 @@
 use clap::Args;
 
-/// Syncs ERA1 encoded blocks from a local or remote source.
+/// X Layer Apollo configuration arguments
 #[derive(Clone, Debug, Default, Args)]
 pub struct ApolloArgs {
     /// Enable Apollo
