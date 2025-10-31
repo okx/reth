@@ -137,10 +137,10 @@ impl ApolloService {
 
     /// Load config from Apollo
     pub async fn load_config(&self) -> Result<(), ApolloError> {
-        for (_, namespace) in &self.namespace_map {
+        for (namespace, full_namespace) in &self.namespace_map {
             let config = self
                 .inner
-                .get_config_from_namespace("content", namespace)
+                .get_config_from_namespace("content", full_namespace)
                 .map(|c| c.config_value.clone());
             if let Some(config) = config {
                 // Get config cache for namespace

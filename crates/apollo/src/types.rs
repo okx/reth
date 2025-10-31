@@ -83,7 +83,12 @@ pub enum ConfigValue {
 impl ConfigValue {
     /// Parse from JsonValue once during cache update
     pub fn from_json(value: &JsonValue) -> Option<Self> {
-        if let Some(v) = value.as_u64() {
+        if let Some(arr) = value.as_array() {
+            // Handle arrays recursively
+            let values: Vec<ConfigValue> =
+                arr.iter().filter_map(|v| ConfigValue::from_json(v)).collect();
+            Some(ConfigValue::Array(values))
+        } else if let Some(v) = value.as_u64() {
             Some(ConfigValue::U64(v))
         } else if let Some(v) = value.as_i64() {
             Some(ConfigValue::I64(v))
@@ -103,6 +108,8 @@ impl ConfigValue {
         match self {
             ConfigValue::U64(v) => Some(*v),
             ConfigValue::U32(v) => Some(*v as u64),
+            ConfigValue::I64(v) => (*v).try_into().ok(), // ← Add: allow positive i64
+            ConfigValue::I32(v) => (*v).try_into().ok(), // ← Add: allow positive i32
             _ => None,
         }
     }
@@ -112,6 +119,8 @@ impl ConfigValue {
         match self {
             ConfigValue::U32(v) => Some(*v),
             ConfigValue::U64(v) => (*v).try_into().ok(),
+            ConfigValue::I64(v) => (*v).try_into().ok(), // ← Add
+            ConfigValue::I32(v) => (*v).try_into().ok(), // ← Add
             _ => None,
         }
     }
@@ -120,7 +129,9 @@ impl ConfigValue {
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             ConfigValue::I64(v) => Some(*v),
-            ConfigValue::I32(v) => (*v).try_into().ok(),
+            ConfigValue::I32(v) => Some(*v as i64),
+            ConfigValue::U64(v) => (*v).try_into().ok(), // ← Add: allow u64 that fits
+            ConfigValue::U32(v) => Some(*v as i64),      // ← Add: u32 always fits
             _ => None,
         }
     }
@@ -130,6 +141,8 @@ impl ConfigValue {
         match self {
             ConfigValue::I32(v) => Some(*v),
             ConfigValue::I64(v) => (*v).try_into().ok(),
+            ConfigValue::U64(v) => (*v).try_into().ok(), // ← Add
+            ConfigValue::U32(v) => (*v).try_into().ok(), // ← Add
             _ => None,
         }
     }
