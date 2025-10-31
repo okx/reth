@@ -498,7 +498,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: self.era,
 
             // XLayer
-            innertx: InnerTxArgs::default(),
+            innertx: self.innertx,
         }
     }
 
@@ -541,7 +541,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             era: self.era.clone(),
 
             // XLayer
-            innertx: InnerTxArgs::default(),
+            innertx: self.innertx,
         }
     }
 }
