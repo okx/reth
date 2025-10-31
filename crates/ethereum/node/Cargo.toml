@@ -32,7 +32,7 @@ reth-rpc-builder.workspace = true
 reth-rpc-server-types.workspace = true
 reth-node-api.workspace = true
 reth-chainspec.workspace = true
-reth-revm = { workspace = true, features = ["std"] }
+reth-revm = { workspace = true, features = ["std", "inner-tx"] }
 reth-rpc-eth-types.workspace = true
 reth-engine-local.workspace = true
 reth-engine-primitives.workspace = true
@@ -76,7 +76,7 @@ serde_json.workspace = true
 rand.workspace = true
 
 [features]
-default = []
+default = ["inner-tx"]
 asm-keccak = [
     "alloy-primitives/asm-keccak",
     "reth-node-core/asm-keccak",
@@ -96,3 +96,4 @@ test-utils = [
     "reth-primitives-traits/test-utils",
     "reth-evm-ethereum/test-utils",
 ]
+inner-tx = []

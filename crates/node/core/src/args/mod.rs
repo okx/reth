@@ -70,3 +70,7 @@ pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
 
 mod error;
 pub mod types;
+
+/// XLayer specific args
+mod xlayer_innertx;
+pub use xlayer_innertx::InnerTxArgs;
