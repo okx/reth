@@ -1,6 +1,6 @@
 use serde_json::Value as JsonValue;
 
-/// Trait for converting from JsonValue to concrete types\
+/// Trait for converting from ConfigValue to concrete types
 pub trait FromConfigValue: Sized {
     fn from_config_value(value: &ConfigValue) -> Option<Self>;
 }
@@ -108,8 +108,8 @@ impl ConfigValue {
         match self {
             ConfigValue::U64(v) => Some(*v),
             ConfigValue::U32(v) => Some(*v as u64),
-            ConfigValue::I64(v) => (*v).try_into().ok(), // ← Add: allow positive i64
-            ConfigValue::I32(v) => (*v).try_into().ok(), // ← Add: allow positive i32
+            ConfigValue::I64(v) => (*v).try_into().ok(),
+            ConfigValue::I32(v) => (*v).try_into().ok(),
             _ => None,
         }
     }
@@ -119,8 +119,8 @@ impl ConfigValue {
         match self {
             ConfigValue::U32(v) => Some(*v),
             ConfigValue::U64(v) => (*v).try_into().ok(),
-            ConfigValue::I64(v) => (*v).try_into().ok(), // ← Add
-            ConfigValue::I32(v) => (*v).try_into().ok(), // ← Add
+            ConfigValue::I64(v) => (*v).try_into().ok(),
+            ConfigValue::I32(v) => (*v).try_into().ok(),
             _ => None,
         }
     }
@@ -130,8 +130,8 @@ impl ConfigValue {
         match self {
             ConfigValue::I64(v) => Some(*v),
             ConfigValue::I32(v) => Some(*v as i64),
-            ConfigValue::U64(v) => (*v).try_into().ok(), // ← Add: allow u64 that fits
-            ConfigValue::U32(v) => Some(*v as i64),      // ← Add: u32 always fits
+            ConfigValue::U64(v) => (*v).try_into().ok(),
+            ConfigValue::U32(v) => Some(*v as i64),
             _ => None,
         }
     }
@@ -141,8 +141,8 @@ impl ConfigValue {
         match self {
             ConfigValue::I32(v) => Some(*v),
             ConfigValue::I64(v) => (*v).try_into().ok(),
-            ConfigValue::U64(v) => (*v).try_into().ok(), // ← Add
-            ConfigValue::U32(v) => (*v).try_into().ok(), // ← Add
+            ConfigValue::U64(v) => (*v).try_into().ok(),
+            ConfigValue::U32(v) => (*v).try_into().ok(),
             _ => None,
         }
     }
