@@ -173,8 +173,8 @@ impl InnerTxInspector {
         }
         inner_tx.name = format!("{}{}", call_type, inner_tx.name);
 
-        let new_index = self.inner_tx_meta.inner_txs.len().checked_sub(1).map_or(0, |x| x);
-
+        // Add to collection and get the index (before push: len, after push: len - 1)
+        let new_index = self.inner_tx_meta.inner_txs.len();
         self.inner_tx_meta.inner_txs.push(inner_tx.clone());
 
         (inner_tx, new_index)
@@ -297,7 +297,7 @@ impl InnerTxInspector {
         self.current_depth -= 1;
     }
 
-    fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
+    fn handle_selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
         // SELFDESTRUCT doesn't change depth - it happens within current call frame
         let call_type = "suicide";
 
@@ -387,6 +387,12 @@ where
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
-        self.selfdestruct(contract, target, value);
+        self.handle_selfdestruct(contract, target, value);
     }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn foobar() {}
 }
