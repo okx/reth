@@ -11,9 +11,12 @@ pub mod types;
 #[macro_export]
 macro_rules! apollo_config_or {
     ($namespace:expr, $key:expr, $default:expr) => {{
+        let ns = $namespace;  // Bind to extend lifetime
+        let ns_ref: &str = &ns;
+
         let result =$crate::client::ApolloClient::get_instance()
             .ok()
-            .and_then(|apollo| apollo.get_cached_config($namespace, $key))
+            .and_then(|apollo| apollo.get_cached_config(ns_ref, $key))
             .and_then(|v| $crate::types::FromJsonValue::from_json_value(&v));
 
         match result {
@@ -21,7 +24,7 @@ macro_rules! apollo_config_or {
             None => {
                 tracing::debug!(
                     target: "reth::apollo",
-                    namespace = $namespace,
+                    namespace = ns_ref,
                     key = $key,
                     default = ?$default,
                     "Using default config (client not initialized, key missing, or type mismatch)"
