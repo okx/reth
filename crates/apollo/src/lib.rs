@@ -16,19 +16,19 @@ macro_rules! apollo_config_or {
             .and_then(|apollo| apollo.get_cached_config($namespace, $key))
             .and_then(|v| $crate::types::FromJsonValue::from_json_value(&v));
 
-            match result {
-                Some(value) => value,
-                None => {
-                    tracing::debug!(
-                        target: "reth::apollo",
-                        namespace = $namespace,
-                        key = $key,
-                        default = ?$default,
-                        "Using default config (client not initialized, key missing, or type mismatch)"
-                    );
-                    $default
-                }
+        match result {
+            Some(value) => value,
+            None => {
+                tracing::debug!(
+                    target: "reth::apollo",
+                    namespace = $namespace,
+                    key = $key,
+                    default = ?$default,
+                    "Using default config (client not initialized, key missing, or type mismatch)"
+                );
+                $default
             }
+        }
     }};
 }
 

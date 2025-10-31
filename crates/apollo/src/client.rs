@@ -8,14 +8,13 @@ use serde_json::Value as JsonValue;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 const CACHE_EXPIRATION: Duration = Duration::from_secs(60);
 /// Apollo client wrapper for reth
 pub struct ApolloClient {
     /// Inner Apollo SDK client
-    pub inner: Arc<RwLock<ApolloConfigClient>>,
+    pub inner: Arc<ApolloConfigClient>,
     /// Apollo configuration
     pub config: ApolloConfig,
     /// Map of namespaces to full namespace names
@@ -121,7 +120,7 @@ impl ApolloClient {
         }
 
         Ok(ApolloClient {
-            inner: Arc::new(RwLock::new(client)),
+            inner: Arc::new(client),
             config,
             namespace_map,
             cache: Cache::builder().max_capacity(1000).time_to_live(CACHE_EXPIRATION).build(),
@@ -140,11 +139,10 @@ impl ApolloClient {
     /// Load config from Apollo
     pub async fn load_config(&self) -> Result<(), ApolloError> {
         for (_, namespace) in &self.namespace_map {
-            let client = self.inner.read().await;
-            let config = client
+            let config = self
+                .inner
                 .get_config_from_namespace("content", namespace)
                 .map(|c| c.config_value.clone());
-            drop(client);
             if let Some(config) = config {
                 // Get config cache for namespace
                 Self::update_cache_from_config(&self.cache, namespace, &config);
@@ -169,13 +167,11 @@ impl ApolloClient {
         let namespace_map = self.namespace_map.clone();
 
         // Start listening to all namespaces
-        let client_read = client.read().await;
         for (namespace, full_namespace) in &namespace_map {
-            if let Some(err) = client_read.listen_namespace(full_namespace).await {
+            if let Some(err) = client.listen_namespace(full_namespace).await {
                 warn!(target: "reth::apollo", "[Apollo] Failed to listen to namespace {}: {:?}", namespace, err);
             }
         }
-        drop(client_read);
 
         // Load initial config
         self.load_config().await?;
@@ -194,7 +190,7 @@ impl ApolloClient {
 
     // Background listener task
     async fn listener_task(
-        client: Arc<RwLock<ApolloConfigClient>>,
+        client: Arc<ApolloConfigClient>,
         cache: Cache<String, JsonValue>,
         namespace_map: HashMap<String, String>,
         mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
@@ -214,9 +210,8 @@ impl ApolloClient {
                 }
                 _ = async {
                     // Check for change events
-                    let client_read = client.read().await;
                     for (namespace, _) in &namespace_map {
-                        if let Some(change_event) = client_read.fetch_change_event() {
+                        if let Some(change_event) = client.fetch_change_event() {
                             info!(target: "reth::apollo", "[Apollo] Configuration change detected for namespace {}: {:?}", namespace, change_event);
                             Self::fetch_and_update_configs(&client, &cache, &namespace_map).await;
                             break;
@@ -228,16 +223,14 @@ impl ApolloClient {
     }
 
     async fn fetch_and_update_configs(
-        client: &Arc<RwLock<ApolloConfigClient>>,
+        client: &Arc<ApolloConfigClient>,
         cache: &Cache<String, JsonValue>,
         namespace_map: &HashMap<String, String>,
     ) {
         for (namespace, full_namespace) in namespace_map {
-            let client_read = client.read().await;
-            let config = client_read
+            let config = client
                 .get_config_from_namespace("content", full_namespace)
                 .map(|c| c.config_value.clone());
-            drop(client_read);
 
             if let Some(config) = config {
                 Self::update_cache_from_config(&cache, namespace, &config);
@@ -256,7 +249,7 @@ impl ApolloClient {
         match serde_yaml::from_str::<HashMap<String, JsonValue>>(config_value) {
             Ok(parsed_config) => {
                 for (key, value) in parsed_config {
-                    cache.insert(make_cache_key(namespace, &key), value);
+                    cache.insert(make_cache_key(namespace, key.as_str()), value);
                 }
             }
             Err(e) => {
@@ -265,25 +258,11 @@ impl ApolloClient {
         }
     }
 
-    /// Stop listening and cleanup
-    pub async fn stop_listening(&self) -> Result<(), ApolloError> {
-        let mut state = self.listener_state.lock().await;
-        if let Some(tx) = state.shutdown_tx.take() {
-            let _ = tx.send(()).await;
-        }
-
-        if let Some(task) = state.task.take() {
-            task.abort();
-        }
-
-        info!(target: "reth::apollo", "[Apollo] Stopped listening to configuration changes");
-        Ok(())
-    }
-
     /// Query cached configurations
     pub fn get_cached_config(&self, namespace: &str, key: &str) -> Option<JsonValue> {
-        debug!(target: "reth::apollo", "[Apollo] Getting cached config for namespace {}: key: {:?}", namespace, make_cache_key(namespace, key));
-        self.cache.get(&make_cache_key(namespace, key))
+        let cache_key = make_cache_key(namespace, key);
+        debug!(target: "reth::apollo", "[Apollo] Getting cached config for namespace {}: key: {:?}", namespace, cache_key);
+        self.cache.get(&cache_key)
     }
 }
 

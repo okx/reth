@@ -72,16 +72,13 @@ pub struct ApolloConfig {
     pub secret: Option<String>,
 }
 
+/// Apollo error enum
 #[derive(Debug, thiserror::Error)]
 pub enum ApolloError {
+    /// Failed to initialize Apollo client
     #[error("Failed to initialize Apollo client: {0}")]
     ClientInit(String),
-    #[error("Failed to stop Apollo client: {0}")]
-    ClientStop(String),
+    /// Invalid namespace
     #[error("Invalid namespace: {0}")]
     InvalidNamespace(String),
-    #[error("Failed to fetch config: {0}")]
-    FetchConfig(String),
-    #[error("Config parsing error: {0}")]
-    ParseError(String),
 }
