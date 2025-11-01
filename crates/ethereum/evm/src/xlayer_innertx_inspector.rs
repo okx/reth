@@ -103,7 +103,7 @@ pub struct InnerTx {
 
 /// Metadata for tracking inner transactions
 #[derive(Debug, Default)]
-pub struct InnerTxMeta {
+pub(crate) struct InnerTxMeta {
     /// Current index counter for tracking inner transactions at each depth
     pub index: u64,
     /// The deepest call depth encountered so far

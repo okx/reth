@@ -68,4 +68,3 @@ optional-checks = [
     "optional-eip3607",
     "optional-no-base-fee",
 ]
-inner-tx = []
