@@ -71,6 +71,9 @@ mod test_utils;
 #[cfg(feature = "test-utils")]
 pub use test_utils::*;
 
+#[cfg(feature = "inner-tx")]
+pub mod xlayer_innertx_inspector;
+
 /// Ethereum-related EVM configuration.
 #[derive(Debug, Clone)]
 pub struct EthEvmConfig<C = ChainSpec, EvmFactory = EthEvmFactory> {
