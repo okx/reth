@@ -5,6 +5,8 @@ use alloy_consensus::{constants::GWEI_TO_WEI, BlockHeader};
 use alloy_primitives::{BlockNumber, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use futures::Stream;
+use reth_apollo::apollo_config_or;
+use reth_apollo::namespace::{Component, Namespace};
 use reth_engine_primitives::{
     ConsensusEngineEvent, ConsensusEngineLiveSyncProgress, ForkchoiceStatus,
 };
@@ -217,8 +219,8 @@ impl NodeState {
             ConsensusEngineEvent::ForkchoiceUpdated(state, status) => {
                 let ForkchoiceState { head_block_hash, safe_block_hash, finalized_block_hash } =
                     state;
-                if self.safe_block_hash != Some(safe_block_hash) &&
-                    self.finalized_block_hash != Some(finalized_block_hash)
+                if self.safe_block_hash != Some(safe_block_hash)
+                    && self.finalized_block_hash != Some(finalized_block_hash)
                 {
                     let msg = match status {
                         ForkchoiceStatus::Valid => "Forkchoice updated",
@@ -485,12 +487,26 @@ where
                 if now.saturating_sub(this.state.latest_block_time.unwrap_or(0)) > 60 {
                     // Once we start receiving consensus nodes, don't emit status unless stalled for
                     // 1 minute
-                    info!(
-                        target: "reth::cli",
-                        connected_peers = this.state.num_connected_peers(),
-                        %latest_block,
-                        "Status"
-                    );
+
+                    // Spawn task to fetch and log apollo config
+                    tokio::spawn(async {
+                        let gpo_price = apollo_config_or!(
+                            Component::OpReth.with_namespace(Namespace::Sequencer),
+                            "gpo.maxprice",
+                            vec![6u64, 7u64]
+                        );
+                        info!(target: "reth::cli", "[Apollo] GPO max price: {:?}", gpo_price);
+                    });
+
+                    // Spawn task to fetch and log apollo config
+                    tokio::spawn(async {
+                        let gpo_factor = apollo_config_or!(
+                            Component::OpReth.with_namespace(Namespace::Sequencer),
+                            "gpo.factor",
+                            123i64
+                        );
+                        info!(target: "reth::cli", "[Apollo] GPO factor: {:?}", gpo_factor);
+                    });
                 }
             } else {
                 info!(
@@ -553,7 +569,7 @@ impl Eta {
             else {
                 self.eta = None;
                 debug!(target: "reth::cli", %stage, ?current, ?self.last_checkpoint, "Failed to calculate the ETA: processed entities is less than the last checkpoint");
-                return
+                return;
             };
             let elapsed = last_checkpoint_time.elapsed();
             let per_second = processed_since_last as f64 / elapsed.as_secs_f64();
@@ -561,7 +577,7 @@ impl Eta {
             let Some(remaining) = current.total.checked_sub(current.processed) else {
                 self.eta = None;
                 debug!(target: "reth::cli", %stage, ?current, "Failed to calculate the ETA: total entities is less than processed entities");
-                return
+                return;
             };
 
             self.eta = Duration::try_from_secs_f64(remaining as f64 / per_second).ok();
@@ -582,8 +598,8 @@ impl Eta {
     /// It's not the case for network-dependent ([`StageId::Headers`] and [`StageId::Bodies`]) and
     /// [`StageId::Execution`] stages.
     fn fmt_for_stage(&self, stage: StageId) -> Option<String> {
-        if !self.is_available() ||
-            matches!(stage, StageId::Headers | StageId::Bodies | StageId::Execution)
+        if !self.is_available()
+            || matches!(stage, StageId::Headers | StageId::Bodies | StageId::Execution)
         {
             None
         } else {
@@ -602,7 +618,7 @@ impl Display for Eta {
                     f,
                     "{}",
                     humantime::format_duration(Duration::from_secs(remaining.as_secs()))
-                )
+                );
             }
         }
 
