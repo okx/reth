@@ -223,6 +223,10 @@ where
             extra_data: attributes.extra_data,
         }
     }
+
+    fn is_innertx_enabled(&self) -> bool {
+        false
+    }
 }
 
 impl<ChainSpec, N, R> ConfigureEngineEvm<OpExecutionData> for OpEvmConfig<ChainSpec, N, R>

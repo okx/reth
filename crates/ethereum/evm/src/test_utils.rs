@@ -169,6 +169,10 @@ impl ConfigureEvm for MockEvmConfig {
     ) -> reth_evm::ExecutionCtxFor<'_, Self> {
         self.inner.context_for_next_block(parent, attributes)
     }
+
+    fn is_innertx_enabled(&self) -> bool {
+        false
+    }
 }
 
 impl ConfigureEngineEvm<ExecutionData> for MockEvmConfig {
