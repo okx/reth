@@ -533,18 +533,15 @@ where
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
-        let result;
-        if self.strategy_factory.is_innertx_enabled() {
-            result = self
-                .strategy_factory
+        let result = if self.strategy_factory.is_innertx_enabled() {
+            self.strategy_factory
                 .executor_for_block(&mut self.db, block, InnerTxInspector::new())
-                .execute_block(block.transactions_recovered())?;
+                .execute_block(block.transactions_recovered())?
         } else {
-            result = self
-                .strategy_factory
+            self.strategy_factory
                 .executor_for_block(&mut self.db, block, NoOpInspector)
-                .execute_block(block.transactions_recovered())?;
-        }
+                .execute_block(block.transactions_recovered())?
+        };
 
         self.db.merge_transitions(BundleRetention::Reverts);
 

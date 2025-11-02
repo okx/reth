@@ -155,7 +155,7 @@ pub struct NodeConfig<ChainSpec> {
     /// All ERA import related arguments with --era prefix
     pub era: EraArgs,
 
-    /// XLayer: All inner txn capturing arguments.
+    /// `XLayer`: All inner txn capturing arguments.
     pub innertx: InnerTxArgs,
 }
 
