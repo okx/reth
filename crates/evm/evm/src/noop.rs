@@ -69,4 +69,9 @@ where
     ) -> crate::ExecutionCtxFor<'_, Self> {
         self.inner().context_for_next_block(parent, attributes)
     }
+
+    /// `XLayer`: returns true if inner-tx is enabled
+    fn is_innertx_enabled(&self) -> bool {
+        false
+    }
 }

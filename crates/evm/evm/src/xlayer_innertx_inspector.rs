@@ -116,7 +116,7 @@ pub(crate) struct InnerTxMeta {
 
 /// Custom inspector that implements beforeOp/afterOp functionality
 #[derive(Clone, Debug, Default)]
-pub(crate) struct InnerTxInspector {
+pub struct InnerTxInspector {
     /// Metadata for tracking and indexing inner transactions
     inner_tx_meta: InnerTxMeta,
     /// Current call depth in the execution stack

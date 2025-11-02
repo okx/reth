@@ -24,7 +24,10 @@ use reth_trie_common::{updates::TrieUpdates, HashedPostState};
 use revm::{
     context::result::ExecutionResult,
     database::{states::bundle_state::BundleRetention, BundleState, State},
+    inspector::NoOpInspector,
 };
+
+use crate::xlayer_innertx_inspector::InnerTxInspector;
 
 /// A type that knows how to execute a block. It is assumed to operate on a
 /// [`crate::Evm`] internally and use [`State`] as database.
@@ -530,10 +533,18 @@ where
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
-        let result = self
-            .strategy_factory
-            .executor_for_block(&mut self.db, block)
-            .execute_block(block.transactions_recovered())?;
+        let result;
+        if self.strategy_factory.is_innertx_enabled() {
+            result = self
+                .strategy_factory
+                .executor_for_block(&mut self.db, block, InnerTxInspector::new())
+                .execute_block(block.transactions_recovered())?;
+        } else {
+            result = self
+                .strategy_factory
+                .executor_for_block(&mut self.db, block, NoOpInspector)
+                .execute_block(block.transactions_recovered())?;
+        }
 
         self.db.merge_transitions(BundleRetention::Reverts);
 
@@ -550,7 +561,7 @@ where
     {
         let result = self
             .strategy_factory
-            .executor_for_block(&mut self.db, block)
+            .executor_for_block(&mut self.db, block, NoOpInspector)
             .with_state_hook(Some(Box::new(state_hook)))
             .execute_block(block.transactions_recovered())?;
 

@@ -46,7 +46,6 @@ pub use aliases::*;
 
 mod engine;
 pub use engine::{ConfigureEngineEvm, ExecutableTxIterator};
-
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod noop;
@@ -60,6 +59,8 @@ pub use alloy_evm::{
 };
 
 pub use alloy_evm::block::state_changes as state_change;
+
+pub mod xlayer_innertx_inspector;
 
 /// A complete configuration of EVM for Reth.
 ///
@@ -323,12 +324,16 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     }
 
     /// Creates a strategy for execution of a given block.
-    fn executor_for_block<'a, DB: Database>(
+    fn executor_for_block<'a, DB: Database, I>(
         &'a self,
         db: &'a mut State<DB>,
         block: &'a SealedBlock<<Self::Primitives as NodePrimitives>::Block>,
-    ) -> impl BlockExecutorFor<'a, Self::BlockExecutorFactory, DB> {
-        let evm = self.evm_for_block(db, block.header());
+        inspector: I,
+    ) -> impl BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>
+    where
+        I: InspectorFor<Self, &'a mut State<DB>> + 'a,
+    {
+        let evm = self.evm_with_env_and_inspector(db, self.evm_env(block.header()), inspector);
         let ctx = self.context_for_block(block);
         self.create_executor(evm, ctx)
     }
@@ -445,8 +450,12 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         &self,
         db: DB,
     ) -> impl Executor<DB, Primitives = Self::Primitives, Error = BlockExecutionError> {
+        // NOTE: called first before execute_one
         BasicBlockExecutor::new(self, db)
     }
+
+    /// `XLayer`: returns true if inner-tx is enabled
+    fn is_innertx_enabled(&self) -> bool;
 }
 
 /// Represents additional attributes required to configure the next block.

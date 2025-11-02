@@ -766,3 +766,8 @@ alloy-signer-local = { git = "https://github.com/okx/alloy", rev = "7253351" }
 alloy-signer = { git = "https://github.com/okx/alloy", rev = "7253351" }
 alloy-provider = { git = "https://github.com/okx/alloy", rev = "7253351" }
 alloy-rpc-types-eth = { git = "https://github.com/okx/alloy", rev = "7253351" }
+alloy-json-rpc = { git = "https://github.com/okx/alloy", rev = "7253351" }
+alloy-transport = { git = "https://github.com/okx/alloy", rev = "7253351" }
+alloy-transport-http = { git = "https://github.com/okx/alloy", rev = "7253351" }
+alloy-transport-ipc = { git = "https://github.com/okx/alloy", rev = "7253351" }
+alloy-transport-ws = { git = "https://github.com/okx/alloy", rev = "7253351" }
