@@ -3,7 +3,7 @@
 use crate::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, RpcServerArgs, TxPoolArgs,
+        PruningArgs, RpcServerArgs, TxPoolArgs, XLayerArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
@@ -156,7 +156,7 @@ pub struct NodeConfig<ChainSpec> {
     pub era: EraArgs,
 
     /// For X Layer- All Apollo related arguments with --apollo prefix
-    pub apollo: ApolloArgs,
+    pub xlayer: XLayerArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -187,7 +187,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             datadir: DatadirArgs::default(),
             engine: EngineArgs::default(),
             era: EraArgs::default(),
-            apollo: ApolloArgs::default(),
+            xlayer: XLayerArgs::default(),
         }
     }
 
@@ -494,7 +494,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             pruning: self.pruning,
             engine: self.engine,
             era: self.era,
-            apollo: self.apollo,
+            xlayer: self.xlayer,
         }
     }
 
@@ -535,7 +535,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             datadir: self.datadir.clone(),
             engine: self.engine.clone(),
             era: self.era.clone(),
-            apollo: self.apollo.clone(),
+            xlayer: self.xlayer.clone(),
         }
     }
 }

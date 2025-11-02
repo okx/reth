@@ -11,8 +11,8 @@ use reth_db::init_db;
 use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
-        ApolloArgs, DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, NetworkArgs,
+        PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs, XLayerArgs,
     },
     node_config::NodeConfig,
     version,
@@ -120,7 +120,7 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
 
     /// For X Layer- All Apollo related arguments with --apollo prefix
     #[command(flatten)]
-    pub apollo: ApolloArgs,
+    pub xlayer: XLayerArgs,
 }
 
 impl<C: ChainSpecParser> NodeCommand<C> {
@@ -173,7 +173,7 @@ where
             ext,
             engine,
             era,
-            apollo,
+            xlayer,
         } = self;
 
         // set up node config
@@ -193,24 +193,30 @@ where
             pruning,
             engine,
             era,
-            apollo,
+            xlayer,
         };
 
         // For X Layer
-        if node_config.apollo.enabled {
-            tracing::info!(target: "reth::apollo", "[Apollo] Apollo enabled: {:?}", node_config.apollo.enabled);
-            tracing::info!(target: "reth::apollo", "[Apollo] Apollo app ID: {:?}", node_config.apollo.apollo_app_id);
-            tracing::info!(target: "reth::apollo", "[Apollo] Apollo IP: {:?}", node_config.apollo.apollo_ip);
-            tracing::info!(target: "reth::apollo", "[Apollo] Apollo cluster: {:?}", node_config.apollo.apollo_cluster);
-            tracing::info!(target: "reth::apollo", "[Apollo] Apollo namespace: {:?}", node_config.apollo.apollo_namespace);
+        if node_config.xlayer.apollo.enabled {
+            tracing::info!(target: "reth::apollo", "[Apollo] Apollo enabled: {:?}", node_config.xlayer.apollo.enabled);
+            tracing::info!(target: "reth::apollo", "[Apollo] Apollo app ID: {:?}", node_config.xlayer.apollo.apollo_app_id);
+            tracing::info!(target: "reth::apollo", "[Apollo] Apollo IP: {:?}", node_config.xlayer.apollo.apollo_ip);
+            tracing::info!(target: "reth::apollo", "[Apollo] Apollo cluster: {:?}", node_config.xlayer.apollo.apollo_cluster);
+            tracing::info!(target: "reth::apollo", "[Apollo] Apollo namespace: {:?}", node_config.xlayer.apollo.apollo_namespace);
 
             // Create Apollo config from args
             let apollo_config = ApolloConfig {
-                meta_server: vec![node_config.apollo.apollo_ip.to_string()],
-                app_id: node_config.apollo.apollo_app_id.to_string(),
-                cluster_name: node_config.apollo.apollo_cluster.to_string(),
+                meta_server: vec![node_config.xlayer.apollo.apollo_ip.to_string()],
+                app_id: node_config.xlayer.apollo.apollo_app_id.to_string(),
+                cluster_name: node_config.xlayer.apollo.apollo_cluster.to_string(),
                 namespaces: Some(
-                    node_config.apollo.apollo_namespace.split(',').map(|s| s.to_string()).collect(),
+                    node_config
+                        .xlayer
+                        .apollo
+                        .apollo_namespace
+                        .split(',')
+                        .map(|s| s.to_string())
+                        .collect(),
                 ),
                 secret: None,
             };
@@ -224,7 +230,7 @@ where
                 }
                 Err(e) => {
                     tracing::error!(target: "reth::apollo", "[Apollo] Failed to initialize Apollo: {:?}; Proceeding with node launch without Apollo", e);
-                    node_config.apollo.enabled = false;
+                    node_config.xlayer.apollo.enabled = false;
                 }
             }
         }
