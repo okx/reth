@@ -102,21 +102,21 @@ pub struct InnerTx {
 }
 
 /// Metadata for tracking inner transactions
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct InnerTxMeta {
     /// Current index counter for tracking inner transactions at each depth
     pub index: u64,
     /// The deepest call depth encountered so far
     pub last_depth: u64,
-    /// Mapping of depth level to its current index counter
+    /// Mappinof depth level to its current index counter
     pub index_map: HashMap<u64, u64>,
     /// Collected inner transactions in execution order
     pub inner_txs: Vec<InnerTx>,
 }
 
 /// Custom inspector that implements beforeOp/afterOp functionality
-#[derive(Debug, Default)]
-pub struct InnerTxInspector {
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InnerTxInspector {
     /// Metadata for tracking and indexing inner transactions
     inner_tx_meta: InnerTxMeta,
     /// Current call depth in the execution stack
@@ -133,6 +133,7 @@ impl InnerTxInspector {
     }
 
     /// Get all collected inner transactions
+    #[allow(unused)]
     pub fn get_inner_txs(&self) -> &[InnerTx] {
         &self.inner_tx_meta.inner_txs
     }
