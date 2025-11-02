@@ -353,31 +353,18 @@ impl<CTX> Inspector<CTX, EthInterpreter> for InnerTxInspector
 where
     CTX: ContextTr,
 {
-    fn initialize_interp(&mut self, interp: &mut Interpreter, context: &mut CTX) {
+    fn initialize_interp(&mut self, _interp: &mut Interpreter, _context: &mut CTX) {
         self.current_depth = 1;
-
-        let _ = interp;
-        let _ = context;
     }
 
     // Ignore
-    fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        let _ = interp;
-        let _ = context;
-    }
+    fn step(&mut self, _interp: &mut Interpreter, _context: &mut CTX) {}
 
     // Ignore
-    fn step_end(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        let _ = interp;
-        let _ = context;
-    }
+    fn step_end(&mut self, _interp: &mut Interpreter, _context: &mut CTX) {}
 
     // Ignore
-    fn log(&mut self, interp: &mut Interpreter, context: &mut CTX, log: Log) {
-        let _ = interp;
-        let _ = context;
-        let _ = log;
-    }
+    fn log(&mut self, _interp: &mut Interpreter, _context: &mut CTX, _log: Log) {}
 
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         self.current_depth += 1;
@@ -387,27 +374,23 @@ where
         None
     }
 
-    fn call_end(&mut self, context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
+    fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
         self.call_end(inputs, outcome);
-
-        let _ = context;
     }
 
-    fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+    fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         self.create(inputs);
 
-        let _ = context;
         None
     }
 
     fn create_end(
         &mut self,
-        context: &mut CTX,
+        _context: &mut CTX,
         inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
         self.create_end(inputs, outcome);
-        let _ = context;
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
