@@ -315,7 +315,7 @@ where
                         Ok(v) => v,
                         Err(e) => {
                             results.push(PreExecResult::from_error(
-                                PreExecError::unknown(e.to_string()),
+                                classify_error(e.to_string()),
                                 0,
                                 evm_env.block_env.number,
                             ));
@@ -347,12 +347,11 @@ where
 
                 pre_exec_res.error = match exec.result {
                     ExecutionResult::Success { .. } => PreExecError::default(),
-                    ExecutionResult::Revert { output, .. } => {
-                        PreExecError::reverted(format!("reverted: 0x{}", hex::encode(output)))
-                    }
-                    ExecutionResult::Halt { reason, .. } => {
-                        PreExecError::unknown(format!("halted: {:?}", reason))
-                    }
+                    ExecutionResult::Revert { output, .. } => PreExecError::reverted(format!(
+                        "execution reverted: 0x{}",
+                        hex::encode(output)
+                    )),
+                    ExecutionResult::Halt { reason, .. } => classify_error(format!("{:?}", reason)),
                 };
 
                 db.commit(exec.state.clone());
@@ -606,4 +605,16 @@ where
         None => MAX_GAS_LIMIT,
     };
     Ok(corrected_gas)
+}
+
+/// Classify error message to appropriate error type
+fn classify_error(msg: String) -> PreExecError {
+    let lower = msg.to_lowercase();
+    match () {
+        _ if lower.contains("out of gas") => PreExecError::reverted("out of gas"),
+        _ if lower.contains("insufficient funds") || lower.contains("insufficient balance") => {
+            PreExecError::insufficient_balance(msg)
+        }
+        _ => PreExecError::unknown(msg),
+    }
 }
