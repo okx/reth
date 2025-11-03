@@ -3,7 +3,7 @@
 use crate::{OpEthApi, OpEthApiError};
 use alloy_eips::BlockId;
 use alloy_evm::overrides::apply_state_overrides;
-use alloy_primitives::{Address, Bytes, U256, U64, hex};
+use alloy_primitives::{Address, Bytes, U64, U256, hex};
 use alloy_rpc_types_eth::{TransactionInfo, state::StateOverride};
 use alloy_rpc_types_trace::geth::call::CallFrame as GethCallFrame;
 use alloy_rpc_types_trace::geth::mux::MuxConfig;
@@ -68,10 +68,14 @@ pub struct PreExecError {
 
 impl PreExecError {
     /// Creates an error with the given code and message
-    pub fn new(code: i32, msg: impl Into<String>) -> Self { Self { code, msg: msg.into() } }
+    pub fn new(code: i32, msg: impl Into<String>) -> Self {
+        Self { code, msg: msg.into() }
+    }
 
     /// Creates an unknown error
-    pub fn unknown(msg: impl Into<String>) -> Self { Self::new(UNKNOWN_ERROR_CODE, msg) }
+    pub fn unknown(msg: impl Into<String>) -> Self {
+        Self::new(UNKNOWN_ERROR_CODE, msg)
+    }
 
     /// Creates an insufficient balance error
     pub fn insufficient_balance(msg: impl Into<String>) -> Self {
@@ -79,10 +83,14 @@ impl PreExecError {
     }
 
     /// Creates a reverted error
-    pub fn reverted(msg: impl Into<String>) -> Self { Self::new(REVERTED_ERROR_CODE, msg) }
+    pub fn reverted(msg: impl Into<String>) -> Self {
+        Self::new(REVERTED_ERROR_CODE, msg)
+    }
 
     /// Creates a check pre-args error
-    pub fn check_args(msg: impl Into<String>) -> Self { Self::new(CHECK_PRE_ARGS_ERROR_CODE, msg) }
+    pub fn check_args(msg: impl Into<String>) -> Self {
+        Self::new(CHECK_PRE_ARGS_ERROR_CODE, msg)
+    }
 }
 
 /// Inner transaction information
