@@ -426,13 +426,8 @@ where
     type EVM = EthEvmConfig<Types::ChainSpec>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        let mut evm_config = EthEvmConfig::new(ctx.chain_spec())
+        let evm_config = EthEvmConfig::new(ctx.chain_spec())
             .with_extra_data(ctx.payload_builder_config().extra_data_bytes());
-
-        if ctx.config().innertx.capture_enabled {
-            info!("Inner tx is enabled.");
-            evm_config = evm_config.enable_innertx();
-        }
 
         Ok(evm_config)
     }

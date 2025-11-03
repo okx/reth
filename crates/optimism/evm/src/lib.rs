@@ -66,6 +66,9 @@ pub struct OpEvmConfig<
     /// Optimism block assembler.
     pub block_assembler: OpBlockAssembler<ChainSpec>,
     _pd: core::marker::PhantomData<N>,
+
+    /// `XLayer`
+    pub innertx_enabled: bool,
 }
 
 impl<ChainSpec, N: NodePrimitives, R: Clone> Clone for OpEvmConfig<ChainSpec, N, R> {
@@ -74,6 +77,9 @@ impl<ChainSpec, N: NodePrimitives, R: Clone> Clone for OpEvmConfig<ChainSpec, N,
             executor_factory: self.executor_factory.clone(),
             block_assembler: self.block_assembler.clone(),
             _pd: self._pd,
+
+            // XLayer
+            innertx_enabled: false,
         }
     }
 }
@@ -82,6 +88,12 @@ impl<ChainSpec: OpHardforks> OpEvmConfig<ChainSpec> {
     /// Creates a new [`OpEvmConfig`] with the given chain spec for OP chains.
     pub fn optimism(chain_spec: Arc<ChainSpec>) -> Self {
         Self::new(chain_spec, OpRethReceiptBuilder::default())
+    }
+
+    /// `XLayer` enable inner tx
+    pub const fn enable_innertx(mut self) -> Self {
+        self.innertx_enabled = true;
+        self
     }
 }
 
@@ -96,6 +108,9 @@ impl<ChainSpec: OpHardforks, N: NodePrimitives, R> OpEvmConfig<ChainSpec, N, R> 
                 OpEvmFactory::default(),
             ),
             _pd: core::marker::PhantomData,
+
+            // XLayer
+            innertx_enabled: false,
         }
     }
 
@@ -225,7 +240,7 @@ where
     }
 
     fn is_innertx_enabled(&self) -> bool {
-        false
+        self.innertx_enabled
     }
 }
 

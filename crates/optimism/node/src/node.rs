@@ -824,7 +824,12 @@ where
         OpEvmConfig<<Node::Types as NodeTypes>::ChainSpec, <Node::Types as NodeTypes>::Primitives>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        let evm_config = OpEvmConfig::new(ctx.chain_spec(), OpRethReceiptBuilder::default());
+        let mut evm_config = OpEvmConfig::new(ctx.chain_spec(), OpRethReceiptBuilder::default());
+
+        if ctx.config().innertx.capture_enabled {
+            info!("Inner tx is enabled.");
+            evm_config = evm_config.enable_innertx();
+        }
 
         Ok(evm_config)
     }
@@ -911,8 +916,8 @@ where
         let Self { pool_config_overrides, .. } = self;
 
         // supervisor used for interop
-        if ctx.chain_spec().is_interop_active_at_timestamp(ctx.head().timestamp) &&
-            self.supervisor_http == DEFAULT_SUPERVISOR_URL
+        if ctx.chain_spec().is_interop_active_at_timestamp(ctx.head().timestamp)
+            && self.supervisor_http == DEFAULT_SUPERVISOR_URL
         {
             info!(target: "reth::cli",
                 url=%DEFAULT_SUPERVISOR_URL,
@@ -957,8 +962,8 @@ where
         debug!(target: "reth::cli", "Spawned txpool maintenance task");
 
         // The Op txpool maintenance task is only spawned when interop is active
-        if ctx.chain_spec().is_interop_active_at_timestamp(ctx.head().timestamp) &&
-            self.supervisor_http == DEFAULT_SUPERVISOR_URL
+        if ctx.chain_spec().is_interop_active_at_timestamp(ctx.head().timestamp)
+            && self.supervisor_http == DEFAULT_SUPERVISOR_URL
         {
             // spawn the Op txpool maintenance task
             let chain_events = ctx.provider().canonical_state_stream();
