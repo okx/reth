@@ -558,8 +558,10 @@ where
     if req.to.is_none() {
         return Err(PreExecError::check_args("to is nil"));
     }
+
     let msg_nonce =
         req.nonce.ok_or_else(|| PreExecError::check_args(format!("{}, nonce is nil", from)))?;
+
     if let Some(prev_req) = prev {
         if let (Some(pf), Some(pn)) = (prev_req.as_ref().from, prev_req.as_ref().nonce) {
             if pf == from && msg_nonce <= pn {
@@ -574,11 +576,13 @@ where
             }
         }
     }
+
     let st_nonce = db
         .basic(from)
         .map_err(|e| PreExecError::unknown(format!("db error: {:?}", e)))?
         .map(|acc| acc.nonce)
         .unwrap_or(0);
+
     if st_nonce > msg_nonce {
         return Err(PreExecError::check_args(format!(
             "nonce too low: address {}, tx: {} state: {}",
@@ -590,6 +594,7 @@ where
             from, st_nonce
         )));
     }
+
     let corrected_gas = match req.gas {
         Some(g) => {
             if g == 0 || g > MAX_GAS_LIMIT {
