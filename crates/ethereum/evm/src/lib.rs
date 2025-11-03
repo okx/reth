@@ -77,9 +77,6 @@ pub struct EthEvmConfig<C = ChainSpec, EvmFactory = EthEvmFactory> {
     pub executor_factory: EthBlockExecutorFactory<RethReceiptBuilder, Arc<C>, EvmFactory>,
     /// Ethereum block assembler.
     pub block_assembler: EthBlockAssembler<C>,
-
-    /// `XLayer`
-    pub innertx_enabled: bool,
 }
 
 impl EthEvmConfig {
@@ -99,12 +96,6 @@ impl<ChainSpec> EthEvmConfig<ChainSpec> {
     pub fn ethereum(chain_spec: Arc<ChainSpec>) -> Self {
         Self::new_with_evm_factory(chain_spec, EthEvmFactory::default())
     }
-
-    /// `XLayer` enable inner tx
-    pub const fn enable_innertx(mut self) -> Self {
-        self.innertx_enabled = true;
-        self
-    }
 }
 
 impl<ChainSpec, EvmFactory> EthEvmConfig<ChainSpec, EvmFactory> {
@@ -117,9 +108,6 @@ impl<ChainSpec, EvmFactory> EthEvmConfig<ChainSpec, EvmFactory> {
                 chain_spec,
                 evm_factory,
             ),
-
-            // XLayer
-            innertx_enabled: false,
         }
     }
 
@@ -298,9 +286,9 @@ where
         }
     }
 
-    /// `XLayer`: returns true if inner-tx is enabled
+    /// `XLayer`: not used as we run OP reth.
     fn is_innertx_enabled(&self) -> bool {
-        self.innertx_enabled
+        false
     }
 }
 
