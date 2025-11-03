@@ -34,7 +34,7 @@ pub use gas_oracle::{
     GasCap, GasPriceOracle, GasPriceOracleConfig, GasPriceOracleResult, RPC_DEFAULT_GAS_CAP,
 };
 pub use id_provider::EthSubscriptionIdProvider;
-pub use legacy::{CrossBoundaryFilterManager, LegacyRpcClient, LegacyRpcConfig};
+pub use legacy::{LegacyRpcClient, LegacyRpcConfig};
 pub use pending_block::{PendingBlock, PendingBlockEnv, PendingBlockEnvOrigin};
 pub use transaction::TransactionSource;
 pub use tx_forward::ForwardConfig;

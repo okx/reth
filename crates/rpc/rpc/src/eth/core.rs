@@ -250,12 +250,6 @@ where
     fn legacy_rpc_client(&self) -> Option<&Arc<reth_rpc_eth_types::LegacyRpcClient>> {
         self.inner.legacy_rpc_client()
     }
-
-    fn legacy_filter_manager(
-        &self,
-    ) -> Option<&Arc<reth_rpc_eth_types::CrossBoundaryFilterManager>> {
-        self.inner.legacy_filter_manager()
-    }
 }
 
 impl<N, Rpc> SpawnBlocking for EthApi<N, Rpc>
@@ -331,9 +325,6 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
 
     /// Optional legacy RPC client for routing historical data.
     legacy_rpc_client: Option<Arc<reth_rpc_eth_types::LegacyRpcClient>>,
-
-    /// Optional filter manager for cross-boundary filters.
-    legacy_filter_manager: Option<Arc<reth_rpc_eth_types::CrossBoundaryFilterManager>>,
 }
 
 impl<N, Rpc> EthApiInner<N, Rpc>
@@ -380,22 +371,27 @@ where
             BatchTxProcessor::new(components.pool().clone(), max_batch_size);
         task_spawner.spawn_critical("tx-batcher", Box::pin(processor));
 
-        // Initialize legacy RPC client and filter manager if config is provided
-        let (legacy_rpc_client, legacy_filter_manager) = if let Some(config) = legacy_rpc_config {
+        // Initialize legacy RPC client if configured
+        let legacy_rpc_client = legacy_rpc_config.and_then(|config| {
             match reth_rpc_eth_types::LegacyRpcClient::from_config(&config) {
                 Ok(client) => {
-                    let filter_mgr =
-                        reth_rpc_eth_types::CrossBoundaryFilterManager::new(config.cutoff_block);
-                    (Some(Arc::new(client)), Some(Arc::new(filter_mgr)))
+                    tracing::info!(
+                        cutoff_block = config.cutoff_block,
+                        endpoint = %config.endpoint,
+                        "Legacy RPC support initialized"
+                    );
+                    Some(Arc::new(client))
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to initialize legacy RPC client: {}", e);
-                    (None, None)
+                    tracing::warn!(
+                        error = %e,
+                        endpoint = %config.endpoint,
+                        "Failed to initialize legacy RPC client, legacy support disabled"
+                    );
+                    None
                 }
             }
-        } else {
-            (None, None)
-        };
+        });
 
         Self {
             components,
@@ -418,7 +414,6 @@ where
             tx_batch_sender,
             pending_block_kind,
             legacy_rpc_client,
-            legacy_filter_manager,
         }
     }
 }
@@ -475,14 +470,6 @@ where
     #[inline]
     pub fn legacy_rpc_client(&self) -> Option<&Arc<reth_rpc_eth_types::LegacyRpcClient>> {
         self.legacy_rpc_client.as_ref()
-    }
-
-    /// Returns the legacy filter manager if configured.
-    #[inline]
-    pub fn legacy_filter_manager(
-        &self,
-    ) -> Option<&Arc<reth_rpc_eth_types::CrossBoundaryFilterManager>> {
-        self.legacy_filter_manager.as_ref()
     }
 
     /// Returns a handle to the EVM config.

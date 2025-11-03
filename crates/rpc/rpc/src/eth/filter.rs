@@ -341,49 +341,6 @@ where
     /// Handler for `eth_newFilter`
     async fn new_filter(&self, filter: Filter) -> RpcResult<FilterId> {
         trace!(target: "rpc::eth", "Serving eth_newFilter");
-
-        // Check if legacy RPC routing is configured and if filter spans boundaries
-        if let (Some(legacy_client), Some(filter_manager)) = (
-            self.inner.eth_api.legacy_rpc_client(),
-            self.inner.eth_api.legacy_filter_manager(),
-        ) {
-            let cutoff_block = legacy_client.cutoff_block();
-            let (from_block, to_block) = self.parse_block_range(&filter)?;
-
-            if to_block < cutoff_block {
-                // Pure legacy filter
-                trace!(target: "rpc::eth", "Creating filter on legacy RPC (pure)");
-                return legacy_client.new_filter(filter).await.map_err(|_| jsonrpsee::types::error::ErrorCode::InternalError.into());
-            } else if from_block >= cutoff_block {
-                // Pure local filter - fall through to normal handling
-                trace!(target: "rpc::eth", "Creating filter locally (pure)");
-            } else {
-                // Hybrid filter - create on both sides
-                trace!(target: "rpc::eth", "Creating hybrid filter on both legacy and local");
-                let (legacy_filter, local_filter) = filter_manager.split_filter(&filter);
-
-                // Create filters on both sides in parallel
-                let (legacy_result, local_result) = tokio::join!(
-                    legacy_client.new_filter(legacy_filter),
-                    self.inner.install_filter(FilterKind::<RpcTransaction<Eth::NetworkTypes>>::Log(Box::new(local_filter)))
-                );
-
-                let legacy_id = legacy_result.map_err(|_| jsonrpsee::types::error::ErrorCode::InternalError)?;
-                let local_id = local_result?;
-
-                // Register hybrid filter in manager
-                let hybrid_id = filter_manager.register_filter(
-                    filter,
-                    reth_rpc_eth_types::legacy::FilterType::Hybrid,
-                    Some(legacy_id),
-                    Some(local_id),
-                );
-
-                return Ok(hybrid_id);
-            }
-        }
-
-        // Default: local filter only
         self.inner
             .install_filter(FilterKind::<RpcTransaction<Eth::NetworkTypes>>::Log(Box::new(filter)))
             .await
@@ -432,40 +389,6 @@ where
         id: FilterId,
     ) -> RpcResult<FilterChanges<RpcTransaction<Eth::NetworkTypes>>> {
         trace!(target: "rpc::eth", "Serving eth_getFilterChanges");
-
-        // Check if this is a hybrid filter
-        if let (Some(legacy_client), Some(filter_manager)) = (
-            self.inner.eth_api.legacy_rpc_client(),
-            self.inner.eth_api.legacy_filter_manager(),
-        ) {
-            if let Some(metadata) = filter_manager.get_filter(&id) {
-                match metadata.filter_type {
-                    reth_rpc_eth_types::legacy::FilterType::PureLegacy => {
-                        // Route to legacy
-                        if let Some(legacy_id) = metadata.legacy_id {
-                            match legacy_client.get_filter_changes(legacy_id).await {
-                                Ok(changes) => {
-                                    // Convert via serde
-                                    let converted: FilterChanges<RpcTransaction<Eth::NetworkTypes>> =
-                                        serde_json::from_value(serde_json::to_value(changes).unwrap()).unwrap();
-                                    return Ok(converted);
-                                }
-                                Err(_) => return Err(jsonrpsee::types::error::ErrorCode::InternalError.into()),
-                            }
-                        }
-                    }
-                    reth_rpc_eth_types::legacy::FilterType::Hybrid => {
-                        // Query both and merge - simplified, just return local for now
-                        // Full implementation would need to merge FilterChanges properly
-                        if let Some(local_id) = metadata.local_id {
-                            return Ok(Self::filter_changes(self, local_id).await?);
-                        }
-                    }
-                    _ => {} // PureLocal - fall through
-                }
-            }
-        }
-
         Ok(Self::filter_changes(self, id).await?)
     }
 
@@ -476,40 +399,6 @@ where
     /// Handler for `eth_getFilterLogs`
     async fn filter_logs(&self, id: FilterId) -> RpcResult<Vec<Log>> {
         trace!(target: "rpc::eth", "Serving eth_getFilterLogs");
-
-        // Check if this is a hybrid filter
-        if let (Some(legacy_client), Some(filter_manager)) = (
-            self.inner.eth_api.legacy_rpc_client(),
-            self.inner.eth_api.legacy_filter_manager(),
-        ) {
-            if let Some(metadata) = filter_manager.get_filter(&id) {
-                match metadata.filter_type {
-                    reth_rpc_eth_types::legacy::FilterType::PureLegacy => {
-                        // Route to legacy
-                        if let Some(legacy_id) = metadata.legacy_id {
-                            return legacy_client.get_filter_logs(legacy_id).await
-                                .map_err(|_| jsonrpsee::types::error::ErrorCode::InternalError.into());
-                        }
-                    }
-                    reth_rpc_eth_types::legacy::FilterType::Hybrid => {
-                        // Query both and merge
-                        if let (Some(legacy_id), Some(local_id)) = (metadata.legacy_id, metadata.local_id) {
-                            let (legacy_result, local_result) = tokio::join!(
-                                legacy_client.get_filter_logs(legacy_id),
-                                Self::filter_logs(self, local_id)
-                            );
-
-                            let legacy_logs = legacy_result.map_err(|_| jsonrpsee::types::error::ErrorCode::InternalError)?;
-                            let local_logs = local_result?;
-
-                            return Ok(filter_manager.merge_logs(legacy_logs, local_logs));
-                        }
-                    }
-                    _ => {} // PureLocal - fall through
-                }
-            }
-        }
-
         Ok(Self::filter_logs(self, id).await?)
     }
 
@@ -517,49 +406,6 @@ where
     async fn uninstall_filter(&self, id: FilterId) -> RpcResult<bool> {
         trace!(target: "rpc::eth", "Serving eth_uninstallFilter");
 
-        // Check if this is a hybrid filter
-        if let (Some(legacy_client), Some(filter_manager)) = (
-            self.inner.eth_api.legacy_rpc_client(),
-            self.inner.eth_api.legacy_filter_manager(),
-        ) {
-            if let Some(metadata) = filter_manager.remove_filter(&id) {
-                match metadata.filter_type {
-                    reth_rpc_eth_types::legacy::FilterType::PureLegacy => {
-                        // Uninstall from legacy only
-                        if let Some(legacy_id) = metadata.legacy_id {
-                            return legacy_client.uninstall_filter(legacy_id).await
-                                .map_err(|_| jsonrpsee::types::error::ErrorCode::InternalError.into());
-                        }
-                    }
-                    reth_rpc_eth_types::legacy::FilterType::Hybrid => {
-                        // Uninstall from both sides
-                        if let (Some(legacy_id), Some(local_id)) = (metadata.legacy_id, metadata.local_id) {
-                            let (legacy_result, local_result) = tokio::join!(
-                                legacy_client.uninstall_filter(legacy_id),
-                                async {
-                                    let mut filters = self.inner.active_filters.inner.lock().await;
-                                    Ok::<bool, ()>(filters.remove(&local_id).is_some())
-                                }
-                            );
-
-                            // Return true if either succeeded
-                            let legacy_ok = legacy_result.unwrap_or(false);
-                            let local_ok = local_result.unwrap_or(false);
-                            return Ok(legacy_ok || local_ok);
-                        }
-                    }
-                    reth_rpc_eth_types::legacy::FilterType::PureLocal => {
-                        // Fall through to local uninstall
-                        if let Some(local_id) = metadata.local_id {
-                            let mut filters = self.inner.active_filters.inner.lock().await;
-                            return Ok(filters.remove(&local_id).is_some());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Default local handling
         let mut filters = self.inner.active_filters.inner.lock().await;
         if filters.remove(&id).is_some() {
             trace!(target: "rpc::eth::filter", ?id, "uninstalled filter");
@@ -618,19 +464,14 @@ where
                 let mut local_logs = local_result?;
 
                 // Merge and sort logs
-                if let Some(filter_manager) = self.inner.eth_api.legacy_filter_manager() {
-                    return Ok(filter_manager.merge_logs(legacy_logs, local_logs));
-                } else {
-                    // Fallback: simple merge
-                    legacy_logs.append(&mut local_logs);
-                    legacy_logs.sort_by(|a, b| {
-                        a.block_number
-                            .cmp(&b.block_number)
-                            .then(a.transaction_index.cmp(&b.transaction_index))
-                            .then(a.log_index.cmp(&b.log_index))
-                    });
-                    return Ok(legacy_logs);
-                }
+                legacy_logs.append(&mut local_logs);
+                legacy_logs.sort_by(|a, b| {
+                    a.block_number
+                        .cmp(&b.block_number)
+                        .then(a.transaction_index.cmp(&b.transaction_index))
+                        .then(a.log_index.cmp(&b.log_index))
+                });
+                return Ok(legacy_logs);
             }
         }
 
@@ -645,10 +486,6 @@ where
 {
     fn legacy_rpc_client(&self) -> Option<&Arc<reth_rpc_eth_types::LegacyRpcClient>> {
         self.inner.eth_api.legacy_rpc_client()
-    }
-
-    fn legacy_filter_manager(&self) -> Option<&Arc<reth_rpc_eth_types::CrossBoundaryFilterManager>> {
-        self.inner.eth_api.legacy_filter_manager()
     }
 }
 
