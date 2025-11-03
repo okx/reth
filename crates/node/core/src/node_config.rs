@@ -33,7 +33,7 @@ use std::{
 };
 use tracing::*;
 
-use crate::args::{ApolloArgs, EraArgs};
+use crate::args::EraArgs;
 pub use reth_engine_primitives::{
     DEFAULT_MAX_PROOF_TASK_CONCURRENCY, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
     DEFAULT_RESERVED_CPU_CORES,
