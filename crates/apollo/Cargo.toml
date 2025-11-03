@@ -40,4 +40,4 @@ async-once-cell = "0.5.4"
 tracing = { workspace = true }
 
 # cache
-moka =  "0.12.11"
+moka = { version = "0.12.11", features = ["future"] }
