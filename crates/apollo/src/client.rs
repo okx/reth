@@ -35,6 +35,10 @@ pub struct ListenerState {
 /// Singleton instance
 static INSTANCE: OnceCell<Arc<ApolloService>> = OnceCell::new();
 
+// Constants
+const POLLING_INTERVAL: Duration = Duration::from_millis(1000);
+const CACHE_MAX_CAPACITY: u64 = 1000;
+
 impl std::fmt::Debug for ApolloService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApolloService")
@@ -120,7 +124,7 @@ impl ApolloService {
             inner: Arc::new(client),
             config,
             namespace_map,
-            cache: Cache::builder().max_capacity(1000).build(),
+            cache: Cache::builder().max_capacity(CACHE_MAX_CAPACITY).build(),
             listener_state: Arc::new(Mutex::new(ListenerState { task: None })),
         })
     }
@@ -189,7 +193,7 @@ impl ApolloService {
         cache: Cache<String, ConfigValue>,
         namespace_map: HashMap<String, String>,
     ) {
-        let mut interval = tokio::time::interval(Duration::from_millis(1000));
+        let mut interval = tokio::time::interval(POLLING_INTERVAL);
         loop {
             interval.tick().await;
 
