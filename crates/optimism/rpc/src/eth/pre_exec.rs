@@ -422,7 +422,7 @@ where
                     bal.insert("after".into(), JsonValue::String(post_bal));
                     let mut addr_obj = JsonMap::new();
                     addr_obj.insert("balance".into(), JsonValue::Object(bal));
-                    out.insert(format!("{:?}", addr), JsonValue::Object(addr_obj));
+                    out.insert(addr.to_checksum(None), JsonValue::Object(addr_obj));
                 }
             }
         }
