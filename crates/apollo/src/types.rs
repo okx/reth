@@ -1,5 +1,31 @@
 use serde_json::Value as JsonValue;
 
+/// Apollo-specific configuration that complements reth's config
+#[derive(Debug, Clone)]
+pub struct ApolloConfig {
+    /// Apollo meta server URLs
+    pub meta_server: Vec<String>,
+    /// App ID in Apollo
+    pub app_id: String,
+    /// Cluster name (default: "default")
+    pub cluster_name: String,
+    /// Namespace (default: "application")
+    pub namespaces: Option<Vec<String>>,
+    /// Optional authentication token
+    pub secret: Option<String>,
+}
+
+/// Apollo error enum
+#[derive(Debug, thiserror::Error)]
+pub enum ApolloError {
+    /// Failed to initialize Apollo client
+    #[error("Failed to initialize Apollo client: {0}")]
+    ClientInit(String),
+    /// Invalid namespace
+    #[error("Invalid namespace: {0}")]
+    InvalidNamespace(String),
+}
+
 /// Trait for converting from ConfigValue to concrete types
 pub trait FromConfigValue: Sized {
     /// Convert from ConfigValue to concrete type
@@ -171,32 +197,6 @@ impl ConfigValue {
             _ => None,
         }
     }
-}
-
-/// Apollo-specific configuration that complements reth's config
-#[derive(Debug, Clone)]
-pub struct ApolloConfig {
-    /// Apollo meta server URLs
-    pub meta_server: Vec<String>,
-    /// App ID in Apollo
-    pub app_id: String,
-    /// Cluster name (default: "default")
-    pub cluster_name: String,
-    /// Namespace (default: "application")
-    pub namespaces: Option<Vec<String>>,
-    /// Optional authentication token
-    pub secret: Option<String>,
-}
-
-/// Apollo error enum
-#[derive(Debug, thiserror::Error)]
-pub enum ApolloError {
-    /// Failed to initialize Apollo client
-    #[error("Failed to initialize Apollo client: {0}")]
-    ClientInit(String),
-    /// Invalid namespace
-    #[error("Invalid namespace: {0}")]
-    InvalidNamespace(String),
 }
 
 #[cfg(test)]
