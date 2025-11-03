@@ -562,10 +562,12 @@ where
         let result = if self.strategy_factory.is_innertx_enabled() {
             self.strategy_factory
                 .executor_for_block(&mut self.db, block, InnerTxInspector::new())
+                .map_err(BlockExecutionError::other)?
                 .execute_block(block.transactions_recovered())?
         } else {
             self.strategy_factory
                 .executor_for_block(&mut self.db, block, NoOpInspector)
+                .map_err(BlockExecutionError::other)?
                 .execute_block(block.transactions_recovered())?
         };
 

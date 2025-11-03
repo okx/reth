@@ -329,13 +329,14 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         db: &'a mut State<DB>,
         block: &'a SealedBlock<<Self::Primitives as NodePrimitives>::Block>,
         inspector: I,
-    ) -> impl BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>
+    ) -> Result<impl BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>, Self::Error>
     where
         I: InspectorFor<Self, &'a mut State<DB>> + 'a,
     {
-        let evm = self.evm_with_env_and_inspector(db, self.evm_env(block.header()), inspector);
-        let ctx = self.context_for_block(block);
-        self.create_executor(evm, ctx)
+        let evm_env = self.evm_env(block.header())?;
+        let evm = self.evm_with_env_and_inspector(db, evm_env, inspector);
+        let ctx = self.context_for_block(block)?;
+        Ok(self.create_executor(evm, ctx))
     }
 
     /// Creates a [`BlockBuilder`]. Should be used when building a new block.
