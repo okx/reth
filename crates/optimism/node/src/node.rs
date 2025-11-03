@@ -486,6 +486,7 @@ where
     EVB: EngineValidatorBuilder<N>,
     RpcMiddleware: RethRpcMiddleware,
     Attrs: OpAttributes<Transaction = TxTy<N::Types>, RpcPayloadAttributes: DeserializeOwned>,
+    EthB::EthApi: reth_optimism_rpc::eth::pre_exec::EthPreExecApiServer,
 {
     type Handle = RpcHandle<N, EthB::EthApi>;
 
@@ -584,6 +585,14 @@ where
                     )?;
                 }
 
+                // register eth_transactionPreExec on eth namespace
+                modules.merge_if_module_configured(
+                    RethRpcModule::Eth,
+                    reth_optimism_rpc::eth::pre_exec::EthPreExecApiServer::into_rpc(
+                        registry.eth_api().clone(),
+                    ),
+                )?;
+
                 Ok(())
             })
             .await
@@ -614,6 +623,7 @@ where
     EVB: EngineValidatorBuilder<N>,
     RpcMiddleware: RethRpcMiddleware,
     Attrs: OpAttributes<Transaction = TxTy<N::Types>, RpcPayloadAttributes: DeserializeOwned>,
+    <EthB as EthApiBuilder<N>>::EthApi: reth_optimism_rpc::eth::pre_exec::EthPreExecApiServer,
 {
     type EthApi = EthB::EthApi;
 

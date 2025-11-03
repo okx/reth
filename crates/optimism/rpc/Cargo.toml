@@ -27,6 +27,8 @@ reth-node-api.workspace = true
 reth-node-builder.workspace = true
 reth-chainspec.workspace = true
 reth-rpc-engine-api.workspace = true
+reth-revm.workspace = true
+revm-inspectors.workspace = true
 
 # op-reth
 reth-optimism-evm.workspace = true
@@ -55,6 +57,8 @@ op-alloy-rpc-jsonrpsee.workspace = true
 op-alloy-consensus.workspace = true
 revm.workspace = true
 op-revm.workspace = true
+alloy-evm.workspace = true
+alloy-rpc-types-trace.workspace = true
 
 # async
 tokio.workspace = true
@@ -66,6 +70,7 @@ tower.workspace = true
 jsonrpsee-core.workspace = true
 jsonrpsee-types.workspace = true
 jsonrpsee.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 # misc

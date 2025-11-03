@@ -7,6 +7,8 @@ pub mod transaction;
 mod block;
 mod call;
 mod pending_block;
+pub mod pre_exec;
+pub mod pre_exec_type;
 
 use crate::{
     eth::{receipt::OpReceiptConverter, transaction::OpTxInfoMapper},
