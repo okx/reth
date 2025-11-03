@@ -220,7 +220,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     fn block_assembler(&self) -> &Self::BlockAssembler;
 
     /// Creates a new [`EvmEnv`] for the given header.
-    fn evm_env(&self, header: &HeaderTy<Self::Primitives>) -> EvmEnvFor<Self>;
+    fn evm_env(&self, header: &HeaderTy<Self::Primitives>) -> Result<EvmEnvFor<Self>, Self::Error>;
 
     /// Returns the configured [`EvmEnv`] for `parent + 1` block.
     ///
@@ -247,7 +247,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
-    ) -> ExecutionCtxFor<'a, Self>;
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error>;
 
     /// Returns the configured [`BlockExecutorFactory::ExecutionCtx`] for `parent + 1`
     /// block.
@@ -255,7 +255,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         &self,
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         attributes: Self::NextBlockEnvCtx,
-    ) -> ExecutionCtxFor<'_, Self>;
+    ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error>;
 
     /// Returns a [`TxEnv`] from a transaction and [`Address`].
     fn tx_env(&self, transaction: impl IntoTxEnv<TxEnvFor<Self>>) -> TxEnvFor<Self> {
@@ -286,9 +286,9 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         &self,
         db: DB,
         header: &HeaderTy<Self::Primitives>,
-    ) -> EvmFor<Self, DB> {
-        let evm_env = self.evm_env(header);
-        self.evm_with_env(db, evm_env)
+    ) -> Result<EvmFor<Self, DB>, Self::Error> {
+        let evm_env = self.evm_env(header)?;
+        Ok(self.evm_with_env(db, evm_env))
     }
 
     /// Returns a new EVM with the given database configured with the given environment settings,
@@ -412,7 +412,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     ) -> Result<impl BlockBuilder<Primitives = Self::Primitives>, Self::Error> {
         let evm_env = self.next_evm_env(parent, &attributes)?;
         let evm = self.evm_with_env(db, evm_env);
-        let ctx = self.context_for_next_block(parent, attributes);
+        let ctx = self.context_for_next_block(parent, attributes)?;
         Ok(self.create_block_builder(evm, parent, ctx))
     }
 
