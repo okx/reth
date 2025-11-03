@@ -44,6 +44,7 @@ metrics.workspace = true
 
 # misc
 humantime.workspace = true
+dyn-clone.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tracing.workspace = true

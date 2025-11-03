@@ -1,12 +1,9 @@
 //! clap [Args](clap::Args) for RPC related arguments.
 
-use std::{
-    collections::HashSet,
-    ffi::OsStr,
-    net::{IpAddr, Ipv4Addr},
-    path::PathBuf,
+use crate::args::{
+    types::{MaxU32, ZeroAsNoneU64},
+    GasPriceOracleArgs, RpcStateCacheArgs,
 };
-
 use alloy_primitives::Address;
 use alloy_rpc_types_engine::JwtSecret;
 use clap::{
@@ -14,15 +11,17 @@ use clap::{
     Arg, Args, Command,
 };
 use rand::Rng;
-use reth_cli_util::parse_ether_value;
+use reth_cli_util::{parse_duration_from_secs_or_ms, parse_ether_value};
 use reth_rpc_eth_types::builder::config::PendingBlockKind;
 use reth_rpc_server_types::{constants, RethRpcModule, RpcModuleSelection};
-use url::Url;
-
-use crate::args::{
-    types::{MaxU32, ZeroAsNoneU64},
-    GasPriceOracleArgs, RpcStateCacheArgs,
+use std::{
+    collections::HashSet,
+    ffi::OsStr,
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+    time::Duration,
 };
+use url::Url;
 
 use super::types::MaxOr;
 
@@ -245,25 +244,26 @@ pub struct RpcServerArgs {
     #[command(flatten)]
     pub gas_price_oracle: GasPriceOracleArgs,
 
-    /// Legacy RPC endpoint URL for routing historical data
-    ///
-    /// When specified, requests for blocks below --legacy-cutoff-block will be forwarded to this endpoint.
-    /// This is useful when migrating from another client (e.g., Erigon) and needing to access historical data.
+    /// XLayer: Legacy RPC endpoint URL for routing historical data
     #[arg(long = "legacy-rpc-url", value_name = "URL")]
     pub legacy_rpc_url: Option<String>,
 
-    /// Block number below which requests are routed to legacy RPC
-    ///
-    /// Requests for blocks < cutoff are forwarded to --legacy-rpc-url.
-    /// Requests for blocks >= cutoff are handled locally by Reth.
+    /// XLayer: Block number below which requests are routed to legacy RPC
     #[arg(long = "legacy-cutoff-block", value_name = "NUMBER", requires = "legacy_rpc_url")]
     pub legacy_cutoff_block: Option<u64>,
 
-    /// Timeout for legacy RPC requests
-    ///
-    /// Specifies how long to wait for responses from the legacy RPC endpoint.
+    /// XLayer: Timeout for legacy RPC requests
     #[arg(long = "legacy-rpc-timeout", value_name = "DURATION", default_value = "30s", requires = "legacy_rpc_url")]
     pub legacy_rpc_timeout: Option<String>,
+
+    /// Timeout for `send_raw_transaction_sync` RPC method.
+    #[arg(
+        long = "rpc.send-raw-transaction-sync-timeout",
+        value_name = "SECONDS",
+        default_value = "30s",
+        value_parser = parse_duration_from_secs_or_ms,
+    )]
+    pub rpc_send_raw_transaction_sync_timeout: Duration,
 }
 
 impl RpcServerArgs {
@@ -379,6 +379,12 @@ impl RpcServerArgs {
     {
         f(self)
     }
+
+    /// Configures the timeout for send raw transaction sync.
+    pub const fn with_send_raw_transaction_sync_timeout(mut self, timeout: Duration) -> Self {
+        self.rpc_send_raw_transaction_sync_timeout = timeout;
+        self
+    }
 }
 
 impl Default for RpcServerArgs {
@@ -426,11 +432,13 @@ impl Default for RpcServerArgs {
             legacy_rpc_url: None,
             legacy_cutoff_block: None,
             legacy_rpc_timeout: None,
+            rpc_send_raw_transaction_sync_timeout:
+                constants::RPC_DEFAULT_SEND_RAW_TX_SYNC_TIMEOUT_SECS,
         }
     }
 }
 
-/// clap value parser for [`RpcModuleSelection`].
+/// clap value parser for [`RpcModuleSelection`] with configurable validation.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 struct RpcModuleSelectionValueParser;
@@ -441,23 +449,20 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
     fn parse_ref(
         &self,
         _cmd: &Command,
-        arg: Option<&Arg>,
+        _arg: Option<&Arg>,
         value: &OsStr,
     ) -> Result<Self::Value, clap::Error> {
         let val =
             value.to_str().ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
-        val.parse::<RpcModuleSelection>().map_err(|err| {
-            let arg = arg.map(|a| a.to_string()).unwrap_or_else(|| "...".to_owned());
-            let possible_values = RethRpcModule::all_variant_names().to_vec().join(",");
-            let msg = format!(
-                "Invalid value '{val}' for {arg}: {err}.\n    [possible values: {possible_values}]"
-            );
-            clap::Error::raw(clap::error::ErrorKind::InvalidValue, msg)
-        })
+        // This will now accept any module name, creating Other(name) for unknowns
+        Ok(val
+            .parse::<RpcModuleSelection>()
+            .expect("RpcModuleSelection parsing cannot fail with Other variant"))
     }
 
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
-        let values = RethRpcModule::all_variant_names().iter().map(PossibleValue::new);
+        // Only show standard modules in help text (excludes "other")
+        let values = RethRpcModule::standard_variant_names().map(PossibleValue::new);
         Some(Box::new(values))
     }
 }

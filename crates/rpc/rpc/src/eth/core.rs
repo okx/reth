@@ -1,7 +1,7 @@
 //! Implementation of the [`jsonrpsee`] generated [`EthApiServer`](crate::EthApi) trait
 //! Handles RPC requests for the `eth_` namespace.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::{eth::helpers::types::EthRpcConverter, EthApiBuilder};
 use alloy_consensus::BlockHeader;
@@ -155,6 +155,7 @@ where
         pending_block_kind: PendingBlockKind,
         raw_tx_forwarder: ForwardConfig,
         legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
+        send_raw_transaction_sync_timeout: Duration,
     ) -> Self {
         let inner = EthApiInner::new(
             components,
@@ -173,6 +174,7 @@ where
             pending_block_kind,
             raw_tx_forwarder.forwarder_client(),
             legacy_rpc_config,
+            send_raw_transaction_sync_timeout,
         );
 
         Self { inner: Arc::new(inner) }
@@ -325,6 +327,8 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
 
     /// Optional legacy RPC client for routing historical data.
     legacy_rpc_client: Option<Arc<reth_rpc_eth_types::LegacyRpcClient>>,
+    /// Timeout duration for `send_raw_transaction_sync` RPC method.
+    send_raw_transaction_sync_timeout: Duration,
 }
 
 impl<N, Rpc> EthApiInner<N, Rpc>
@@ -351,6 +355,7 @@ where
         pending_block_kind: PendingBlockKind,
         raw_tx_forwarder: Option<RpcClient>,
         legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
+        send_raw_transaction_sync_timeout: Duration,
     ) -> Self {
         let signers = parking_lot::RwLock::new(Default::default());
         // get the block number of the latest block
@@ -414,6 +419,7 @@ where
             tx_batch_sender,
             pending_block_kind,
             legacy_rpc_client,
+            send_raw_transaction_sync_timeout,
         }
     }
 }
@@ -584,6 +590,12 @@ where
     #[inline]
     pub const fn raw_tx_forwarder(&self) -> Option<&RpcClient> {
         self.raw_tx_forwarder.as_ref()
+    }
+
+    /// Returns the timeout duration for `send_raw_transaction_sync` RPC method.
+    #[inline]
+    pub const fn send_raw_transaction_sync_timeout(&self) -> Duration {
+        self.send_raw_transaction_sync_timeout
     }
 }
 
