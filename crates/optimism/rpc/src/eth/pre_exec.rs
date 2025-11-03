@@ -151,11 +151,11 @@ pub struct BalanceChange {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreExecResult {
-    /// Inner transactions (interface{} in op-geth)
+    /// Inner transactions
     pub inner_txs: Option<serde_json::Value>,
-    /// Event logs (interface{} in op-geth)
+    /// Event logs
     pub logs: Option<serde_json::Value>,
-    /// State differences (interface{} in op-geth)
+    /// State differences
     pub state_diff: Option<serde_json::Value>,
     /// Error information
     pub error: PreExecError,
@@ -448,7 +448,7 @@ where
     })
 }
 
-/// Convert typed CallFrame to inner txs (op-geth equivalent)
+/// Convert typed CallFrame to inner txs
 fn convert_call_tracer_to_inner_txs(
     call_frame: &GethCallFrame,
 ) -> Result<Vec<PreExecInnerTx>, PreExecError> {
