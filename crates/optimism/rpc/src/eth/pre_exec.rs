@@ -1,12 +1,9 @@
 //! Pre-execution RPC (eth_transactionPreExec) for Optimism.
 
-use crate::{
-    OpEthApi, OpEthApiError,
-    eth::pre_exec_type::{MAX_GAS_LIMIT, PreExecError, PreExecInnerTx, PreExecResult},
-};
+use crate::{OpEthApi, OpEthApiError};
 use alloy_eips::BlockId;
 use alloy_evm::overrides::apply_state_overrides;
-use alloy_primitives::{Address, hex};
+use alloy_primitives::{Address, Bytes, U256, U64, hex};
 use alloy_rpc_types_eth::{TransactionInfo, state::StateOverride};
 use alloy_rpc_types_trace::geth::call::CallFrame as GethCallFrame;
 use alloy_rpc_types_trace::geth::mux::MuxConfig;
@@ -24,6 +21,167 @@ use revm::DatabaseCommit;
 use revm::context_interface::result::ExecutionResult;
 use revm_inspectors::tracing::MuxInspector;
 use serde_json::{Map as JsonMap, Value as JsonValue};
+
+/// Error codes for pre-execution errors
+const UNKNOWN_ERROR_CODE: i32 = 1000;
+const INSUFFICIENT_BALANCE_ERROR_CODE: i32 = 1001;
+const REVERTED_ERROR_CODE: i32 = 1002;
+const CHECK_PRE_ARGS_ERROR_CODE: i32 = 1003;
+
+/// Maximum gas limit for pre-execution
+pub const MAX_GAS_LIMIT: u64 = 30_000_000;
+
+/// Request arguments for pre-execution
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreExecArgs {
+    /// Sender address
+    pub from: Option<Address>,
+    /// Recipient address
+    pub to: Option<Address>,
+    /// Gas limit
+    pub gas: Option<U64>,
+    /// Gas price
+    pub gas_price: Option<U256>,
+    /// Max fee per gas (EIP-1559)
+    pub max_fee_per_gas: Option<U256>,
+    /// Max priority fee per gas (EIP-1559)
+    pub max_priority_fee_per_gas: Option<U256>,
+    /// Value to transfer
+    pub value: Option<U256>,
+    /// Transaction nonce
+    pub nonce: Option<U64>,
+    /// Call data
+    pub data: Option<Bytes>,
+    /// Input data (alias for data)
+    pub input: Option<Bytes>,
+}
+
+/// Error information in pre-execution result
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PreExecError {
+    /// Error code
+    pub code: i32,
+    /// Error message
+    pub msg: String,
+}
+
+impl PreExecError {
+    /// Creates an error with the given code and message
+    pub fn new(code: i32, msg: impl Into<String>) -> Self { Self { code, msg: msg.into() } }
+
+    /// Creates an unknown error
+    pub fn unknown(msg: impl Into<String>) -> Self { Self::new(UNKNOWN_ERROR_CODE, msg) }
+
+    /// Creates an insufficient balance error
+    pub fn insufficient_balance(msg: impl Into<String>) -> Self {
+        Self::new(INSUFFICIENT_BALANCE_ERROR_CODE, msg)
+    }
+
+    /// Creates a reverted error
+    pub fn reverted(msg: impl Into<String>) -> Self { Self::new(REVERTED_ERROR_CODE, msg) }
+
+    /// Creates a check pre-args error
+    pub fn check_args(msg: impl Into<String>) -> Self { Self::new(CHECK_PRE_ARGS_ERROR_CODE, msg) }
+}
+
+/// Inner transaction information
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreExecInnerTx {
+    /// Depth of the call
+    pub dept: U256,
+    /// Internal index
+    pub internal_index: U256,
+    /// Call type (call, staticcall, delegatecall, etc.)
+    pub call_type: String,
+    /// Name of the call
+    pub name: String,
+    /// Trace address
+    pub trace_address: String,
+    /// Code address
+    pub code_address: String,
+    /// From address
+    pub from: String,
+    /// To address
+    pub to: String,
+    /// Input data
+    pub input: String,
+    /// Output data
+    pub output: String,
+    /// Whether the call errored
+    pub is_error: bool,
+    /// Gas used
+    pub gas_used: u64,
+    /// Value transferred
+    pub value: String,
+    /// Value in wei
+    pub value_wei: String,
+    /// Error message if any
+    pub error: String,
+    /// Return gas
+    pub return_gas: u64,
+}
+
+/// State diff for an account
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AccountStateDiff {
+    /// Balance change (before and after)
+    pub balance: BalanceChange,
+}
+
+/// Balance change information
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BalanceChange {
+    /// Balance before execution
+    pub before: String,
+    /// Balance after execution
+    pub after: String,
+}
+
+/// Result of pre-execution
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreExecResult {
+    /// Inner transactions (interface{} in op-geth)
+    pub inner_txs: Option<serde_json::Value>,
+    /// Event logs (interface{} in op-geth)
+    pub logs: Option<serde_json::Value>,
+    /// State differences (interface{} in op-geth)
+    pub state_diff: Option<serde_json::Value>,
+    /// Error information
+    pub error: PreExecError,
+    /// Gas used
+    pub gas_used: u64,
+    /// Block number
+    pub block_number: U256,
+}
+
+impl PreExecResult {
+    /// Creates an error result
+    pub fn from_error(error: PreExecError, gas_used: u64, block_number: U256) -> Self {
+        Self {
+            inner_txs: Some(serde_json::Value::Array(vec![])),
+            logs: Some(serde_json::Value::Array(vec![])),
+            state_diff: Some(serde_json::Value::Object(serde_json::Map::new())),
+            error,
+            gas_used,
+            block_number,
+        }
+    }
+
+    /// Creates a successful result
+    pub fn success(gas_used: u64, block_number: U256) -> Self {
+        Self {
+            inner_txs: Some(serde_json::Value::Array(vec![])),
+            logs: Some(serde_json::Value::Array(vec![])),
+            state_diff: Some(serde_json::Value::Object(serde_json::Map::new())),
+            error: PreExecError::default(),
+            gas_used,
+            block_number,
+        }
+    }
+}
 
 /// Eth API extension for pre-execution
 #[cfg_attr(not(feature = "client"), rpc(server, namespace = "eth"))]
