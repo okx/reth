@@ -494,6 +494,13 @@ impl OpGenesisInfo {
 pub fn make_op_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header {
     let mut header = reth_chainspec::make_genesis_header(genesis, hardforks);
 
+    // If legacyXLayerBlock is specified in config, override the header number
+    if let Some(legacy_block_value) = genesis.config.extra_fields.get("legacyXLayerBlock") {
+        if let Some(legacy_block) = legacy_block_value.as_u64() {
+            header.number = legacy_block;
+        }
+    }
+
     // If Isthmus is active, overwrite the withdrawals root with the storage root of predeploy
     // `L2ToL1MessagePasser.sol`
     if hardforks.fork(OpHardfork::Isthmus).active_at_timestamp(header.timestamp) {
