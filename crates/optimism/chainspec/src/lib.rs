@@ -336,7 +336,14 @@ impl OpHardforks for OpChainSpec {
 }
 
 impl From<Genesis> for OpChainSpec {
-    fn from(genesis: Genesis) -> Self {
+    fn from(mut genesis: Genesis) -> Self {
+
+        // If legacyXLayerBlock is specified in config, override genesis.number
+        if let Some(legacy_block_value) = genesis.config.extra_fields.get("legacyXLayerBlock") {
+            if let Some(legacy_block) = legacy_block_value.as_u64() {
+                genesis.number = Some(legacy_block);
+            }
+        }
         use reth_optimism_forks::OpHardfork;
         let optimism_genesis_info = OpGenesisInfo::extract_from(&genesis);
         let genesis_info =
@@ -493,13 +500,6 @@ impl OpGenesisInfo {
 /// Helper method building a [`Header`] given [`Genesis`] and [`ChainHardforks`].
 pub fn make_op_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header {
     let mut header = reth_chainspec::make_genesis_header(genesis, hardforks);
-
-    // If legacyXLayerBlock is specified in config, override the header number
-    if let Some(legacy_block_value) = genesis.config.extra_fields.get("legacyXLayerBlock") {
-        if let Some(legacy_block) = legacy_block_value.as_u64() {
-            header.number = legacy_block;
-        }
-    }
 
     // If Isthmus is active, overwrite the withdrawals root with the storage root of predeploy
     // `L2ToL1MessagePasser.sol`
@@ -994,8 +994,8 @@ mod tests {
         // Verify genesis_header number is overridden by legacyXLayerBlock
         assert_eq!(chain_spec.genesis_header().number(), 1000);
 
-        // Verify that genesis.number in JSON is 0, but header number is 1000
-        assert_eq!(chain_spec.genesis().number, Some(0));
+        // Verify that genesis.number is also updated to match legacyXLayerBlock
+        assert_eq!(chain_spec.genesis().number, Some(1000));
         assert_eq!(chain_spec.genesis_header().number(), 1000);
     }
 
