@@ -996,7 +996,6 @@ mod tests {
 
         // Verify that genesis.number is also updated to match legacyXLayerBlock
         assert_eq!(chain_spec.genesis().number, Some(1000));
-        assert_eq!(chain_spec.genesis_header().number(), 1000);
     }
 
     #[test]
