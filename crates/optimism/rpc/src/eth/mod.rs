@@ -3,11 +3,11 @@
 pub mod ext;
 pub mod receipt;
 pub mod transaction;
+pub mod xlayer_ext;
 
 mod block;
 mod call;
 mod pending_block;
-pub mod pre_exec;
 
 use crate::{
     eth::{receipt::OpReceiptConverter, transaction::OpTxInfoMapper},

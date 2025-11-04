@@ -7,6 +7,7 @@ use crate::{
     OpEngineApiBuilder, OpEngineTypes,
 };
 use op_alloy_consensus::{interop::SafetyLevel, OpPooledTransaction};
+use op_alloy_rpc_types::OpTransactionRequest;
 use op_alloy_rpc_types_engine::OpExecutionData;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, Hardforks};
 use reth_engine_local::LocalPayloadAttributesBuilder;
@@ -44,7 +45,7 @@ use reth_optimism_payload_builder::{
 };
 use reth_optimism_primitives::{DepositReceipt, OpPrimitives};
 use reth_optimism_rpc::{
-    eth::{ext::OpEthExtApi, OpEthApiBuilder},
+    eth::{ext::OpEthExtApi, xlayer_ext::XLayerEthApiExt, OpEthApiBuilder},
     historical::{HistoricalRpc, HistoricalRpcClient},
     miner::{MinerApiExtServer, OpMinerExtApi},
     witness::{DebugExecutionWitnessApiServer, OpDebugWitnessApi},
@@ -56,7 +57,7 @@ use reth_optimism_txpool::{
     OpPooledTx,
 };
 use reth_provider::{providers::ProviderFactoryBuilder, CanonStateSubscriptions};
-use reth_rpc_api::{eth::RpcTypes, DebugApiServer, L2EthApiExtServer};
+use reth_rpc_api::{eth::{EthApiTypes, RpcTypes}, DebugApiServer, L2EthApiExtServer, XLayerEthApiExtServer};
 use reth_rpc_server_types::RethRpcModule;
 use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::{
@@ -486,7 +487,7 @@ where
     EVB: EngineValidatorBuilder<N>,
     RpcMiddleware: RethRpcMiddleware,
     Attrs: OpAttributes<Transaction = TxTy<N::Types>, RpcPayloadAttributes: DeserializeOwned>,
-    EthB::EthApi: reth_optimism_rpc::eth::pre_exec::EthPreExecApiServer,
+    <EthB::EthApi as EthApiTypes>::NetworkTypes: RpcTypes<TransactionRequest = OpTransactionRequest>,
 {
     type Handle = RpcHandle<N, EthB::EthApi>;
 
@@ -585,12 +586,11 @@ where
                     )?;
                 }
 
-                // register eth_transactionPreExec on eth namespace
+                // install the xlayer eth extension in the eth namespace
+                let xlayer_eth_ext = XLayerEthApiExt::new(registry.eth_api().clone());
                 modules.merge_if_module_configured(
                     RethRpcModule::Eth,
-                    reth_optimism_rpc::eth::pre_exec::EthPreExecApiServer::into_rpc(
-                        registry.eth_api().clone(),
-                    ),
+                    XLayerEthApiExtServer::<OpTransactionRequest>::into_rpc(xlayer_eth_ext),
                 )?;
 
                 Ok(())
@@ -623,7 +623,7 @@ where
     EVB: EngineValidatorBuilder<N>,
     RpcMiddleware: RethRpcMiddleware,
     Attrs: OpAttributes<Transaction = TxTy<N::Types>, RpcPayloadAttributes: DeserializeOwned>,
-    <EthB as EthApiBuilder<N>>::EthApi: reth_optimism_rpc::eth::pre_exec::EthPreExecApiServer,
+    <EthB::EthApi as EthApiTypes>::NetworkTypes: RpcTypes<TransactionRequest = OpTransactionRequest>,
 {
     type EthApi = EthB::EthApi;
 
