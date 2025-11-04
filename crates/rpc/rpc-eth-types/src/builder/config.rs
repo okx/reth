@@ -134,12 +134,6 @@ impl Default for EthConfig {
 }
 
 impl EthConfig {
-    /// XLayer: Configures legacy RPC routing
-    pub fn with_legacy_rpc(mut self, legacy_rpc_config: Option<LegacyRpcConfig>) -> Self {
-        self.legacy_rpc_config = legacy_rpc_config;
-        self
-    }
-
     /// Configures the caching layer settings
     pub const fn state_cache(mut self, cache: EthStateCacheConfig) -> Self {
         self.cache = cache;

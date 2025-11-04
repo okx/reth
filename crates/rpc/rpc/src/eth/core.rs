@@ -244,16 +244,6 @@ where
     }
 }
 
-impl<N, Rpc> reth_rpc_eth_api::helpers::LegacyRpc for EthApi<N, Rpc>
-where
-    N: RpcNodeCore,
-    Rpc: RpcConvert,
-{
-    fn legacy_rpc_client(&self) -> Option<&Arc<reth_rpc_eth_types::LegacyRpcClient>> {
-        self.inner.legacy_rpc_client()
-    }
-}
-
 impl<N, Rpc> SpawnBlocking for EthApi<N, Rpc>
 where
     N: RpcNodeCore,
@@ -325,10 +315,11 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     /// Configuration for pending block construction.
     pending_block_kind: PendingBlockKind,
 
-    /// Optional legacy RPC client for routing historical data.
-    legacy_rpc_client: Option<Arc<reth_rpc_eth_types::LegacyRpcClient>>,
     /// Timeout duration for `send_raw_transaction_sync` RPC method.
     send_raw_transaction_sync_timeout: Duration,
+
+    /// XLayer: Optional legacy RPC client for routing historical data.
+    pub(crate) legacy_rpc_client: Option<Arc<reth_rpc_eth_types::LegacyRpcClient>>,
 }
 
 impl<N, Rpc> EthApiInner<N, Rpc>
@@ -376,23 +367,15 @@ where
             BatchTxProcessor::new(components.pool().clone(), max_batch_size);
         task_spawner.spawn_critical("tx-batcher", Box::pin(processor));
 
-        // Initialize legacy RPC client if configured
+        // XLayer: Initialize legacy RPC client if configured
         let legacy_rpc_client = legacy_rpc_config.and_then(|config| {
             match reth_rpc_eth_types::LegacyRpcClient::from_config(&config) {
                 Ok(client) => {
-                    tracing::info!(
-                        cutoff_block = config.cutoff_block,
-                        endpoint = %config.endpoint,
-                        "Legacy RPC support initialized"
-                    );
+                    tracing::info!(cutoff = config.cutoff_block, endpoint = %config.endpoint, "Legacy RPC initialized");
                     Some(Arc::new(client))
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        endpoint = %config.endpoint,
-                        "Failed to initialize legacy RPC client, legacy support disabled"
-                    );
+                    tracing::warn!(error = %e, endpoint = %config.endpoint, "Legacy RPC init failed");
                     None
                 }
             }
@@ -470,12 +453,6 @@ where
     #[inline]
     pub const fn blocking_task_pool(&self) -> &BlockingTaskPool {
         &self.blocking_task_pool
-    }
-
-    /// Returns the legacy RPC client if configured.
-    #[inline]
-    pub fn legacy_rpc_client(&self) -> Option<&Arc<reth_rpc_eth_types::LegacyRpcClient>> {
-        self.legacy_rpc_client.as_ref()
     }
 
     /// Returns a handle to the EVM config.

@@ -7,6 +7,7 @@ pub mod transaction;
 mod block;
 mod call;
 mod pending_block;
+mod mod_xlayer;
 
 use crate::{
     eth::{receipt::OpReceiptConverter, transaction::OpTxInfoMapper},
@@ -309,16 +310,6 @@ where
 {
     fn with_dev_accounts(&self) {
         *self.inner.eth_api.signers().write() = DevSigner::random_signers(20)
-    }
-}
-
-impl<N, Rpc> reth_rpc_eth_api::helpers::LegacyRpc for OpEthApi<N, Rpc>
-where
-    N: RpcNodeCore,
-    Rpc: RpcConvert,
-{
-    fn legacy_rpc_client(&self) -> Option<&Arc<reth_rpc_eth_types::LegacyRpcClient>> {
-        self.inner.eth_api.legacy_rpc_client()
     }
 }
 

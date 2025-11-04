@@ -98,6 +98,7 @@ pub use eth::EthHandlers;
 
 // Rpc server metrics
 mod metrics;
+mod xlayer_legacy;
 use crate::middleware::RethRpcMiddleware;
 pub use metrics::{MeteredRequestFuture, RpcRequestMetricsService};
 use reth_chain_state::CanonStateSubscriptions;

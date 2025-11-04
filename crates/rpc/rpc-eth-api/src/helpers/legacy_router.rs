@@ -1,11 +1,10 @@
-//! Legacy RPC routing utilities
-//!
-//! Provides simple helpers to minimize code duplication when adding legacy routing logic.
+//! XLayer: Legacy RPC routing utilities
 
 use alloy_eips::BlockId;
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 /// Check if a block number should be routed to legacy RPC
 #[inline]
@@ -36,18 +35,15 @@ pub fn should_route_block_id_to_legacy(
 }
 
 /// Convert any value through serde JSON (for type system compatibility)
-///
-/// This is used to convert between `alloy_rpc_types_eth::Transaction` and `RpcTransaction<T::NetworkTypes>`
 #[inline]
 pub fn convert_via_serde<T, U>(value: T) -> Result<U, ErrorObjectOwned>
 where
     T: Serialize,
     U: for<'de> Deserialize<'de>,
 {
-    let json = serde_json::to_value(value)
-        .map_err(|e| internal_rpc_err(format!("Serialization error: {}", e)))?;
-    serde_json::from_value(json)
-        .map_err(|e| internal_rpc_err(format!("Deserialization error: {}", e)))
+    serde_json::to_value(value)
+        .and_then(serde_json::from_value)
+        .map_err(internal_rpc_err)
 }
 
 /// Convert Option<T> to Option<U> through serde
@@ -79,19 +75,31 @@ pub fn boxed_err_to_rpc(e: Box<dyn std::error::Error + Send + Sync>) -> ErrorObj
     internal_rpc_err(e.to_string())
 }
 
-// ========================================
-// Routing Macros (Experimental)
-// ========================================
+/// Execute a legacy RPC call with timing and error logging
+pub async fn exec_legacy<F, T>(method: &str, fut: F) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
+{
+    let start = std::time::Instant::now();
+    match fut.await {
+        Ok(result) => {
+            tracing::info!(target: "rpc::eth::legacy", method, elapsed_ms = %start.elapsed().as_millis(), "← legacy");
+            Ok(result)
+        }
+        Err(e) => {
+            tracing::error!(target: "rpc::eth::legacy", method, elapsed_ms = %start.elapsed().as_millis(), error = %e, "← legacy (error)");
+            Err(e)
+        }
+    }
+}
 
 /// Route a request by BlockNumberOrTag to legacy RPC if below cutoff
 #[macro_export]
 macro_rules! route_by_number {
-    ($self:ident, $number:ident, $legacy_call:expr, $local_expr:expr) => {{
+    ($method:literal, $self:ident, $number:ident, $legacy_call:expr, $local_expr:expr) => {{
         if $crate::helpers::should_route_to_legacy($self.legacy_rpc_client(), $number) {
-            tracing::trace!(target: "rpc::eth", ?$number, "Routing to legacy RPC");
-            let result = $legacy_call
-                .await
-                .map_err($crate::helpers::boxed_err_to_rpc)?;
+            tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$number, "→ legacy");
+            let result = $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc)?;
             $crate::helpers::convert_option_via_serde(result)
         } else {
             $local_expr
@@ -102,12 +110,10 @@ macro_rules! route_by_number {
 /// Route a request by BlockId to legacy RPC if below cutoff
 #[macro_export]
 macro_rules! route_by_block_id {
-    ($self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
+    ($method:literal, $self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
         if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), Some($block_id)) {
-            tracing::trace!(target: "rpc::eth", ?$block_id, "Routing to legacy RPC");
-            let result = $legacy_call
-                .await
-                .map_err($crate::helpers::boxed_err_to_rpc)?;
+            tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$block_id, "→ legacy");
+            let result = $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc)?;
             $crate::helpers::convert_option_via_serde(result)
         } else {
             $local_expr
@@ -118,12 +124,10 @@ macro_rules! route_by_block_id {
 /// Route by optional BlockId (for state queries)
 #[macro_export]
 macro_rules! route_by_block_id_opt {
-    ($self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
+    ($method:literal, $self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
         if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), $block_id) {
-            tracing::trace!(target: "rpc::eth", ?$block_id, "Routing to legacy RPC");
-            $legacy_call
-                .await
-                .map_err($crate::helpers::boxed_err_to_rpc)
+            tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$block_id, "→ legacy");
+            $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc)
         } else {
             $local_expr
         }
@@ -133,14 +137,12 @@ macro_rules! route_by_block_id_opt {
 /// Try local first, then fallback to legacy (for hash-based queries)
 #[macro_export]
 macro_rules! try_local_then_legacy {
-    ($self:ident, $key:ident, $local_expr:expr, $legacy_call:expr) => {{
+    ($method:literal, $self:ident, $key:ident, $local_expr:expr, $legacy_call:expr) => {{
         let local_result = $local_expr;
         if local_result.is_none() {
             if let Some(_legacy_client) = $self.legacy_rpc_client() {
-                tracing::trace!(target: "rpc::eth", ?$key, "Not found locally, trying legacy RPC");
-                let result = $legacy_call
-                    .await
-                    .map_err($crate::helpers::boxed_err_to_rpc)?;
+                tracing::info!(target: "rpc::eth::legacy", method = $method, key = ?$key, "→ legacy (fallback)");
+                let result = $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc)?;
                 return $crate::helpers::convert_option_via_serde(result);
             }
         }
@@ -153,10 +155,8 @@ macro_rules! try_local_then_legacy {
 macro_rules! route_if_legacy_configured {
     ($self:ident, $legacy_call:expr, $local_expr:expr) => {{
         if let Some(_legacy_client) = $self.legacy_rpc_client() {
-            tracing::trace!(target: "rpc::eth", "Routing to legacy RPC");
-            return $legacy_call
-                .await
-                .map_err($crate::helpers::boxed_err_to_rpc);
+            tracing::info!(target: "rpc::eth::legacy", "→ legacy");
+            return $crate::helpers::exec_legacy("", $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc);
         }
         $local_expr
     }};
@@ -168,12 +168,10 @@ macro_rules! route_conditional_with_convert {
     ($self:ident, $condition:expr, $block_id:ident, $request:ident, $legacy_method:ident, $local_expr:expr) => {{
         if $condition {
             if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), $block_id) {
-                tracing::trace!(target: "rpc::eth", ?$block_id, "Routing to legacy RPC");
+                tracing::info!(target: "rpc::eth::legacy", block = ?$block_id, "→ legacy");
                 let tx_req = $crate::helpers::convert_via_serde($request)?;
-                return $self.legacy_rpc_client().unwrap()
-                    .$legacy_method(tx_req, $block_id)
-                    .await
-                    .map_err($crate::helpers::boxed_err_to_rpc);
+                let legacy_fut = $self.legacy_rpc_client().unwrap().$legacy_method(tx_req, $block_id);
+                return $crate::helpers::exec_legacy("", legacy_fut).await.map_err($crate::helpers::boxed_err_to_rpc);
             }
         }
         $local_expr
@@ -196,10 +194,6 @@ mod tests {
         );
         Arc::new(reth_rpc_eth_types::LegacyRpcClient::from_config(&config).unwrap())
     }
-
-    // ========================================
-    // Phase 1.1: Type Conversion Tests (Most Critical) ⭐
-    // ========================================
 
     #[test]
     fn test_convert_simple_types() {
@@ -314,10 +308,6 @@ mod tests {
         );
     }
 
-    // ========================================
-    // Phase 1.2: Routing Logic Tests
-    // ========================================
-
     #[test]
     fn test_should_route_to_legacy_below_cutoff() {
         let client = create_test_client(1000000);
@@ -400,10 +390,6 @@ mod tests {
         // But not u64::MAX itself
         assert!(!should_route_to_legacy(Some(&client), BlockNumberOrTag::Number(u64::MAX)));
     }
-
-    // ========================================
-    // Error Handling Tests
-    // ========================================
 
     #[test]
     fn test_internal_rpc_err_preserves_message() {

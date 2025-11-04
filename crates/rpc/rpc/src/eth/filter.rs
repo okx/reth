@@ -1,5 +1,7 @@
 //! `eth_` `Filter` RPC handler implementation
 
+mod filter_xlayer;
+
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{Sealable, TxHash};
 use alloy_rpc_types_eth::{
@@ -310,27 +312,6 @@ where
     ) -> Result<Vec<Log>, EthFilterError> {
         self.inner.clone().logs_for_filter(filter, limits).await
     }
-
-    /// Parse block range from filter for legacy routing logic
-    fn parse_block_range(&self, filter: &Filter) -> RpcResult<(u64, u64)> {
-        let from = match filter.block_option.get_from_block() {
-            Some(alloy_rpc_types_eth::BlockNumberOrTag::Number(n)) => *n,
-            Some(alloy_rpc_types_eth::BlockNumberOrTag::Earliest) => 0,
-            _ => {
-                // For latest/pending/finalized/safe, use current block
-                // This is a rough approximation - in production you'd query the actual block number
-                u64::MAX
-            }
-        };
-
-        let to = match filter.block_option.get_to_block() {
-            Some(alloy_rpc_types_eth::BlockNumberOrTag::Number(n)) => *n,
-            Some(alloy_rpc_types_eth::BlockNumberOrTag::Earliest) => 0,
-            _ => u64::MAX,
-        };
-
-        Ok((from, to))
-    }
 }
 
 #[async_trait]
@@ -420,72 +401,13 @@ where
     /// Handler for `eth_getLogs`
     async fn logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
         trace!(target: "rpc::eth", "Serving eth_getLogs");
-
-        // Check if legacy RPC routing is configured
-        if let Some(legacy_client) = self.inner.eth_api.legacy_rpc_client() {
-            let cutoff_block = legacy_client.cutoff_block();
-
-            // Parse block range from filter
-            let (from_block, to_block) = self.parse_block_range(&filter)?;
-
-            // Determine routing strategy
-            if to_block < cutoff_block {
-                // Pure legacy: all blocks are below cutoff
-                trace!(target: "rpc::eth", ?from_block, ?to_block, ?cutoff_block, "Routing to legacy RPC (pure)");
-                return legacy_client
-                    .get_logs(filter)
-                    .await
-                    .map_err(|_| jsonrpsee::types::error::ErrorCode::InternalError.into());
-            } else if from_block >= cutoff_block {
-                // Pure local: all blocks are at or above cutoff
-                trace!(target: "rpc::eth", ?from_block, ?to_block, ?cutoff_block, "Processing locally (pure)");
-                // Fall through to local processing
-            } else {
-                // Hybrid: spans both legacy and local ranges
-                trace!(target: "rpc::eth", ?from_block, ?to_block, ?cutoff_block, "Hybrid query: splitting and merging");
-
-                // Split filter into legacy and local parts
-                let mut legacy_filter = filter.clone();
-                legacy_filter = legacy_filter.to_block(alloy_rpc_types_eth::BlockNumberOrTag::Number(cutoff_block - 1));
-
-                let mut local_filter = filter;
-                local_filter = local_filter.from_block(alloy_rpc_types_eth::BlockNumberOrTag::Number(cutoff_block));
-
-                // Query both in parallel
-                let (legacy_result, local_result): (
-                    Result<Vec<Log>, Box<dyn std::error::Error + Send + Sync>>,
-                    Result<Vec<Log>, _>
-                ) = tokio::join!(
-                    legacy_client.get_logs(legacy_filter),
-                    async { self.logs_for_filter(local_filter, self.inner.query_limits).await }
-                );
-
-                let mut legacy_logs = legacy_result.map_err(|_| jsonrpsee::types::error::ErrorCode::InternalError)?;
-                let mut local_logs = local_result?;
-
-                // Merge and sort logs
-                legacy_logs.append(&mut local_logs);
-                legacy_logs.sort_by(|a, b| {
-                    a.block_number
-                        .cmp(&b.block_number)
-                        .then(a.transaction_index.cmp(&b.transaction_index))
-                        .then(a.log_index.cmp(&b.log_index))
-                });
-                return Ok(legacy_logs);
-            }
+        // XLayer: Check if this query needs legacy RPC routing (based on block range)
+        // Returns Some(...) if legacy/hybrid routing is needed, None for pure local processing
+        if let Some(result) = self.route_logs_to_legacy(filter.clone()).await {
+            return result;
         }
 
-        // Default local processing
         Ok(self.logs_for_filter(filter, self.inner.query_limits).await?)
-    }
-}
-
-impl<Eth> reth_rpc_eth_api::helpers::LegacyRpc for EthFilter<Eth>
-where
-    Eth: reth_rpc_eth_api::helpers::LegacyRpc + EthApiTypes,
-{
-    fn legacy_rpc_client(&self) -> Option<&Arc<reth_rpc_eth_types::LegacyRpcClient>> {
-        self.inner.eth_api.legacy_rpc_client()
     }
 }
 
