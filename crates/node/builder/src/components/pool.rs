@@ -149,7 +149,7 @@ where
         let TxPoolBuilder { ctx, validator, .. } = self;
         info!(
             target: "reth::txpool",
-            "Transaction pool configuration: pending_max_count={}, pending_max_size_mb={}, basefee_max_count={}, basefee_max_size_mb={}, queued_max_count={}, queued_max_size_mb={}, max_account_slots={}, price_bump={}",
+            "Transaction pool configuration: pending_max_count={}, pending_max_size_mb={}, basefee_max_count={}, basefee_max_size_mb={}, queued_max_count={}, queued_max_size_mb={}, max_account_slots={}, minimal_protocol_basefee={:?}, minimum_priority_fee={:?}",
             pool_config.pending_limit.max_txs,
             pool_config.pending_limit.max_size / (1024 * 1024),
             pool_config.basefee_limit.max_txs,
@@ -157,7 +157,8 @@ where
             pool_config.queued_limit.max_txs,
             pool_config.queued_limit.max_size / (1024 * 1024),
             pool_config.max_account_slots,
-            pool_config.price_bumps.default_price_bump,
+            pool_config.minimal_protocol_basefee,
+            pool_config.minimum_priority_fee,
         );
         let transaction_pool = reth_transaction_pool::Pool::new(
             validator,
