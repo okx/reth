@@ -7,7 +7,6 @@ pub mod transaction;
 mod block;
 mod call;
 mod pending_block;
-mod mod_xlayer;
 
 use crate::{
     eth::{receipt::OpReceiptConverter, transaction::OpTxInfoMapper},
@@ -37,6 +36,7 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{
     EthStateCache, FeeHistoryCache, GasPriceOracle, PendingBlock, PendingBlockEnvOrigin,
+    LegacyRpcClient,
 };
 use reth_storage_api::{ProviderHeader, ProviderTx};
 use reth_tasks::{
@@ -500,5 +500,16 @@ where
             pending_block_rx,
             flashblock_rx,
         ))
+    }
+}
+
+// XLayer: Implement LegacyRpc trait for OpEthApi to enable legacy RPC routing
+impl<N, Rpc> reth_rpc_eth_api::helpers::LegacyRpc for OpEthApi<N, Rpc>
+where
+    N: RpcNodeCore,
+    Rpc: RpcConvert,
+{
+    fn legacy_rpc_client(&self) -> Option<&Arc<LegacyRpcClient>> {
+        self.inner.eth_api.legacy_rpc_client()
     }
 }
