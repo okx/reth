@@ -162,6 +162,7 @@ where
                         }
                     };
 
+                    let gas_used = exec.result.gas_used();
                     let mut pre_exec_res = match process_tracer_results(
                         exec.clone(),
                         inspector,
@@ -172,7 +173,7 @@ where
                         Err(e) => {
                             results.push(PreExecResult::from_error(
                                 e,
-                                0,
+                                gas_used,
                                 current_evm_env.block_env.number,
                             ));
                             prev = Some(current_req_for_next);
@@ -327,7 +328,7 @@ fn convert_call_frame_recursive(
         from: format!("{:?}", frame.from),
         to: frame.to.map(|a| format!("{:?}", a)).unwrap_or_default(),
         input: format!("{:?}", frame.input),
-        gas_used: gas, // For historical reason, we use `gas` here
+        gas_used,
         output,
         is_error,
         value: value_wei.clone(),
