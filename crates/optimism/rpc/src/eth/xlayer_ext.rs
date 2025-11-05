@@ -268,11 +268,7 @@ where
     };
 
     // gas used
-    let gas_used = match &exec.result {
-        ExecutionResult::Success { gas_used, .. } => *gas_used,
-        ExecutionResult::Revert { gas_used, .. } => *gas_used,
-        ExecutionResult::Halt { gas_used, .. } => *gas_used,
-    };
+    let gas_used = exec.result.gas_used();
 
     Ok(PreExecResult {
         inner_txs: Some(inner_txs),
