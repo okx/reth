@@ -26,7 +26,9 @@ reth-rpc-api.workspace = true
 reth-node-api.workspace = true
 reth-node-builder.workspace = true
 reth-chainspec.workspace = true
+reth-chain-state.workspace = true
 reth-rpc-engine-api.workspace = true
+reth-rpc-convert.workspace = true
 reth-revm.workspace = true
 revm-inspectors.workspace = true
 
@@ -62,6 +64,8 @@ alloy-rpc-types-trace.workspace = true
 
 # async
 tokio.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 async-trait.workspace = true
 tower.workspace = true
