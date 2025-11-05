@@ -1,8 +1,10 @@
+use alloy_primitives::U256;
 use clap::Args;
 use reth_optimism_payload_builder::BridgeInterceptConfig;
+use std::time::Duration;
 
 /// X Layer specific configuration flags
-#[derive(Debug, Clone, Args, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Args, PartialEq, Default)]
 #[command(next_help_heading = "X Layer")]
 pub struct XLayerArgs {
     /// Bridge transaction interception configuration
@@ -12,6 +14,9 @@ pub struct XLayerArgs {
     /// Enable Apollo
     #[command(flatten)]
     pub apollo: ApolloArgs,
+    /// XLayer gas price configuration
+    #[command(flatten)]
+    pub gas_price: XLayerGasPriceArgs,
     // /// Another X Layer feature
     // #[command(flatten)]
     // pub another_feature: AnotherFeatureArgs,
@@ -20,8 +25,9 @@ pub struct XLayerArgs {
 impl XLayerArgs {
     /// Validate all X Layer configurations
     pub fn validate(&self) -> Result<(), String> {
-        self.intercept.validate()
+        self.intercept.validate()?;
         // self.another_feature.validate()?;
+        Ok(())
     }
 }
 
@@ -149,6 +155,134 @@ pub struct ApolloArgs {
     pub apollo_namespace: String,
 }
 
+/// XLayer gas price configuration
+#[derive(Debug, Clone, Args, PartialEq)]
+#[command(next_help_heading = "XLayer Gas Price")]
+pub struct XLayerGasPriceArgs {
+    /// Gas price calculation type: "default", "follower", or "fixed"
+    /// If not specified, XLayer gas price scheduler will not be initialized
+    #[arg(long = "xlayer.gasprice.type")]
+    pub price_type: Option<String>,
+
+    /// Gas price update period
+    #[arg(long = "xlayer.gasprice.update-period", value_parser = parse_duration)]
+    pub update_period: Option<Duration>,
+
+    /// Gas price calculation factor
+    #[arg(long = "xlayer.gasprice.factor")]
+    pub factor: Option<f64>,
+
+    /// Kafka URL for gas price updates
+    #[arg(long = "xlayer.gasprice.kafka-url")]
+    pub kafka_url: Option<String>,
+
+    /// Kafka topic for gas price updates
+    #[arg(long = "xlayer.gasprice.topic")]
+    pub topic: Option<String>,
+
+    /// Kafka consumer group ID
+    #[arg(long = "xlayer.gasprice.group-id")]
+    pub group_id: Option<String>,
+
+    /// Kafka username for authentication
+    #[arg(long = "xlayer.gasprice.username")]
+    pub username: Option<String>,
+
+    /// Kafka password for authentication
+    #[arg(long = "xlayer.gasprice.password")]
+    pub password: Option<String>,
+
+    /// Path to Kafka root CA certificate
+    #[arg(long = "xlayer.gasprice.root-ca-path")]
+    pub root_ca_path: Option<String>,
+
+    /// L1 coin ID for price tracking
+    #[arg(long = "xlayer.gasprice.l1-coin-id")]
+    pub l1_coin_id: Option<i32>,
+
+    /// L2 coin ID for price tracking
+    #[arg(long = "xlayer.gasprice.l2-coin-id")]
+    pub l2_coin_id: Option<i32>,
+
+    /// Default L1 coin price (fallback value)
+    #[arg(long = "xlayer.gasprice.default-l1-coin-price")]
+    pub default_l1_coin_price: Option<f64>,
+
+    /// Default L2 coin price (fallback value)
+    #[arg(long = "xlayer.gasprice.default-l2-coin-price")]
+    pub default_l2_coin_price: Option<f64>,
+
+    /// Fixed gas price in USDT (for "fixed" type)
+    #[arg(long = "xlayer.gasprice.gas-price-usdt")]
+    pub gas_price_usdt: Option<f64>,
+
+    /// Congestion threshold for dynamic gas price adjustment
+    #[arg(long = "xlayer.gasprice.congestion-threshold")]
+    pub congestion_threshold: Option<i32>,
+
+    /// Default gas price for XLayer (in wei)
+    #[arg(long = "xlayer.gasprice.default")]
+    pub default: Option<U256>,
+}
+
+/// Helper function to parse duration from string
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    // Parse duration string like "10s", "5m", "1h"
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration string".to_string());
+    }
+
+    let (num_str, unit) = if let Some(pos) = s.find(|c: char| !c.is_ascii_digit()) {
+        (&s[..pos], &s[pos..])
+    } else {
+        return Err("duration must have a unit (s, m, h)".to_string());
+    };
+
+    let num: u64 = num_str.parse().map_err(|e| format!("invalid number: {}", e))?;
+
+    match unit {
+        "s" | "sec" | "second" | "seconds" => Ok(Duration::from_secs(num)),
+        "m" | "min" | "minute" | "minutes" => Ok(Duration::from_secs(num * 60)),
+        "h" | "hour" | "hours" => Ok(Duration::from_secs(num * 3600)),
+        "ms" | "millisecond" | "milliseconds" => Ok(Duration::from_millis(num)),
+        _ => Err(format!("unknown duration unit: {}", unit)),
+    }
+}
+
+impl Default for XLayerGasPriceArgs {
+    fn default() -> Self {
+        Self {
+            price_type: None,
+            update_period: None,
+            factor: None,
+            kafka_url: None,
+            topic: None,
+            group_id: None,
+            username: None,
+            password: None,
+            root_ca_path: None,
+            l1_coin_id: None,
+            l2_coin_id: None,
+            default_l1_coin_price: None,
+            default_l2_coin_price: None,
+            gas_price_usdt: None,
+            congestion_threshold: None,
+            default: None,
+        }
+    }
+}
+
+impl reth_xlayer_gasprice::suggester::XLayerGasPriceArgsTrait for XLayerGasPriceArgs {
+    fn price_type(&self) -> Option<&str> {
+        self.price_type.as_deref()
+    }
+
+    fn default(&self) -> Option<alloy_primitives::U256> {
+        self.default
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +302,7 @@ mod tests {
         assert_eq!(args.intercept.enabled, default_args.intercept.enabled);
         assert_eq!(args.intercept.bridge_contract, default_args.intercept.bridge_contract);
         assert_eq!(args.intercept.target_token, default_args.intercept.target_token);
+        assert_eq!(args.gas_price, default_args.gas_price);
         assert!(args.validate().is_ok());
     }
 
@@ -347,5 +482,28 @@ mod tests {
         let config = args.to_bridge_intercept_config().unwrap();
         assert!(config.enabled);
         assert!(!config.wildcard);
+    }
+
+    #[test]
+    fn test_parse_xlayer_gas_price_args() {
+        let args = CommandParser::<XLayerGasPriceArgs>::parse_from([
+            "reth",
+            "--xlayer.gasprice.type",
+            "follower",
+            "--xlayer.gasprice.factor",
+            "1.5",
+        ])
+        .args;
+        assert_eq!(args.price_type, Some("follower".to_string()));
+        assert_eq!(args.factor, Some(1.5));
+    }
+
+    #[test]
+    fn test_parse_duration() {
+        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert!(parse_duration("invalid").is_err());
     }
 }

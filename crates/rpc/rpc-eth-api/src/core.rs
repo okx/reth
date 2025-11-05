@@ -1,9 +1,9 @@
 //! Implementation of the [`jsonrpsee`] generated [`EthApiServer`] trait. Handles RPC requests for
 //! the `eth_` namespace.
 use crate::{
-    helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState, EthTransactions, FullEthApi},
-    route_by_block_id, route_by_block_id_opt, route_by_number, try_local_then_legacy, RpcBlock,
-    RpcHeader, RpcReceipt, RpcTransaction,
+    helpers::{EthApiSpec, EthBlocks, EthCall, EthState, EthTransactions, FullEthApi, XLayerFees},
+    route_by_block_id, route_by_block_id_opt, route_by_number, try_local_then_legacy,
+    RpcBlock, RpcHeader, RpcReceipt, RpcTransaction,
 };
 use alloy_dyn_abi::TypedData;
 use alloy_eips::{eip2930::AccessListResult, BlockId, BlockNumberOrTag};
@@ -306,6 +306,10 @@ pub trait EthApi<
     /// Introduced in EIP-4844, returns the current blob base fee in wei.
     #[method(name = "blobBaseFee")]
     async fn blob_base_fee(&self) -> RpcResult<U256>;
+
+    /// Returns the minimum gas price for XLayer transactions.
+    #[method(name = "minGasPrice")]
+    async fn min_gas_price(&self) -> RpcResult<U256>;
 
     /// Returns the Transaction fee history
     ///
@@ -795,7 +799,7 @@ where
     /// Handler for: `eth_gasPrice`
     async fn gas_price(&self) -> RpcResult<U256> {
         trace!(target: "rpc::eth", "Serving eth_gasPrice");
-        Ok(EthFees::gas_price(self).await?)
+        Ok(XLayerFees::gas_price(self).await?)
     }
 
     /// Handler for: `eth_getAccount`
@@ -811,13 +815,19 @@ where
     /// Handler for: `eth_maxPriorityFeePerGas`
     async fn max_priority_fee_per_gas(&self) -> RpcResult<U256> {
         trace!(target: "rpc::eth", "Serving eth_maxPriorityFeePerGas");
-        Ok(EthFees::suggested_priority_fee(self).await?)
+        Ok(XLayerFees::suggested_priority_fee(self).await?)
     }
 
     /// Handler for: `eth_blobBaseFee`
     async fn blob_base_fee(&self) -> RpcResult<U256> {
         trace!(target: "rpc::eth", "Serving eth_blobBaseFee");
-        Ok(EthFees::blob_base_fee(self).await?)
+        Ok(XLayerFees::blob_base_fee(self).await?)
+    }
+
+    /// Handler for: `eth_minGasPrice`
+    async fn min_gas_price(&self) -> RpcResult<U256> {
+        trace!(target: "rpc::eth", "Serving eth_minGasPrice");
+        Ok(XLayerFees::min_gas_price(self).await?)
     }
 
     // FeeHistory is calculated based on lazy evaluation of fees for historical blocks, and further
@@ -836,7 +846,7 @@ where
         reward_percentiles: Option<Vec<f64>>,
     ) -> RpcResult<FeeHistory> {
         trace!(target: "rpc::eth", ?block_count, ?newest_block, ?reward_percentiles, "Serving eth_feeHistory");
-        Ok(EthFees::fee_history(self, block_count.to(), newest_block, reward_percentiles).await?)
+        Ok(XLayerFees::fee_history(self, block_count.to(), newest_block, reward_percentiles).await?)
     }
 
     /// Handler for: `eth_mining`
