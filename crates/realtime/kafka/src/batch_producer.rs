@@ -12,7 +12,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 pub(crate) struct BatchProducer {
-    producer: FutureProducer,
     buffer_tx: mpsc::Sender<ProducerMessage>,
     handle_task: JoinHandle<()>,
     shutdown_tx: mpsc::Sender<()>,
@@ -33,12 +32,10 @@ impl BatchProducer {
 
         let (buffer_tx, buffer_rx) = mpsc::channel::<ProducerMessage>(DEFAULT_KAFKA_BUFFER_SIZE);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-        let producer_clone = producer.clone();
 
-        let handle_task =
-            tokio::spawn(Self::handle(producer_clone, buffer_rx, shutdown_rx, success_tx));
+        let handle_task = tokio::spawn(Self::handle(producer, buffer_rx, shutdown_rx, success_tx));
 
-        Ok(Self { producer, buffer_tx, handle_task, shutdown_tx })
+        Ok(Self { buffer_tx, handle_task, shutdown_tx })
     }
 
     pub(crate) async fn send_message(&self, msg: ProducerMessage) -> Result<(), KafkaError> {

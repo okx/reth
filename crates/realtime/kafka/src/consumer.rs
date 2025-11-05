@@ -1,14 +1,12 @@
 // consumer.rs
 
 use crate::types::{KafkaConfig, KafkaError};
-use futures::StreamExt;
 use rdkafka::{
     config::ClientConfig,
     consumer::{CommitMode, Consumer, StreamConsumer},
-    Message, Offset, TopicPartitionList,
+    Message,
 };
 use serde::Deserialize;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub struct KafkaConsumer {
@@ -17,6 +15,7 @@ pub struct KafkaConsumer {
 }
 
 impl KafkaConsumer {
+    /// Creates a new Kafka consumer
     pub fn new(config: KafkaConfig, latest_flag: bool) -> Result<Self, KafkaError> {
         let offset = if latest_flag { "latest" } else { "earliest" };
 
@@ -28,13 +27,10 @@ impl KafkaConsumer {
             .set("enable.auto.commit", "false")
             .create()?;
 
-        let metadata = consumer
-            .fetch_metadata(None, std::time::Duration::from_secs(5))
-            .map_err(|e| KafkaError::SendMessageError("foobar".to_string()))?;
-
         Ok(Self { consumer, config })
     }
 
+    /// Consumes messages from Kafka
     pub async fn consume_kafka<BlockInfo, TxMsg, ErrorMsg>(
         &self,
         mut shutdown_rx: mpsc::Receiver<()>,
@@ -111,7 +107,7 @@ impl KafkaConsumer {
 
                         if send_msg.is_ok() {
                             if let Err(e) = self.consumer.commit_message(&message, CommitMode::Async) {
-                                tracing::warn!("[Realtime] failed to commit")
+                                tracing::warn!("[Realtime] failed to commit: {:?}", e);
                             }
                         }
 
@@ -123,7 +119,10 @@ impl KafkaConsumer {
             }
         }
     }
+
+    /// Closes the Kafka consumer
     pub fn close(self) -> Result<(), KafkaError> {
+        self.consumer.unsubscribe();
         Ok(())
     }
 }

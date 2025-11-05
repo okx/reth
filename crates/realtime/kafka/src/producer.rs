@@ -14,6 +14,7 @@ pub struct KafkaProducer {
 }
 
 impl KafkaProducer {
+    /// Creates a new Kafka producer
     pub async fn new(
         config: KafkaConfig,
         success_chan: Option<mpsc::Sender<()>>,
@@ -26,11 +27,13 @@ impl KafkaProducer {
         Ok(Self { producer, config })
     }
 
+    /// Closes the Kafka producer
     pub async fn close(self) -> Result<(), KafkaError> {
         self.producer.close().await?;
         Ok(())
     }
 
+    /// Sends a Kafka transaction message
     pub async fn send_kafka_transaction<T: Serialize>(
         &self,
         tx_hash: String,
@@ -49,6 +52,7 @@ impl KafkaProducer {
         Ok(())
     }
 
+    /// Sends a Kafka block info message
     pub async fn send_kafka_block_info<T: Serialize>(
         &self,
         block_number: u64,
@@ -67,6 +71,7 @@ impl KafkaProducer {
         Ok(())
     }
 
+    /// Sends a Kafka error trigger message
     pub async fn send_kafka_error_trigger(&self, block_number: u64) -> Result<(), KafkaError> {
         let message = ErrorTriggerMessage { block_number };
 
