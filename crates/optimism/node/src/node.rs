@@ -189,6 +189,7 @@ impl OpNode {
             .with_min_suggested_priority_fee(self.args.min_suggested_priority_fee)
             .with_historical_rpc(self.args.historical_rpc.clone())
             .with_flashblocks(self.args.flashblocks_url.clone())
+            .with_xlayer_args(self.args.xlayer_args.clone())
     }
 
     /// Instantiates the [`ProviderFactoryBuilder`] for an opstack node.
@@ -310,6 +311,8 @@ pub struct OpAddOns<
     /// Enable transaction conditionals.
     enable_tx_conditional: bool,
     min_suggested_priority_fee: u64,
+    /// XLayer arguments
+    xlayer_args: XLayerArgs,
 }
 
 impl<N, EthB, PVB, EB, EVB, RpcMiddleware> OpAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
@@ -326,6 +329,7 @@ where
         historical_rpc: Option<String>,
         enable_tx_conditional: bool,
         min_suggested_priority_fee: u64,
+        xlayer_args: XLayerArgs,
     ) -> Self {
         Self {
             rpc_add_ons,
@@ -335,6 +339,7 @@ where
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
         }
     }
 }
@@ -385,6 +390,7 @@ where
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
             ..
         } = self;
         OpAddOns::new(
@@ -395,6 +401,7 @@ where
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
         )
     }
 
@@ -411,6 +418,7 @@ where
             enable_tx_conditional,
             min_suggested_priority_fee,
             historical_rpc,
+            xlayer_args,
             ..
         } = self;
         OpAddOns::new(
@@ -421,6 +429,7 @@ where
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
         )
     }
 
@@ -440,6 +449,7 @@ where
             enable_tx_conditional,
             min_suggested_priority_fee,
             historical_rpc,
+            xlayer_args,
             ..
         } = self;
         OpAddOns::new(
@@ -450,6 +460,7 @@ where
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
         )
     }
 
@@ -512,6 +523,7 @@ where
             sequencer_headers,
             enable_tx_conditional,
             historical_rpc,
+            xlayer_args,
             ..
         } = self;
 
@@ -562,6 +574,7 @@ where
             ctx.node.provider().clone(),
         );
 
+        let task_executor = ctx.node.task_executor().clone();
         rpc_add_ons
             .launch_add_ons_with(ctx, move |container| {
                 let reth_node_builder::rpc::RpcModuleContainer { modules, auth_module, registry } =
@@ -594,6 +607,47 @@ where
                         RethRpcModule::Eth,
                         tx_conditional_ext.into_rpc(),
                     )?;
+                }
+
+                // Initialize XLayer gas price scheduler if configured
+                // This is done here (after RPC initialization) to ensure all components are ready
+                // Only initialize if price_type is specified and not empty
+                if let Some(ref price_type) = xlayer_args.gas_price.price_type {
+                    if !price_type.is_empty() {
+                        info!(?xlayer_args.gas_price, "Initializing XLayer gas price scheduler");
+                        
+                        // Create gas price suggester directly from args
+                        let pricer = reth_xlayer_gasprice::suggester::new_l2_gas_price_suggester(&xlayer_args.gas_price);
+                        
+                        // Get EthApi to share with scheduler
+                        let eth_api = registry.eth_api().clone();
+                        
+                        // Set pricer to XLayerFees
+                        // OpEthApi implements XLayerFees, so we can call set_pricer
+                        use reth_rpc_eth_api::helpers::XLayerFees;
+                        eth_api.set_pricer(pricer.clone());
+                        
+                        // Create scheduler with EthApi (which contains the shared GasPriceOracle)
+                        let scheduler = std::sync::Arc::new(
+                            reth_xlayer_gasprice::scheduler::XLayerScheduler::with_eth_api(
+                                pricer,
+                                eth_api,
+                                xlayer_args.gas_price.default,
+                                xlayer_args.gas_price.update_period,
+                                xlayer_args.gas_price.congestion_threshold,
+                            )
+                        );
+                        
+                        // Spawn background task - run() will initialize and start the scheduler
+                        task_executor.spawn_critical(
+                            "xlayer-gas-price-scheduler",
+                            Box::pin(async move {
+                                scheduler.run().await;
+                            })
+                        );
+                        
+                        info!(target: "reth::cli", "XLayer gas price scheduler initialized");
+                    }
                 }
 
                 Ok(())
@@ -676,6 +730,8 @@ pub struct OpAddOnsBuilder<NetworkT, RpcMiddleware = Identity> {
     tokio_runtime: Option<tokio::runtime::Handle>,
     /// A URL pointing to a secure websocket service that streams out flashblocks.
     flashblocks_url: Option<Url>,
+    /// XLayer arguments
+    xlayer_args: XLayerArgs,
 }
 
 impl<NetworkT> Default for OpAddOnsBuilder<NetworkT> {
@@ -691,6 +747,7 @@ impl<NetworkT> Default for OpAddOnsBuilder<NetworkT> {
             rpc_middleware: Identity::new(),
             tokio_runtime: None,
             flashblocks_url: None,
+            xlayer_args: XLayerArgs::default(),
         }
     }
 }
@@ -752,6 +809,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             tokio_runtime,
             _nt,
             flashblocks_url,
+            xlayer_args,
             ..
         } = self;
         OpAddOnsBuilder {
@@ -765,12 +823,19 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             rpc_middleware,
             tokio_runtime,
             flashblocks_url,
+            xlayer_args,
         }
     }
 
     /// With a URL pointing to a flashblocks secure websocket subscription.
     pub fn with_flashblocks(mut self, flashblocks_url: Option<Url>) -> Self {
         self.flashblocks_url = flashblocks_url;
+        self
+    }
+    
+    /// With XLayer arguments.
+    pub fn with_xlayer_args(mut self, xlayer_args: XLayerArgs) -> Self {
+        self.xlayer_args = xlayer_args;
         self
     }
 }
@@ -797,6 +862,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             rpc_middleware,
             tokio_runtime,
             flashblocks_url,
+            xlayer_args,
             ..
         } = self;
 
@@ -819,6 +885,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
         )
     }
 }

@@ -28,8 +28,9 @@ use reth_optimism_flashblocks::{
 use reth_rpc::eth::{core::EthApiInner, DevSigner};
 use reth_rpc_eth_api::{
     helpers::{
-        pending_block::BuildPendingEnv, spec::SignersForApi, AddDevSigners, EthApiSpec, EthFees,
-        EthState, LoadFee, LoadPendingBlock, LoadState, SpawnBlocking, Trace,
+        fee_xlayer::PricerStorage, pending_block::BuildPendingEnv, spec::SignersForApi,
+        AddDevSigners, EthApiSpec, EthFees, EthState, LoadFee, LoadPendingBlock, LoadState,
+        SpawnBlocking, Trace, XLayerFees,
     },
     EthApiTypes, FromEvmError, FullEthApiServer, RpcConvert, RpcConverter, RpcNodeCore,
     RpcNodeCoreExt, RpcTypes, SignableTxRequest,
@@ -86,6 +87,7 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
             min_suggested_priority_fee,
             pending_block_rx,
             flashblock_rx,
+            pricer: PricerStorage::default(),
         });
         Self { inner }
     }
@@ -293,6 +295,21 @@ where
 {
 }
 
+impl<N, Rpc> XLayerFees for OpEthApi<N, Rpc>
+where
+    N: RpcNodeCore,
+    OpEthApiError: FromEvmError<N::Evm>,
+    Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError>,
+{
+    fn set_pricer(&self, pricer: Arc<dyn reth_rpc_eth_api::helpers::pricer::L2GasPricer>) {
+        *self.inner.pricer.write() = Some(pricer);
+    }
+
+    fn get_pricer(&self) -> Option<Arc<dyn reth_rpc_eth_api::helpers::pricer::L2GasPricer>> {
+        self.inner.pricer.read().clone()
+    }
+}
+
 impl<N, Rpc> Trace for OpEthApi<N, Rpc>
 where
     N: RpcNodeCore,
@@ -338,6 +355,8 @@ pub struct OpEthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     ///
     /// If set, then it provides sequences of flashblock built.
     flashblock_rx: Option<FlashBlockCompleteSequenceRx>,
+    /// L2 gas price pricer storage for XLayer support.
+    pricer: PricerStorage,
 }
 
 impl<N: RpcNodeCore, Rpc: RpcConvert> fmt::Debug for OpEthApiInner<N, Rpc> {

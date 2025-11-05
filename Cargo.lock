@@ -9421,12 +9421,14 @@ dependencies = [
  "reth-rpc",
  "reth-rpc-api",
  "reth-rpc-engine-api",
+ "reth-rpc-eth-api",
  "reth-rpc-eth-types",
  "reth-rpc-server-types",
  "reth-tasks",
  "reth-tracing",
  "reth-transaction-pool",
  "reth-trie-common",
+ "reth-xlayer-gasprice",
  "revm",
  "serde",
  "serde_json",
@@ -10823,6 +10825,21 @@ dependencies = [
  "reth-trie-db",
  "reth-trie-sparse",
  "smallvec",
+ "tracing",
+]
+
+[[package]]
+name = "reth-xlayer-gasprice"
+version = "1.7.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "parking_lot",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-rpc-eth-api",
+ "reth-transaction-pool",
+ "tokio",
  "tracing",
 ]
 

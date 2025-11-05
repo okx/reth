@@ -1,0 +1,32 @@
+[package]
+name = "reth-xlayer-gasprice"
+version = "1.7.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/paradigmxyz/reth"
+description = "XLayer gas price oracle implementation for Reth"
+
+[dependencies]
+# Alloy dependencies
+alloy-consensus.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+
+# Reth dependencies
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+reth-rpc-eth-api.workspace = true
+reth-transaction-pool.workspace = true
+
+# Async runtime
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+
+# Logging
+tracing.workspace = true
+
+# Utilities
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+

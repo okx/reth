@@ -44,7 +44,7 @@ pub use reth_optimism_evm::*;
 pub use reth_optimism_storage::OpStorage;
 
 mod args_xlayer;
-pub use args_xlayer::XLayerArgs;
+pub use args_xlayer::{XLayerArgs, XLayerGasPriceArgs};
 
 use op_revm as _;
 use revm as _;
