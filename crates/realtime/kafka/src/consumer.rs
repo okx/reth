@@ -50,14 +50,14 @@ impl KafkaConsumer {
         ];
 
         if let Err(e) = self.consumer.subscribe(&topics) {
-            let _ = error_chan.send(KafkaError::from(e)).await;
+            let _ = error_chan.send(KafkaError::Rdkafka(e)).await;
             return;
         }
 
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    tracing::info!("shutting down kafka consumption");
+                    tracing::info!(target: "reth::realtime::kafka","[Realtime] shutting down kafka consumption");
                     break;
                 }
 
@@ -67,7 +67,7 @@ impl KafkaConsumer {
                         let payload = match message.payload() {
                             Some(p) => p,
                             None => {
-                                tracing::warn!("[Realtime] Empty message payload");
+                                tracing::warn!(target: "reth::realtime::kafka", "[Realtime] Empty message payload");
                                 continue;
                             }
                         };
@@ -77,43 +77,47 @@ impl KafkaConsumer {
                         match topic {
                             t if t == self.config.block_topic => {
                                 send_msg = match serde_json::from_slice::<BlockInfo>(payload) {
-                                    Ok(block_msg) =>block_tx.send(block_msg).await.map_err(|e| KafkaError::SendingMessageError(e.to_string())),
-                                    Err(e) => {tracing::warn!("[Realtime] Error unmarshalling block message {:?}", e);
+                                    Ok(block_msg) =>block_tx.send(block_msg).await.map_err(|e| KafkaError::ChannelError(e.to_string())),
+                                    Err(e) => {tracing::warn!(target: "reth::realtime::kafka", "[Realtime] Error unmarshalling block info message {:?}", e);
+                                    let _ = error_chan.send(KafkaError::Deserialization(e)).await;
                                     continue;
                                 }
                                 };
                             }
                             t if t == self.config.tx_topic => {
                                 send_msg = match serde_json::from_slice::<TxMsg>(payload) {
-                                    Ok(tx_msg) => tx_tx.send(tx_msg).await.map_err(|e| KafkaError::SendingMessageError(e.to_string())),
-                                    Err(e) => {tracing::warn!("[Realtime] Error unmarshalling block message {:?}", e);
+                                    Ok(tx_msg) => tx_tx.send(tx_msg).await.map_err(|e| KafkaError::ChannelError(e.to_string())),
+                                    Err(e) => {tracing::warn!(target: "reth::realtime::kafka", "[Realtime] Error unmarshalling transaction message {:?}", e);
+                                    let _ = error_chan.send(KafkaError::Deserialization(e)).await;
                                     continue;
                                 }
                                 };
                             }
                             t if t == self.config.error_topic => {
                                 send_msg = match serde_json::from_slice::<ErrorMsg>(payload) {
-                                    Ok(error_msg) => error_tx.send(error_msg).await.map_err(|e| KafkaError::SendingMessageError(e.to_string())),
-                                    Err(e) => {tracing::warn!("[Realtime] Error unmarshalling block message {:?}", e);
+                                    Ok(error_msg) => error_tx.send(error_msg).await.map_err(|e| KafkaError::ChannelError(e.to_string())),
+                                    Err(e) => {tracing::warn!(target: "reth::realtime::kafka", "[Realtime] Error unmarshalling error message {:?}", e);
+                                    let _ = error_chan.send(KafkaError::Deserialization(e)).await;
                                     continue;
                                 }
                                 };
                             }
                             _ => {
-                                tracing::warn!("[Realtime] unknown topic");
+                                tracing::warn!(target: "reth::realtime::kafka", "[Realtime] unknown topic");
                                 continue;
                             }
                         }
 
                         if send_msg.is_ok() {
                             if let Err(e) = self.consumer.commit_message(&message, CommitMode::Async) {
-                                tracing::warn!("[Realtime] failed to commit: {:?}", e);
+                                tracing::warn!(target: "reth::realtime::kafka", "[Realtime] failed to commit: {:?}", e);
+                                let _ = error_chan.send(KafkaError::CommitMessageError(e.to_string())).await;
                             }
                         }
 
                     }
                     else {
-                        tracing::warn!("[Realtime] Kafka error: {:?}", res.err());
+                        tracing::warn!(target: "reth::realtime::kafka", "[Realtime] Kafka error: {:?}", res.err());
                     }
                 }
             }

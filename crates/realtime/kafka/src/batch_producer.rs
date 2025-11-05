@@ -39,7 +39,7 @@ impl BatchProducer {
     }
 
     pub(crate) async fn send_message(&self, msg: ProducerMessage) -> Result<(), KafkaError> {
-        self.buffer_tx.send(msg).await.map_err(|e| KafkaError::SendMessageError(e.to_string()))
+        self.buffer_tx.send(msg).await.map_err(|e| KafkaError::ChannelError(e.to_string()))
     }
 
     async fn handle(
@@ -68,12 +68,13 @@ impl BatchProducer {
                                 }
                             }
                             Err((err, _)) => {
-                                  tracing::error!("{}", KafkaError::SendMessageError(err.to_string()));                            }
+                                  tracing::error!("[Realtime] failed to send message: {:?}", KafkaError::Rdkafka(err));
+                                }
                         }
                     });
                 }
                 _ = shutdown_rx.recv() => {
-                    tracing::info!("shutting down batch producer");
+                    tracing::info!(target: "reth::realtime::kafka", "[Realtime] shutting down batch producer");
                     break;
                 }
             }
@@ -81,14 +82,9 @@ impl BatchProducer {
     }
 
     pub(crate) async fn close(self) -> Result<(), KafkaError> {
-        self.shutdown_tx
-            .send(())
-            .await
-            .map_err(|_| KafkaError::BufferClosed("shutdown".to_string()))?;
+        self.shutdown_tx.send(()).await.map_err(|e| KafkaError::ChannelError(e.to_string()))?;
 
-        self.handle_task
-            .await
-            .map_err(|e| KafkaError::NewBatchProducerError(format!("{:?}", e)))?;
+        self.handle_task.await.map_err(|e| KafkaError::ChannelError(e.to_string()))?;
 
         Ok(())
     }

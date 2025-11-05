@@ -3,16 +3,39 @@ use serde::{Deserialize, Serialize};
 /// Kafka error
 #[derive(Debug, thiserror::Error)]
 pub enum KafkaError {
-    #[error("buffer is full, cannot queue message: {0}")]
-    BufferFull(String),
-    #[error("buffer channel closed: {0}")]
-    BufferClosed(String),
-    #[error("send message error: {0}")]
-    SendMessageError(String),
-    #[error("new batch producer error: {0}")]
-    NewBatchProducerError(String),
-    #[error("unmarshal message error: {0}")]
-    SendingMessageError(String),
+    /// Internal channel for buffering messages is full
+    #[error("message buffer is full, cannot accept more messages")]
+    BufferFull,
+
+    /// Internal channel error
+    #[error("internal channel error: {0}")]
+    ChannelError(String),
+
+    /// Failed to forward consumed message to application
+    #[error("failed to forward message to application: {0}")]
+    MessageForward(String),
+
+    /// Failed to serialize message payload
+    #[error("failed to serialize message: {0}")]
+    Serialization(serde_json::Error),
+
+    /// Failed to deserialize message payload
+    #[error("failed to deserialize message: {0}")]
+    Deserialization(serde_json::Error),
+
+    /// Failed to commit message
+    #[error("commit message error: {0}")]
+    CommitMessageError(String),
+
+    /// Failed to create Kafka producer
+    #[error("failed to create Kafka producer: {0}")]
+    ProducerCreation(String),
+
+    /// Failed to create Kafka consumer
+    #[error("failed to create Kafka consumer: {0}")]
+    ConsumerCreation(String),
+
+    /// Underlying rdkafka error.
     #[error(transparent)]
     Rdkafka(#[from] rdkafka::error::KafkaError),
 }

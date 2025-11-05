@@ -20,7 +20,7 @@ impl KafkaProducer {
         success_chan: Option<mpsc::Sender<()>>,
     ) -> Result<Self, KafkaError> {
         let producer: BatchProducer = BatchProducer::new(config.clone(), success_chan).await?;
-        tracing::info!(
+        tracing::info!(target: "reth::realtime::kafka",
             "[Realtime] kafka producer created and listening to servers: {:?}",
             config.bootstrap_servers
         );
@@ -39,8 +39,7 @@ impl KafkaProducer {
         tx_hash: String,
         message: &T,
     ) -> Result<(), KafkaError> {
-        let json_data = serde_json::to_vec(message)
-            .map_err(|e| KafkaError::SendMessageError(format!("marshalling error: {}", e)))?;
+        let json_data = serde_json::to_vec(message).map_err(|e| KafkaError::Serialization(e))?;
 
         let kafka_msg = ProducerMessage {
             topic: self.config.tx_topic.clone(),
@@ -58,8 +57,7 @@ impl KafkaProducer {
         block_number: u64,
         message: &T,
     ) -> Result<(), KafkaError> {
-        let json_data = serde_json::to_vec(message)
-            .map_err(|e| KafkaError::SendMessageError(format!("marshalling error: {}", e)))?;
+        let json_data = serde_json::to_vec(message).map_err(|e| KafkaError::Serialization(e))?;
 
         let kafka_msg = ProducerMessage {
             topic: self.config.block_topic.clone(),
@@ -75,8 +73,7 @@ impl KafkaProducer {
     pub async fn send_kafka_error_trigger(&self, block_number: u64) -> Result<(), KafkaError> {
         let message = ErrorTriggerMessage { block_number };
 
-        let json_data = serde_json::to_vec(&message)
-            .map_err(|e| KafkaError::SendMessageError(format!("marshalling error: {}", e)))?;
+        let json_data = serde_json::to_vec(&message).map_err(|e| KafkaError::Serialization(e))?;
 
         let kafka_msg = ProducerMessage {
             topic: self.config.error_topic.clone(),
