@@ -6147,7 +6147,11 @@ dependencies = [
  "reth-optimism-payload-builder",
  "reth-optimism-primitives",
  "reth-optimism-rpc",
+ "reth-rpc",
  "tracing",
+ "xlayer-db",
+ "xlayer-exex",
+ "xlayer-rpc",
 ]
 
 [[package]]
@@ -7263,6 +7267,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "xlayer-db",
+ "xlayer-exex",
+ "xlayer-rpc",
 ]
 
 [[package]]
@@ -13972,6 +13979,67 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix 1.1.2",
+]
+
+[[package]]
+name = "xlayer-db"
+version = "1.8.3"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "eyre",
+ "once_cell",
+ "reth-db",
+ "reth-revm",
+ "revm-context-interface",
+ "revm-inspectors",
+ "serde",
+]
+
+[[package]]
+name = "xlayer-exex"
+version = "1.8.3"
+dependencies = [
+ "alloy-consensus",
+ "alloy-evm",
+ "alloy-rlp",
+ "eyre",
+ "futures",
+ "reth-ethereum",
+ "reth-evm",
+ "reth-primitives-traits",
+ "reth-revm",
+ "reth-tracing",
+ "revm-database",
+ "xlayer-db",
+]
+
+[[package]]
+name = "xlayer-rpc"
+version = "1.8.3"
+dependencies = [
+ "alloy-network-primitives",
+ "alloy-primitives",
+ "alloy-rpc-types-eth",
+ "clap",
+ "futures",
+ "jsonrpsee",
+ "jsonrpsee-types",
+ "reth-errors",
+ "reth-ethereum",
+ "reth-evm",
+ "reth-node-core",
+ "reth-optimism-node",
+ "reth-revm",
+ "reth-rpc",
+ "reth-rpc-convert",
+ "reth-rpc-eth-api",
+ "reth-rpc-server-types",
+ "revm-context-interface",
+ "revm-database",
+ "serde",
+ "tokio",
+ "xlayer-db",
 ]
 
 [[package]]

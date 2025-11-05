@@ -188,9 +188,7 @@ pub mod ress;
 #[doc(inline)]
 pub use reth_cli_runner::{tokio_runtime, CliContext, CliRunner};
 
-// for rendering diagrams
-use aquamarine as _;
-
-// used in main
-use clap as _;
-use reth_cli_util as _;
+// xlayer
+use xlayer_db as _;
+use xlayer_exex as _;
+use xlayer_rpc as _;
