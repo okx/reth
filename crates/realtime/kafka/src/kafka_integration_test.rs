@@ -21,6 +21,10 @@ mod tests {
         producer::KafkaProducer,
         types::{ErrorMsg, KafkaConfig, KafkaError},
     };
+    use alloy_rpc_types_engine::PayloadId;
+    use reth_optimism_flashblocks::{
+        ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, FlashBlock, Metadata,
+    };
     use serde::{Deserialize, Serialize};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -53,6 +57,7 @@ mod tests {
             block_topic: "test-blocks".into(),
             error_topic: "test-errors".into(),
             tx_topic: "test-txs".into(),
+            flashblock_topic: "test-flashblocks".into(),
         };
 
         let (success_tx, mut success_rx) = mpsc::channel(100);
@@ -64,6 +69,7 @@ mod tests {
             block_topic: "test-blocks".into(),
             error_topic: "test-errors".into(),
             tx_topic: "test-txs".into(),
+            flashblock_topic: "test-flashblocks".into(),
         };
 
         let consumer = KafkaConsumer::new(consumer_config, false).unwrap();
@@ -72,12 +78,15 @@ mod tests {
         let (block_tx, mut block_rx) = mpsc::channel::<TestBlockMessage>(10);
         let (tx_tx, mut tx_rx) = mpsc::channel::<TestTxMessage>(10);
         let (error_tx, mut error_rx) = mpsc::channel::<ErrorMsg>(10);
+        let (flashblock_tx, mut flashblock_rx) = mpsc::channel::<FlashBlock>(10);
         let (err_chan, _) = mpsc::channel::<KafkaError>(10);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Spawn consumer
         tokio::spawn(async move {
-            consumer.consume_kafka(shutdown_rx, block_tx, tx_tx, error_tx, err_chan).await;
+            consumer
+                .consume_kafka(shutdown_rx, block_tx, tx_tx, error_tx, flashblock_tx, err_chan)
+                .await;
         });
 
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -123,6 +132,26 @@ mod tests {
 
         assert_eq!(received_error.block_number, 12345);
         println!("Error trigger successfully received");
+
+        // Send flashblock message
+        let flashblock_msg = FlashBlock {
+            payload_id: PayloadId::new([0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef]),
+            index: 0,
+            base: Some(ExecutionPayloadBaseV1::default()),
+            diff: ExecutionPayloadFlashblockDeltaV1::default(),
+            metadata: Metadata::default(),
+        };
+        producer.send_kafka_flashblock(flashblock_msg.payload_id, &flashblock_msg).await.unwrap();
+
+        // Wait for success callback
+        tokio::time::timeout(Duration::from_secs(2), success_rx.recv()).await.unwrap();
+        let received_flashblock =
+            tokio::time::timeout(Duration::from_secs(2), flashblock_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(received_flashblock, flashblock_msg);
+        println!("Flashblock message successfully received");
 
         // Cleanup
         shutdown_tx.send(()).await.unwrap();

@@ -4,6 +4,7 @@ use crate::{
     batch_producer::BatchProducer,
     types::{ErrorTriggerMessage, KafkaConfig, KafkaError, ProducerMessage},
 };
+use alloy_rpc_types_engine::PayloadId;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
@@ -78,6 +79,23 @@ impl KafkaProducer {
         let kafka_msg = ProducerMessage {
             topic: self.config.error_topic.clone(),
             key: Some(block_number.to_be_bytes().to_vec()),
+            payload: json_data,
+        };
+
+        self.producer.send_message(kafka_msg).await?;
+        Ok(())
+    }
+
+    pub async fn send_kafka_flashblock<T: Serialize>(
+        &self,
+        payload_id: PayloadId,
+        flashblock: &T,
+    ) -> Result<(), KafkaError> {
+        let json_data = serde_json::to_vec(flashblock).map_err(|e| KafkaError::Serialization(e))?;
+
+        let kafka_msg = ProducerMessage {
+            topic: self.config.flashblock_topic.clone(),
+            key: Some(payload_id.to_string().into_bytes()),
             payload: json_data,
         };
 

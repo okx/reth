@@ -60,6 +60,8 @@ pub struct KafkaConfig {
     pub block_topic: String,
     /// The topic to send the transaction message to
     pub tx_topic: String,
+    /// The topic to send the flashblock message to
+    pub flashblock_topic: String,
     /// The topic to send the error trigger message to
     pub error_topic: String,
     /// The client ID to use for the Kafka producer

@@ -6,12 +6,20 @@ use rdkafka::{
     consumer::{CommitMode, Consumer, StreamConsumer},
     Message,
 };
+use reth_optimism_flashblocks::FlashBlock;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
+/// Kafka consumer
 pub struct KafkaConsumer {
     consumer: StreamConsumer,
     config: KafkaConfig,
+}
+
+impl std::fmt::Debug for KafkaConsumer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaConsumer").field("config", &self.config).finish()
+    }
 }
 
 impl KafkaConsumer {
@@ -37,6 +45,7 @@ impl KafkaConsumer {
         block_tx: mpsc::Sender<BlockInfo>,
         tx_tx: mpsc::Sender<TxMsg>,
         error_tx: mpsc::Sender<ErrorMsg>,
+        flashblock_tx: mpsc::Sender<FlashBlock>,
         error_chan: mpsc::Sender<KafkaError>,
     ) where
         BlockInfo: for<'de> Deserialize<'de> + Send + 'static,
@@ -47,6 +56,7 @@ impl KafkaConsumer {
             self.config.block_topic.as_str(),
             self.config.tx_topic.as_str(),
             self.config.error_topic.as_str(),
+            self.config.flashblock_topic.as_str(),
         ];
 
         if let Err(e) = self.consumer.subscribe(&topics) {
@@ -97,6 +107,15 @@ impl KafkaConsumer {
                                 send_msg = match serde_json::from_slice::<ErrorMsg>(payload) {
                                     Ok(error_msg) => error_tx.send(error_msg).await.map_err(|e| KafkaError::ChannelError(e.to_string())),
                                     Err(e) => {tracing::warn!(target: "reth::realtime::kafka", "[Realtime] Error unmarshalling error message {:?}", e);
+                                    let _ = error_chan.send(KafkaError::Deserialization(e)).await;
+                                    continue;
+                                }
+                                };
+                            }
+                            t if t == self.config.flashblock_topic => {
+                                send_msg = match serde_json::from_slice::<FlashBlock>(payload) {
+                                    Ok(flashblock_msg) => flashblock_tx.send(flashblock_msg).await.map_err(|e| KafkaError::ChannelError(e.to_string())),
+                                    Err(e) => {tracing::warn!(target: "reth::realtime::kafka", "[Realtime] Error unmarshalling flashblock message {:?}", e);
                                     let _ = error_chan.send(KafkaError::Deserialization(e)).await;
                                     continue;
                                 }

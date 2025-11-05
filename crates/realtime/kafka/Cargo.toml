@@ -19,6 +19,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reth-optimism-flashblocks = { workspace = true }
+alloy-rpc-types-engine = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
