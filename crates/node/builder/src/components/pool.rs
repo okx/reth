@@ -8,7 +8,7 @@ use reth_transaction_pool::{
     TransactionPool, TransactionValidationTaskExecutor, TransactionValidator,
 };
 use std::{collections::HashSet, future::Future};
-
+use tracing::info;
 use crate::{BuilderContext, FullNodeTypes};
 
 /// A type that knows how to build the transaction pool.
@@ -147,7 +147,18 @@ where
     > {
         // Destructure self to avoid partial move issues
         let TxPoolBuilder { ctx, validator, .. } = self;
-
+        info!(
+            target: "reth::txpool",
+            "Transaction pool configuration: pending_max_count={}, pending_max_size_mb={}, basefee_max_count={}, basefee_max_size_mb={}, queued_max_count={}, queued_max_size_mb={}, max_account_slots={}, price_bump={}",
+            pool_config.pending_limit.max_txs,
+            pool_config.pending_limit.max_size / (1024 * 1024),
+            pool_config.basefee_limit.max_txs,
+            pool_config.basefee_limit.max_size / (1024 * 1024),
+            pool_config.queued_limit.max_txs,
+            pool_config.queued_limit.max_size / (1024 * 1024),
+            pool_config.max_account_slots,
+            pool_config.price_bumps.default_price_bump,
+        );
         let transaction_pool = reth_transaction_pool::Pool::new(
             validator,
             CoinbaseTipOrdering::default(),
