@@ -95,6 +95,7 @@ members = [
     "crates/primitives/",
     "crates/prune/prune",
     "crates/prune/types",
+    "crates/realtime/kafka/",
     "crates/ress/protocol",
     "crates/ress/provider",
     "crates/revm/",
