@@ -26,8 +26,7 @@ pub enum ApolloError {
     InvalidNamespace(String),
 }
 
-/// Trait for converting from ConfigValue to concrete types
-pub trait FromConfigValue: Sized {
+pub(crate) trait FromConfigValue: Sized {
     /// Convert from ConfigValue to concrete type
     fn from_config_value(value: &ConfigValue) -> Option<Self>;
 }
@@ -86,9 +85,8 @@ where
     }
 }
 
-/// Strongly-typed config value - deserialized once, read many times
 #[derive(Debug, Clone)]
-pub enum ConfigValue {
+pub(crate) enum ConfigValue {
     /// 64-bit unsigned integer
     U64(u64),
     /// 32-bit unsigned integer
@@ -109,7 +107,7 @@ pub enum ConfigValue {
 
 impl ConfigValue {
     /// Parse from JsonValue once during cache update
-    pub fn from_json(value: &JsonValue) -> Option<Self> {
+    pub(crate) fn from_json(value: &JsonValue) -> Option<Self> {
         if let Some(arr) = value.as_array() {
             // Handle arrays recursively
             let values: Vec<ConfigValue> =
@@ -130,8 +128,7 @@ impl ConfigValue {
         }
     }
 
-    /// Convert to 64-bit unsigned integer
-    pub fn as_u64(&self) -> Option<u64> {
+    fn as_u64(&self) -> Option<u64> {
         match self {
             ConfigValue::U64(v) => Some(*v),
             ConfigValue::U32(v) => Some(*v as u64),
@@ -141,8 +138,7 @@ impl ConfigValue {
         }
     }
 
-    /// Convert to 32-bit unsigned integer
-    pub fn as_u32(&self) -> Option<u32> {
+    fn as_u32(&self) -> Option<u32> {
         match self {
             ConfigValue::U32(v) => Some(*v),
             ConfigValue::U64(v) => (*v).try_into().ok(),
@@ -152,8 +148,7 @@ impl ConfigValue {
         }
     }
 
-    /// Convert to 64-bit signed integer
-    pub fn as_i64(&self) -> Option<i64> {
+    fn as_i64(&self) -> Option<i64> {
         match self {
             ConfigValue::I64(v) => Some(*v),
             ConfigValue::I32(v) => Some(*v as i64),
@@ -163,8 +158,7 @@ impl ConfigValue {
         }
     }
 
-    /// Convert to 32-bit signed integer
-    pub fn as_i32(&self) -> Option<i32> {
+    fn as_i32(&self) -> Option<i32> {
         match self {
             ConfigValue::I32(v) => Some(*v),
             ConfigValue::I64(v) => (*v).try_into().ok(),
@@ -174,24 +168,21 @@ impl ConfigValue {
         }
     }
 
-    /// Convert to 64-bit floating point number
-    pub fn as_f64(&self) -> Option<f64> {
+    fn as_f64(&self) -> Option<f64> {
         match self {
             ConfigValue::F64(v) => Some(*v),
             _ => None,
         }
     }
 
-    /// Convert to boolean
-    pub fn as_bool(&self) -> Option<bool> {
+    fn as_bool(&self) -> Option<bool> {
         match self {
             ConfigValue::Bool(v) => Some(*v),
             _ => None,
         }
     }
 
-    /// Convert to string
-    pub fn as_string(&self) -> Option<&str> {
+    fn as_string(&self) -> Option<&str> {
         match self {
             ConfigValue::String(v) => Some(v),
             _ => None,

@@ -13,22 +13,15 @@ use tracing::{debug, error, info, warn};
 
 /// Apollo client wrapper for reth
 pub struct ApolloService {
-    /// Inner Apollo SDK client
-    pub inner: Arc<ApolloConfigClient>,
-    /// Apollo configuration
-    pub config: ApolloConfig,
-    /// Map of namespaces to full namespace names
-    pub namespace_map: HashMap<String, String>,
-    /// Configuration cache
-    pub cache: Cache<String, ConfigValue>,
-    /// Background listener task state
-    pub listener_state: Arc<Mutex<ListenerState>>,
+    inner: Arc<ApolloConfigClient>,
+    config: ApolloConfig,
+    namespace_map: HashMap<String, String>,
+    cache: Cache<String, ConfigValue>,
+    listener_state: Arc<Mutex<ListenerState>>,
 }
 
-/// State for the background listener task
 #[derive(Debug)]
-pub struct ListenerState {
-    /// Background task handle
+struct ListenerState {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -62,6 +55,7 @@ impl Clone for ApolloService {
     }
 }
 
+#[allow(dead_code)]
 impl ApolloService {
     /// Get singleton instance
     pub async fn initialize(config: ApolloConfig) -> Result<Arc<ApolloService>, ApolloError> {
@@ -129,16 +123,14 @@ impl ApolloService {
         })
     }
 
-    /// Get singleton instance
-    pub fn get_instance() -> Result<Arc<ApolloService>, ApolloError> {
+    pub(crate) fn get_instance() -> Result<Arc<ApolloService>, ApolloError> {
         INSTANCE
             .get()
             .cloned()
             .ok_or(ApolloError::ClientInit("Apollo client not initialized".to_string()))
     }
 
-    /// Load config from Apollo
-    pub async fn load_config(&self) -> Result<(), ApolloError> {
+    async fn load_config(&self) -> Result<(), ApolloError> {
         for (namespace, full_namespace) in &self.namespace_map {
             let config = self
                 .inner
@@ -155,8 +147,7 @@ impl ApolloService {
         Ok(())
     }
 
-    /// Start continuous listening
-    pub async fn start_listening(&self) -> Result<(), ApolloError> {
+    async fn start_listening(&self) -> Result<(), ApolloError> {
         let mut state = self.listener_state.lock().await;
         if state.task.is_some() {
             return Ok(());
@@ -187,7 +178,6 @@ impl ApolloService {
         Ok(())
     }
 
-    // Background listener task
     async fn listener_task(
         client: Arc<ApolloConfigClient>,
         cache: Cache<String, ConfigValue>,
@@ -222,7 +212,6 @@ impl ApolloService {
         }
     }
 
-    /// Parse YAML config and update cache with individual keys
     fn update_cache_from_config(
         cache: &Cache<String, ConfigValue>,
         namespace: &str,
@@ -244,8 +233,7 @@ impl ApolloService {
         }
     }
 
-    /// Query cached configurations
-    pub fn get_cached_config(&self, namespace: &str, key: &str) -> Option<ConfigValue> {
+    pub(crate) fn get_cached_config(&self, namespace: &str, key: &str) -> Option<ConfigValue> {
         let cache_key = make_cache_key(namespace, key);
         debug!(target: "reth::apollo", "[Apollo] Getting cached config for namespace {}: key: {:?}", namespace, cache_key);
         self.cache.get(&cache_key)
