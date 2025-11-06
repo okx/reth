@@ -16,7 +16,16 @@ impl ReceiptBuilder for RethReceiptBuilder {
         &self,
         ctx: ReceiptBuilderCtx<'_, Self::Transaction, E>,
     ) -> Self::Receipt {
+        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
+        
         let ReceiptBuilderCtx { tx, result, cumulative_gas_used, .. } = ctx;
+        let tx_hash = tx.tx_hash();
+        
+        // Monitoring point 10: Receipt generation
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_transaction_progress(*tx_hash, TransactionProcessId::ReceiptGenProgress, "Generating transaction receipt");
+        }
+        
         Receipt {
             tx_type: tx.tx_type(),
             // Success flag was added in `EIP-658: Embedding transaction status code in

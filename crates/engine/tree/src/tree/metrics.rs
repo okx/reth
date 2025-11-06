@@ -74,22 +74,57 @@ impl EngineApiMetrics {
 
         let mut executor = executor.with_state_hook(Some(Box::new(wrapper)));
 
-        let f = || {
-            executor.apply_pre_execution_changes()?;
-            for tx in transactions {
-                let tx = tx?;
-                let span =
-                    debug_span!(target: "engine::tree", "execute_tx", tx_hash=?tx.tx().tx_hash());
-                let _enter = span.enter();
-                trace!(target: "engine::tree", "Executing transaction");
-                executor.execute_transaction(tx)?;
-            }
-            executor.finish().map(|(evm, result)| (evm.into_db(), result))
-        };
-
         // Use metered to execute and track timing/gas metrics
         let (mut db, result) = self.metered(|| {
-            let res = f();
+            use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
+            
+            // Collect all transaction hashes first for subsequent tracing
+            let mut tx_hashes = Vec::new();
+            let mut tx_refs = Vec::new();
+            
+            for tx in transactions {
+                let tx = match tx {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        return (0, Err(e));
+                    }
+                };
+                let tx_hash = *tx.tx().tx_hash();
+                tx_hashes.push(tx_hash);
+                tx_refs.push(tx);
+            }
+            
+            let res = (|| {
+                executor.apply_pre_execution_changes()?;
+                for tx in tx_refs {
+                    let tx_hash = *tx.tx().tx_hash();
+                    
+                    // Monitoring point 8: State processing start
+                    if let Some(tracer) = get_global_tracer() {
+                        tracer.log_transaction_start(tx_hash, TransactionProcessId::StateProcessStart, "Processing state");
+                    }
+                    
+                    let span =
+                        debug_span!(target: "engine::tree", "execute_tx", tx_hash=?tx_hash);
+                    let _enter = span.enter();
+                    trace!(target: "engine::tree", "Executing transaction");
+                    executor.execute_transaction(tx)?;
+                }
+                
+                // Monitoring point 11: State commit
+                let (evm, result) = executor.finish()?;
+                let db = evm.into_db();
+                
+                // Record state commit for all collected transaction hashes
+                if let Some(tracer) = get_global_tracer() {
+                    for tx_hash in tx_hashes {
+                        tracer.log_transaction_end(tx_hash, TransactionProcessId::StateCommitEnd, true, "State commit completed");
+                    }
+                }
+                
+                Ok((db, result))
+            })();
+            
             let gas_used = res.as_ref().map(|r| r.1.gas_used).unwrap_or(0);
             (gas_used, res)
         })?;

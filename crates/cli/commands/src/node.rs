@@ -11,7 +11,7 @@ use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, NetworkArgs,
-        PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs,
+        PayloadBuilderArgs, PruningArgs, RpcServerArgs, TransactionTraceArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -113,6 +113,10 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "ERA")]
     pub era: EraArgs,
 
+    /// All transaction trace related arguments with --tx-trace prefix
+    #[command(flatten)]
+    pub tx_trace: TransactionTraceArgs,
+
     /// Additional cli arguments
     #[command(flatten, next_help_heading = "Extension")]
     pub ext: Ext,
@@ -168,7 +172,19 @@ where
             ext,
             engine,
             era,
+            tx_trace,
         } = self;
+
+        // Initialize transaction tracer if enabled
+        if tx_trace.enable {
+            use reth_node_metrics::transaction_trace::init_global_tracer;
+            init_global_tracer(tx_trace.enable, tx_trace.output_path.clone());
+            if let Some(ref path) = tx_trace.output_path {
+                tracing::info!(target: "reth::cli", ?path, "Transaction tracing enabled, output path configured");
+            } else {
+                tracing::info!(target: "reth::cli", "Transaction tracing enabled, logging to console only");
+            }
+        }
 
         // set up node config
         let mut node_config = NodeConfig {
@@ -187,6 +203,7 @@ where
             pruning,
             engine,
             era,
+            tx_trace,
         };
 
         let data_dir = node_config.datadir();

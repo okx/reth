@@ -32,9 +32,16 @@ where
     ///
     /// Returns the hash of the transaction.
     async fn send_raw_transaction(&self, tx: Bytes) -> Result<B256, Self::Error> {
-        let recovered = recover_raw_transaction(&tx)?;
+        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
 
+        // Monitoring point 1: RPC receive start
+        let recovered = recover_raw_transaction(&tx)?;
         let pool_transaction = <Self::Pool as TransactionPool>::Transaction::from_pooled(recovered);
+        let tx_hash = *pool_transaction.hash();
+        
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_transaction_start(tx_hash, TransactionProcessId::RpcReceiveStart, "Receiving transaction via RPC");
+        }
 
         // forward the transaction to the specific endpoint if configured.
         if let Some(client) = self.raw_tx_forwarder() {
@@ -47,10 +54,18 @@ where
             let hash =
                 client.request("eth_sendRawTransaction", (rlp_hex,)).await.inspect_err(|err| {
                     tracing::debug!(target: "rpc::eth", %err, hash=% *pool_transaction.hash(), "failed to forward raw transaction");
+                    if let Some(tracer) = get_global_tracer() {
+                        tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveEnd, false, "Failed to forward transaction");
+                    }
                 }).map_err(EthApiError::other)?;
 
             // Retain tx in local tx pool after forwarding, for local RPC usage.
             let _ = self.inner.add_pool_transaction(pool_transaction).await;
+
+            if let Some(tracer) = get_global_tracer() {
+                tracer.log_transaction_progress(tx_hash, TransactionProcessId::RpcReceiveProgress, "Preparing to send to transaction pool");
+                tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveEnd, true, "RPC receive successful");
+            }
 
             return Ok(hash);
         }
@@ -58,9 +73,23 @@ where
         // broadcast raw transaction to subscribers if there is any.
         self.broadcast_raw_transaction(tx);
 
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_transaction_progress(tx_hash, TransactionProcessId::RpcReceiveProgress, "Preparing to send to transaction pool");
+        }
+
         // submit the transaction to the pool with a `Local` origin
         let AddedTransactionOutcome { hash, .. } =
-            self.inner.add_pool_transaction(pool_transaction).await?;
+            self.inner.add_pool_transaction(pool_transaction).await
+                .map_err(|err| {
+                    if let Some(tracer) = get_global_tracer() {
+                        tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveEnd, false, &format!("Failed to add to transaction pool: {}", err));
+                    }
+                    err
+                })?;
+
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveEnd, true, "RPC receive successful");
+        }
 
         Ok(hash)
     }

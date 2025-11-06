@@ -29,7 +29,10 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{
     BuiltPayload, EngineApiMessageVersion, NewPayloadError, PayloadBuilderAttributes, PayloadTypes,
 };
-use reth_primitives_traits::{NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
+use reth_primitives_traits::{
+    BlockBody, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
+    transaction::TxHashRef,
+};
 use reth_provider::{
     providers::ConsistentDbView, BlockNumReader, BlockReader, DBProvider, DatabaseProviderFactory,
     HashedPostStateProvider, ProviderError, StateProviderBox, StateProviderFactory, StateReader,
@@ -2366,6 +2369,20 @@ where
         let start = Instant::now();
 
         let executed = execute(&mut self.payload_validator, input, ctx)?;
+        
+        // Monitoring point 12: Block insertion start
+        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
+        let block_hash = executed.recovered_block().hash();
+        let block_number = executed.recovered_block().number();
+        if let Some(tracer) = get_global_tracer() {
+            // Log block-level trace
+            tracer.log_block_start(block_hash, block_number, TransactionProcessId::BlockInsertStart, "Starting block insertion");
+            // Also log transaction-level traces
+            for tx in executed.recovered_block().body().transactions_iter() {
+                let tx_hash = *tx.tx_hash();
+                tracer.log_transaction_start(tx_hash, TransactionProcessId::BlockInsertStart, "Inserting block");
+            }
+        }
 
         // if the parent is the canonical head, we can insert the block as the pending block
         if self.state.tree_state.canonical_block_hash() == executed.recovered_block().parent_hash()
@@ -2380,11 +2397,35 @@ where
         // emit insert event
         let elapsed = start.elapsed();
         let engine_event = if is_fork {
-            ConsensusEngineEvent::ForkBlockAdded(executed, elapsed)
+            ConsensusEngineEvent::ForkBlockAdded(executed.clone(), elapsed)
         } else {
-            ConsensusEngineEvent::CanonicalBlockAdded(executed, elapsed)
+            ConsensusEngineEvent::CanonicalBlockAdded(executed.clone(), elapsed)
         };
         self.emit_event(EngineApiEvent::BeaconConsensus(engine_event));
+        
+        // Monitoring point 13: Block validation complete
+        // Monitoring point 14: Block confirmation complete
+        if let Some(tracer) = get_global_tracer() {
+            let is_canonical = !is_fork;
+            let block_insert_duration = start.elapsed().as_millis();
+            
+            // Log block-level trace
+            tracer.log_block_progress(block_hash, block_number, TransactionProcessId::BlockValidateStart, "Validating block");
+            tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockInsertEnd, true, Some(block_insert_duration), "Block insertion completed");
+            if is_canonical {
+                tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockConfirmEnd, true, Some(elapsed.as_millis()), "Block confirmation completed");
+            }
+            
+            // Also log transaction-level traces
+            for tx in executed.recovered_block().body().transactions_iter() {
+                let tx_hash = *tx.tx_hash();
+                tracer.log_transaction_progress(tx_hash, TransactionProcessId::BlockValidateStart, "Validating block");
+                tracer.log_transaction_end(tx_hash, TransactionProcessId::BlockInsertEnd, true, "Block insertion completed");
+                if is_canonical {
+                    tracer.log_transaction_end(tx_hash, TransactionProcessId::BlockConfirmEnd, true, "Block confirmation completed");
+                }
+            }
+        }
 
         self.metrics
             .engine

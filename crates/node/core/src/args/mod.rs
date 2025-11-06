@@ -68,5 +68,9 @@ pub use ress_args::RessArgs;
 mod era;
 pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
 
+/// `TransactionTraceArgs` for configuring transaction tracing
+mod transaction_trace;
+pub use transaction_trace::TransactionTraceArgs;
+
 mod error;
 pub mod types;

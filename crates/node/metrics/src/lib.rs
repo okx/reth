@@ -14,6 +14,11 @@ pub mod recorder;
 /// The metric server serving the metrics.
 pub mod server;
 pub mod version;
+/// Transaction tracing for monitoring transaction lifecycle
+pub mod transaction_trace;
 
 pub use metrics_exporter_prometheus::*;
 pub use metrics_process::*;
+pub use transaction_trace::TransactionTracer;
+// Re-export transaction trace module items for convenience
+pub use transaction_trace::{get_global_tracer, init_global_tracer, TransactionProcessId};
