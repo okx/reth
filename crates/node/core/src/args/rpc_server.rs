@@ -245,16 +245,16 @@ pub struct RpcServerArgs {
     pub gas_price_oracle: GasPriceOracleArgs,
 
     /// XLayer: Legacy RPC endpoint URL for routing historical data
-    #[arg(long = "legacy-rpc-url", value_name = "URL")]
+    #[arg(long = "rpc.legacy-url", value_name = "URL")]
     pub legacy_rpc_url: Option<String>,
 
-    /// XLayer: Block number below which requests are routed to legacy RPC
-    #[arg(long = "legacy-cutoff-block", value_name = "NUMBER", requires = "legacy_rpc_url")]
-    pub legacy_cutoff_block: Option<u64>,
-
     /// XLayer: Timeout for legacy RPC requests
-    #[arg(long = "legacy-rpc-timeout", value_name = "DURATION", default_value = "30s", requires = "legacy_rpc_url")]
+    #[arg(long = "rpc.legacy-timeout", value_name = "DURATION", default_value = "30s", requires = "legacy_rpc_url")]
     pub legacy_rpc_timeout: Option<String>,
+
+    /// XLayer: Cutoff block (auto-derived from genesis, internal use only)
+    #[arg(skip)]
+    pub legacy_cutoff_block: Option<u64>,
 
     /// Timeout for `send_raw_transaction_sync` RPC method.
     #[arg(

@@ -18,13 +18,7 @@ pub(crate) fn build_legacy_rpc_config(
             .and_then(|s| humantime::parse_duration(s).ok())
             .unwrap_or(Duration::from_secs(30));
 
-        info!(
-            target: "reth::cli",
-            legacy_url = %url,
-            cutoff = cutoff,
-            timeout = ?timeout,
-            "Legacy RPC routing enabled"
-        );
+        info!(target: "reth::cli", legacy_url = %url, cutoff = cutoff, timeout = ?timeout, "Legacy RPC routing enabled");
 
         Some(LegacyRpcConfig::new(cutoff, url.clone(), timeout))
     } else {
