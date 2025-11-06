@@ -1,9 +1,7 @@
 //! Core import functionality without CLI dependencies.
 
-use alloy_consensus::BlockHeader;
 use alloy_primitives::B256;
 use futures::StreamExt;
-use reth_chainspec::EthChainSpec;
 use reth_config::Config;
 use reth_consensus::FullConsensus;
 use reth_db_api::{tables, transaction::DbTx};
@@ -100,10 +98,8 @@ where
     let mut total_decoded_blocks = 0;
     let mut total_decoded_txns = 0;
 
-    let last_block_number = provider_factory.last_block_number()?;
-    let genesis_block_number = provider_factory.provider()?.chain_spec().genesis_header().number();
     let mut sealed_header = provider_factory
-        .sealed_header(genesis_block_number)?
+        .sealed_header(provider_factory.last_block_number()?)?
         .expect("should have genesis");
 
     while let Some(file_client) =
