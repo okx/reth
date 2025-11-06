@@ -24,14 +24,11 @@ macro_rules! apollo_config_or {
         let ns = $namespace;  // Bind to extend lifetime
         let ns_ref: &str = &ns;
 
-        let result = $crate::client::ApolloService::get_instance()
+        $crate::client::ApolloService::get_instance()
             .ok()
-            .and_then(|apollo| apollo.get_cached_config(ns_ref, $key))
-            .and_then(|v| $crate::types::FromConfigValue::from_config_value(&v));
-
-        match result {
-            Some(value) => value,
-            None => {
+            .and_then(|apollo| apollo.try_get_cached_config(ns_ref, $key))
+            .and_then(|v| $crate::types::FromConfigValue::from_config_value(&v))
+            .unwrap_or_else( || {
                 tracing::warn!(
                     target: "reth::apollo",
                     namespace = ns_ref,
@@ -40,8 +37,7 @@ macro_rules! apollo_config_or {
                     "[Apollo] Using default config (client not initialized, key missing, or type mismatch)"
                 );
                 $default
-            }
-        }
+            })
     }};
 }
 

@@ -39,13 +39,4 @@ impl Namespace {
             Namespace::Halt => "halt",
         }
     }
-
-    /// Get the component for this namespace
-    pub const fn component(&self) -> Option<Component> {
-        match self {
-            Namespace::Sequencer => Some(Component::OpReth),
-            Namespace::JsonRpc => Some(Component::OpReth),
-            Namespace::Halt => None,
-        }
-    }
 }

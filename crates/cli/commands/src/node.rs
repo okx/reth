@@ -118,7 +118,7 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "Extension")]
     pub ext: Ext,
 
-    /// For X Layer- All Apollo related arguments with --apollo prefix
+    /// For X Layer
     #[command(flatten)]
     pub xlayer: XLayerArgs,
 }
@@ -224,14 +224,11 @@ where
             tracing::info!(target: "reth::apollo", "[Apollo] Creating Apollo config");
 
             // Initialize Apollo singleton
-            match ApolloService::initialize(apollo_config).await {
-                Ok(_) => {
-                    tracing::info!(target: "reth::apollo", "[Apollo] Apollo initialized successfully")
-                }
-                Err(e) => {
-                    tracing::error!(target: "reth::apollo", "[Apollo] Failed to initialize Apollo: {:?}; Proceeding with node launch without Apollo", e);
-                    node_config.xlayer.apollo.enabled = false;
-                }
+            if let Err(e) = ApolloService::try_initialize(apollo_config).await {
+                tracing::error!(target: "reth::apollo", "[Apollo] Failed to initialize Apollo: {:?}; Proceeding with node launch without Apollo", e);
+                node_config.xlayer.apollo.enabled = false;
+            } else {
+                tracing::info!(target: "reth::apollo", "[Apollo] Apollo initialized successfully")
             }
         }
 

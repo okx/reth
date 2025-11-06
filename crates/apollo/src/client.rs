@@ -58,10 +58,10 @@ impl Clone for ApolloService {
 #[allow(dead_code)]
 impl ApolloService {
     /// Get singleton instance
-    pub async fn initialize(config: ApolloConfig) -> Result<Arc<ApolloService>, ApolloError> {
+    pub async fn try_initialize(config: ApolloConfig) -> Result<Arc<ApolloService>, ApolloError> {
         let instance = INSTANCE
             .get_or_try_init(async {
-                let client = Self::new_instance(config).await?;
+                let client = Self::try_new_instance(config).await?;
                 Ok(Arc::new(client))
             })
             .await?;
@@ -73,7 +73,7 @@ impl ApolloService {
     }
 
     /// Create new instance
-    async fn new_instance(config: ApolloConfig) -> Result<ApolloService, ApolloError> {
+    async fn try_new_instance(config: ApolloConfig) -> Result<ApolloService, ApolloError> {
         // Validate configuration
         if config.app_id.is_empty()
             || config.meta_server.is_empty()
@@ -222,7 +222,7 @@ impl ApolloService {
                 for (key, value) in parsed_config {
                     cache.insert(
                         make_cache_key(namespace, key.as_str()),
-                        ConfigValue::from_json(&value)
+                        ConfigValue::try_from_json(&value)
                             .unwrap_or_else(|| ConfigValue::String(value.to_string())),
                     );
                 }
@@ -233,7 +233,7 @@ impl ApolloService {
         }
     }
 
-    pub(crate) fn get_cached_config(&self, namespace: &str, key: &str) -> Option<ConfigValue> {
+    pub(crate) fn try_get_cached_config(&self, namespace: &str, key: &str) -> Option<ConfigValue> {
         let cache_key = make_cache_key(namespace, key);
         debug!(target: "reth::apollo", "[Apollo] Getting cached config for namespace {}: key: {:?}", namespace, cache_key);
         self.cache.get(&cache_key)
