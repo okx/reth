@@ -1,5 +1,5 @@
 ---
-description: General rule for X Layer node development expertise
+description: General rule for Rust development expertise
 globs: **/*
 alwaysApply: true
 ---
