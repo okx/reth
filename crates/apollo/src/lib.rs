@@ -27,7 +27,7 @@ macro_rules! apollo_config_or {
         $crate::client::ApolloService::get_instance()
             .ok()
             .and_then(|apollo| apollo.try_get_cached_config(ns_ref, $key))
-            .and_then(|v| $crate::types::FromConfigValue::from_config_value(&v))
+            .and_then(|v| $crate::types::FromConfigValue::try_from_config_value(&v))
             .unwrap_or_else( || {
                 tracing::warn!(
                     target: "reth::apollo",
