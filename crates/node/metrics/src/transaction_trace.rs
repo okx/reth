@@ -4,9 +4,9 @@ use alloy_primitives::B256;
 use serde_json::json;
 use std::{
     collections::HashMap,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -202,28 +202,72 @@ pub struct TransactionTracer {
 struct TransactionTracerInner {
     enabled: bool,
     output_path: Option<PathBuf>,
+    output_file: Mutex<Option<File>>,
     traces: Mutex<HashMap<B256, TransactionTraceStats>>,
 }
 
 impl TransactionTracer {
     /// Create a new transaction tracer
     pub fn new(enabled: bool, output_path: Option<PathBuf>) -> Self {
-        // Create output directory if specified
-        if let Some(ref path) = output_path {
-            if let Err(e) = fs::create_dir_all(path) {
-                tracing::warn!(
-                    target: "tx_trace",
-                    ?path,
-                    error = %e,
-                    "Failed to create transaction trace output directory"
-                );
+        let output_file = if let Some(ref path) = output_path {
+            // Determine the actual file path
+            // If path ends with separator or doesn't have a file extension, treat as directory
+            let file_path = if path.to_string_lossy().ends_with('/') || path.to_string_lossy().ends_with('\\') {
+                // Ends with separator, treat as directory
+                path.join("trace.log")
+            } else if path.extension().is_none() && !path.exists() {
+                // No extension and doesn't exist, likely a directory path
+                path.join("trace.log")
+            } else {
+                // Has extension or exists, treat as file path
+                path.clone()
+            };
+
+            // Create parent directory if needed
+            if let Some(parent) = file_path.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    tracing::warn!(
+                        target: "tx_trace",
+                        ?parent,
+                        error = %e,
+                        "Failed to create transaction trace output directory"
+                    );
+                }
             }
-        }
+
+            // Open file in append mode
+            match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file_path)
+            {
+                Ok(file) => {
+                    tracing::info!(
+                        target: "tx_trace",
+                        ?file_path,
+                        "Transaction trace file opened for appending"
+                    );
+                    Some(file)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tx_trace",
+                        ?file_path,
+                        error = %e,
+                        "Failed to open transaction trace file"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Self {
             inner: Arc::new(TransactionTracerInner {
                 enabled,
-                output_path,
+                output_path: output_path.clone(),
+                output_file: Mutex::new(output_file),
                 traces: Mutex::new(HashMap::new()),
             }),
         }
@@ -255,10 +299,11 @@ impl TransactionTracer {
         };
 
         // Log to console as JSON format for easy parsing
-        let timestamp_ms = std::time::SystemTime::now()
+        let timestamp_duration = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+            .unwrap_or_default();
+        let timestamp_ms = timestamp_duration.as_millis();
+        let timestamp_us = timestamp_duration.as_micros();
         let log_json = json!({
             "trace_type": "TX_TRACE",
             "event_kind": "START",
@@ -266,13 +311,33 @@ impl TransactionTracer {
             "process_id": process_id as u32,
             "process_name": process_id.as_str(),
             "timestamp_ms": timestamp_ms,
+            "timestamp_us": timestamp_us,
             "message": message
         });
+        let json_str = serde_json::to_string(&log_json).unwrap_or_default();
+        
+        // Log to console
         tracing::info!(
             target: "tx_trace",
             "{}",
-            serde_json::to_string(&log_json).unwrap_or_default()
+            json_str
         );
+
+        // Write to file if enabled (one JSON per line)
+        if let Ok(mut file_guard) = self.inner.output_file.lock() {
+            if let Some(ref mut file) = *file_guard {
+                if let Err(e) = writeln!(file, "{}", json_str) {
+                    tracing::warn!(
+                        target: "tx_trace",
+                        error = %e,
+                        "Failed to write to transaction trace file"
+                    );
+                } else {
+                    // Flush immediately for real-time logging
+                    let _ = file.flush();
+                }
+            }
+        }
 
         // Store in memory
         let mut traces = self.inner.traces.lock().unwrap();
@@ -307,10 +372,11 @@ impl TransactionTracer {
         };
 
         // Log to console as JSON format for easy parsing
-        let timestamp_ms = std::time::SystemTime::now()
+        let timestamp_duration = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+            .unwrap_or_default();
+        let timestamp_ms = timestamp_duration.as_millis();
+        let timestamp_us = timestamp_duration.as_micros();
         let log_json = json!({
             "trace_type": "TX_TRACE",
             "event_kind": "PROGRESS",
@@ -318,13 +384,33 @@ impl TransactionTracer {
             "process_id": process_id as u32,
             "process_name": process_id.as_str(),
             "timestamp_ms": timestamp_ms,
+            "timestamp_us": timestamp_us,
             "message": message
         });
+        let json_str = serde_json::to_string(&log_json).unwrap_or_default();
+        
+        // Log to console
         tracing::info!(
             target: "tx_trace",
             "{}",
-            serde_json::to_string(&log_json).unwrap_or_default()
+            json_str
         );
+
+        // Write to file if enabled (one JSON per line)
+        if let Ok(mut file_guard) = self.inner.output_file.lock() {
+            if let Some(ref mut file) = *file_guard {
+                if let Err(e) = writeln!(file, "{}", json_str) {
+                    tracing::warn!(
+                        target: "tx_trace",
+                        error = %e,
+                        "Failed to write to transaction trace file"
+                    );
+                } else {
+                    // Flush immediately for real-time logging
+                    let _ = file.flush();
+                }
+            }
+        }
 
         // Store in memory
         let mut traces = self.inner.traces.lock().unwrap();
@@ -380,12 +466,14 @@ impl TransactionTracer {
 
         // Log to console as JSON format for easy parsing
         let status = if success { "SUCCESS" } else { "FAILED" };
-        let timestamp_ms = std::time::SystemTime::now()
+        let timestamp_duration = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+            .unwrap_or_default();
+        let timestamp_ms = timestamp_duration.as_millis();
+        let timestamp_us = timestamp_duration.as_micros();
         let log_json = if let Some(duration_val) = duration {
             let duration_ms = duration_val.as_millis();
+            let duration_us = duration_val.as_micros();
             json!({
                 "trace_type": "TX_TRACE",
                 "event_kind": "END",
@@ -394,7 +482,9 @@ impl TransactionTracer {
                 "process_name": process_id.as_str(),
                 "status": status,
                 "timestamp_ms": timestamp_ms,
+                "timestamp_us": timestamp_us,
                 "duration_ms": duration_ms,
+                "duration_us": duration_us,
                 "message": message
             })
         } else {
@@ -406,124 +496,45 @@ impl TransactionTracer {
                 "process_name": process_id.as_str(),
                 "status": status,
                 "timestamp_ms": timestamp_ms,
+                "timestamp_us": timestamp_us,
                 "message": message
             })
         };
+        let json_str = serde_json::to_string(&log_json).unwrap_or_default();
+        
+        // Log to console
         tracing::info!(
             target: "tx_trace",
             "{}",
-            serde_json::to_string(&log_json).unwrap_or_default()
+            json_str
         );
+
+        // Write to file if enabled (one JSON per line)
+        if let Ok(mut file_guard) = self.inner.output_file.lock() {
+            if let Some(ref mut file) = *file_guard {
+                if let Err(e) = writeln!(file, "{}", json_str) {
+                    tracing::warn!(
+                        target: "tx_trace",
+                        error = %e,
+                        "Failed to write to transaction trace file"
+                    );
+                } else {
+                    // Flush immediately for real-time logging
+                    let _ = file.flush();
+                }
+            }
+        }
 
         // Store in memory
         let mut traces = self.inner.traces.lock().unwrap();
         if let Some(stats) = traces.get_mut(&tx_hash) {
             stats.events.push(event);
-
-            // If this is the final confirmation, write to file
             if process_id == TransactionProcessId::BlockConfirmEnd && success {
                 stats.end_time = Some(Instant::now());
-                self.write_trace_file(&tx_hash, stats);
             }
         }
     }
 
-    /// Write trace to file
-    fn write_trace_file(&self, tx_hash: &B256, stats: &TransactionTraceStats) {
-        if let Some(ref output_path) = self.inner.output_path {
-            let filename = format!("{}.trace", tx_hash);
-            let file_path = output_path.join(filename);
-
-            if let Ok(mut file) = File::create(&file_path) {
-                writeln!(file, "Transaction Trace: {}", tx_hash).ok();
-                writeln!(file, "=").ok();
-                writeln!(file, "").ok();
-
-                if let Some(total_duration) = stats.total_duration() {
-                    writeln!(file, "Total Duration: {} ms", total_duration.as_millis()).ok();
-                }
-                writeln!(file, "").ok();
-
-                writeln!(file, "Events:").ok();
-                writeln!(file, "------").ok();
-
-                for event in &stats.events {
-                    let status_str = match event.status {
-                        TransactionTraceStatus::Start => "START",
-                        TransactionTraceStatus::Progress => "PROGRESS",
-                        TransactionTraceStatus::Success => "SUCCESS",
-                        TransactionTraceStatus::Failed => "FAILED",
-                    };
-
-                    let duration_str = if let Some(duration) = event.duration {
-                        format!(" ({} ms)", duration.as_millis())
-                    } else {
-                        String::new()
-                    };
-
-                    let elapsed = if let Some(start) = stats.start_time {
-                        event.timestamp.duration_since(start).as_millis()
-                    } else {
-                        0
-                    };
-                    writeln!(
-                        file,
-                        "[{}] ProcessId: {} ({}) | Status: {} | Message: {}{}",
-                        elapsed,
-                        event.process_id as u32,
-                        event.process_id.as_str(),
-                        status_str,
-                        event.message,
-                        duration_str
-                    )
-                    .ok();
-                }
-
-                writeln!(file, "").ok();
-                writeln!(file, "Stage Durations:").ok();
-                writeln!(file, "---------------").ok();
-
-                // Group by base stage ID and calculate duration
-                let base_stages = [
-                    (50010, "RPC Receive"),
-                    (50020, "TxPool Add"),
-                    (50022, "TxPool Validate"),
-                    (50030, "Miner Select"),
-                    (50032, "Tx Execution"),
-                    (50034, "Tx Packaging"),
-                    (50036, "Block End"),
-                    (50040, "State Process"),
-                    (50042, "State Apply"),
-                    (50044, "Receipt Generation"),
-                    (50046, "State Commit"),
-                    (50050, "Block Insert"),
-                    (50052, "Block Validate"),
-                    (50054, "Block Confirm"),
-                ];
-                
-                for (base_id, stage_name) in base_stages {
-                    if let Some(duration) = stats.stage_duration_by_base(base_id) {
-                        writeln!(
-                            file,
-                            "{} ({}): {} ms",
-                            stage_name,
-                            base_id,
-                            duration.as_millis()
-                        )
-                        .ok();
-                    }
-                }
-
-                file.flush().ok();
-            } else {
-                tracing::warn!(
-                    target: "tx_trace",
-                    ?file_path,
-                    "Failed to create transaction trace file"
-                );
-            }
-        }
-    }
 
     /// Get trace statistics for a transaction
     pub fn get_trace_stats(&self, tx_hash: &B256) -> Option<TransactionTraceStats> {
@@ -578,10 +589,11 @@ impl TransactionTracer {
             return;
         }
 
-        let timestamp_ms = std::time::SystemTime::now()
+        let timestamp_duration = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+            .unwrap_or_default();
+        let timestamp_ms = timestamp_duration.as_millis();
+        let timestamp_us = timestamp_duration.as_micros();
         let log_json = json!({
             "trace_type": "BLOCK_TRACE",
             "event_kind": "START",
@@ -590,13 +602,33 @@ impl TransactionTracer {
             "process_id": process_id as u32,
             "process_name": process_id.as_str(),
             "timestamp_ms": timestamp_ms,
+            "timestamp_us": timestamp_us,
             "message": message
         });
+        let json_str = serde_json::to_string(&log_json).unwrap_or_default();
+        
+        // Log to console
         tracing::info!(
             target: "tx_trace",
             "{}",
-            serde_json::to_string(&log_json).unwrap_or_default()
+            json_str
         );
+
+        // Write to file if enabled (one JSON per line)
+        if let Ok(mut file_guard) = self.inner.output_file.lock() {
+            if let Some(ref mut file) = *file_guard {
+                if let Err(e) = writeln!(file, "{}", json_str) {
+                    tracing::warn!(
+                        target: "tx_trace",
+                        error = %e,
+                        "Failed to write to transaction trace file"
+                    );
+                } else {
+                    // Flush immediately for real-time logging
+                    let _ = file.flush();
+                }
+            }
+        }
     }
 
     /// Log block progress event
@@ -611,10 +643,11 @@ impl TransactionTracer {
             return;
         }
 
-        let timestamp_ms = std::time::SystemTime::now()
+        let timestamp_duration = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+            .unwrap_or_default();
+        let timestamp_ms = timestamp_duration.as_millis();
+        let timestamp_us = timestamp_duration.as_micros();
         let log_json = json!({
             "trace_type": "BLOCK_TRACE",
             "event_kind": "PROGRESS",
@@ -623,13 +656,33 @@ impl TransactionTracer {
             "process_id": process_id as u32,
             "process_name": process_id.as_str(),
             "timestamp_ms": timestamp_ms,
+            "timestamp_us": timestamp_us,
             "message": message
         });
+        let json_str = serde_json::to_string(&log_json).unwrap_or_default();
+        
+        // Log to console
         tracing::info!(
             target: "tx_trace",
             "{}",
-            serde_json::to_string(&log_json).unwrap_or_default()
+            json_str
         );
+
+        // Write to file if enabled (one JSON per line)
+        if let Ok(mut file_guard) = self.inner.output_file.lock() {
+            if let Some(ref mut file) = *file_guard {
+                if let Err(e) = writeln!(file, "{}", json_str) {
+                    tracing::warn!(
+                        target: "tx_trace",
+                        error = %e,
+                        "Failed to write to transaction trace file"
+                    );
+                } else {
+                    // Flush immediately for real-time logging
+                    let _ = file.flush();
+                }
+            }
+        }
     }
 
     /// Log block end event
@@ -639,7 +692,7 @@ impl TransactionTracer {
         block_number: u64,
         process_id: TransactionProcessId,
         success: bool,
-        duration_ms: Option<u128>,
+        duration: Option<Duration>,
         message: &str,
     ) {
         if !self.inner.enabled {
@@ -647,11 +700,14 @@ impl TransactionTracer {
         }
 
         let status = if success { "SUCCESS" } else { "FAILED" };
-        let timestamp_ms = std::time::SystemTime::now()
+        let timestamp_duration = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let log_json = if let Some(duration) = duration_ms {
+            .unwrap_or_default();
+        let timestamp_ms = timestamp_duration.as_millis();
+        let timestamp_us = timestamp_duration.as_micros();
+        let log_json = if let Some(duration_val) = duration {
+            let duration_ms = duration_val.as_millis();
+            let duration_us = duration_val.as_micros();
             json!({
                 "trace_type": "BLOCK_TRACE",
                 "event_kind": "END",
@@ -661,7 +717,9 @@ impl TransactionTracer {
                 "process_name": process_id.as_str(),
                 "status": status,
                 "timestamp_ms": timestamp_ms,
-                "duration_ms": duration,
+                "timestamp_us": timestamp_us,
+                "duration_ms": duration_ms,
+                "duration_us": duration_us,
                 "message": message
             })
         } else {
@@ -674,14 +732,34 @@ impl TransactionTracer {
                 "process_name": process_id.as_str(),
                 "status": status,
                 "timestamp_ms": timestamp_ms,
+                "timestamp_us": timestamp_us,
                 "message": message
             })
         };
+        let json_str = serde_json::to_string(&log_json).unwrap_or_default();
+        
+        // Log to console
         tracing::info!(
             target: "tx_trace",
             "{}",
-            serde_json::to_string(&log_json).unwrap_or_default()
+            json_str
         );
+
+        // Write to file if enabled (one JSON per line)
+        if let Ok(mut file_guard) = self.inner.output_file.lock() {
+            if let Some(ref mut file) = *file_guard {
+                if let Err(e) = writeln!(file, "{}", json_str) {
+                    tracing::warn!(
+                        target: "tx_trace",
+                        error = %e,
+                        "Failed to write to transaction trace file"
+                    );
+                } else {
+                    // Flush immediately for real-time logging
+                    let _ = file.flush();
+                }
+            }
+        }
     }
 }
 

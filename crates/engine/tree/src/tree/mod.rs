@@ -2375,13 +2375,8 @@ where
         let block_hash = executed.recovered_block().hash();
         let block_number = executed.recovered_block().number();
         if let Some(tracer) = get_global_tracer() {
-            // Log block-level trace
+            // Log block-level trace only (not per-transaction to avoid duplication)
             tracer.log_block_start(block_hash, block_number, TransactionProcessId::BlockInsertStart, "Starting block insertion");
-            // Also log transaction-level traces
-            for tx in executed.recovered_block().body().transactions_iter() {
-                let tx_hash = *tx.tx_hash();
-                tracer.log_transaction_start(tx_hash, TransactionProcessId::BlockInsertStart, "Inserting block");
-            }
         }
 
         // if the parent is the canonical head, we can insert the block as the pending block
@@ -2407,23 +2402,13 @@ where
         // Monitoring point 14: Block confirmation complete
         if let Some(tracer) = get_global_tracer() {
             let is_canonical = !is_fork;
-            let block_insert_duration = start.elapsed().as_millis();
+            let block_insert_duration = start.elapsed();
             
-            // Log block-level trace
+            // Log block-level trace only (not per-transaction to avoid duplication)
             tracer.log_block_progress(block_hash, block_number, TransactionProcessId::BlockValidateStart, "Validating block");
             tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockInsertEnd, true, Some(block_insert_duration), "Block insertion completed");
             if is_canonical {
-                tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockConfirmEnd, true, Some(elapsed.as_millis()), "Block confirmation completed");
-            }
-            
-            // Also log transaction-level traces
-            for tx in executed.recovered_block().body().transactions_iter() {
-                let tx_hash = *tx.tx_hash();
-                tracer.log_transaction_progress(tx_hash, TransactionProcessId::BlockValidateStart, "Validating block");
-                tracer.log_transaction_end(tx_hash, TransactionProcessId::BlockInsertEnd, true, "Block insertion completed");
-                if is_canonical {
-                    tracer.log_transaction_end(tx_hash, TransactionProcessId::BlockConfirmEnd, true, "Block confirmation completed");
-                }
+                tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockConfirmEnd, true, Some(elapsed), "Block confirmation completed");
             }
         }
 
