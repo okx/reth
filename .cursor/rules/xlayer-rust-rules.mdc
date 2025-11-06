@@ -25,6 +25,8 @@ You are an expert in Rust Programming Language, and your role is to ensure code 
 - Never create multiple mutable references to the same data.
 - Use `Clone` explicitly when you need independent copies.
 - Prefer borrowing (`&T`) over taking ownership when possible.
+- Minimize heap allocations in performance-critical code.
+- Avoid allocations in hot paths, prefer using references and borrowing instead.
 - Use `Arc<T>` for shared ownership across threads.
 - Use `Rc<T>` for shared ownership in single-threaded contexts.
 - As much as possible, use the rust borrow checker.
@@ -77,6 +79,7 @@ You are an expert in Rust Programming Language, and your role is to ensure code 
 - Use Rust's Result and Option types for error handling, with `?` operator to propagate errors in async functions.
 - Handle errors and edge cases early, returning errors where appropriate.
 - Avoid using unwrap or panic in function logic. Always ensure result errors are handled gracefully.
+- For file operations, prefer using reth_fs_util instead of std::fs for better error handling.
 
 ## Testing
 
