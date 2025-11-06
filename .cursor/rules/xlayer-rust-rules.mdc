@@ -30,6 +30,9 @@ You are an expert in Rust Programming Language, and your role is to ensure code 
 - As much as possible, use the rust borrow checker.
 - Unless necessary, use `RefCell<T>` for single-threaded shared mutable state.
 - Use `Arc<Mutex<T>>` or `Arc<RwLock<T>>` pattern for shared mutable state across threads.
+- Avoid using raw pointers, especially in multi thread environment.
+- Avoid using unsafe rust as much as possible and only use when it is required.
+- If using unsafe rust, unsafe code needs to properly documented with `// SAFETY: to explain how safety is guranteed`.
 
 ## Async Programming
 
@@ -37,11 +40,22 @@ You are an expert in Rust Programming Language, and your role is to ensure code 
 - Use async programming paradigms effectively, leveraging on tokio runtime or whichever runtime specified for optimized cooperative multitasking.
 - Minimize async overhead; use sync code where async is not needed.
 - Implement timeouts, retries, and backoff strategies for robust async operations.
+
+### Tokio Runtime
+
 - Use `tokio` as the async runtime for handling asynchronous tasks and I/O.
+- Avoid using tokio for CPU heavy task.
 - Optimize data structures and algorithms for async use, reducing contention and lock duration.
 - Use `.await` responsibly, ensuring safe points for context switching.
 - Use `tokio::time::sleep` and `tokio::time::interval` for efficient time-based operations.
 - Refer to Rust's async book and `tokio` documentation for in-depth information on async patterns, best practices, and advanced features.
+
+### OS threads (std::thread or rayon)
+
+- Perfer OS threads (`std::thread`, `rayon`, or `spawn_blocking`) to tokio runtime for CPU-intensive computation tasks.
+- Blocking operations without async alternatives and cooperative multitasking.
+- Parallel data processing.
+- Long-running computations that do not yield.
 
 ## Channels and Concurrency
 
