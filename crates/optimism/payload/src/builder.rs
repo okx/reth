@@ -370,18 +370,18 @@ impl<Txs> OpBuilder<'_, Txs> {
             builder.finish(state_provider)?;
         
         // Monitoring point 6: Transaction packaging complete
-        // Monitoring point 7: Block end
         // Note: Use recovered_block to get all transactions including system transactions
         use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
-        use reth_primitives_traits::BlockBody;
         use alloy_consensus::transaction::TxHashRef;
         if let Some(tracer) = get_global_tracer() {
             // Use recovered_block to get all transactions (including system transactions)
             for tx in block.body().transactions_iter() {
                 let tx_hash = *tx.tx_hash();
                 tracer.log_transaction_progress(tx_hash, TransactionProcessId::TxPackagingProgress, "Packaging transaction into block");
-                tracer.log_transaction_end(tx_hash, TransactionProcessId::BlockEndEnd, true, "Block construction completed");
+                tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPackagingEnd, true, "Transaction packaging completed");
             }
+            // Monitoring point 7: Block end (record once per block, not per transaction)
+            // Note: BlockEndEnd is recorded at block level in engine/tree/mod.rs, so we don't duplicate it here
         }
 
         let sealed_block = Arc::new(block.sealed_block().clone());
@@ -725,6 +725,11 @@ where
                 return Ok(Some(()))
             }
 
+            // Monitoring point 4: Miner selection end (transaction selected and ready for execution)
+            if let Some(tracer) = get_global_tracer() {
+                tracer.log_transaction_end(tx_hash, TransactionProcessId::MinerSelectEnd, true, "Transaction selected for execution");
+            }
+            
             // Monitoring point 5: Transaction execution start
             if let Some(tracer) = get_global_tracer() {
                 tracer.log_transaction_start(tx_hash, TransactionProcessId::TxExecutionStart, "Starting transaction execution");

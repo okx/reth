@@ -109,6 +109,11 @@ impl EngineApiMetrics {
                     let _enter = span.enter();
                     trace!(target: "engine::tree", "Executing transaction");
                     executor.execute_transaction(tx)?;
+                    
+                    // Monitoring point 8: State processing end
+                    if let Some(tracer) = get_global_tracer() {
+                        tracer.log_transaction_end(tx_hash, TransactionProcessId::StateProcessEnd, true, "State processing completed");
+                    }
                 }
                 
                 // Monitoring point 11: State commit

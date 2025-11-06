@@ -303,6 +303,11 @@ where
             };
         }
 
+        // Monitoring point 4: Miner selection end (transaction selected and ready for execution)
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_transaction_end(tx_hash, TransactionProcessId::MinerSelectEnd, true, "Transaction selected for execution");
+        }
+
         // Monitoring point 5: Transaction execution start
         if let Some(tracer) = get_global_tracer() {
             tracer.log_transaction_start(tx_hash, TransactionProcessId::TxExecutionStart, "Starting transaction execution");
@@ -378,13 +383,14 @@ where
     let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
     
     // Monitoring point 6: Transaction packaging complete
-    // Monitoring point 7: Block end
     if let Some(tracer) = get_global_tracer() {
         for tx in block.body().transactions() {
             let tx_hash = *tx.tx_hash();
             tracer.log_transaction_progress(tx_hash, TransactionProcessId::TxPackagingProgress, "Packaging transaction into block");
-            tracer.log_transaction_end(tx_hash, TransactionProcessId::BlockEndEnd, true, "Block construction completed");
+            tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPackagingEnd, true, "Transaction packaging completed");
         }
+        // Monitoring point 7: Block end (record once per block, not per transaction)
+        // Note: BlockEndEnd is recorded at block level in engine/tree/mod.rs, so we don't duplicate it here
     }
 
     let requests = chain_spec
