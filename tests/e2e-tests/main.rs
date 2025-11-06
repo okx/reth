@@ -1,7 +1,7 @@
 //! Integration tests for e2e operations
 //!
-//! Run with: `cargo test -p xlayer-e2e-test -- --nocapture --test-threads=1` to run all tests
-//! or run: `cargo test -p xlayer-e2e-test <test_name> -- --nocapture --test-threads=1` to run a specific test
+//! Run all tests with: `cargo test -p xlayer-e2e-test -- --nocapture --test-threads=1`
+//! or run a specific test with: `cargo test -p xlayer-e2e-test <test_name> -- --nocapture --test-threads=1`
 
 use xlayer_e2e_test::operations;
 use alloy_primitives::U256;
@@ -143,7 +143,6 @@ async fn test_debug_trace_rpc(#[case] test_name: &str) {
                 .expect("Failed to trace block by hash");
             
             assert!(!trace_result.is_null(), "Trace result should not be null");
-            println!("DebugTraceBlockByHash result: {:?}", trace_result);
         }
         "DebugTraceBlockByNumber" => {
             // Test debug_traceBlockByNumber
@@ -152,7 +151,6 @@ async fn test_debug_trace_rpc(#[case] test_name: &str) {
                 .expect("Failed to trace block by number");
             
             assert!(!trace_result.is_null(), "Trace result should not be null");
-            println!("DebugTraceBlockByNumber result: {:?}", trace_result);
         }
         "DebugTraceTransaction" => {
             // Get block by number to extract hash
@@ -189,7 +187,6 @@ async fn test_debug_trace_rpc(#[case] test_name: &str) {
                 .expect("Failed to trace transaction");
             
             assert!(!trace_result.is_null(), "Trace result should not be null");
-            println!("DebugTraceTransaction result: {:?}", trace_result);
         }
         _ => panic!("Unknown test case: {}", test_name),
     }
@@ -221,7 +218,6 @@ async fn test_eth_block_rpc(#[case] test_name: &str) {
                 .expect("Failed to get block by hash");
             
             assert!(!block.is_null(), "Block should not be null");
-            println!("EthGetBlockByHash result: {:?}", block);
         }
         "EthGetBlockByNumber" => {
             let block = operations::eth_get_block_by_number(&client, block_number, true)
@@ -229,7 +225,6 @@ async fn test_eth_block_rpc(#[case] test_name: &str) {
                 .expect("Failed to get block by number");
             
             assert!(!block.is_null(), "Block should not be null");
-            println!("EthGetBlockByNumber result: {:?}", block);
         }
         "EthGetBlockTransactionCountByHash" => {
             let tx_count = operations::eth_get_block_transaction_count_by_hash(&client, &block_hash)
@@ -237,7 +232,6 @@ async fn test_eth_block_rpc(#[case] test_name: &str) {
                 .expect("Failed to get block transaction count by hash");
             
             println!("EthGetBlockTransactionCountByHash result: {}", tx_count);
-            // Transaction count can be 0 or more
         }
         "EthGetBlockTransactionCountByNumber" => {
             let tx_count = operations::eth_get_block_transaction_count_by_number(&client, block_number)
@@ -245,7 +239,6 @@ async fn test_eth_block_rpc(#[case] test_name: &str) {
                 .expect("Failed to get block transaction count by number");
             
             println!("EthGetBlockTransactionCountByNumber result: {}", tx_count);
-            // Transaction count can be 0 or more
         }
         "EthGetTransactionByBlockHashAndIndex" => {
             let tx = operations::eth_get_transaction_by_block_hash_and_index(&client, &block_hash, "0x0")
@@ -253,7 +246,6 @@ async fn test_eth_block_rpc(#[case] test_name: &str) {
                 .expect("Failed to get transaction by block hash and index");
             
             println!("EthGetTransactionByBlockHashAndIndex result: {:?}", tx);
-            // Transaction may be null if block has no transactions
         }
         "EthGetTransactionByBlockNumberAndIndex" => {
             let tx = operations::eth_get_transaction_by_block_number_and_index(&client, block_number, "0x0")
@@ -261,7 +253,6 @@ async fn test_eth_block_rpc(#[case] test_name: &str) {
                 .expect("Failed to get transaction by block number and index");
             
             println!("EthGetTransactionByBlockNumberAndIndex result: {:?}", tx);
-            // Transaction may be null if block has no transactions
         }
         "EthGetBlockReceipts" => {
             let client = operations::create_test_client();
@@ -283,8 +274,6 @@ async fn test_eth_block_rpc(#[case] test_name: &str) {
             println!("Recipient: {}", to_address);
 
             // Perform batch ERC20 token transfers
-            // The transfer_erc20_token_batch function uses the TmpSenderPrivateKey account
-            // which owns all the ERC20 tokens after deployment
             let (tx_hashes, target_block_number, target_block_hash) = 
                 operations::transfer_erc20_token_batch(
                     operations::manager::DEFAULT_L2_NETWORK_URL,
@@ -600,27 +589,6 @@ async fn test_txpool_rpc(#[case] test_name: &str) {
         }
         _ => panic!("Unknown test case: {}", test_name),
     }
-}
-
-#[tokio::test]
-async fn test_deploy_contract() {
-    use xlayer_e2e_test::operations::constants_xlayer::{ContractBBytecodeStr};
-    use xlayer_e2e_test::operations::manager::{DEFAULT_RICH_PRIVATE_KEY, DEFAULT_L2_NETWORK_URL};
-    
-    // Deploy Contract B (no constructor arguments)
-    let contract_address = operations::deploy_contract(
-        DEFAULT_L2_NETWORK_URL,
-        DEFAULT_RICH_PRIVATE_KEY,
-        ContractBBytecodeStr,
-        None,
-    )
-    .await
-    .expect("Failed to deploy Contract B");
-    
-    println!("Contract B deployed at: {:#x}", contract_address);
-    
-    // Verify the address is not zero
-    assert_ne!(contract_address, alloy_primitives::Address::ZERO);
 }
 
 #[rstest::rstest]
@@ -989,153 +957,4 @@ async fn test_new_transaction_types(#[case] test_name: &str) {
         }
         _ => panic!("Unknown test case: {}", test_name),
     }
-}
-
-/// Test that deploys all contracts and caches them for future tests
-/// This test requires a running L2 node. 
-/// Run with: cargo test test_ensure_contracts_deployed --test e2e_tests
-#[tokio::test]
-async fn test_ensure_contracts_deployed() {
-    // This will deploy contracts once and cache them
-    let contracts = operations::ensure_contracts_deployed()
-        .await
-        .expect("Failed to deploy contracts");
-    
-    println!("\nContracts deployed successfully!");
-    println!("ContractA: {:#x}", contracts.contract_a);
-    println!("ContractB: {:#x}", contracts.contract_b);
-    println!("ContractC: {:#x}", contracts.contract_c);
-    println!("Factory: {:#x}", contracts.factory);
-    println!("ERC20: {:#x}", contracts.erc20);
-    println!("Deployment address: {:#x}", contracts.deployment_address);
-    
-    // Verify all addresses are non-zero
-    assert_ne!(contracts.contract_a, alloy_primitives::Address::ZERO);
-    assert_ne!(contracts.contract_b, alloy_primitives::Address::ZERO);
-    assert_ne!(contracts.contract_c, alloy_primitives::Address::ZERO);
-    assert_ne!(contracts.factory, alloy_primitives::Address::ZERO);
-    assert_ne!(contracts.erc20, alloy_primitives::Address::ZERO);
-    
-    // Call it again to verify caching works
-    let contracts2 = operations::ensure_contracts_deployed()
-        .await
-        .expect("Failed to get cached contracts");
-    
-    // Should return the same addresses
-    assert_eq!(contracts.contract_a, contracts2.contract_a);
-    assert_eq!(contracts.contract_b, contracts2.contract_b);
-    println!("\nContract caching verified!");
-}
-
-#[tokio::test]
-async fn test_erc20_transfer() {
-    let client = operations::create_test_client();
-    
-    // Deploy contracts and get ERC20 address
-    let contracts = operations::ensure_contracts_deployed()
-        .await
-        .expect("Failed to deploy contracts");
-    
-    println!("ERC20 contract at: {:#x}", contracts.erc20);
-    println!("Deployment address (token holder): {:#x}", contracts.deployment_address);
-    
-    // Configuration for batch transfer
-    let batch_size = 5; // Send 5 ERC20 transfers
-    let amount = U256::from(100u128) * U256::from(10u128).pow(U256::from(18u128)); // 100 tokens per transfer
-    let to_address = operations::manager::DEFAULT_L2_NEW_ACC1_ADDRESS;
-    
-    println!("Performing batch transfer of {} transactions", batch_size);
-    println!("Amount per transfer: {} tokens", amount / U256::from(10u128).pow(U256::from(18u128)));
-    println!("Recipient: {}", to_address);
-    
-    // Perform batch ERC20 token transfers
-    // The transfer_erc20_token_batch function uses the TmpSenderPrivateKey account
-    // which owns all the ERC20 tokens after deployment
-    let (tx_hashes, target_block_number, target_block_hash) = 
-        operations::transfer_erc20_token_batch(
-            operations::manager::DEFAULT_L2_NETWORK_URL,
-            contracts.erc20,
-            amount,
-            to_address,
-            batch_size,
-        )
-        .await
-        .expect("Failed to perform batch ERC20 transfers");
-    
-    println!("Batch transfers completed in block #{} ({})", target_block_number, target_block_hash);
-    println!("Number of transactions: {}", tx_hashes.len());
-    
-    // Verify the correct number of transactions were created
-    assert_eq!(tx_hashes.len(), batch_size, "Should have {} transaction hashes", batch_size);
-    
-    // Verify all transaction hashes are valid
-    for (i, tx_hash) in tx_hashes.iter().enumerate() {
-        println!("Transaction {}: {}", i + 1, tx_hash);
-        assert!(tx_hash.starts_with("0x"), "Transaction hash {} should start with 0x", i);
-        assert_eq!(tx_hash.len(), 66, "Transaction hash {} should be 66 characters", i);
-    }
-    
-    // Verify block number and hash
-    assert!(target_block_number > 0, "Block number should be greater than 0");
-    assert!(target_block_hash.starts_with("0x"), "Block hash should start with 0x");
-    assert_eq!(target_block_hash.len(), 66, "Block hash should be 66 characters");
-    
-    // Get receipts for all transactions to verify they were all successful
-    for (i, tx_hash) in tx_hashes.iter().enumerate() {
-        let receipt = operations::eth_get_transaction_receipt(&client, tx_hash)
-            .await
-            .expect(&format!("Failed to get receipt for transaction {}", i));
-        
-        assert!(!receipt.is_null(), "Transaction receipt {} should not be null", i);
-        
-        // Verify transaction was successful
-        let status = receipt["status"]
-            .as_str()
-            .expect(&format!("Status field not found in receipt {}", i));
-        assert_eq!(status, "0x1", "Transaction {} should be successful", i);
-        
-        println!("Transaction {} verified successfully", i + 1);
-    }
-    
-    // Test getting block receipts by block number
-    let receipts_by_number = operations::eth_get_block_receipts(
-        &client, 
-        operations::BlockId::Number(target_block_number)
-    )
-    .await
-    .expect("Failed to get block receipts by number");
-    
-    assert!(!receipts_by_number.is_null(), "Block receipts should not be null");
-    
-    if let Some(receipts_array) = receipts_by_number.as_array() {
-        println!("Number of receipts in block: {}", receipts_array.len());
-        assert!(receipts_array.len() >= batch_size, 
-            "Should have at least {} receipts in the block", batch_size);
-    } else {
-        panic!("Block receipts should be an array");
-    }
-    
-    // Test getting block receipts by block hash
-    let receipts_by_hash = operations::eth_get_block_receipts(
-        &client, 
-        operations::BlockId::Hash(target_block_hash.clone())
-    )
-    .await
-    .expect("Failed to get block receipts by hash");
-    
-    assert!(!receipts_by_hash.is_null(), "Block receipts by hash should not be null");
-    
-    if let Some(receipts_array) = receipts_by_hash.as_array() {
-        println!("Number of receipts in block (by hash): {}", receipts_array.len());
-        assert!(receipts_array.len() >= batch_size, 
-            "Should have at least {} receipts in the block", batch_size);
-    } else {
-        panic!("Block receipts by hash should be an array");
-    }
-    
-    println!("\nERC20 batch transfer test passed!");
-    println!("✓ {} transactions sent successfully", batch_size);
-    println!("✓ All transactions mined in block #{}", target_block_number);
-    println!("✓ All transactions verified with status = success");
-    println!("✓ Block receipts retrieved successfully");
 }

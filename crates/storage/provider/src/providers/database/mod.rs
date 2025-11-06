@@ -101,6 +101,10 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
         self
     }
 
+    /// Sets the genesis block number for the static file provider.
+    ///
+    /// This method configures the genesis block number used by the underlying static file
+    /// provider for proper block range handling.
     pub fn with_genesis_block_number(mut self, genesis_block_number: u64) -> Self {
         self.static_file_provider.set_genesis_block_number(genesis_block_number);
         self

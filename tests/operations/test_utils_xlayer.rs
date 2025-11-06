@@ -11,8 +11,16 @@ use std::str::FromStr;
 use tokio::time::{sleep, Duration};
 
 use super::manager::{DEFAULT_RICH_PRIVATE_KEY, DEFAULT_TIMEOUT_TX_TO_BE_MINED};
+use super::HttpClient;
 
-const TmpSenderPrivateKey : &str = "363ea277eec54278af051fb574931aec751258450a286edce9e1f64401f3b9c8";
+const TMP_SENDER_PRIVATE_KEY : &str = "363ea277eec54278af051fb574931aec751258450a286edce9e1f64401f3b9c8";
+
+/// Creates an HTTP client for the local test RPC endpoint
+pub fn create_test_client() -> HttpClient {
+    HttpClient::builder()
+        .build("http://localhost:8124")
+        .expect("Failed to create HTTP client")
+}
 
 /// Transfers tokens from a specific private key to an address
 ///
@@ -30,7 +38,6 @@ pub async fn transfer_token_with_from(
     amount: U256,
     to_address: &str,
 ) -> Result<String> {
-    // Parse the private key (strip 0x prefix if present)
     let key_str = from_private_key.trim_start_matches("0x");
     let signer = PrivateKeySigner::from_str(key_str)
         .map_err(|e| eyre!("Failed to parse private key: {}", e))?;
@@ -183,11 +190,17 @@ pub async fn deploy_contract(
 /// Holds addresses of all deployed test contracts
 #[derive(Debug, Clone)]
 pub struct DeployedContracts {
+    /// Address of Contract A
     pub contract_a: Address,
+    /// Address of Contract B
     pub contract_b: Address,
+    /// Address of Contract C
     pub contract_c: Address,
+    /// Address of the contract factory
     pub factory: Address,
+    /// Address of the ERC20 token contract
     pub erc20: Address,
+    /// Address used for contract deployment
     pub deployment_address: Address,
 }
 
@@ -219,7 +232,7 @@ pub async fn ensure_contracts_deployed() -> Result<&'static DeployedContracts> {
     println!("=== Starting contract deployment ===");
 
     // Get deployment address from TmpSenderPrivateKey
-    let deployment_signer = PrivateKeySigner::from_str(TmpSenderPrivateKey)?;
+    let deployment_signer = PrivateKeySigner::from_str(TMP_SENDER_PRIVATE_KEY)?;
     let deployment_address = deployment_signer.address();
     
     println!("Deployment address: {:#x}", deployment_address);
@@ -251,8 +264,8 @@ pub async fn ensure_contracts_deployed() -> Result<&'static DeployedContracts> {
     println!("Deploying ContractB...");
     let contract_b = deploy_contract(
         DEFAULT_L2_NETWORK_URL,
-        TmpSenderPrivateKey,
-        ContractBBytecodeStr,
+        TMP_SENDER_PRIVATE_KEY,
+        CONTRACT_B_BYTECODE_STR,
         None,
     )
     .await?;
@@ -263,8 +276,8 @@ pub async fn ensure_contracts_deployed() -> Result<&'static DeployedContracts> {
     let contract_a_constructor_args = contract_b.abi_encode();
     let contract_a = deploy_contract(
         DEFAULT_L2_NETWORK_URL,
-        TmpSenderPrivateKey,
-        ContractABytecodeStr,
+        TMP_SENDER_PRIVATE_KEY,
+        CONTRACT_A_BYTECODE_STR,
         Some(Bytes::from(contract_a_constructor_args)),
     )
     .await?;
@@ -274,8 +287,8 @@ pub async fn ensure_contracts_deployed() -> Result<&'static DeployedContracts> {
     println!("Deploying ContractFactory...");
     let factory = deploy_contract(
         DEFAULT_L2_NETWORK_URL,
-        TmpSenderPrivateKey,
-        ContractFactoryBytecodeStr,
+        TMP_SENDER_PRIVATE_KEY,
+        CONTRACT_FACTORY_BYTECODE_STR,
         None,
     )
     .await?;
@@ -285,8 +298,8 @@ pub async fn ensure_contracts_deployed() -> Result<&'static DeployedContracts> {
     println!("Deploying ContractC...");
     let contract_c = deploy_contract(
         DEFAULT_L2_NETWORK_URL,
-        TmpSenderPrivateKey,
-        ContractCBytecodeStr,
+        TMP_SENDER_PRIVATE_KEY,
+        CONTRACT_C_BYTECODE_STR,
         None,
     )
     .await?;
@@ -296,8 +309,8 @@ pub async fn ensure_contracts_deployed() -> Result<&'static DeployedContracts> {
     println!("Deploying ERC20...");
     let erc20 = deploy_contract(
         DEFAULT_L2_NETWORK_URL,
-        TmpSenderPrivateKey,
-        Erc20BytecodeStr,
+        TMP_SENDER_PRIVATE_KEY,
+        ERC20_BYTECODE_STR,
         None,
     )
     .await?;
@@ -495,7 +508,7 @@ pub async fn transfer_erc20_token_batch(
     let to = Address::from_str(to_address)?;
 
     // Create provider to get gas price and nonce
-    let key_str = TmpSenderPrivateKey.trim_start_matches("0x");
+    let key_str = TMP_SENDER_PRIVATE_KEY.trim_start_matches("0x");
     let signer = PrivateKeySigner::from_str(key_str)?;
     let from_address = signer.address();
 
@@ -517,7 +530,7 @@ pub async fn transfer_erc20_token_batch(
         let nonce = start_nonce + i as u64;
         let tx_hash = erc20_transfer_tx(
             rpc_url,
-            TmpSenderPrivateKey,
+            TMP_SENDER_PRIVATE_KEY,
             amount,
             Some(gas_price),
             to,
@@ -532,7 +545,7 @@ pub async fn transfer_erc20_token_batch(
     // Send the last transaction with the starting nonce
     let tx_hash = erc20_transfer_tx(
         rpc_url,
-        TmpSenderPrivateKey,
+        TMP_SENDER_PRIVATE_KEY,
         amount,
         Some(gas_price),
         to,
