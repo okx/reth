@@ -123,7 +123,8 @@ impl ApolloService {
         })
     }
 
-    pub(crate) fn get_instance() -> Result<Arc<ApolloService>, ApolloError> {
+    /// Get singleton instance
+    pub fn get_instance() -> Result<Arc<ApolloService>, ApolloError> {
         INSTANCE
             .get()
             .cloned()
@@ -233,7 +234,8 @@ impl ApolloService {
         }
     }
 
-    pub(crate) fn try_get_cached_config(&self, namespace: &str, key: &str) -> Option<ConfigValue> {
+    /// Try to get cached config from cache
+    pub fn try_get_cached_config(&self, namespace: &str, key: &str) -> Option<ConfigValue> {
         let cache_key = make_cache_key(namespace, key);
         debug!(target: "reth::apollo", "[Apollo] Getting cached config for namespace {}: key: {:?}", namespace, cache_key);
         self.cache.get(&cache_key)

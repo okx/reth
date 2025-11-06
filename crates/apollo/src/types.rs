@@ -26,8 +26,8 @@ pub enum ApolloError {
     InvalidNamespace(String),
 }
 
-#[allow(dead_code)]
-pub(crate) trait FromConfigValue: Sized {
+/// Trait to convert from ConfigValue to concrete type
+pub trait FromConfigValue: Sized {
     /// Convert from ConfigValue to concrete type
     fn try_from_config_value(value: &ConfigValue) -> Option<Self>;
 }
@@ -88,9 +88,9 @@ where
     }
 }
 
-#[allow(dead_code)]
+/// ConfigValue enum
 #[derive(Debug, Clone)]
-pub(crate) enum ConfigValue {
+pub enum ConfigValue {
     /// 64-bit unsigned integer
     U64(u64),
     /// 32-bit unsigned integer
@@ -109,6 +109,7 @@ pub(crate) enum ConfigValue {
     Array(Vec<ConfigValue>),
 }
 
+/// ConfigValue implementation
 impl ConfigValue {
     /// Parse from JsonValue once during cache update
     pub(crate) fn try_from_json(value: &JsonValue) -> Option<Self> {
