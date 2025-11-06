@@ -39,7 +39,7 @@ impl BatchProducer {
     }
 
     pub(crate) async fn send_message(&self, msg: ProducerMessage) -> Result<(), KafkaError> {
-        self.buffer_tx.send(msg).await.map_err(|e| KafkaError::ChannelError(e.to_string()))
+        self.buffer_tx.send(msg).await.map_err(|e| KafkaError::MessageForward(e.to_string()))
     }
 
     async fn handle(
@@ -81,7 +81,7 @@ impl BatchProducer {
         }
     }
 
-    pub(crate) async fn close(self) -> Result<(), KafkaError> {
+    pub(crate) async fn try_close(self) -> Result<(), KafkaError> {
         self.shutdown_tx.send(()).await.map_err(|e| KafkaError::ChannelError(e.to_string()))?;
 
         self.handle_task.await.map_err(|e| KafkaError::ChannelError(e.to_string()))?;

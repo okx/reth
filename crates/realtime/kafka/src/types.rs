@@ -3,10 +3,6 @@ use serde::{Deserialize, Serialize};
 /// Kafka error
 #[derive(Debug, thiserror::Error)]
 pub enum KafkaError {
-    /// Internal channel for buffering messages is full
-    #[error("message buffer is full, cannot accept more messages")]
-    BufferFull,
-
     /// Internal channel error
     #[error("internal channel error: {0}")]
     ChannelError(String),
@@ -73,23 +69,27 @@ pub struct KafkaConfig {
 /// Block info message
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlockInfo {
+    /// The header of the block
     pub header: String,
 }
 
 /// Transaction message
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TxMsg {
+    /// The block number of the transaction
     pub block_number: u64,
 }
 
 /// Error message
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorMsg {
+    /// The block number of the error
     pub block_number: u64,
 }
 
 /// Error trigger message
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorTriggerMessage {
+    /// The block number of the error trigger
     pub block_number: u64,
 }

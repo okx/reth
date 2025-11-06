@@ -33,7 +33,8 @@ impl KafkaConsumer {
             .set("group.id", &config.group_id)
             .set("auto.offset.reset", offset)
             .set("enable.auto.commit", "false")
-            .create()?;
+            .create()
+            .map_err(|e| KafkaError::ConsumerCreation(e.to_string()))?;
 
         Ok(Self { consumer, config })
     }
@@ -144,8 +145,7 @@ impl KafkaConsumer {
     }
 
     /// Closes the Kafka consumer
-    pub fn close(self) -> Result<(), KafkaError> {
-        self.consumer.unsubscribe();
-        Ok(())
+    pub fn close(self) {
+        self.consumer.unsubscribe()
     }
 }

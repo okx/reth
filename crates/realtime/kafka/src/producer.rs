@@ -20,7 +20,9 @@ impl KafkaProducer {
         config: KafkaConfig,
         success_chan: Option<mpsc::Sender<()>>,
     ) -> Result<Self, KafkaError> {
-        let producer: BatchProducer = BatchProducer::new(config.clone(), success_chan).await?;
+        let producer: BatchProducer = BatchProducer::new(config.clone(), success_chan)
+            .await
+            .map_err(|e| KafkaError::ProducerCreation(e.to_string()))?;
         tracing::info!(target: "reth::realtime::kafka",
             "[Realtime] kafka producer created and listening to servers: {:?}",
             config.bootstrap_servers
@@ -29,13 +31,13 @@ impl KafkaProducer {
     }
 
     /// Closes the Kafka producer
-    pub async fn close(self) -> Result<(), KafkaError> {
-        self.producer.close().await?;
+    pub async fn try_close(self) -> Result<(), KafkaError> {
+        self.producer.try_close().await?;
         Ok(())
     }
 
     /// Sends a Kafka transaction message
-    pub async fn send_kafka_transaction<T: Serialize>(
+    pub async fn try_send_kafka_transaction<T: Serialize>(
         &self,
         tx_hash: String,
         message: &T,
@@ -53,7 +55,7 @@ impl KafkaProducer {
     }
 
     /// Sends a Kafka block info message
-    pub async fn send_kafka_block_info<T: Serialize>(
+    pub async fn try_send_kafka_block_info<T: Serialize>(
         &self,
         block_number: u64,
         message: &T,
@@ -71,7 +73,7 @@ impl KafkaProducer {
     }
 
     /// Sends a Kafka error trigger message
-    pub async fn send_kafka_error_trigger(&self, block_number: u64) -> Result<(), KafkaError> {
+    pub async fn try_send_kafka_error_trigger(&self, block_number: u64) -> Result<(), KafkaError> {
         let message = ErrorTriggerMessage { block_number };
 
         let json_data = serde_json::to_vec(&message).map_err(|e| KafkaError::Serialization(e))?;
@@ -86,7 +88,8 @@ impl KafkaProducer {
         Ok(())
     }
 
-    pub async fn send_kafka_flashblock<T: Serialize>(
+    /// Sends a Kafka flashblock message
+    pub async fn try_send_kafka_flashblock<T: Serialize>(
         &self,
         payload_id: PayloadId,
         flashblock: &T,

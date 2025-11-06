@@ -96,7 +96,7 @@ mod tests {
         // Send block message
         let block_msg = TestBlockMessage { number: 12345, hash: "0xabc123".into() };
 
-        producer.send_kafka_block_info(12345, &block_msg).await.unwrap();
+        producer.try_send_kafka_block_info(12345, &block_msg).await.unwrap();
 
         // Wait for success callback
         tokio::time::timeout(Duration::from_secs(2), success_rx.recv()).await.unwrap();
@@ -110,7 +110,7 @@ mod tests {
         // Send transaction message
         let tx_msg = TestTxMessage { tx_hash: "0xdef456".into(), block_number: 12345 };
 
-        producer.send_kafka_transaction("0xdef456".to_string(), &tx_msg).await.unwrap();
+        producer.try_send_kafka_transaction("0xdef456".to_string(), &tx_msg).await.unwrap();
 
         // Wait for success callback
         tokio::time::timeout(Duration::from_secs(2), success_rx.recv()).await.unwrap();
@@ -122,7 +122,7 @@ mod tests {
         println!("Transaction message successfully received");
 
         // Send error trigger
-        producer.send_kafka_error_trigger(12345).await.unwrap();
+        producer.try_send_kafka_error_trigger(12345).await.unwrap();
 
         // Wait for success callback
         tokio::time::timeout(Duration::from_secs(2), success_rx.recv()).await.unwrap();
@@ -141,7 +141,10 @@ mod tests {
             diff: ExecutionPayloadFlashblockDeltaV1::default(),
             metadata: Metadata::default(),
         };
-        producer.send_kafka_flashblock(flashblock_msg.payload_id, &flashblock_msg).await.unwrap();
+        producer
+            .try_send_kafka_flashblock(flashblock_msg.payload_id, &flashblock_msg)
+            .await
+            .unwrap();
 
         // Wait for success callback
         tokio::time::timeout(Duration::from_secs(2), success_rx.recv()).await.unwrap();
@@ -155,7 +158,7 @@ mod tests {
 
         // Cleanup
         shutdown_tx.send(()).await.unwrap();
-        producer.close().await.unwrap();
+        producer.try_close().await.unwrap();
         println!("Kafka test passed");
     }
 }
