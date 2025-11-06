@@ -1,0 +1,839 @@
+name: X Layer Scheduled CI
+
+# Schedule daily runs at 5:00 PM Beijing Time (UTC+8)
+on:
+  schedule:
+    - cron: '0 9 * * *'   # 17:00 Beijing Time (UTC+8)
+  workflow_dispatch:      # Allow manual trigger
+
+# Ensure only one workflow runs at a time
+concurrency:
+  group: scheduler-xlayer-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  SEED: rustethereumethereumrust
+  RUST_BACKTRACE: 1
+
+jobs:
+  ##############################################################################
+  # Phase 0: Sync from Upstream
+  ##############################################################################
+
+  sync-upstream:
+    name: Sync from upstream (okx/reth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/okx/reth.git || true
+          git remote -v
+
+      - name: Fetch upstream
+        run: |
+          echo "Fetching from upstream okx/reth..."
+          git fetch upstream dev
+
+      - name: Merge upstream/dev into current branch
+        id: merge
+        continue-on-error: true
+        run: |
+          echo "Current branch: $(git branch --show-current)"
+          echo "Attempting to merge upstream/dev..."
+
+          if git merge --no-edit upstream/dev; then
+            echo "✅ Merge successful"
+            echo "merge_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Merge conflict detected"
+            echo "merge_status=conflict" >> $GITHUB_OUTPUT
+            git merge --abort
+            exit 1
+          fi
+
+      - name: Push merged changes
+        if: steps.merge.outputs.merge_status == 'success'
+        run: |
+          echo "Pushing changes to origin..."
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Generate sync summary
+        if: always()
+        run: |
+          echo "## 🔄 Upstream Sync Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Upstream:** https://github.com/okx/reth (dev branch)" >> $GITHUB_STEP_SUMMARY
+          echo "**Target Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ steps.merge.outputs.merge_status }}" == "success" ]]; then
+            echo "✅ **Successfully synced from upstream**" >> $GITHUB_STEP_SUMMARY
+
+            # Show recent commits from upstream
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Recent Upstream Changes" >> $GITHUB_STEP_SUMMARY
+            git log --oneline --graph --decorate -10 >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Merge conflict detected**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ Please resolve conflicts manually:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Clone the repository" >> $GITHUB_STEP_SUMMARY
+            echo "2. Run: \`git remote add upstream https://github.com/okx/reth.git\`" >> $GITHUB_STEP_SUMMARY
+            echo "3. Run: \`git fetch upstream\`" >> $GITHUB_STEP_SUMMARY
+            echo "4. Run: \`git merge upstream/dev\`" >> $GITHUB_STEP_SUMMARY
+            echo "5. Resolve conflicts and push" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Fail workflow if merge conflict
+        if: steps.merge.outputs.merge_status != 'success'
+        run: |
+          echo "::error::Merge conflict detected. Please resolve manually."
+          exit 1
+
+  ##############################################################################
+  # Phase 1: Security Audit
+  ##############################################################################
+
+  security-audit:
+    needs: [sync-upstream]
+    name: Security Audit - RustSec Vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        id: audit
+        continue-on-error: true
+        run: |
+          cargo audit --json > audit-report.json
+          cargo audit
+
+      - name: Generate audit summary
+        if: always()
+        run: |
+          echo "## 🔒 Security Audit (RustSec)" >> $GITHUB_STEP_SUMMARY
+          if [ -f audit-report.json ]; then
+            vulnerabilities=$(jq '.vulnerabilities.count' audit-report.json 2>/dev/null || echo "0")
+            warnings=$(jq '.warnings | length' audit-report.json 2>/dev/null || echo "0")
+
+            if [ "$vulnerabilities" -gt 0 ]; then
+              echo "❌ **Found $vulnerabilities vulnerabilities**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              jq -r '.vulnerabilities.list[] | "### [\(.advisory.id)](\(.advisory.url))\n- **Crate:** `\(.package.name)` \(.package.version)\n- **Severity:** \(.advisory.cvss // "N/A")\n- **Description:** \(.advisory.title)\n"' audit-report.json >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+            else
+              echo "✅ **No known vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            if [ "$warnings" -gt 0 ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ **$warnings warnings**" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "✅ **No known vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-report
+          path: audit-report.json
+          retention-days: 30
+
+  cargo-deny:
+    needs: [sync-upstream]
+    name: Security Audit - Cargo Deny Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        checks:
+          - advisories
+          - licenses
+          - bans
+          - sources
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Run cargo deny - ${{ matrix.checks }}
+        id: deny_check
+        continue-on-error: true
+        run: |
+          echo "## 📋 Cargo Deny - ${{ matrix.checks }}" >> $GITHUB_STEP_SUMMARY
+          if cargo deny check ${{ matrix.checks }} --format json > deny-${{ matrix.checks }}.json 2>&1; then
+            echo "✅ **${{ matrix.checks }} check passed**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **${{ matrix.checks }} check failed**" >> $GITHUB_STEP_SUMMARY
+            cat deny-${{ matrix.checks }}.json >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+          fi
+
+      - name: Upload deny report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-deny-${{ matrix.checks }}
+          path: deny-${{ matrix.checks }}.json
+          retention-days: 30
+
+  license-compliance:
+    needs: [sync-upstream]
+    name: Security Audit - License Compliance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-license
+        run: cargo install cargo-license --locked
+
+      - name: Generate license report
+        run: |
+          echo "## 📜 License Compliance Report" >> $GITHUB_STEP_SUMMARY
+          cargo license --json > licenses.json
+
+          # Count licenses
+          total=$(jq '. | length' licenses.json)
+          echo "- **Total dependencies:** $total" >> $GITHUB_STEP_SUMMARY
+
+          # List unique licenses
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### License Summary" >> $GITHUB_STEP_SUMMARY
+          jq -r '[.[].license] | group_by(.) | map({license: .[0], count: length}) | sort_by(-.count) | .[] | "- **\(.license // "Unknown")**: \(.count) crates"' licenses.json >> $GITHUB_STEP_SUMMARY
+
+      - name: Check for problematic licenses
+        continue-on-error: true
+        run: |
+          # Check for copyleft licenses (GPL, AGPL, etc.)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ⚠️ Copyleft License Check" >> $GITHUB_STEP_SUMMARY
+
+          if jq -e '.[] | select(.license | test("GPL|AGPL|LGPL"; "i"))' licenses.json > copyleft.json 2>/dev/null && [ -s copyleft.json ]; then
+            echo "Found dependencies with copyleft licenses:" >> $GITHUB_STEP_SUMMARY
+            jq -r '.[] | "- `\(.name)` \(.version): **\(.license)**"' copyleft.json >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ No copyleft licenses found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload license report
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-report
+          path: licenses.json
+          retention-days: 30
+
+  ##############################################################################
+  # Phase 2: Test Suite
+  ##############################################################################
+
+  unit-tests:
+    needs: [sync-upstream]
+    name: Unit Tests - ${{ matrix.type }}
+    runs-on:
+      group: Reth
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - type: ethereum
+            args: --features "asm-keccak ethereum" --locked
+          - type: optimism
+            args: --features "asm-keccak" --locked --exclude reth --exclude reth-bench --exclude "example-*" --exclude "reth-ethereum-*" --exclude "*-ethereum"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run unit tests
+        run: |
+          cargo nextest run \
+            ${{ matrix.args }} --workspace \
+            --exclude ef-tests --no-tests=warn \
+            -E "!kind(test) and not binary(e2e_testsuite)"
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          echo "## 🧪 Unit Tests - ${{ matrix.type }}" >> $GITHUB_STEP_SUMMARY
+          if [ $? -eq 0 ]; then
+            echo "✅ **All tests passed**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Some tests failed**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  integration-tests:
+    needs: [sync-upstream]
+    name: Integration Tests - ${{ matrix.network }}
+    runs-on:
+      group: Reth
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        network: ["ethereum", "optimism"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Install Geth
+        if: matrix.network == 'ethereum'
+        run: .github/assets/install_geth.sh
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run integration tests (ethereum)
+        if: matrix.network == 'ethereum'
+        run: |
+          cargo nextest run \
+            --locked --features "asm-keccak ${{ matrix.network }}" \
+            --workspace --exclude ef-tests \
+            -E "kind(test) and not binary(e2e_testsuite)"
+
+      - name: Run integration tests (optimism)
+        if: matrix.network == 'optimism'
+        run: |
+          cargo nextest run \
+            --locked -p reth-optimism-node
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          echo "## 🔗 Integration Tests - ${{ matrix.network }}" >> $GITHUB_STEP_SUMMARY
+          if [ $? -eq 0 ]; then
+            echo "✅ **All tests passed**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Some tests failed**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  e2e-tests:
+    needs: [sync-upstream]
+    name: E2E Tests
+    runs-on:
+      group: Reth
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run e2e tests
+        run: |
+          cargo nextest run \
+            --locked --features "asm-keccak" \
+            --workspace \
+            --exclude 'example-*' \
+            --exclude 'exex-subscription' \
+            --exclude 'reth-bench' \
+            --exclude 'ef-tests' \
+            --exclude 'op-reth' \
+            --exclude 'reth' \
+            -E 'binary(e2e_testsuite)'
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          echo "## 🎯 E2E Tests" >> $GITHUB_STEP_SUMMARY
+          if [ $? -eq 0 ]; then
+            echo "✅ **All tests passed**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Some tests failed**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  ethereum-state-tests:
+    needs: [sync-upstream]
+    name: Ethereum State Tests
+    runs-on:
+      group: Reth
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Checkout ethereum/tests
+        uses: actions/checkout@v5
+        with:
+          repository: ethereum/tests
+          ref: 81862e4848585a438d64f911a19b3825f0f4cd95
+          path: testing/ef-tests/ethereum-tests
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Download & extract EEST fixtures
+        shell: bash
+        env:
+          EEST_TESTS_TAG: v4.5.0
+        run: |
+          set -euo pipefail
+          mkdir -p testing/ef-tests/execution-spec-tests
+          URL="https://github.com/ethereum/execution-spec-tests/releases/download/${EEST_TESTS_TAG}/fixtures_stable.tar.gz"
+          curl -L "$URL" | tar -xz --strip-components=1 -C testing/ef-tests/execution-spec-tests
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run EF tests
+        run: cargo nextest run --release -p ef-tests --features "asm-keccak ef-tests"
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          echo "## ⚡ Ethereum State Tests" >> $GITHUB_STEP_SUMMARY
+          if [ $? -eq 0 ]; then
+            echo "✅ **All EF tests passed**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Some EF tests failed**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  ##############################################################################
+  # Phase 3: Summary & Notification
+  ##############################################################################
+
+  summary:
+    name: Generate Summary Report
+    runs-on: ubuntu-latest
+    needs:
+      - sync-upstream
+      - security-audit
+      - cargo-deny
+      - license-compliance
+      - unit-tests
+      - integration-tests
+      - e2e-tests
+      - ethereum-state-tests
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+
+      - name: Generate comprehensive summary
+        run: |
+          echo "# 📊 X Layer Scheduled CI Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 🔍 Results Overview" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Category | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          # Upstream Sync
+          if [[ "${{ needs.sync-upstream.result }}" == "success" ]]; then
+            echo "| Upstream Sync | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Upstream Sync | ❌ Failed (Conflict) |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Security Audit
+          if [[ "${{ needs.security-audit.result }}" == "success" ]]; then
+            echo "| Security Audit (RustSec) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Security Audit (RustSec) | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Cargo Deny
+          if [[ "${{ needs.cargo-deny.result }}" == "success" ]]; then
+            echo "| Cargo Deny Checks | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Cargo Deny Checks | ⚠️ Issues Found |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # License Compliance
+          if [[ "${{ needs.license-compliance.result }}" == "success" ]]; then
+            echo "| License Compliance | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| License Compliance | ⚠️ Issues Found |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Unit Tests
+          if [[ "${{ needs.unit-tests.result }}" == "success" ]]; then
+            echo "| Unit Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Unit Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Integration Tests
+          if [[ "${{ needs.integration-tests.result }}" == "success" ]]; then
+            echo "| Integration Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Integration Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # E2E Tests
+          if [[ "${{ needs.e2e-tests.result }}" == "success" ]]; then
+            echo "| E2E Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| E2E Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # EF Tests
+          if [[ "${{ needs.ethereum-state-tests.result }}" == "success" ]]; then
+            echo "| Ethereum State Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Ethereum State Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Overall Status
+          if [[ "${{ needs.sync-upstream.result }}" == "success" ]] && \
+             [[ "${{ needs.security-audit.result }}" == "success" ]] && \
+             [[ "${{ needs.cargo-deny.result }}" == "success" ]] && \
+             [[ "${{ needs.unit-tests.result }}" == "success" ]] && \
+             [[ "${{ needs.integration-tests.result }}" == "success" ]] && \
+             [[ "${{ needs.e2e-tests.result }}" == "success" ]] && \
+             [[ "${{ needs.ethereum-state-tests.result }}" == "success" ]]; then
+            echo "## ✅ Overall Status: SUCCESS" >> $GITHUB_STEP_SUMMARY
+            echo "all_passed" > status.txt
+          else
+            echo "## ❌ Overall Status: FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "some_failed" > status.txt
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "View detailed logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-summary
+          path: status.txt
+          retention-days: 30
+
+
+  notify:
+    name: Send Lark Notification
+    runs-on: ubuntu-latest
+    needs: [summary, sync-upstream, security-audit, cargo-deny, license-compliance, unit-tests, integration-tests, e2e-tests, ethereum-state-tests]
+    if: always()
+    steps:
+      - name: Determine Status and Send Notification
+        env:
+          LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+        run: |
+          # Determine overall status and color
+          if [[ "${{ needs.summary.result }}" == "success" ]]; then
+            CARD_COLOR="green"
+            STATUS_TEXT="✅ 所有任务成功"
+            STATUS_EMOJI="✅"
+          else
+            CARD_COLOR="red"
+            STATUS_TEXT="❌ 部分任务失败"
+            STATUS_EMOJI="❌"
+          fi
+
+          # Get current time in Beijing timezone
+          CURRENT_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
+          COMMIT_SHORT="${GITHUB_SHA:0:8}"
+
+          # Build status for each check
+          get_status_icon() {
+            if [[ "$1" == "success" ]]; then
+              echo "✅"
+            else
+              echo "❌"
+            fi
+          }
+
+          SYNC_ICON=$(get_status_icon "${{ needs.sync-upstream.result }}")
+          AUDIT_ICON=$(get_status_icon "${{ needs.security-audit.result }}")
+          DENY_ICON=$(get_status_icon "${{ needs.cargo-deny.result }}")
+          LICENSE_ICON=$(get_status_icon "${{ needs.license-compliance.result }}")
+          UNIT_ICON=$(get_status_icon "${{ needs.unit-tests.result }}")
+          INTEGRATION_ICON=$(get_status_icon "${{ needs.integration-tests.result }}")
+          E2E_ICON=$(get_status_icon "${{ needs.e2e-tests.result }}")
+          EF_ICON=$(get_status_icon "${{ needs.ethereum-state-tests.result }}")
+
+          # Build Lark Card JSON
+          cat > lark_card.json <<EOF
+          {
+            "msg_type": "interactive",
+            "card": {
+              "header": {
+                "title": {
+                  "tag": "plain_text",
+                  "content": "${STATUS_EMOJI} X Layer Reth 定时 CI 报告"
+                },
+                "template": "${CARD_COLOR}"
+              },
+              "elements": [
+                {
+                  "tag": "div",
+                  "fields": [
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "**📅 运行时间**\n${CURRENT_TIME}"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "**🔀 分支**\n${{ github.ref_name }}"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "**📝 Commit**\n${COMMIT_SHORT}"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "**🔢 Run ID**\n${{ github.run_id }}"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "tag": "hr"
+                },
+                {
+                  "tag": "div",
+                  "text": {
+                    "tag": "lark_md",
+                    "content": "**检查项状态**"
+                  }
+                },
+                {
+                  "tag": "div",
+                  "fields": [
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${SYNC_ICON} 上游同步"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${AUDIT_ICON} 安全审计"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${DENY_ICON} 依赖检查"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${LICENSE_ICON} 许可证检查"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${UNIT_ICON} 单元测试"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${INTEGRATION_ICON} 集成测试"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${E2E_ICON} E2E测试"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${EF_ICON} 以太坊状态测试"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "tag": "hr"
+                },
+                {
+                  "tag": "div",
+                  "text": {
+                    "tag": "lark_md",
+                    "content": "**${STATUS_TEXT}**"
+                  }
+                },
+                {
+                  "tag": "action",
+                  "actions": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "查看详细日志"
+                      },
+                      "type": "primary",
+                      "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+          EOF
+
+          # Send to Lark/Feishu
+          if [ -n "$LARK_WEBHOOK_URL" ]; then
+            echo "Sending card notification to Lark..."
+
+            response=$(curl -s -w "\n%{http_code}" -X POST "$LARK_WEBHOOK_URL" \
+              -H 'Content-Type: application/json' \
+              -d @lark_card.json)
+
+            http_code=$(echo "$response" | tail -n1)
+            response_body=$(echo "$response" | head -n-1)
+
+            if [ "$http_code" -eq 200 ]; then
+              echo "✅ Lark notification sent successfully"
+              echo "Response: $response_body"
+            else
+              echo "❌ Failed to send Lark notification"
+              echo "HTTP Code: $http_code"
+              echo "Response: $response_body"
+            fi
+          else
+            echo "⚠️ LARK_WEBHOOK_URL not configured. Skipping notification."
+            echo ""
+            echo "To enable Lark notifications:"
+            echo "1. Go to GitHub repository Settings → Secrets → Actions"
+            echo "2. Add a new secret named 'LARK_WEBHOOK_URL'"
+            echo "3. Paste your Lark webhook URL as the value"
+            echo ""
+            echo "Generated card preview:"
+            cat lark_card.json | jq '.'
+          fi
+
