@@ -1,9 +1,9 @@
 name: X Layer Scheduled CI
 
-# Schedule daily runs at 5:00 PM Beijing Time (UTC+8)
+# Schedule daily runs at 2:00 PM Beijing Time (UTC+8)
 on:
   schedule:
-    - cron: '0 9 * * *'   # 17:00 Beijing Time (UTC+8)
+    - cron: '0 6 * * *'   # 14:00 Beijing Time (UTC+8)
   workflow_dispatch:      # Allow manual trigger
 
 # Ensure only one workflow runs at a time
@@ -320,6 +320,207 @@ jobs:
           fi
 
   ##############################################################################
+  # Phase 1.5: Security Audit
+  ##############################################################################
+
+  security-audit:
+    needs: [sync-upstream]
+    name: Security Audit (cargo audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true  # Don't fail the entire workflow if vulnerabilities found
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        id: audit
+        continue-on-error: true
+        run: |
+          echo "## 🔍 Security Audit Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if cargo audit --json > audit-report.json 2>&1; then
+            echo "✅ **No known vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
+            echo "audit_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ **Vulnerabilities detected**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            # Parse and display vulnerabilities
+            cargo audit 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+
+            echo "audit_status=warning" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-report
+          path: audit-report.json
+          retention-days: 30
+
+  cargo-deny:
+    needs: [sync-upstream]
+    name: Cargo Deny Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Run cargo deny (advisories)
+        continue-on-error: true
+        run: |
+          echo "## 🛡️ Cargo Deny - Security Advisories" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if cargo deny check advisories 2>&1 | tee deny-advisories.log; then
+            echo "✅ **No security advisories issues**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Security advisory issues found**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 50 deny-advisories.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Run cargo deny (licenses)
+        continue-on-error: true
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📜 Cargo Deny - License Compliance" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if cargo deny check licenses 2>&1 | tee deny-licenses.log; then
+            echo "✅ **All licenses compliant**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **License compliance issues found**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 50 deny-licenses.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Run cargo deny (bans)
+        continue-on-error: true
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚫 Cargo Deny - Banned Crates" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if cargo deny check bans 2>&1 | tee deny-bans.log; then
+            echo "✅ **No banned crates detected**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Banned crates or duplicate versions found**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 50 deny-bans.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Run cargo deny (sources)
+        continue-on-error: true
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📦 Cargo Deny - Dependency Sources" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if cargo deny check sources 2>&1 | tee deny-sources.log; then
+            echo "✅ **All dependency sources approved**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Unapproved dependency sources found**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 50 deny-sources.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload deny reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-deny-reports
+          path: deny-*.log
+          retention-days: 30
+
+  license-compliance:
+    needs: [sync-upstream]
+    name: License Compliance Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-license
+        run: cargo install cargo-license --locked
+
+      - name: Generate license report
+        run: |
+          echo "## 📋 Dependency License Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Generate full report
+          cargo license --json > licenses.json
+          cargo license --tsv > licenses.tsv
+
+          # Summary by license type
+          echo "### License Distribution" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| License | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+
+          cargo license --tsv | tail -n +2 | cut -f2 | sort | uniq -c | sort -rn | while read count license; do
+            echo "| $license | $count |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Full license report generated**" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload license reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-reports
+          path: |
+            licenses.json
+            licenses.tsv
+          retention-days: 30
+
+  ##############################################################################
   # Phase 2: Summary & Notification
   ##############################################################################
 
@@ -332,6 +533,9 @@ jobs:
       - integration-tests
       - e2e-tests
       - ethereum-state-tests
+      - security-audit
+      - cargo-deny
+      - license-compliance
     if: always()
     timeout-minutes: 10
     steps:
@@ -394,9 +598,30 @@ jobs:
             echo "| Ethereum State Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
           fi
 
+          # Security Audit
+          if [[ "${{ needs.security-audit.result }}" == "success" ]]; then
+            echo "| Security Audit | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Security Audit | ⚠️ Warning |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Cargo Deny
+          if [[ "${{ needs.cargo-deny.result }}" == "success" ]]; then
+            echo "| Cargo Deny | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Cargo Deny | ⚠️ Warning |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # License Compliance
+          if [[ "${{ needs.license-compliance.result }}" == "success" ]]; then
+            echo "| License Compliance | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| License Compliance | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Overall Status
+          # Overall Status (test failures only, audit failures don't affect overall status)
           if [[ "${{ needs.sync-upstream.result }}" == "success" ]] && \
              [[ "${{ needs.unit-tests.result }}" == "success" ]] && \
              [[ "${{ needs.integration-tests.result }}" == "success" ]] && \
@@ -407,6 +632,17 @@ jobs:
           else
             echo "## ❌ Overall Status: FAILED" >> $GITHUB_STEP_SUMMARY
             echo "some_failed" > status.txt
+          fi
+
+          # Security Status (displayed separately)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ needs.security-audit.result }}" == "success" ]] && \
+             [[ "${{ needs.cargo-deny.result }}" == "success" ]] && \
+             [[ "${{ needs.license-compliance.result }}" == "success" ]]; then
+            echo "### 🔒 Security Status: ALL CLEAR" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Security Status: WARNINGS DETECTED" >> $GITHUB_STEP_SUMMARY
+            echo "Please review security audit reports in artifacts." >> $GITHUB_STEP_SUMMARY
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -424,7 +660,7 @@ jobs:
   notify:
     name: Send Lark Notification
     runs-on: ubuntu-latest
-    needs: [summary, sync-upstream, unit-tests, integration-tests, e2e-tests, ethereum-state-tests]
+    needs: [summary, sync-upstream, unit-tests, integration-tests, e2e-tests, ethereum-state-tests, security-audit, cargo-deny, license-compliance]
     if: always()
     steps:
       - name: Install jq
@@ -441,11 +677,11 @@ jobs:
           # Determine overall status and color
           if [[ "${{ needs.summary.result }}" == "success" ]]; then
             CARD_COLOR="green"
-            STATUS_TEXT="✅ 所有任务成功"
+            STATUS_TEXT="✅ All Tasks Passed"
             STATUS_EMOJI="✅"
           else
             CARD_COLOR="red"
-            STATUS_TEXT="❌ 部分任务失败"
+            STATUS_TEXT="❌ Some Tasks Failed"
             STATUS_EMOJI="❌"
           fi
 
@@ -467,6 +703,9 @@ jobs:
           INTEGRATION_ICON=$(get_status_icon "${{ needs.integration-tests.result }}")
           E2E_ICON=$(get_status_icon "${{ needs.e2e-tests.result }}")
           EF_ICON=$(get_status_icon "${{ needs.ethereum-state-tests.result }}")
+          AUDIT_ICON=$(get_status_icon "${{ needs.security-audit.result }}")
+          DENY_ICON=$(get_status_icon "${{ needs.cargo-deny.result }}")
+          LICENSE_ICON=$(get_status_icon "${{ needs.license-compliance.result }}")
 
           # Build Lark Card JSON
           cat > lark_card.json <<EOF
@@ -476,7 +715,7 @@ jobs:
               "header": {
                 "title": {
                   "tag": "plain_text",
-                  "content": "${STATUS_EMOJI} X Layer Reth 定时 CI 报告"
+                  "content": "${STATUS_EMOJI} X Layer Reth Scheduled CI Report"
                 },
                 "template": "${CARD_COLOR}"
               },
@@ -488,28 +727,28 @@ jobs:
                       "is_short": true,
                       "text": {
                         "tag": "lark_md",
-                        "content": "**📅 运行时间**\n${CURRENT_TIME}"
+                        "content": "**📅 Run Time**\\n${CURRENT_TIME}"
                       }
                     },
                     {
                       "is_short": true,
                       "text": {
                         "tag": "lark_md",
-                        "content": "**🔀 分支**\n${{ github.ref_name }}"
+                        "content": "**🔀 Branch**\\n${{ github.ref_name }}"
                       }
                     },
                     {
                       "is_short": true,
                       "text": {
                         "tag": "lark_md",
-                        "content": "**📝 Commit**\n${COMMIT_SHORT}"
+                        "content": "**📝 Commit**\\n${COMMIT_SHORT}"
                       }
                     },
                     {
                       "is_short": true,
                       "text": {
                         "tag": "lark_md",
-                        "content": "**🔢 Run ID**\n${{ github.run_id }}"
+                        "content": "**🔢 Run ID**\\n${{ github.run_id }}"
                       }
                     }
                   ]
@@ -521,7 +760,7 @@ jobs:
                   "tag": "div",
                   "text": {
                     "tag": "lark_md",
-                    "content": "**检查项状态**"
+                    "content": "**🧪 Test Status**"
                   }
                 },
                 {
@@ -531,35 +770,71 @@ jobs:
                       "is_short": true,
                       "text": {
                         "tag": "lark_md",
-                        "content": "${SYNC_ICON} 上游同步"
+                        "content": "${SYNC_ICON} Upstream Sync"
                       }
                     },
                     {
                       "is_short": true,
                       "text": {
                         "tag": "lark_md",
-                        "content": "${UNIT_ICON} 单元测试"
+                        "content": "${UNIT_ICON} Unit Tests"
                       }
                     },
                     {
                       "is_short": true,
                       "text": {
                         "tag": "lark_md",
-                        "content": "${INTEGRATION_ICON} 集成测试"
+                        "content": "${INTEGRATION_ICON} Integration Tests"
                       }
                     },
                     {
                       "is_short": true,
                       "text": {
                         "tag": "lark_md",
-                        "content": "${E2E_ICON} E2E测试"
+                        "content": "${E2E_ICON} E2E Tests"
                       }
                     },
                     {
                       "is_short": true,
                       "text": {
                         "tag": "lark_md",
-                        "content": "${EF_ICON} 以太坊状态测试"
+                        "content": "${EF_ICON} Ethereum State Tests"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "tag": "hr"
+                },
+                {
+                  "tag": "div",
+                  "text": {
+                    "tag": "lark_md",
+                    "content": "**🔒 Security Audit**"
+                  }
+                },
+                {
+                  "tag": "div",
+                  "fields": [
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${AUDIT_ICON} Vulnerability Scan"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${DENY_ICON} Dependency Policy"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${LICENSE_ICON} License Compliance"
                       }
                     }
                   ]
@@ -581,7 +856,7 @@ jobs:
                       "tag": "button",
                       "text": {
                         "tag": "plain_text",
-                        "content": "查看详细日志"
+                        "content": "View Detailed Logs"
                       },
                       "type": "primary",
                       "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
