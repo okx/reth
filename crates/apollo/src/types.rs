@@ -124,8 +124,10 @@ impl ConfigValue {
                     Some(ConfigValue::U64(v))
                 } else if let Some(v) = n.as_i64() {
                     Some(ConfigValue::I64(v))
+                } else if let Some(v) = n.as_f64() {
+                    Some(ConfigValue::F64(v))
                 } else {
-                    n.as_f64().map(ConfigValue::F64)
+                    None
                 }
             }
             JsonValue::Bool(b) => Some(ConfigValue::Bool(*b)),
