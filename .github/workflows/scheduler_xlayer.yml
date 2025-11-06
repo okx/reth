@@ -32,7 +32,7 @@ jobs:
       packages: none
     steps:
       - name: Checkout current branch
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
@@ -130,25 +130,23 @@ jobs:
             args: --features "asm-keccak" --locked --exclude reth --exclude reth-bench --exclude "example-*" --exclude "reth-ethereum-*" --exclude "*-ethereum"
     steps:
       - name: Checkout code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248  # stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Setup mold linker
-        uses: rui314/setup-mold@2e3eb197622a4ecc27b87797e707be2d12f87f0b  # v1
+        uses: rui314/setup-mold@v1
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
       - name: Install nextest
-        uses: taiki-e/install-action@56ab7930c591507f833cbaebf4d0e5a1422ab5f7  # v2.42.0
-        with:
-          tool: nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Run unit tests
         run: |
@@ -180,29 +178,27 @@ jobs:
         network: ["ethereum", "optimism"]
     steps:
       - name: Checkout code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248  # stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Setup mold linker
-        uses: rui314/setup-mold@2e3eb197622a4ecc27b87797e707be2d12f87f0b  # v1
+        uses: rui314/setup-mold@v1
 
       - name: Install Geth
         if: matrix.network == 'ethereum'
         run: .github/assets/install_geth.sh
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
       - name: Install nextest
-        uses: taiki-e/install-action@56ab7930c591507f833cbaebf4d0e5a1422ab5f7  # v2.42.0
-        with:
-          tool: nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Run integration tests (ethereum)
         if: matrix.network == 'ethereum'
@@ -237,22 +233,20 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248  # stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
       - name: Install nextest
-        uses: taiki-e/install-action@56ab7930c591507f833cbaebf4d0e5a1422ab5f7  # v2.42.0
-        with:
-          tool: nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Run e2e tests
         run: |
@@ -286,12 +280,12 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
 
       - name: Checkout ethereum/tests
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
         with:
           repository: ethereum/tests
           ref: 81862e4848585a438d64f911a19b3825f0f4cd95
@@ -310,20 +304,18 @@ jobs:
           curl -L "$URL" | tar -xz --strip-components=1 -C testing/ef-tests/execution-spec-tests
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248  # stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Setup mold linker
-        uses: rui314/setup-mold@2e3eb197622a4ecc27b87797e707be2d12f87f0b  # v1
+        uses: rui314/setup-mold@v1
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
       - name: Install nextest
-        uses: taiki-e/install-action@56ab7930c591507f833cbaebf4d0e5a1422ab5f7  # v2.42.0
-        with:
-          tool: nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Run EF tests
         run: cargo nextest run --release -p ef-tests --features "asm-keccak ef-tests"
@@ -352,15 +344,15 @@ jobs:
     continue-on-error: true  # Don't fail the entire workflow if vulnerabilities found
     steps:
       - name: Checkout code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248  # stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
@@ -389,7 +381,7 @@ jobs:
 
       - name: Upload audit report
         if: always()
-        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # v4.3.1
+        uses: actions/upload-artifact@v4
         with:
           name: security-audit-report
           path: audit-report.json
@@ -404,15 +396,15 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248  # stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
@@ -484,7 +476,7 @@ jobs:
 
       - name: Upload deny reports
         if: always()
-        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # v4.3.1
+        uses: actions/upload-artifact@v4
         with:
           name: cargo-deny-reports
           path: deny-*.log
@@ -499,15 +491,15 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248  # stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84  # v2.7.3
+        uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
@@ -537,7 +529,7 @@ jobs:
           echo "✅ **Full license report generated**" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload license reports
-        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # v4.3.1
+        uses: actions/upload-artifact@v4
         with:
           name: license-reports
           path: |
@@ -567,12 +559,12 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
 
       - name: Download all artifacts
-        uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427  # v4.1.4
+        uses: actions/download-artifact@v4
         with:
           path: reports
 
@@ -677,7 +669,7 @@ jobs:
           echo "View detailed logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload summary
-        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # v4.3.1
+        uses: actions/upload-artifact@v4
         with:
           name: ci-summary
           path: status.txt
