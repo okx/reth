@@ -130,7 +130,7 @@ dependencies = [
 [[package]]
 name = "alloy-consensus-any"
 version = "1.0.37"
-source = "git+https://github.com/okx/alloy?rev=65707b1#65707b146e7e448666af615cc3464d649dcc04b2"
+source = "git+https://github.com/okx/alloy?rev=7253351#7253351821eeacc7af0956d6d2ec5553837a16c1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
