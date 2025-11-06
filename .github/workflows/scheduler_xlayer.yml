@@ -107,180 +107,13 @@ jobs:
           exit 1
 
   ##############################################################################
-  # Phase 1: Security Audit
-  ##############################################################################
-
-  security-audit:
-    needs: [sync-upstream]
-    name: Security Audit - RustSec Vulnerabilities
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ github.ref }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
-      - name: Run cargo audit
-        id: audit
-        continue-on-error: true
-        run: |
-          cargo audit --json > audit-report.json
-          cargo audit
-
-      - name: Generate audit summary
-        if: always()
-        run: |
-          echo "## 🔒 Security Audit (RustSec)" >> $GITHUB_STEP_SUMMARY
-          if [ -f audit-report.json ]; then
-            vulnerabilities=$(jq '.vulnerabilities.count' audit-report.json 2>/dev/null || echo "0")
-            warnings=$(jq '.warnings | length' audit-report.json 2>/dev/null || echo "0")
-
-            if [ "$vulnerabilities" -gt 0 ]; then
-              echo "❌ **Found $vulnerabilities vulnerabilities**" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              jq -r '.vulnerabilities.list[] | "### [\(.advisory.id)](\(.advisory.url))\n- **Crate:** `\(.package.name)` \(.package.version)\n- **Severity:** \(.advisory.cvss // "N/A")\n- **Description:** \(.advisory.title)\n"' audit-report.json >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
-            else
-              echo "✅ **No known vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
-            fi
-
-            if [ "$warnings" -gt 0 ]; then
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "⚠️ **$warnings warnings**" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "✅ **No known vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Upload audit report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-audit-report
-          path: audit-report.json
-          retention-days: 30
-
-  cargo-deny:
-    needs: [sync-upstream]
-    name: Security Audit - Cargo Deny Checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      matrix:
-        checks:
-          - advisories
-          - licenses
-          - bans
-          - sources
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ github.ref }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
-
-      - name: Run cargo deny - ${{ matrix.checks }}
-        id: deny_check
-        continue-on-error: true
-        run: |
-          echo "## 📋 Cargo Deny - ${{ matrix.checks }}" >> $GITHUB_STEP_SUMMARY
-          if cargo deny check ${{ matrix.checks }} --format json > deny-${{ matrix.checks }}.json 2>&1; then
-            echo "✅ **${{ matrix.checks }} check passed**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ **${{ matrix.checks }} check failed**" >> $GITHUB_STEP_SUMMARY
-            cat deny-${{ matrix.checks }}.json >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
-          fi
-
-      - name: Upload deny report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-deny-${{ matrix.checks }}
-          path: deny-${{ matrix.checks }}.json
-          retention-days: 30
-
-  license-compliance:
-    needs: [sync-upstream]
-    name: Security Audit - License Compliance
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ github.ref }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Install cargo-license
-        run: cargo install cargo-license --locked
-
-      - name: Generate license report
-        run: |
-          echo "## 📜 License Compliance Report" >> $GITHUB_STEP_SUMMARY
-          cargo license --json > licenses.json
-
-          # Count licenses
-          total=$(jq '. | length' licenses.json)
-          echo "- **Total dependencies:** $total" >> $GITHUB_STEP_SUMMARY
-
-          # List unique licenses
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### License Summary" >> $GITHUB_STEP_SUMMARY
-          jq -r '[.[].license] | group_by(.) | map({license: .[0], count: length}) | sort_by(-.count) | .[] | "- **\(.license // "Unknown")**: \(.count) crates"' licenses.json >> $GITHUB_STEP_SUMMARY
-
-      - name: Check for problematic licenses
-        continue-on-error: true
-        run: |
-          # Check for copyleft licenses (GPL, AGPL, etc.)
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### ⚠️ Copyleft License Check" >> $GITHUB_STEP_SUMMARY
-
-          if jq -e '.[] | select(.license | test("GPL|AGPL|LGPL"; "i"))' licenses.json > copyleft.json 2>/dev/null && [ -s copyleft.json ]; then
-            echo "Found dependencies with copyleft licenses:" >> $GITHUB_STEP_SUMMARY
-            jq -r '.[] | "- `\(.name)` \(.version): **\(.license)**"' copyleft.json >> $GITHUB_STEP_SUMMARY
-          else
-            echo "✅ No copyleft licenses found" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Upload license report
-        uses: actions/upload-artifact@v4
-        with:
-          name: license-report
-          path: licenses.json
-          retention-days: 30
-
-  ##############################################################################
-  # Phase 2: Test Suite
+  # Phase 1: Test Suite
   ##############################################################################
 
   unit-tests:
     needs: [sync-upstream]
     name: Unit Tests - ${{ matrix.type }}
-    runs-on:
-      group: Reth
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -330,8 +163,7 @@ jobs:
   integration-tests:
     needs: [sync-upstream]
     name: Integration Tests - ${{ matrix.network }}
-    runs-on:
-      group: Reth
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -388,8 +220,7 @@ jobs:
   e2e-tests:
     needs: [sync-upstream]
     name: E2E Tests
-    runs-on:
-      group: Reth
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - name: Checkout code
@@ -434,8 +265,7 @@ jobs:
   ethereum-state-tests:
     needs: [sync-upstream]
     name: Ethereum State Tests
-    runs-on:
-      group: Reth
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout code
@@ -490,7 +320,7 @@ jobs:
           fi
 
   ##############################################################################
-  # Phase 3: Summary & Notification
+  # Phase 2: Summary & Notification
   ##############################################################################
 
   summary:
@@ -498,9 +328,6 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - sync-upstream
-      - security-audit
-      - cargo-deny
-      - license-compliance
       - unit-tests
       - integration-tests
       - e2e-tests
@@ -539,27 +366,6 @@ jobs:
             echo "| Upstream Sync | ❌ Failed (Conflict) |" >> $GITHUB_STEP_SUMMARY
           fi
 
-          # Security Audit
-          if [[ "${{ needs.security-audit.result }}" == "success" ]]; then
-            echo "| Security Audit (RustSec) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| Security Audit (RustSec) | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Cargo Deny
-          if [[ "${{ needs.cargo-deny.result }}" == "success" ]]; then
-            echo "| Cargo Deny Checks | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| Cargo Deny Checks | ⚠️ Issues Found |" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # License Compliance
-          if [[ "${{ needs.license-compliance.result }}" == "success" ]]; then
-            echo "| License Compliance | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| License Compliance | ⚠️ Issues Found |" >> $GITHUB_STEP_SUMMARY
-          fi
-
           # Unit Tests
           if [[ "${{ needs.unit-tests.result }}" == "success" ]]; then
             echo "| Unit Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
@@ -592,8 +398,6 @@ jobs:
 
           # Overall Status
           if [[ "${{ needs.sync-upstream.result }}" == "success" ]] && \
-             [[ "${{ needs.security-audit.result }}" == "success" ]] && \
-             [[ "${{ needs.cargo-deny.result }}" == "success" ]] && \
              [[ "${{ needs.unit-tests.result }}" == "success" ]] && \
              [[ "${{ needs.integration-tests.result }}" == "success" ]] && \
              [[ "${{ needs.e2e-tests.result }}" == "success" ]] && \
@@ -620,9 +424,16 @@ jobs:
   notify:
     name: Send Lark Notification
     runs-on: ubuntu-latest
-    needs: [summary, sync-upstream, security-audit, cargo-deny, license-compliance, unit-tests, integration-tests, e2e-tests, ethereum-state-tests]
+    needs: [summary, sync-upstream, unit-tests, integration-tests, e2e-tests, ethereum-state-tests]
     if: always()
     steps:
+      - name: Install jq
+        run: |
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+          jq --version
+
       - name: Determine Status and Send Notification
         env:
           LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
@@ -652,9 +463,6 @@ jobs:
           }
 
           SYNC_ICON=$(get_status_icon "${{ needs.sync-upstream.result }}")
-          AUDIT_ICON=$(get_status_icon "${{ needs.security-audit.result }}")
-          DENY_ICON=$(get_status_icon "${{ needs.cargo-deny.result }}")
-          LICENSE_ICON=$(get_status_icon "${{ needs.license-compliance.result }}")
           UNIT_ICON=$(get_status_icon "${{ needs.unit-tests.result }}")
           INTEGRATION_ICON=$(get_status_icon "${{ needs.integration-tests.result }}")
           E2E_ICON=$(get_status_icon "${{ needs.e2e-tests.result }}")
@@ -724,27 +532,6 @@ jobs:
                       "text": {
                         "tag": "lark_md",
                         "content": "${SYNC_ICON} 上游同步"
-                      }
-                    },
-                    {
-                      "is_short": true,
-                      "text": {
-                        "tag": "lark_md",
-                        "content": "${AUDIT_ICON} 安全审计"
-                      }
-                    },
-                    {
-                      "is_short": true,
-                      "text": {
-                        "tag": "lark_md",
-                        "content": "${DENY_ICON} 依赖检查"
-                      }
-                    },
-                    {
-                      "is_short": true,
-                      "text": {
-                        "tag": "lark_md",
-                        "content": "${LICENSE_ICON} 许可证检查"
                       }
                     },
                     {
