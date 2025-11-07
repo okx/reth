@@ -1,4 +1,4 @@
-// ! Chain specification for the X Layer Mainnet network.
+// ! Chain specification for the X Layer Testnet network.
 
 use alloc::{sync::Arc, vec};
 
@@ -12,17 +12,17 @@ use reth_primitives_traits::{Header, SealedHeader};
 
 use crate::{LazyLock, OpChainSpec};
 
-/// X Layer Mainnet genesis hash
+/// X Layer Testnet genesis hash
 ///
 /// Computed from the genesis block header.
 /// This value is hardcoded to avoid expensive computation on every startup.
-pub(crate) const XLAYER_MAINNET_GENESIS_HASH: B256 = b256!("dc33d8c0ec9de14fc2c21bd6077309a0a856df22821bd092a2513426e096a789");
+pub(crate) const XLAYER_TESTNET_GENESIS_HASH: B256 = b256!("ccb16eb07b7a718c2ee374df57b0e28c9ac9d8d18ca6d3204cfbba661067855a");
 
-/// X Layer Mainnet genesis state root
+/// X Layer Testnet genesis state root
 ///
-/// The Merkle Patricia Trie root of all 1,866,483 accounts in the genesis alloc.
+/// The Merkle Patricia Trie root of all 6,234,122 accounts in the genesis alloc.
 /// This value is hardcoded to avoid expensive computation on every startup.
-pub(crate) const XLAYER_MAINNET_STATE_ROOT: B256 = b256!("5d335834cb1c1c20a1f44f964b16cd409aa5d10891d5c6cf26f1f2c26726efcf");
+pub(crate) const XLAYER_TESTNET_STATE_ROOT: B256 = b256!("3de62c8ade3d3adaa88d48a3ffeebd7c8b6c5b81906d706c22f02f0d2dd3b8fa");
 
 /// Build hardforks from genesis config
 fn build_hardforks(genesis: &Genesis) -> ChainHardforks {
@@ -117,7 +117,7 @@ fn build_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header
     // The Isthmus logic requires access to L2ToL1MessagePasser predeploy storage,
     // which we don't have in the minimal genesis.
     //
-    // Solution: The pre-computed XLAYER_MAINNET_STATE_ROOT and XLAYER_MAINNET_GENESIS_HASH
+    // Solution: The pre-computed XLAYER_TESTNET_STATE_ROOT and XLAYER_TESTNET_GENESIS_HASH
     // already include the correct Isthmus handling from the full genesis computation.
 
     Header {
@@ -128,7 +128,7 @@ fn build_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header
         difficulty: genesis.difficulty,
         nonce: genesis.nonce.into(),
         extra_data: genesis.extra_data.clone(),
-        state_root: XLAYER_MAINNET_STATE_ROOT, // Pre-computed to skip expensive computation!
+        state_root: XLAYER_TESTNET_STATE_ROOT, // Pre-computed to skip expensive computation!
         timestamp: genesis.timestamp,
         mix_hash: genesis.mix_hash,
         beneficiary: genesis.coinbase,
@@ -142,22 +142,22 @@ fn build_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header
     }
 }
 
-/// The X Layer mainnet spec
-pub static XLAYER_MAINNET: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
+/// The X Layer testnet spec
+pub static XLAYER_TESTNET: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
     // Use minimal genesis without alloc for fast loading
-    let mut genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/xlayer_mainnet.json"))
-        .expect("Can't deserialize X Layer Mainnet genesis json");
+    let mut genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/xlayer_testnet.json"))
+        .expect("Can't deserialize X Layer Testnet genesis json");
 
     // Clear alloc to ensure we don't accidentally use it (should already be empty in the JSON)
     genesis.alloc.clear();
 
     let hardforks = build_hardforks(&genesis);
     let genesis_header = build_genesis_header(&genesis, &hardforks);
-    let genesis_header = SealedHeader::new(genesis_header, XLAYER_MAINNET_GENESIS_HASH);
+    let genesis_header = SealedHeader::new(genesis_header, XLAYER_TESTNET_GENESIS_HASH);
 
     OpChainSpec {
         inner: ChainSpec {
-            chain: Chain::from_id(196), // X Layer chain ID
+            chain: Chain::from_id(1952), // X Layer Testnet chain ID
             genesis_header,
             genesis,
             paris_block_and_final_difficulty: Some((0, U256::from(0))),
@@ -182,52 +182,44 @@ mod tests {
     use reth_optimism_forks::OpHardfork;
 
     #[test]
-    fn test_xlayer_mainnet_chain_id() {
-        let spec = &*XLAYER_MAINNET;
-        assert_eq!(spec.chain().id(), 196, "Chain ID should be 196");
+    fn test_xlayer_testnet_chain_id() {
+        let spec = &*XLAYER_TESTNET;
+        assert_eq!(spec.chain().id(), 1952, "Chain ID should be 1952");
     }
 
     #[test]
-    fn test_xlayer_mainnet_genesis_hash() {
-        let spec = &*XLAYER_MAINNET;
+    fn test_xlayer_testnet_genesis_hash() {
+        let spec = &*XLAYER_TESTNET;
 
-        // This hash was computed from the full genesis.json with 1,866,483 accounts
-        // Verified on 2025-11-07 from docker logs
+        // This hash was computed from the full genesis.json with 6,234,122 accounts
         assert_eq!(
             spec.genesis_hash(),
-            XLAYER_MAINNET_GENESIS_HASH,
+            XLAYER_TESTNET_GENESIS_HASH,
             "Genesis hash must match the pre-computed value"
         );
     }
 
     #[test]
-    fn test_xlayer_mainnet_state_root() {
-        let spec = &*XLAYER_MAINNET;
+    fn test_xlayer_testnet_state_root() {
+        let spec = &*XLAYER_TESTNET;
 
-        // This state root was computed from the full genesis.json with 1,866,483 accounts
-        // Verified on 2025-11-07 from docker logs
         assert_eq!(
             spec.genesis_header().state_root,
-            XLAYER_MAINNET_STATE_ROOT,
+            XLAYER_TESTNET_STATE_ROOT,
             "State root must match the pre-computed value"
         );
     }
 
     #[test]
-    fn test_xlayer_mainnet_genesis_number() {
-        let spec = &*XLAYER_MAINNET;
-
-        // X Layer starts from a legacy block
-        assert_eq!(
-            spec.genesis_header().number,
-            42810021,
-            "Genesis block number should be 42810021"
-        );
+    fn test_xlayer_testnet_genesis_block_number() {
+        let spec = &*XLAYER_TESTNET;
+        // Testnet genesis block is 12241700 (0xbacb24)
+        assert_eq!(spec.genesis_header().number, 12241700, "Genesis block should be 12241700");
     }
 
     #[test]
-    fn test_xlayer_mainnet_hardforks() {
-        let spec = &*XLAYER_MAINNET;
+    fn test_xlayer_testnet_hardforks() {
+        let spec = &*XLAYER_TESTNET;
 
         // Verify key hardforks are configured and active
         assert!(
@@ -249,35 +241,15 @@ mod tests {
     }
 
     #[test]
-    fn test_xlayer_mainnet_genesis_alloc_empty() {
-        let spec = &*XLAYER_MAINNET;
+    fn test_xlayer_testnet_fast_loading() {
+        let spec = &*XLAYER_TESTNET;
 
-        // The built-in spec should have empty alloc for fast loading
-        // The actual account state is in the database (initialized via init-state)
+        // Verify that alloc is empty (for fast loading)
         assert_eq!(
             spec.genesis().alloc.len(),
             0,
-            "Built-in genesis should have empty alloc for fast loading"
-        );
-    }
-
-    #[test]
-    fn test_xlayer_mainnet_expected_values() {
-        // This test explicitly verifies the expected hash and root from logs
-        // to catch any accidental changes
-        let expected_hash = b256!("dc33d8c0ec9de14fc2c21bd6077309a0a856df22821bd092a2513426e096a789");
-        let expected_root = b256!("5d335834cb1c1c20a1f44f964b16cd409aa5d10891d5c6cf26f1f2c26726efcf");
-
-        assert_eq!(
-            XLAYER_MAINNET_GENESIS_HASH,
-            expected_hash,
-            "XLAYER_MAINNET_GENESIS_HASH constant should match expected value from logs"
-        );
-
-        assert_eq!(
-            XLAYER_MAINNET_STATE_ROOT,
-            expected_root,
-            "XLAYER_MAINNET_STATE_ROOT constant should match expected value from logs"
+            "Genesis alloc should be empty for fast loading"
         );
     }
 }
+

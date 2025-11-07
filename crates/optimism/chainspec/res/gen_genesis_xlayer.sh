@@ -4,44 +4,87 @@
 
 set -e
 
+# Cleanup function
+cleanup() {
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+    fi
+}
+trap cleanup EXIT
+
 # Check arguments
 if [ "$#" -ne 2 ]; then
     echo "Usage: $0 <network> <genesis-file>"
     echo ""
     echo "Arguments:"
     echo "  network       Network type: mainnet, testnet, devnet"
-    echo "  genesis-file  Path to full genesis.json"
+    echo "  genesis-file  Path to full genesis.json or .tar.gz archive"
     echo ""
     echo "Example:"
     echo "  $0 mainnet /path/to/genesis-mainnet.json"
+    echo "  $0 testnet /path/to/genesis-testnet.tar.gz"
     exit 1
 fi
 
 NETWORK="$1"
-GENESIS_FILE="$2"
+INPUT_FILE="$2"
 OUTPUT_FILE="genesis/xlayer_${NETWORK}.json"
 
-# Validate network type (accept any name for flexibility)
-# Common: mainnet, testnet, devnet
+# Validate network type
 if [[ -z "$NETWORK" ]]; then
     echo "❌ Network name cannot be empty"
     exit 1
 fi
 
 # Check input file exists
-if [ ! -f "$GENESIS_FILE" ]; then
-    echo "❌ Genesis file not found: $GENESIS_FILE"
+if [ ! -f "$INPUT_FILE" ]; then
+    echo "❌ Input file not found: $INPUT_FILE"
     exit 1
 fi
 
 echo "=== X Layer Genesis Generator ==="
 echo ""
 
+# Handle compressed archives
+GENESIS_FILE="$INPUT_FILE"
+if [[ "$INPUT_FILE" == *.tar.gz ]] || [[ "$INPUT_FILE" == *.tgz ]]; then
+    echo "📦 Detected compressed archive, extracting..."
+    TEMP_DIR=$(mktemp -d)
+    tar -xzf "$INPUT_FILE" -C "$TEMP_DIR"
+
+    # Find the genesis JSON file
+    GENESIS_FILE=$(find "$TEMP_DIR" -name "*.json" -type f | head -1)
+    if [ -z "$GENESIS_FILE" ]; then
+        echo "❌ No JSON file found in archive"
+        exit 1
+    fi
+    echo "✅ Extracted: $(basename $GENESIS_FILE)"
+    echo ""
+fi
+
+# Prepare genesis file for op-reth - set number field from legacyXLayerBlock
+echo "🔧 Preparing genesis for op-reth..."
+LEGACY_BLOCK=$(jq -r '.config.legacyXLayerBlock // "null"' "$GENESIS_FILE")
+
+if [ "$LEGACY_BLOCK" != "null" ] && [ -n "$LEGACY_BLOCK" ]; then
+    BLOCK_HEX=$(printf '0x%x' $LEGACY_BLOCK)
+    echo "   Setting genesis block number to $LEGACY_BLOCK ($BLOCK_HEX)"
+
+    # Update genesis file with correct block number
+    TEMP_GENESIS=$(mktemp)
+    jq ".number = \"$BLOCK_HEX\"" "$GENESIS_FILE" > "$TEMP_GENESIS"
+    mv "$TEMP_GENESIS" "$GENESIS_FILE"
+    echo "✅ Genesis block number updated"
+else
+    echo "ℹ️  No legacyXLayerBlock found, using original number field"
+fi
+echo ""
+
 # Get file stats
 SIZE_MB=$(du -m "$GENESIS_FILE" | cut -f1)
 ALLOC_COUNT=$(jq '.alloc | length' "$GENESIS_FILE")
 CHAIN_ID=$(jq -r '.config.chainId' "$GENESIS_FILE")
-echo "Input:  $GENESIS_FILE"
+echo "Input:  $(basename $GENESIS_FILE)"
 echo "        Chain ID: $CHAIN_ID, Size: ${SIZE_MB} MB, Alloc: ${ALLOC_COUNT} accounts"
 
 # Generate minimal genesis with metadata comment at the beginning
