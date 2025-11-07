@@ -15,10 +15,21 @@ pub struct TransactionTraceArgs {
     #[arg(long = "tx-trace.enable", help_heading = "Transaction Trace")]
     pub enable: bool,
 
-    /// Path to write transaction trace output files.
+    /// Path to write transaction trace output file.
     ///
-    /// If specified, transaction traces will be written to files in this directory.
-    /// Each transaction will have its own trace file named by transaction hash.
+    /// If specified, all transaction traces will be written to a single file.
+    /// Each log entry is written as a single JSON line, making it easy to parse.
+    ///
+    /// Path handling:
+    /// - If the path ends with a directory separator (`/` or `\`), `trace.log` will be appended.
+    /// - If the path has no extension and doesn't exist, it's treated as a directory and `trace.log` will be appended.
+    /// - If the path has an extension (e.g., `.log`) or exists, it's used directly as the output file.
+    ///
+    /// Examples:
+    /// - `--tx-trace.output-path=/datadir/logs` → writes to `/datadir/logs/trace.log`
+    /// - `--tx-trace.output-path=/datadir/logs/my.log` → writes to `/datadir/logs/my.log`
+    /// - `--tx-trace.output-path=/datadir/logs/` → writes to `/datadir/logs/trace.log`
+    ///
     /// If not specified, traces will only be logged to the console.
     #[arg(
         long = "tx-trace.output-path",
