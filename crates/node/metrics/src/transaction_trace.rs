@@ -502,60 +502,6 @@ impl TransactionTracer {
         }
     }
 
-    /// Log block progress event
-    pub fn log_block_progress(
-        &self,
-        block_hash: B256,
-        block_number: u64,
-        process_id: TransactionProcessId,
-        message: &str,
-    ) {
-        if !self.inner.enabled {
-            return;
-        }
-
-        let timestamp_duration = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let timestamp_ms = timestamp_duration.as_millis();
-        let timestamp_us = timestamp_duration.as_micros();
-        let log_json = json!({
-            "trace_type": "BLOCK_TRACE",
-            "event_kind": "PROGRESS",
-            "block_hash": format!("{:#x}", block_hash),
-            "block_number": block_number,
-            "process_id": process_id as u32,
-            "process_name": process_id.as_str(),
-            "timestamp_ms": timestamp_ms,
-            "timestamp_us": timestamp_us,
-            "message": message
-        });
-        let json_str = serde_json::to_string(&log_json).unwrap_or_default();
-        
-        // Log to console
-        tracing::info!(
-            target: "tx_trace",
-            "{}",
-            json_str
-        );
-
-        // Write to file if enabled (one JSON per line)
-        if let Ok(mut file_guard) = self.inner.output_file.lock() {
-            if let Some(ref mut file) = *file_guard {
-                if let Err(e) = writeln!(file, "{}", json_str) {
-                    tracing::warn!(
-                        target: "tx_trace",
-                        error = %e,
-                        "Failed to write to transaction trace file"
-                    );
-                } else {
-                    // Flush immediately for real-time logging
-                    let _ = file.flush();
-                }
-            }
-        }
-    }
-
     /// Log block end event
     pub fn log_block_end(
         &self,
