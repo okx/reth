@@ -93,7 +93,6 @@ pub struct TransactionTracer {
 
 struct TransactionTracerInner {
     enabled: bool,
-    output_path: Option<PathBuf>,
     output_file: Mutex<Option<File>>,
 }
 
@@ -157,7 +156,6 @@ impl TransactionTracer {
         Self {
             inner: Arc::new(TransactionTracerInner {
                 enabled,
-                output_path: output_path.clone(),
                 output_file: Mutex::new(output_file),
             }),
         }
