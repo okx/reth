@@ -2370,7 +2370,7 @@ where
 
         let executed = execute(&mut self.payload_validator, input, ctx)?;
         
-        // Monitoring point 12: Block insertion start
+        // Block insertion start
         use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
         let block_hash = executed.recovered_block().hash();
         let block_number = executed.recovered_block().number();
