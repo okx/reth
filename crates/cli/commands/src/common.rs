@@ -129,12 +129,17 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         let has_receipt_pruning = config.prune.as_ref().is_some_and(|a| a.has_receipts_pruning());
         let prune_modes =
             config.prune.as_ref().map(|prune| prune.segments.clone()).unwrap_or_default();
+
+        // Set genesis block number BEFORE creating ProviderFactory to avoid Arc reference count issues
+        let mut static_file_provider = static_file_provider;
+        static_file_provider.set_genesis_block_number(self.chain.genesis().number.unwrap_or_default());
+
         let factory = ProviderFactory::<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>::new(
             db,
             self.chain.clone(),
             static_file_provider,
         )
-        .with_prune_modes(prune_modes.clone()).with_genesis_block_number(self.chain.genesis().number.unwrap());
+        .with_prune_modes(prune_modes.clone());
 
         // Check for consistency between database and static files.
         if let Some(unwind_target) = factory

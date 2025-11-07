@@ -40,6 +40,7 @@ pub mod constants;
 mod dev;
 mod op;
 mod op_sepolia;
+mod xlayer_mainnet;
 
 #[cfg(feature = "superchain-configs")]
 mod superchain;
@@ -52,6 +53,7 @@ pub use basefee::*;
 pub use dev::OP_DEV;
 pub use op::OP_MAINNET;
 pub use op_sepolia::OP_SEPOLIA;
+pub use xlayer_mainnet::XLAYER_MAINNET;
 
 /// Re-export for convenience
 pub use reth_optimism_forks::*;
@@ -339,6 +341,16 @@ impl OpHardforks for OpChainSpec {
 
 impl From<Genesis> for OpChainSpec {
     fn from(mut genesis: Genesis) -> Self {
+        use tracing::info;
+
+        let start = std::time::Instant::now();
+        let alloc_count = genesis.alloc.len();
+
+        info!(
+            target: "reth::chainspec::genesis",
+            alloc_accounts = alloc_count,
+            "Starting OpChainSpec conversion from Genesis"
+        );
 
         // If legacyXLayerBlock is specified in config, override genesis.number
         if let Some(legacy_block_value) = genesis.config.extra_fields.get("legacyXLayerBlock") {
@@ -347,7 +359,12 @@ impl From<Genesis> for OpChainSpec {
             }
         }
         use reth_optimism_forks::OpHardfork;
+
         let optimism_genesis_info = OpGenesisInfo::extract_from(&genesis);
+        info!(
+            target: "reth::chainspec::genesis",
+            "OpGenesisInfo extraction completed"
+        );
         let genesis_info =
             optimism_genesis_info.optimism_chain_info.genesis_info.unwrap_or_default();
 
@@ -427,9 +444,14 @@ impl From<Genesis> for OpChainSpec {
         ordered_hardforks.append(&mut block_hardforks);
 
         let hardforks = ChainHardforks::new(ordered_hardforks);
-        let genesis_header = SealedHeader::seal_slow(make_op_genesis_header(&genesis, &hardforks));
 
-        Self {
+        let genesis_header = SealedHeader::seal_slow(make_op_genesis_header(&genesis, &hardforks));
+        info!(
+            target: "reth::chainspec::genesis",
+            "Genesis header creation completed"
+        );
+
+        let chain_spec = Self {
             inner: ChainSpec {
                 chain: genesis.config.chain_id.into(),
                 genesis_header,
@@ -441,7 +463,36 @@ impl From<Genesis> for OpChainSpec {
                 base_fee_params: optimism_genesis_info.base_fee_params,
                 ..Default::default()
             },
-        }
+        };
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // 🔥🔥🔥 IMPORTANT: Copy these values to xlayer_mainnet.rs 🔥🔥🔥
+        // ═══════════════════════════════════════════════════════════════════════
+        eprintln!("");
+        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        eprintln!("🔑 GENESIS CONSTANTS (copy to your xlayer_*.rs file):");
+        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        eprintln!("");
+        eprintln!("Genesis Hash: {:#x}", chain_spec.inner.genesis_header.hash());
+        eprintln!("State Root:   {:#x}", chain_spec.inner.genesis_header.state_root);
+        eprintln!("");
+        eprintln!("📋 Rust code:");
+        eprintln!("pub const XLAYER_*_GENESIS_HASH: B256 = b256!(\"{:x}\");", chain_spec.inner.genesis_header.hash());
+        eprintln!("pub const XLAYER_*_STATE_ROOT: B256 = b256!(\"{:x}\");", chain_spec.inner.genesis_header.state_root);
+        eprintln!("");
+        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        eprintln!("");
+
+        info!(
+            target: "reth::chainspec::genesis",
+            total_elapsed_ms = start.elapsed().as_millis(),
+            alloc_accounts = alloc_count,
+            genesis_hash = ?chain_spec.inner.genesis_header.hash(),
+            state_root = ?chain_spec.inner.genesis_header.state_root,
+            "OpChainSpec conversion from Genesis completed"
+        );
+
+        chain_spec
     }
 }
 

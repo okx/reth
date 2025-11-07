@@ -467,13 +467,17 @@ where
         N: ProviderNodeTypes<DB = DB, ChainSpec = ChainSpec>,
         Evm: ConfigureEvm<Primitives = N::Primitives> + 'static,
     {
+        // Set genesis block number BEFORE creating ProviderFactory to avoid Arc reference count issues
+        let mut static_file_provider = StaticFileProvider::read_write(self.data_dir().static_files())?;
+        static_file_provider.set_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default());
+
         let factory = ProviderFactory::new(
             self.right().clone(),
             self.chain_spec(),
-            StaticFileProvider::read_write(self.data_dir().static_files())?,
+            static_file_provider,
         )
         .with_prune_modes(self.prune_modes())
-        .with_static_files_metrics().with_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default());
+        .with_static_files_metrics();
 
         let has_receipt_pruning =
             self.toml_config().prune.as_ref().is_some_and(|a| a.has_receipts_pruning());
