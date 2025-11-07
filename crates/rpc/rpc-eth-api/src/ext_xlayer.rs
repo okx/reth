@@ -3,7 +3,7 @@
 use alloy_eips::BlockId;
 use alloy_rpc_types_eth::state::StateOverride;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use reth_rpc_eth_types::pre_exec::PreExecResult;
+use reth_rpc_eth_types::pre_exec_xlayer::PreExecResult;
 use alloy_json_rpc::RpcObject;
 
 /// Extension trait for `eth_` namespace for xlayer.

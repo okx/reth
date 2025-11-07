@@ -45,7 +45,7 @@ use reth_optimism_payload_builder::{
 };
 use reth_optimism_primitives::{DepositReceipt, OpPrimitives};
 use reth_optimism_rpc::{
-    eth::{ext::OpEthExtApi, xlayer_ext::XLayerEthApiExt, OpEthApiBuilder},
+    eth::{ext::OpEthExtApi, ext_xlayer::XLayerEthApiExt, OpEthApiBuilder},
     historical::{HistoricalRpc, HistoricalRpcClient},
     miner::{MinerApiExtServer, OpMinerExtApi},
     witness::{DebugExecutionWitnessApiServer, OpDebugWitnessApi},

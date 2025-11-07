@@ -15,9 +15,9 @@ use op_alloy_rpc_types::OpTransactionRequest;
 use reth_rpc_eth_api::{
     EthApiTypes, RpcTypes,
     helpers::{Call, LoadState, SpawnBlocking, Trace},
-    xlayer_ext::XLayerEthApiExtServer,
+    ext_xlayer::XLayerEthApiExtServer,
 };
-use reth_rpc_eth_types::pre_exec::{PreExecError, PreExecInnerTx, PreExecResult};
+use reth_rpc_eth_types::pre_exec_xlayer::{PreExecError, PreExecInnerTx, PreExecResult};
 use revm::DatabaseCommit;
 use revm::context_interface::result::ExecutionResult;
 use revm_inspectors::tracing::MuxInspector;

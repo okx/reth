@@ -3,7 +3,7 @@
 pub mod ext;
 pub mod receipt;
 pub mod transaction;
-pub mod xlayer_ext;
+pub mod ext_xlayer;
 
 mod block;
 mod call;
