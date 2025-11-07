@@ -100,8 +100,6 @@ where
         + AsRef<PF::ProviderRW>,
     PF::ChainSpec: EthChainSpec<Header = <PF::Primitives as NodePrimitives>::BlockHeader>,
 {
-    let init_start = std::time::Instant::now();
-
     let chain = factory.chain_spec();
 
     let genesis = chain.genesis();
@@ -109,14 +107,6 @@ where
 
     // Get the genesis block number from the chain spec
     let genesis_block_number = chain.genesis_header().number();
-
-    info!(
-        target: "reth::storage::genesis",
-        genesis_hash = ?hash,
-        genesis_block = genesis_block_number,
-        alloc_accounts = genesis.alloc.len(),
-        "Starting genesis initialization check"
-    );
 
     // Check if we already have the genesis header or if we have the wrong one.
     match factory.block_hash(genesis_block_number) {
@@ -127,15 +117,11 @@ where
                 // database. Since `factory.block_hash` will only query the static files, we need to
                 // make sure that our database has been written to, and throw error if it's empty.
                 if factory.get_stage_checkpoint(StageId::Headers)?.is_none() {
-                    error!(target: "reth::storage::genesis", "Genesis header found on static files, but database is uninitialized.");
+                    error!(target: "reth::storage", "Genesis header found on static files, but database is uninitialized.");
                     return Err(InitStorageError::UninitializedDatabase)
                 }
 
-                info!(
-                    target: "reth::storage::genesis",
-                    elapsed_ms = init_start.elapsed().as_millis(),
-                    "Genesis already initialized, skipping write"
-                );
+                debug!("Genesis already written, skipping.");
                 return Ok(hash)
             }
 
@@ -150,17 +136,21 @@ where
         }
     }
 
-    info!(target: "reth::storage::genesis", "Genesis not found in database, starting write...");
+    debug!("Writing genesis block.");
 
     let alloc = &genesis.alloc;
 
     // use transaction to insert genesis header
     let provider_rw = factory.database_provider_rw()?;
-
     insert_genesis_hashes(&provider_rw, alloc.iter())?;
     insert_genesis_history(&provider_rw, alloc.iter())?;
+
+    // Insert header
     insert_genesis_header(&provider_rw, &chain)?;
+
     insert_genesis_state(&provider_rw, alloc.iter())?;
+
+    // compute state root to populate trie tables
     compute_state_root(&provider_rw, None)?;
 
     // set stage checkpoint to genesis block number for all stages
@@ -184,12 +174,6 @@ where
     // `commit_unwind`` will first commit the DB and then the static file provider, which is
     // necessary on `init_genesis`.
     UnifiedStorageWriter::commit_unwind(provider_rw)?;
-
-    info!(
-        target: "reth::storage::genesis",
-        total_elapsed_ms = init_start.elapsed().as_millis(),
-        "Genesis initialization completed successfully"
-    );
 
     Ok(hash)
 }
