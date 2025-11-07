@@ -253,14 +253,12 @@ where
             if let Some(pre) = diff.pre.get(addr) {
                 let pre_bal = pre.balance.unwrap_or_default().to_string();
                 let post_bal = post.balance.unwrap_or_default().to_string();
-                if pre_bal != post_bal {
-                    let mut bal = JsonMap::new();
-                    bal.insert("before".into(), JsonValue::String(pre_bal));
-                    bal.insert("after".into(), JsonValue::String(post_bal));
-                    let mut addr_obj = JsonMap::new();
-                    addr_obj.insert("balance".into(), JsonValue::Object(bal));
-                    out.insert(addr.to_checksum(None), JsonValue::Object(addr_obj));
-                }
+                let mut bal = JsonMap::new();
+                bal.insert("before".into(), JsonValue::String(pre_bal));
+                bal.insert("after".into(), JsonValue::String(post_bal));
+                let mut addr_obj = JsonMap::new();
+                addr_obj.insert("balance".into(), JsonValue::Object(bal));
+                out.insert(addr.to_checksum(None), JsonValue::Object(addr_obj));
             }
         }
         JsonValue::Object(out)
