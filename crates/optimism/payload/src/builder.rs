@@ -3,7 +3,7 @@
 use crate::{
     config::{OpBuilderConfig, OpDAConfig},
     error::OpPayloadBuilderError,
-    intercept_okx::BridgeInterceptConfig,
+    intercept_xlayer::BridgeInterceptConfig,
     payload::OpBuiltPayload,
     OpAttributes, OpPayloadBuilderAttributes, OpPayloadPrimitives,
 };
@@ -371,7 +371,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         // 3. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool() {
             let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
-            if ctx.execute_best_transactions_okx(&mut info, &mut builder, best_txs)?.is_some() {
+            if ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?.is_some() {
                 return Ok(BuildOutcomeKind::Cancelled)
             }
 

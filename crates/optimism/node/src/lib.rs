@@ -43,8 +43,8 @@ pub use reth_optimism_evm::*;
 
 pub use reth_optimism_storage::OpStorage;
 
-mod args_okx;
-pub use args_okx::XLayerArgs;
+mod args_xlayer;
+pub use args_xlayer::XLayerArgs;
 
 use op_revm as _;
 use revm as _;

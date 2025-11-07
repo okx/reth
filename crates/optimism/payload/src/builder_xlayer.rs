@@ -1,6 +1,6 @@
-//! OKX-specific payload builder extensions
+//! XLayer-specific payload builder extensions
 //!
-//! This module extends the standard OP payload builder with OKX-specific
+//! This module extends the standard OP payload builder with XLayer-specific
 //! transaction interception logic, similar to op-geth's worker_okx.go
 
 use crate::{
@@ -53,7 +53,7 @@ where
     /// * `Ok(Some(()))` - If the job was cancelled
     /// * `Ok(None)` - If all transactions were processed successfully
     /// * `Err(...)` - If a fatal error occurred during execution
-    pub fn execute_best_transactions_okx(
+    pub fn execute_best_transactions_xlayer(
         &self,
         info: &mut ExecutionInfo,
         builder: &mut impl BlockBuilder<Primitives = Evm::Primitives>,
