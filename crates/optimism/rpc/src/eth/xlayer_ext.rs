@@ -271,9 +271,42 @@ where
     // gas used
     let gas_used = exec.result.gas_used();
 
+    // logs
+    let logs = match &exec.result {
+        ExecutionResult::Success { logs, .. } => {
+            let log_array: Vec<JsonValue> = logs
+                .iter()
+                .enumerate()
+                .map(|(idx, log)| {
+                    let mut log_obj = JsonMap::new();
+                    log_obj.insert("address".into(), JsonValue::String(log.address.to_checksum(None)));
+                    log_obj.insert(
+                        "topics".into(),
+                        JsonValue::Array(
+                            log.topics()
+                                .iter()
+                                .map(|t| JsonValue::String(format!("{:#x}", t)))
+                                .collect(),
+                        ),
+                    );
+                    log_obj.insert("data".into(), JsonValue::String(format!("0x{}", hex::encode(&log.data.data))));
+                    log_obj.insert("blockNumber".into(), JsonValue::String(format!("0x{:x}", block_number.saturating_sub(U256::from(1)).saturating_to::<u64>())));
+                    log_obj.insert("transactionHash".into(), JsonValue::String(format!("0x{}", hex::encode([0u8; 32]))));
+                    log_obj.insert("transactionIndex".into(), JsonValue::String("0x0".into()));
+                    log_obj.insert("blockHash".into(), JsonValue::String(format!("0x{}", hex::encode([0u8; 32]))));
+                    log_obj.insert("logIndex".into(), JsonValue::String(format!("0x{:x}", idx)));
+                    log_obj.insert("removed".into(), JsonValue::Bool(false));
+                    JsonValue::Object(log_obj)
+                })
+                .collect();
+            JsonValue::Array(log_array)
+        }
+        _ => JsonValue::Array(vec![]),
+    };
+
     Ok(PreExecResult {
         inner_txs: Some(inner_txs),
-        logs: Some(JsonValue::Array(vec![])),
+        logs: Some(logs),
         state_diff: Some(state_diff),
         error: PreExecError::default(),
         gas_used,
