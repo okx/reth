@@ -163,11 +163,19 @@ where
                     };
 
                     let gas_used = exec.result.gas_used();
+                    // resolve block hash from `at` if available
+                    let block_hash_opt = match at.clone() {
+                        BlockId::Hash(h) => Some(h.block_hash.into()),
+                        _ => None,
+                    };
+                    let tx_idx = results.len() as u64;
                     let mut pre_exec_res = match process_tracer_results(
                         exec.clone(),
                         inspector,
                         &db,
                         current_evm_env.block_env.number,
+                        block_hash_opt,
+                        tx_idx,
                     ) {
                         Ok(r) => r,
                         Err(e) => {
@@ -216,6 +224,8 @@ fn process_tracer_results<DB, HR>(
     inspector: MuxInspector,
     db: &DB,
     block_number: U256,
+    block_hash: Option<alloy_primitives::B256>,
+    tx_index: u64,
 ) -> Result<PreExecResult, PreExecError>
 where
     DB: revm::DatabaseRef,
@@ -269,37 +279,30 @@ where
     // gas used
     let gas_used = exec.result.gas_used();
 
-    // logs
-    let logs = match &exec.result {
-        ExecutionResult::Success { logs, .. } => {
-            let log_array: Vec<JsonValue> = logs
-                .iter()
-                .enumerate()
-                .map(|(idx, log)| {
-                    let mut log_obj = JsonMap::new();
-                    log_obj.insert("address".into(), JsonValue::String(log.address.to_checksum(None)));
-                    log_obj.insert(
-                        "topics".into(),
-                        JsonValue::Array(
-                            log.topics()
-                                .iter()
-                                .map(|t| JsonValue::String(format!("{:#x}", t)))
-                                .collect(),
-                        ),
-                    );
-                    log_obj.insert("data".into(), JsonValue::String(format!("0x{}", hex::encode(&log.data.data))));
-                    log_obj.insert("blockNumber".into(), JsonValue::String(format!("0x{:x}", block_number.saturating_sub(U256::from(1)).saturating_to::<u64>())));
-                    log_obj.insert("transactionHash".into(), JsonValue::String(format!("0x{}", hex::encode([0u8; 32]))));
-                    log_obj.insert("transactionIndex".into(), JsonValue::String("0x0".into()));
-                    log_obj.insert("blockHash".into(), JsonValue::String(format!("0x{}", hex::encode([0u8; 32]))));
-                    log_obj.insert("logIndex".into(), JsonValue::String(format!("0x{:x}", idx)));
-                    log_obj.insert("removed".into(), JsonValue::Bool(false));
-                    JsonValue::Object(log_obj)
-                })
-                .collect();
-            JsonValue::Array(log_array)
-        }
-        _ => JsonValue::Array(vec![]),
+    // get logs
+    let logs = {
+        let log_vec = exec.result.logs();
+        let tx_hash = alloy_primitives::B256::from(
+            alloy_primitives::U256::from(tx_index).to_be_bytes(),
+        );
+        let rpc_logs: Vec<alloy_rpc_types_eth::Log> = log_vec
+            .iter()
+            .enumerate()
+            .map(|(idx, log)| alloy_rpc_types_eth::Log {
+                inner: log.clone(),
+                block_hash,
+                block_number: Some(
+                    block_number
+                        .saturating_sub(alloy_primitives::U256::from(1))
+                        .saturating_to(),
+                ),
+                transaction_hash: Some(tx_hash),
+                transaction_index: Some(tx_index),
+                log_index: Some(idx as u64),
+                ..Default::default()
+            })
+            .collect();
+        serde_json::to_value(rpc_logs).unwrap_or_default()
     };
 
     Ok(PreExecResult {
