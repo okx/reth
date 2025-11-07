@@ -79,6 +79,7 @@ macro_rules! create_superchain_specs {
                 "base",
                 "base_sepolia",
                 "base-sepolia",
+                "xlayer-mainnet",
                 $(
                     $crate::key_for!($name, $env),
                 )+
@@ -93,6 +94,7 @@ macro_rules! create_superchain_specs {
                     "optimism_sepolia" | "optimism-sepolia" => Some($crate::OP_SEPOLIA.clone()),
                     "base"                                  => Some($crate::BASE_MAINNET.clone()),
                     "base_sepolia" | "base-sepolia"         => Some($crate::BASE_SEPOLIA.clone()),
+                    "xlayer-mainnet"                        => Some($crate::XLAYER_MAINNET.clone()),
                     $(
                         $crate::key_for!($name, $env)        => Some($crate::[<$name:upper _ $env:upper>].clone()),
                     )+

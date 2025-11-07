@@ -72,12 +72,29 @@ pub trait ChainSpecParser: Clone + Send + Sync + 'static {
 
 /// A helper to parse a [`Genesis`](alloy_genesis::Genesis) as argument or from disk.
 pub fn parse_genesis(s: &str) -> eyre::Result<alloy_genesis::Genesis> {
+    use tracing::{info, debug};
+
+    let start = std::time::Instant::now();
+
     // try to read json from path first
+    let read_start = std::time::Instant::now();
     let raw = match fs::read_to_string(PathBuf::from(shellexpand::full(s)?.into_owned())) {
-        Ok(raw) => raw,
+        Ok(raw) => {
+            let elapsed = read_start.elapsed();
+            let size_mb = raw.len() as f64 / 1024.0 / 1024.0;
+            info!(
+                target: "reth::cli::genesis",
+                path = %s,
+                size_mb = size_mb,
+                elapsed_ms = elapsed.as_millis(),
+                "Genesis file read completed"
+            );
+            raw
+        }
         Err(io_err) => {
             // valid json may start with "\n", but must contain "{"
             if s.contains('{') {
+                debug!(target: "reth::cli::genesis", "Parsing genesis from inline JSON");
                 s.to_string()
             } else {
                 return Err(io_err.into()) // assume invalid path
@@ -85,5 +102,16 @@ pub fn parse_genesis(s: &str) -> eyre::Result<alloy_genesis::Genesis> {
         }
     };
 
-    Ok(serde_json::from_str(&raw)?)
+    let parse_start = std::time::Instant::now();
+    let genesis = serde_json::from_str(&raw)?;
+    let parse_elapsed = parse_start.elapsed();
+
+    info!(
+        target: "reth::cli::genesis",
+        parse_elapsed_ms = parse_elapsed.as_millis(),
+        total_elapsed_ms = start.elapsed().as_millis(),
+        "Genesis JSON deserialization completed"
+    );
+
+    Ok(genesis)
 }

@@ -7804,6 +7804,7 @@ dependencies = [
  "reth-db",
  "serde_json",
  "shellexpand",
+ "tracing",
 ]
 
 [[package]]
@@ -9615,6 +9616,7 @@ dependencies = [
  "serde_json",
  "tar-no-std",
  "thiserror 2.0.17",
+ "tracing",
 ]
 
 [[package]]
@@ -11603,7 +11605,7 @@ dependencies = [
  "regex",
  "relative-path",
  "rustc_version 0.4.1",
- "syn 2.0.108",
+ "syn 2.0.110",
  "unicode-ident",
 ]
 
@@ -14597,14 +14599,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "xsum"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0637d3a5566a82fa5214bae89087bc8c9fb94cd8e8a3c07feb691bb8d9c632db"
-
-[[package]]
 name = "xlayer-e2e-test"
-version = "1.8.3"
+version = "1.9.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -14630,6 +14626,12 @@ dependencies = [
  "tracing",
  "url",
 ]
+
+[[package]]
+name = "xsum"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0637d3a5566a82fa5214bae89087bc8c9fb94cd8e8a3c07feb691bb8d9c632db"
 
 [[package]]
 name = "yansi"
