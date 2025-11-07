@@ -4,7 +4,7 @@ use crate::{
     args::RollupArgs,
     engine::OpEngineValidator,
     txpool::{OpTransactionPool, OpTransactionValidator},
-    OpEngineApiBuilder, OpEngineTypes, XLayerArgs,
+    OpEngineApiBuilder, OpEngineTypes, XLayerArgs, XLayerGasPriceArgs,
 };
 use op_alloy_consensus::{interop::SafetyLevel, OpPooledTransaction};
 use op_alloy_rpc_types_engine::OpExecutionData;
@@ -29,7 +29,7 @@ use reth_node_builder::{
     rpc::{
         BasicEngineValidatorBuilder, EngineApiBuilder, EngineValidatorAddOn,
         EngineValidatorBuilder, EthApiBuilder, Identity, PayloadValidatorBuilder, RethRpcAddOns,
-        RethRpcMiddleware, RethRpcServerHandles, RpcAddOns, RpcContext, RpcHandle,
+        RethRpcMiddleware, RethRpcServerHandles, RpcAddOns, RpcContext, RpcHandle, RpcRegistry,
     },
     BuilderContext, DebugNode, Node, NodeAdapter, NodeComponentsBuilder,
 };
@@ -57,7 +57,9 @@ use reth_optimism_txpool::{
 };
 use reth_provider::{providers::ProviderFactoryBuilder, CanonStateSubscriptions};
 use reth_rpc_api::{eth::RpcTypes, DebugApiServer, L2EthApiExtServer};
+use reth_rpc_eth_api::EthApiTypes;
 use reth_rpc_server_types::RethRpcModule;
+use reth_tasks::TaskExecutor;
 use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, EthPoolTransaction, PoolPooledTx, PoolTransaction,
@@ -485,6 +487,52 @@ where
     }
 }
 
+/// Initialize XLayer gas price controller
+///
+/// This function sets up the gas price suggester, scheduler, and spawns the background task
+/// for managing XLayer gas prices.
+fn initialize_xlayer_gas_price_controller<Node, EthApi>(
+    gas_price: &XLayerGasPriceArgs,
+    registry: &mut RpcRegistry<Node, EthApi>,
+    task_executor: TaskExecutor,
+) where
+    Node: FullNodeComponents,
+    EthApi: EthApiTypes + reth_rpc_eth_api::helpers::XLayerFees + Clone,
+{
+    info!(?gas_price, "Initializing XLayer gas price scheduler");
+    
+    // Create gas price suggester directly from args
+    let pricer = reth_xlayer_gasprice::suggester::new_l2_gas_price_suggester(gas_price);
+    
+    // Get EthApi to share with scheduler
+    let eth_api = registry.eth_api().clone();
+    
+    // Set pricer to XLayerFees
+    // OpEthApi implements XLayerFees, so we can call set_pricer
+    eth_api.set_pricer(pricer.clone());
+    
+    // Create scheduler with EthApi (which contains the shared GasPriceOracle)
+    let scheduler = std::sync::Arc::new(
+        reth_xlayer_gasprice::scheduler::XLayerScheduler::with_eth_api(
+            pricer,
+            eth_api,
+            gas_price.default,
+            gas_price.update_period,
+            gas_price.congestion_threshold,
+        )
+    );
+    
+    // Spawn background task - run() will initialize and start the scheduler
+    task_executor.spawn_critical(
+        "xlayer-gas-price-scheduler",
+        Box::pin(async move {
+            scheduler.run().await;
+        })
+    );
+    
+    info!(target: "reth::cli", "XLayer gas price scheduler initialized");
+}
+
 impl<N, EthB, PVB, EB, EVB, Attrs, RpcMiddleware> NodeAddOns<N>
     for OpAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
 where
@@ -614,39 +662,11 @@ where
                 // Only initialize if price_type is specified and not empty
                 if let Some(ref price_type) = xlayer_args.gas_price.price_type {
                     if !price_type.is_empty() {
-                        info!(?xlayer_args.gas_price, "Initializing XLayer gas price scheduler");
-                        
-                        // Create gas price suggester directly from args
-                        let pricer = reth_xlayer_gasprice::suggester::new_l2_gas_price_suggester(&xlayer_args.gas_price);
-                        
-                        // Get EthApi to share with scheduler
-                        let eth_api = registry.eth_api().clone();
-                        
-                        // Set pricer to XLayerFees
-                        // OpEthApi implements XLayerFees, so we can call set_pricer
-                        use reth_rpc_eth_api::helpers::XLayerFees;
-                        eth_api.set_pricer(pricer.clone());
-                        
-                        // Create scheduler with EthApi (which contains the shared GasPriceOracle)
-                        let scheduler = std::sync::Arc::new(
-                            reth_xlayer_gasprice::scheduler::XLayerScheduler::with_eth_api(
-                                pricer,
-                                eth_api,
-                                xlayer_args.gas_price.default,
-                                xlayer_args.gas_price.update_period,
-                                xlayer_args.gas_price.congestion_threshold,
-                            )
+                        initialize_xlayer_gas_price_controller(
+                            &xlayer_args.gas_price,
+                            registry,
+                            task_executor,
                         );
-                        
-                        // Spawn background task - run() will initialize and start the scheduler
-                        task_executor.spawn_critical(
-                            "xlayer-gas-price-scheduler",
-                            Box::pin(async move {
-                                scheduler.run().await;
-                            })
-                        );
-                        
-                        info!(target: "reth::cli", "XLayer gas price scheduler initialized");
                     }
                 }
 
