@@ -36,6 +36,7 @@ procfs = "0.17.0"
 [dev-dependencies]
 reqwest.workspace = true
 socket2.workspace = true
+tempfile = "3.8"
 
 [lints]
 workspace = true

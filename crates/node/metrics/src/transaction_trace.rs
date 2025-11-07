@@ -170,24 +170,34 @@ impl TransactionTracer {
 
     /// Write JSON string to trace file
     fn write_to_file(&self, json_str: &str) {
-        if let Ok(mut file_guard) = self.inner.output_file.lock() {
-            if let Some(ref mut file) = *file_guard {
-                if let Err(e) = writeln!(file, "{}", json_str) {
-                    tracing::warn!(
-                        target: "tx_trace",
-                        error = %e,
-                        "Failed to write to transaction trace file"
-                    );
-                } else {
-                    // Flush immediately for real-time logging
-                    if let Err(e) = file.flush() {
+        match self.inner.output_file.lock() {
+            Ok(mut file_guard) => {
+                if let Some(ref mut file) = *file_guard {
+                    if let Err(e) = writeln!(file, "{}", json_str) {
                         tracing::warn!(
                             target: "tx_trace",
                             error = %e,
-                            "Failed to flush transaction trace file"
+                            "Failed to write to transaction trace file"
                         );
+                    } else {
+                        // Flush immediately for real-time logging
+                        if let Err(e) = file.flush() {
+                            tracing::warn!(
+                                target: "tx_trace",
+                                error = %e,
+                                "Failed to flush transaction trace file"
+                            );
+                        }
                     }
                 }
+            }
+            Err(e) => {
+                // Lock acquisition failed (e.g., mutex was poisoned)
+                tracing::warn!(
+                    target: "tx_trace",
+                    error = %e,
+                    "Failed to acquire lock for transaction trace file"
+                );
             }
         }
     }
@@ -352,3 +362,202 @@ impl TransactionTracer {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+    use std::{
+        fs,
+        io::Read,
+        sync::Arc,
+        thread,
+    };
+    use tempfile::TempDir;
+
+    fn create_test_tracer() -> (TransactionTracer, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let trace_file = temp_dir.path().join("trace.log");
+        let tracer = TransactionTracer::new(true, Some(trace_file));
+        (tracer, temp_dir)
+    }
+
+    #[test]
+    fn test_tracer_creation() {
+        let tracer = TransactionTracer::new(false, None);
+        assert!(!tracer.is_enabled());
+
+        let (tracer, _temp_dir) = create_test_tracer();
+        assert!(tracer.is_enabled());
+    }
+
+    #[test]
+    fn test_log_transaction_start() {
+        let (tracer, temp_dir) = create_test_tracer();
+        let tx_hash = B256::from([1u8; 32]);
+
+        tracer.log_transaction_start(
+            tx_hash,
+            TransactionProcessId::RpcReceiveStart,
+            "Test transaction",
+        );
+
+        let trace_file = temp_dir.path().join("trace.log");
+        assert!(trace_file.exists());
+
+        let mut contents = String::new();
+        fs::File::open(&trace_file)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+
+        assert!(contents.contains("TX_TRACE"));
+        assert!(contents.contains("RPC Receive Start"));
+        assert!(contents.contains(&format!("{:#x}", tx_hash)));
+    }
+
+    #[test]
+    fn test_log_transaction_end() {
+        let (tracer, temp_dir) = create_test_tracer();
+        let tx_hash = B256::from([2u8; 32]);
+
+        tracer.log_transaction_end(
+            tx_hash,
+            TransactionProcessId::RpcReceiveEnd,
+            true,
+            "Transaction completed",
+        );
+
+        let trace_file = temp_dir.path().join("trace.log");
+        let mut contents = String::new();
+        fs::File::open(&trace_file)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+
+        assert!(contents.contains("TX_TRACE"));
+        assert!(contents.contains("RPC Receive End"));
+        assert!(contents.contains("SUCCESS"));
+        assert!(contents.contains(&format!("{:#x}", tx_hash)));
+    }
+
+    #[test]
+    fn test_concurrent_write_to_file() {
+        let (tracer, temp_dir) = create_test_tracer();
+        let tracer = Arc::new(tracer);
+        let trace_file = temp_dir.path().join("trace.log");
+
+        let num_threads = 10;
+        let writes_per_thread = 100;
+        let mut handles = vec![];
+
+        for thread_id in 0..num_threads {
+            let tracer_clone = Arc::clone(&tracer);
+            let handle = thread::spawn(move || {
+                for i in 0..writes_per_thread {
+                    let tx_hash = B256::from([thread_id as u8; 32]);
+                    let process_id = if i % 2 == 0 {
+                        TransactionProcessId::RpcReceiveStart
+                    } else {
+                        TransactionProcessId::RpcReceiveEnd
+                    };
+                    tracer_clone.log_transaction_start(
+                        tx_hash,
+                        process_id,
+                        &format!("Thread {} write {}", thread_id, i),
+                    );
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut contents = String::new();
+        fs::File::open(&trace_file)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+
+        let log_lines: Vec<&str> = contents
+            .lines()
+            .filter(|line| !line.is_empty() && line.contains("TX_TRACE"))
+            .collect();
+
+        assert_eq!(
+            log_lines.len(),
+            num_threads * writes_per_thread,
+            "Expected {} log entries, found {}",
+            num_threads * writes_per_thread,
+            log_lines.len()
+        );
+
+        for line in log_lines {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "Invalid JSON: {}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_concurrent_write_with_different_hashes() {
+        let (tracer, temp_dir) = create_test_tracer();
+        let tracer = Arc::new(tracer);
+        let trace_file = temp_dir.path().join("trace.log");
+
+        let num_threads = 5;
+        let mut handles = vec![];
+
+        for thread_id in 0..num_threads {
+            let tracer_clone = Arc::clone(&tracer);
+            let handle = thread::spawn(move || {
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes[0] = thread_id as u8;
+                let tx_hash = B256::from(hash_bytes);
+
+                for _ in 0..50 {
+                    tracer_clone.log_transaction_start(
+                        tx_hash,
+                        TransactionProcessId::TxExecutionStart,
+                        "Concurrent execution test",
+                    );
+                    tracer_clone.log_transaction_end(
+                        tx_hash,
+                        TransactionProcessId::TxExecutionEnd,
+                        true,
+                        "Execution completed",
+                    );
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut contents = String::new();
+        fs::File::open(&trace_file)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+
+        let log_lines: Vec<&str> = contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        assert_eq!(log_lines.len(), num_threads * 50 * 2);
+
+        for line in log_lines {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "Invalid JSON in concurrent write test"
+            );
+        }
+    }
+}

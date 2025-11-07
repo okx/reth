@@ -9116,6 +9116,7 @@ dependencies = [
  "reth-tasks",
  "serde_json",
  "socket2 0.5.10",
+ "tempfile",
  "tikv-jemalloc-ctl",
  "tokio",
  "tower",
