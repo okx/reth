@@ -2397,18 +2397,14 @@ where
             ConsensusEngineEvent::CanonicalBlockAdded(executed.clone(), elapsed)
         };
         self.emit_event(EngineApiEvent::BeaconConsensus(engine_event));
-        
-        // Monitoring point 13: Block validation complete
-        // Monitoring point 14: Block confirmation complete
+
         if let Some(tracer) = get_global_tracer() {
             let is_canonical = !is_fork;
             let block_insert_duration = start.elapsed();
             
             // Log block-level trace only (not per-transaction to avoid duplication)
-            tracer.log_block_progress(block_hash, block_number, TransactionProcessId::BlockValidateStart, "Validating block");
-            tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockInsertEnd, true, Some(block_insert_duration), "Block insertion completed");
             if is_canonical {
-                tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockConfirmEnd, true, Some(elapsed), "Block confirmation completed");
+                tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockInsertEnd, true, Some(block_insert_duration), "Block insertion completed");
             }
         }
 

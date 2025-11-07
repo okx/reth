@@ -99,7 +99,7 @@ impl EngineApiMetrics {
                 for tx in tx_refs {
                     let tx_hash = *tx.tx().tx_hash();
                     
-                    // Monitoring point 8: State processing start
+                    // State processing start
                     if let Some(tracer) = get_global_tracer() {
                         tracer.log_transaction_start(tx_hash, TransactionProcessId::StateProcessStart, "Processing state");
                     }
@@ -110,13 +110,13 @@ impl EngineApiMetrics {
                     trace!(target: "engine::tree", "Executing transaction");
                     executor.execute_transaction(tx)?;
                     
-                    // Monitoring point 8: State processing end
+                    // State processing end
                     if let Some(tracer) = get_global_tracer() {
                         tracer.log_transaction_end(tx_hash, TransactionProcessId::StateProcessEnd, true, "State processing completed");
                     }
                 }
                 
-                // Monitoring point 11: State commit
+                // State commit
                 let (evm, result) = executor.finish()?;
                 let db = evm.into_db();
                 

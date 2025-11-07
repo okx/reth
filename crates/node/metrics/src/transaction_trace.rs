@@ -16,124 +16,66 @@ use std::{
 /// This ensures each event has a unique process_id
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransactionProcessId {
-    // RPC Receive stage (50010-50012)
+    // RPC Receive stage (50010-50011)
     RpcReceiveStart = 50010,
-    RpcReceiveProgress = 50011,
-    RpcReceiveEnd = 50012,
+    RpcReceiveEnd = 50011,
     
-    // TxPool Add stage (50020-50022)
+    // TxPool stage (50020-50022)
     TxPoolAddStart = 50020,
-    TxPoolAddProgress = 50021,
-    TxPoolAddEnd = 50022,
-    
-    // TxPool Validate stage (50023-50024, no START as it's a sub-stage)
-    TxPoolValidateProgress = 50023,
-    TxPoolValidateEnd = 50024,
-    
+    TxPoolValidateStart = 50021,
+    TxPoolValidateEnd = 50022,
+    TxPoolAddEnd = 50024,
+
     // Miner Select stage (50030-50032)
     MinerSelectStart = 50030,
-    MinerSelectProgress = 50031,
-    MinerSelectEnd = 50032,
+    MinerSelectEnd = 50031,
     
     // Tx Execution stage (50033-50035)
-    TxExecutionStart = 50033,
-    TxExecutionProgress = 50034,
-    TxExecutionEnd = 50035,
+    TxExecutionStart = 50040,
+    TxExecutionEnd = 50041,
+    TxPackagingEnd = 50042,
     
-    // Tx Packaging stage (50036-50037, no START as it's part of block building)
-    TxPackagingProgress = 50036,
-    TxPackagingEnd = 50037,
-    
-    // Block End stage (50038-50039)
-    BlockEndStart = 50038,
-    BlockEndEnd = 50039,
-    
-    // State Process stage (50040-50042)
-    StateProcessStart = 50040,
-    StateProcessProgress = 50041,
-    StateProcessEnd = 50042,
-    
-    // State Apply stage (50043, no START/PROGRESS as it's part of commit)
-    StateApplyProgress = 50043,
-    
-    // Receipt Generation stage (50044-50045)
-    ReceiptGenProgress = 50044,
-    ReceiptGenEnd = 50045,
-    
-    // State Commit stage (50046-50047)
-    StateCommitStart = 50046,
-    StateCommitEnd = 50047,
+    // State Process stage (50040-50043)
+    StateProcessStart = 50050,
+    StateProcessEnd = 50051,
+    StateCommitEnd = 50052,
     
     // Block Insert stage (50050-50052)
-    BlockInsertStart = 50050,
-    BlockInsertProgress = 50051,
-    BlockInsertEnd = 50052,
-    
-    // Block Validate stage (50053-50054)
-    BlockValidateStart = 50053,
-    BlockValidateEnd = 50054,
-    
-    // Block Confirm stage (50055-50056)
-    BlockConfirmStart = 50055,
-    BlockConfirmEnd = 50056,
+    BlockInsertStart = 50060,
+    BlockInsertEnd = 50061,
 }
 
 impl TransactionProcessId {
     pub fn as_str(&self) -> &'static str {
         match self {
             TransactionProcessId::RpcReceiveStart => "RPC Receive Start",
-            TransactionProcessId::RpcReceiveProgress => "RPC Receive Progress",
             TransactionProcessId::RpcReceiveEnd => "RPC Receive End",
             TransactionProcessId::TxPoolAddStart => "TxPool Add Start",
-            TransactionProcessId::TxPoolAddProgress => "TxPool Add Progress",
             TransactionProcessId::TxPoolAddEnd => "TxPool Add End",
-            TransactionProcessId::TxPoolValidateProgress => "TxPool Validate Progress",
+            TransactionProcessId::TxPoolValidateStart => "TxPool Validate Progress",
             TransactionProcessId::TxPoolValidateEnd => "TxPool Validate End",
             TransactionProcessId::MinerSelectStart => "Miner Select Start",
-            TransactionProcessId::MinerSelectProgress => "Miner Select Progress",
             TransactionProcessId::MinerSelectEnd => "Miner Select End",
             TransactionProcessId::TxExecutionStart => "Tx Execution Start",
-            TransactionProcessId::TxExecutionProgress => "Tx Execution Progress",
             TransactionProcessId::TxExecutionEnd => "Tx Execution End",
-            TransactionProcessId::TxPackagingProgress => "Tx Packaging Progress",
             TransactionProcessId::TxPackagingEnd => "Tx Packaging End",
-            TransactionProcessId::BlockEndStart => "Block End Start",
-            TransactionProcessId::BlockEndEnd => "Block End End",
             TransactionProcessId::StateProcessStart => "State Process Start",
-            TransactionProcessId::StateProcessProgress => "State Process Progress",
             TransactionProcessId::StateProcessEnd => "State Process End",
-            TransactionProcessId::StateApplyProgress => "State Apply Progress",
-            TransactionProcessId::ReceiptGenProgress => "Receipt Generation Progress",
-            TransactionProcessId::ReceiptGenEnd => "Receipt Generation End",
-            TransactionProcessId::StateCommitStart => "State Commit Start",
             TransactionProcessId::StateCommitEnd => "State Commit End",
             TransactionProcessId::BlockInsertStart => "Block Insert Start",
-            TransactionProcessId::BlockInsertProgress => "Block Insert Progress",
             TransactionProcessId::BlockInsertEnd => "Block Insert End",
-            TransactionProcessId::BlockValidateStart => "Block Validate Start",
-            TransactionProcessId::BlockValidateEnd => "Block Validate End",
-            TransactionProcessId::BlockConfirmStart => "Block Confirm Start",
-            TransactionProcessId::BlockConfirmEnd => "Block Confirm End",
         }
     }
     
     /// Get the base stage ID (for backward compatibility and grouping)
     pub fn base_stage_id(&self) -> u32 {
         match self {
-            TransactionProcessId::RpcReceiveStart | TransactionProcessId::RpcReceiveProgress | TransactionProcessId::RpcReceiveEnd => 50010,
-            TransactionProcessId::TxPoolAddStart | TransactionProcessId::TxPoolAddProgress | TransactionProcessId::TxPoolAddEnd => 50020,
-            TransactionProcessId::TxPoolValidateProgress | TransactionProcessId::TxPoolValidateEnd => 50022,
-            TransactionProcessId::MinerSelectStart | TransactionProcessId::MinerSelectProgress | TransactionProcessId::MinerSelectEnd => 50030,
-            TransactionProcessId::TxExecutionStart | TransactionProcessId::TxExecutionProgress | TransactionProcessId::TxExecutionEnd => 50032,
-            TransactionProcessId::TxPackagingProgress | TransactionProcessId::TxPackagingEnd => 50034,
-            TransactionProcessId::BlockEndStart | TransactionProcessId::BlockEndEnd => 50036,
-            TransactionProcessId::StateProcessStart | TransactionProcessId::StateProcessProgress | TransactionProcessId::StateProcessEnd => 50040,
-            TransactionProcessId::StateApplyProgress => 50042,
-            TransactionProcessId::ReceiptGenProgress | TransactionProcessId::ReceiptGenEnd => 50044,
-            TransactionProcessId::StateCommitStart | TransactionProcessId::StateCommitEnd => 50046,
-            TransactionProcessId::BlockInsertStart | TransactionProcessId::BlockInsertProgress | TransactionProcessId::BlockInsertEnd => 50050,
-            TransactionProcessId::BlockValidateStart | TransactionProcessId::BlockValidateEnd => 50052,
-            TransactionProcessId::BlockConfirmStart | TransactionProcessId::BlockConfirmEnd => 50054,
+            TransactionProcessId::RpcReceiveStart | TransactionProcessId::RpcReceiveEnd => 50010,
+            TransactionProcessId::TxPoolAddStart | TransactionProcessId::TxPoolValidateStart | TransactionProcessId::TxPoolValidateEnd | TransactionProcessId::TxPoolAddEnd => 50020,
+            TransactionProcessId::MinerSelectStart | TransactionProcessId::MinerSelectEnd => 50030,
+            TransactionProcessId::TxExecutionStart | TransactionProcessId::TxExecutionEnd | TransactionProcessId::TxPackagingEnd => 50040,
+            TransactionProcessId::StateProcessStart | TransactionProcessId::StateProcessEnd | TransactionProcessId::StateCommitEnd => 50050,
+            TransactionProcessId::BlockInsertStart | TransactionProcessId::BlockInsertEnd => 50060,
         }
     }
 }
@@ -351,74 +293,6 @@ impl TransactionTracer {
         stats.events.push(event);
     }
 
-    /// Log transaction progress
-    pub fn log_transaction_progress(
-        &self,
-        tx_hash: B256,
-        process_id: TransactionProcessId,
-        message: &str,
-    ) {
-        if !self.inner.enabled {
-            return;
-        }
-
-        let event = TransactionTraceEvent {
-            tx_hash,
-            process_id,
-            status: TransactionTraceStatus::Progress,
-            message: message.to_string(),
-            timestamp: Instant::now(),
-            duration: None,
-        };
-
-        // Log to console as JSON format for easy parsing
-        let timestamp_duration = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let timestamp_ms = timestamp_duration.as_millis();
-        let timestamp_us = timestamp_duration.as_micros();
-        let log_json = json!({
-            "trace_type": "TX_TRACE",
-            "event_kind": "PROGRESS",
-            "tx_hash": format!("{:#x}", tx_hash),
-            "process_id": process_id as u32,
-            "process_name": process_id.as_str(),
-            "timestamp_ms": timestamp_ms,
-            "timestamp_us": timestamp_us,
-            "message": message
-        });
-        let json_str = serde_json::to_string(&log_json).unwrap_or_default();
-        
-        // Log to console
-        tracing::info!(
-            target: "tx_trace",
-            "{}",
-            json_str
-        );
-
-        // Write to file if enabled (one JSON per line)
-        if let Ok(mut file_guard) = self.inner.output_file.lock() {
-            if let Some(ref mut file) = *file_guard {
-                if let Err(e) = writeln!(file, "{}", json_str) {
-                    tracing::warn!(
-                        target: "tx_trace",
-                        error = %e,
-                        "Failed to write to transaction trace file"
-                    );
-                } else {
-                    // Flush immediately for real-time logging
-                    let _ = file.flush();
-                }
-            }
-        }
-
-        // Store in memory
-        let mut traces = self.inner.traces.lock().unwrap();
-        if let Some(stats) = traces.get_mut(&tx_hash) {
-            stats.events.push(event);
-        }
-    }
-
     /// Log transaction end (success or failure)
     pub fn log_transaction_end(
         &self,
@@ -529,9 +403,6 @@ impl TransactionTracer {
         let mut traces = self.inner.traces.lock().unwrap();
         if let Some(stats) = traces.get_mut(&tx_hash) {
             stats.events.push(event);
-            if process_id == TransactionProcessId::BlockConfirmEnd && success {
-                stats.end_time = Some(Instant::now());
-            }
         }
     }
 

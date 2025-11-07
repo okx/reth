@@ -203,13 +203,13 @@ where
 
     let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp);
 
-    // Monitoring point 4: Miner selection start
+    // Miner selection start
     use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
     
     while let Some(pool_tx) = best_txs.next() {
         let tx_hash = *pool_tx.hash();
         
-        // Monitoring point 4: Miner selecting transaction
+        // Miner selecting transaction
         if let Some(tracer) = get_global_tracer() {
             tracer.log_transaction_start(tx_hash, TransactionProcessId::MinerSelectStart, "Miner selecting transaction");
         }
@@ -303,19 +303,19 @@ where
             };
         }
 
-        // Monitoring point 4: Miner selection end (transaction selected and ready for execution)
+        // Miner selection end (transaction selected and ready for execution)
         if let Some(tracer) = get_global_tracer() {
             tracer.log_transaction_end(tx_hash, TransactionProcessId::MinerSelectEnd, true, "Transaction selected for execution");
         }
 
-        // Monitoring point 5: Transaction execution start
+        // Transaction execution start
         if let Some(tracer) = get_global_tracer() {
             tracer.log_transaction_start(tx_hash, TransactionProcessId::TxExecutionStart, "Starting transaction execution");
         }
         
         let gas_used = match builder.execute_transaction(tx.clone()) {
             Ok(gas_used) => {
-                // Monitoring point 5: Transaction execution successful
+                // Transaction execution successful
                 if let Some(tracer) = get_global_tracer() {
                     tracer.log_transaction_end(tx_hash, TransactionProcessId::TxExecutionEnd, true, "Transaction execution successful");
                 }
@@ -324,7 +324,7 @@ where
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                 error, ..
             })) => {
-                // Monitoring point 5: Transaction execution failed
+                // Transaction execution failed
                 if let Some(tracer) = get_global_tracer() {
                     tracer.log_transaction_end(tx_hash, TransactionProcessId::TxExecutionEnd, false, &format!("Transaction execution failed: {}", error));
                 }
@@ -386,7 +386,6 @@ where
     if let Some(tracer) = get_global_tracer() {
         for tx in block.body().transactions() {
             let tx_hash = *tx.tx_hash();
-            tracer.log_transaction_progress(tx_hash, TransactionProcessId::TxPackagingProgress, "Packaging transaction into block");
             tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPackagingEnd, true, "Transaction packaging completed");
         }
         // Monitoring point 7: Block end (record once per block, not per transaction)

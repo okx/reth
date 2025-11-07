@@ -511,15 +511,15 @@ where
                     authority_ids: authorities.map(|auths| self.get_sender_ids(auths)),
                 };
                 
-                // Monitoring point 2: Transaction pool add start
+                // Transaction pool add start
                 use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
                 if let Some(tracer) = get_global_tracer() {
                     tracer.log_transaction_start(tx_hash, TransactionProcessId::TxPoolAddStart, "Adding transaction to pool");
                 }
                 
-                // Monitoring point 3: Transaction pool validation start
+                // Transaction pool validation start
                 if let Some(tracer) = get_global_tracer() {
-                    tracer.log_transaction_progress(tx_hash, TransactionProcessId::TxPoolValidateProgress, "Starting validation");
+                    tracer.log_transaction_start(tx_hash, TransactionProcessId::TxPoolValidateStart, "Starting validation");
                 }
                 
                 let added = pool.add_transaction(tx, balance, state_nonce, bytecode_hash)?;
@@ -560,7 +560,7 @@ where
                 // Notify listeners for _all_ transactions
                 self.on_new_transaction(added.into_new_transaction_event());
 
-                // Monitoring point 2: Transaction pool add successful
+                // Transaction pool add successful
                 if let Some(tracer) = get_global_tracer() {
                     tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPoolAddEnd, true, "Transaction added to pool, waiting for mining");
                 }
