@@ -42,6 +42,11 @@ impl PreExecError {
     pub fn check_args(msg: impl Into<String>) -> Self {
         Self::new(CHECK_PRE_ARGS_ERROR_CODE, msg)
     }
+
+    /// Converts this error into a PreExecResult with gas and block number
+    pub fn into_result(self, gas_used: u64, block_number: U256) -> PreExecResult {
+        PreExecResult::from_error(self, gas_used, block_number)
+    }
 }
 
 /// Inner transaction information

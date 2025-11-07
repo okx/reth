@@ -2,8 +2,8 @@
 
 use alloy_eips::BlockId;
 use alloy_evm::overrides::apply_state_overrides;
-use alloy_primitives::{Address, U256, hex};
-use alloy_rpc_types_eth::{TransactionInfo, state::StateOverride};
+use alloy_primitives::{hex, Address, U256};
+use alloy_rpc_types_eth::{state::StateOverride, TransactionInfo};
 use alloy_rpc_types_trace::geth::call::CallFrame as GethCallFrame;
 use alloy_rpc_types_trace::geth::mux::MuxConfig;
 use alloy_rpc_types_trace::geth::pre_state::PreStateFrame;
@@ -13,13 +13,13 @@ use alloy_rpc_types_trace::geth::{
 use jsonrpsee::core::RpcResult;
 use op_alloy_rpc_types::OpTransactionRequest;
 use reth_rpc_eth_api::{
-    EthApiTypes, RpcTypes,
-    helpers::{Call, LoadState, SpawnBlocking, Trace},
     ext_xlayer::XLayerEthApiExtServer,
+    helpers::{Call, LoadState, SpawnBlocking, Trace},
+    EthApiTypes, RpcTypes,
 };
 use reth_rpc_eth_types::pre_exec_xlayer::{PreExecError, PreExecInnerTx, PreExecResult};
-use revm::DatabaseCommit;
 use revm::context_interface::result::ExecutionResult;
+use revm::DatabaseCommit;
 use revm_inspectors::tracing::MuxInspector;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -71,11 +71,10 @@ where
 
                 if let Some(overrides) = state_overrides {
                     if let Err(e) = apply_state_overrides(overrides, &mut db) {
-                        results.push(PreExecResult::from_error(
-                            PreExecError::unknown(format!("state override error: {:?}", e)),
-                            0,
-                            evm_env.block_env.number,
-                        ));
+                        results.push(
+                            PreExecError::unknown(format!("state override error: {:?}", e))
+                                .into_result(0, evm_env.block_env.number),
+                        );
                         return Ok(results);
                     }
                 }
@@ -87,11 +86,7 @@ where
                             tx_req.as_mut().gas = Some(corrected_gas);
                         }
                         Err(err) => {
-                            results.push(PreExecResult::from_error(
-                                err,
-                                0,
-                                evm_env.block_env.number,
-                            ));
+                            results.push(err.into_result(0, evm_env.block_env.number));
                             prev = Some(tx_req);
                             continue;
                         }
@@ -106,11 +101,10 @@ where
                     ) {
                         Ok(v) => v,
                         Err(e) => {
-                            results.push(PreExecResult::from_error(
-                                PreExecError::unknown(e.to_string()),
-                                0,
-                                evm_env.block_env.number,
-                            ));
+                            results.push(
+                                PreExecError::unknown(e.to_string())
+                                    .into_result(0, evm_env.block_env.number),
+                            );
                             prev = Some(current_req_for_next);
                             continue;
                         }
@@ -134,11 +128,10 @@ where
                     let mut inspector = match MuxInspector::try_from_config(mux_config) {
                         Ok(i) => i,
                         Err(e) => {
-                            results.push(PreExecResult::from_error(
-                                PreExecError::unknown(e.to_string()),
-                                0,
-                                evm_env.block_env.number,
-                            ));
+                            results.push(
+                                PreExecError::unknown(e.to_string())
+                                    .into_result(0, evm_env.block_env.number),
+                            );
                             prev = Some(current_req_for_next);
                             continue;
                         }
@@ -152,11 +145,10 @@ where
                     ) {
                         Ok(v) => v,
                         Err(e) => {
-                            results.push(PreExecResult::from_error(
-                                classify_error(e.to_string()),
-                                0,
-                                evm_env.block_env.number,
-                            ));
+                            results.push(
+                                classify_error(e.to_string())
+                                    .into_result(0, evm_env.block_env.number),
+                            );
                             prev = Some(current_req_for_next);
                             continue;
                         }
@@ -179,11 +171,7 @@ where
                     ) {
                         Ok(r) => r,
                         Err(e) => {
-                            results.push(PreExecResult::from_error(
-                                e,
-                                gas_used,
-                                current_evm_env.block_env.number,
-                            ));
+                            results.push(e.into_result(gas_used, current_evm_env.block_env.number));
                             prev = Some(current_req_for_next);
                             continue;
                         }
@@ -282,9 +270,8 @@ where
     // get logs
     let logs = {
         let log_vec = exec.result.logs();
-        let tx_hash = alloy_primitives::B256::from(
-            alloy_primitives::U256::from(tx_index).to_be_bytes(),
-        );
+        let tx_hash =
+            alloy_primitives::B256::from(alloy_primitives::U256::from(tx_index).to_be_bytes());
         let rpc_logs: Vec<alloy_rpc_types_eth::Log> = log_vec
             .iter()
             .enumerate()
@@ -292,9 +279,7 @@ where
                 inner: log.clone(),
                 block_hash,
                 block_number: Some(
-                    block_number
-                        .saturating_sub(alloy_primitives::U256::from(1))
-                        .saturating_to(),
+                    block_number.saturating_sub(alloy_primitives::U256::from(1)).saturating_to(),
                 ),
                 transaction_hash: Some(tx_hash),
                 transaction_index: Some(tx_index),
