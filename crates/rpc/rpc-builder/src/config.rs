@@ -93,7 +93,7 @@ impl RethRpcServerConfig for RpcServerArgs {
 
     fn eth_config(&self) -> EthConfig {
         // XLayer: Build legacy RPC config from CLI arguments
-        let legacy_rpc_config = crate::xlayer_legacy::build_legacy_rpc_config(
+        let legacy_rpc_config = crate::legacy_xlayer::build_legacy_rpc_config(
             self.legacy_rpc_url.as_ref(),
             self.legacy_cutoff_block,
             self.legacy_rpc_timeout.as_ref(),
