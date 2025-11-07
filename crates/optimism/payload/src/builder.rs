@@ -369,8 +369,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(state_provider)?;
         
-        // Monitoring point 6: Transaction packaging complete
-        // Note: Use recovered_block to get all transactions including system transactions
+        // Transaction packaging complete
         use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
         use alloy_consensus::transaction::TxHashRef;
         if let Some(tracer) = get_global_tracer() {
@@ -379,8 +378,6 @@ impl<Txs> OpBuilder<'_, Txs> {
                 let tx_hash = *tx.tx_hash();
                 tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPackagingEnd, true, "Transaction packaging completed");
             }
-            // Monitoring point 7: Block end (record once per block, not per transaction)
-            // Note: BlockEndEnd is recorded at block level in engine/tree/mod.rs, so we don't duplicate it here
         }
 
         let sealed_block = Arc::new(block.sealed_block().clone());

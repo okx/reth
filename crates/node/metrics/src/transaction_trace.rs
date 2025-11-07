@@ -26,7 +26,7 @@ pub enum TransactionProcessId {
     TxPoolAddStart = 50020,
     TxPoolValidateStart = 50021,
     TxPoolValidateEnd = 50022,
-    TxPoolAddEnd = 50024,
+    TxPoolAddEnd = 50023,
 
     // Miner Select stage (50030-50032)
     MinerSelectStart = 50030,

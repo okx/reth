@@ -526,7 +526,7 @@ where
                 let hash = *added.hash();
                 let state = added.transaction_state();
 
-                // Monitoring point 3: Transaction pool validation end (success)
+                // Transaction pool validation end (success)
                 if let Some(tracer) = get_global_tracer() {
                     tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPoolValidateEnd, true, "Transaction validation successful");
                 }
@@ -569,7 +569,7 @@ where
             }
             TransactionValidationOutcome::Invalid(tx, err) => {
                 let tx_hash = *tx.hash();
-                // Monitoring point 3: Transaction pool validation failed
+                // Transaction pool validation failed
                 use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
                 if let Some(tracer) = get_global_tracer() {
                     tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPoolValidateEnd, false, &format!("Transaction validation failed: {}", err));
@@ -580,7 +580,7 @@ where
                 Err(PoolError::new(*tx.hash(), err))
             }
             TransactionValidationOutcome::Error(tx_hash, err) => {
-                // Monitoring point 3: Transaction pool validation error
+                // Transaction pool validation error
                 use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
                 if let Some(tracer) = get_global_tracer() {
                     tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPoolValidateEnd, false, &format!("Validation error: {}", err));

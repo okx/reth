@@ -382,14 +382,12 @@ where
 
     let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
     
-    // Monitoring point 6: Transaction packaging complete
+    // Transaction packaging complete
     if let Some(tracer) = get_global_tracer() {
         for tx in block.body().transactions() {
             let tx_hash = *tx.tx_hash();
             tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPackagingEnd, true, "Transaction packaging completed");
         }
-        // Monitoring point 7: Block end (record once per block, not per transaction)
-        // Note: BlockEndEnd is recorded at block level in engine/tree/mod.rs, so we don't duplicate it here
     }
 
     let requests = chain_spec
