@@ -19,6 +19,18 @@ sol! {
     }
 }
 
+/// Common fields shared across transfer commands
+#[derive(Parser, Debug)]
+struct CommonTransferArgs {
+    /// RPC URL
+    #[arg(long)]
+    rpc_url: String,
+    /// Private key (hex string, with or without 0x prefix)
+    #[arg(long)]
+    private_key: String,
+}
+
+
 /// Create a provider with wallet from RPC URL and private key
 async fn create_provider_with_wallet(
     rpc_url: &str,
@@ -118,12 +130,8 @@ struct XlayerCli {
 pub enum XlayerCommands {
     /// Transfer native assets (ETH) to a specified address.
     Transfer {
-        /// RPC URL
-        #[arg(long)]
-        rpc_url: String,
-        /// Private key (hex string, with or without 0x prefix)
-        #[arg(long)]
-        private_key: String,
+        #[command(flatten)]
+        common: CommonTransferArgs,
         /// Recipient address
         #[arg(long)]
         to: Address,
@@ -133,12 +141,8 @@ pub enum XlayerCommands {
     },
     /// Transfer ERC20 tokens using transfer(address,uint256) function.
     TokenTransfer {
-        /// RPC URL
-        #[arg(long)]
-        rpc_url: String,
-        /// Private key (hex string, with or without 0x prefix)
-        #[arg(long)]
-        private_key: String,
+        #[command(flatten)]
+        common: CommonTransferArgs,
         /// Token contract address
         #[arg(long)]
         token: Address,
@@ -160,14 +164,16 @@ async fn main() -> Result<()> {
 
     let cli = XlayerCli::parse();
 
+
     match cli.command {
-        XlayerCommands::Transfer { rpc_url, private_key, to, amount } => {
-            transfer_native_asset(&rpc_url, &private_key, to, amount).await?;
+        XlayerCommands::Transfer { common, to, amount } => {
+            transfer_native_asset(&common.rpc_url, &common.private_key, to, amount).await?;
         }
-        XlayerCommands::TokenTransfer { rpc_url, private_key, token, to, amount } => {
-            transfer_token(&rpc_url, &private_key, token, to, amount).await?;
+        XlayerCommands::TokenTransfer { common, token, to, amount } => {
+            transfer_token(&common.rpc_url, &common.private_key, token, to, amount).await?;
         }
     }
+
 
     Ok(())
 }
