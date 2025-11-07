@@ -18,6 +18,10 @@ pub enum TransactionProcessId {
     RpcReceiveStart = 50010,
     RpcReceiveEnd = 50011,
     
+    // RPC Forward stage (50012-50013)
+    RpcForwardStart = 50012,
+    RpcForwardEnd = 50013,
+    
     // TxPool stage (50020-50022)
     TxPoolAddStart = 50020,
     TxPoolValidateStart = 50021,
@@ -48,6 +52,8 @@ impl TransactionProcessId {
         match self {
             TransactionProcessId::RpcReceiveStart => "RPC Receive Start",
             TransactionProcessId::RpcReceiveEnd => "RPC Receive End",
+            TransactionProcessId::RpcForwardStart => "RPC Forward Start",
+            TransactionProcessId::RpcForwardEnd => "RPC Forward End",
             TransactionProcessId::TxPoolAddStart => "TxPool Add Start",
             TransactionProcessId::TxPoolAddEnd => "TxPool Add End",
             TransactionProcessId::TxPoolValidateStart => "TxPool Validate Progress",
@@ -68,7 +74,7 @@ impl TransactionProcessId {
     /// Get the base stage ID (for backward compatibility and grouping)
     pub fn base_stage_id(&self) -> u32 {
         match self {
-            TransactionProcessId::RpcReceiveStart | TransactionProcessId::RpcReceiveEnd => 50010,
+            TransactionProcessId::RpcReceiveStart | TransactionProcessId::RpcReceiveEnd | TransactionProcessId::RpcForwardStart | TransactionProcessId::RpcForwardEnd => 50010,
             TransactionProcessId::TxPoolAddStart | TransactionProcessId::TxPoolValidateStart | TransactionProcessId::TxPoolValidateEnd | TransactionProcessId::TxPoolAddEnd => 50020,
             TransactionProcessId::MinerSelectStart | TransactionProcessId::MinerSelectEnd => 50030,
             TransactionProcessId::TxExecutionStart | TransactionProcessId::TxExecutionEnd | TransactionProcessId::TxPackagingEnd => 50040,

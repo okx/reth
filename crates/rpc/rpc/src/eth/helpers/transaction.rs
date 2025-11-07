@@ -34,16 +34,11 @@ where
     async fn send_raw_transaction(&self, tx: Bytes) -> Result<B256, Self::Error> {
         use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
 
-        // RPC receive start
         let recovered = recover_raw_transaction(&tx)?;
         let pool_transaction = <Self::Pool as TransactionPool>::Transaction::from_pooled(recovered);
         let tx_hash = *pool_transaction.hash();
-        
-        if let Some(tracer) = get_global_tracer() {
-            tracer.log_transaction_start(tx_hash, TransactionProcessId::RpcReceiveStart, "Receiving transaction via RPC send_rawTransaction");
-        }
 
-        // forward the transaction to the specific endpoint if configured.
+        // forward the transaction to the specific endpoint if configured (RPC node forwarding to sequencer).
         if let Some(client) = self.raw_tx_forwarder() {
             tracing::debug!(target: "rpc::eth", hash = %pool_transaction.hash(), "forwarding raw transaction to forwarder");
             let rlp_hex = hex::encode_prefixed(&tx);
@@ -51,22 +46,37 @@ where
             // broadcast raw transaction to subscribers if there is any.
             self.broadcast_raw_transaction(tx);
 
+            // Monitoring point: RPC forward start (RPC node forwarding to sequencer)
+            if let Some(tracer) = get_global_tracer() {
+                tracer.log_transaction_start(tx_hash, TransactionProcessId::RpcForwardStart, "Forwarding transaction to sequencer");
+            }
+            
+            let start = std::time::Instant::now();
             let hash =
                 client.request("eth_sendRawTransaction", (rlp_hex,)).await.inspect_err(|err| {
                     tracing::debug!(target: "rpc::eth", %err, hash=% *pool_transaction.hash(), "failed to forward raw transaction");
+                    // Monitoring point: RPC forward end (failed)
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveEnd, false, "Failed to forward transaction");
+                        tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcForwardEnd, false, &format!("Failed to forward transaction: {}", err));
                     }
                 }).map_err(EthApiError::other)?;
+            
+            let duration = start.elapsed();
+            // Monitoring point: RPC forward end (success)
+            if let Some(tracer) = get_global_tracer() {
+                tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcForwardEnd, true, &format!("Transaction forwarded successfully, duration: {}ms", duration.as_millis()));
+            }
 
             // Retain tx in local tx pool after forwarding, for local RPC usage.
             let _ = self.inner.add_pool_transaction(pool_transaction).await;
 
-            if let Some(tracer) = get_global_tracer() {
-                tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveEnd, true, "RPC receive successful");
-            }
-
             return Ok(hash);
+        }
+
+        // Sequencer node receiving transaction (no forwarder configured).
+        // Monitoring point: RPC receive start (Sequencer node receiving transaction)
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_transaction_start(tx_hash, TransactionProcessId::RpcReceiveStart, "Receiving transaction via RPC send_rawTransaction");
         }
 
         // broadcast raw transaction to subscribers if there is any.
@@ -76,12 +86,14 @@ where
         let AddedTransactionOutcome { hash, .. } =
             self.inner.add_pool_transaction(pool_transaction).await
                 .map_err(|err| {
+                    // Monitoring point: RPC receive end (failed)
                     if let Some(tracer) = get_global_tracer() {
                         tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveEnd, false, &format!("Failed to add to transaction pool: {}", err));
                     }
                     err
                 })?;
 
+        // Monitoring point: RPC receive end (success)
         if let Some(tracer) = get_global_tracer() {
             tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveEnd, true, "RPC receive successful");
         }

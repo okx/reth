@@ -9513,6 +9513,7 @@ dependencies = [
  "reth-metrics",
  "reth-node-api",
  "reth-node-builder",
+ "reth-node-metrics",
  "reth-optimism-chainspec",
  "reth-optimism-evm",
  "reth-optimism-flashblocks",
