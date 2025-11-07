@@ -2400,11 +2400,10 @@ where
 
         if let Some(tracer) = get_global_tracer() {
             let is_canonical = !is_fork;
-            let block_insert_duration = start.elapsed();
             
             // Log block-level trace only (not per-transaction to avoid duplication)
             if is_canonical {
-                tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockInsertEnd, true, Some(block_insert_duration), "Block insertion completed");
+                tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockInsertEnd, true, "Block insertion completed");
             }
         }
 
