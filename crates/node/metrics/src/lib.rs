@@ -21,4 +21,4 @@ pub use metrics_exporter_prometheus::*;
 pub use metrics_process::*;
 pub use transaction_trace::TransactionTracer;
 // Re-export transaction trace module items for convenience
-pub use transaction_trace::{get_global_tracer, init_global_tracer, TransactionProcessId};
+pub use transaction_trace::{get_global_tracer, init_global_tracer, flush_global_tracer, TransactionProcessId};

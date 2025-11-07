@@ -7477,6 +7477,7 @@ dependencies = [
 name = "reth-cli-runner"
 version = "1.8.3"
 dependencies = [
+ "reth-node-metrics",
  "reth-tasks",
  "tokio",
  "tracing",

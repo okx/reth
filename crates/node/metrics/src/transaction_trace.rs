@@ -6,8 +6,18 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
+
+/// Number of log entries to write before forcing a flush
+const FLUSH_INTERVAL_WRITES: u64 = 100;
+
+/// Time interval between flushes (in seconds)
+const FLUSH_INTERVAL_SECONDS: u64 = 1;
 
 /// Transaction process ID for tracking different stages and event types
 /// Each stage has three event IDs: START and END
@@ -94,6 +104,9 @@ pub struct TransactionTracer {
 struct TransactionTracerInner {
     enabled: bool,
     output_file: Mutex<Option<File>>,
+    // Flush control: track write count and last flush time
+    write_count: AtomicU64,
+    last_flush_time: Mutex<Instant>,
 }
 
 impl TransactionTracer {
@@ -157,6 +170,8 @@ impl TransactionTracer {
             inner: Arc::new(TransactionTracerInner {
                 enabled,
                 output_file: Mutex::new(output_file),
+                write_count: AtomicU64::new(0),
+                last_flush_time: Mutex::new(Instant::now()),
             }),
         }
     }
@@ -166,7 +181,7 @@ impl TransactionTracer {
         self.inner.enabled
     }
 
-    /// Write JSON string to trace file
+    /// Write JSON string to trace file with periodic flush
     fn write_to_file(&self, json_str: &str) {
         match self.inner.output_file.lock() {
             Ok(mut file_guard) => {
@@ -178,13 +193,31 @@ impl TransactionTracer {
                             "Failed to write to transaction trace file"
                         );
                     } else {
-                        // Flush immediately for real-time logging
-                        if let Err(e) = file.flush() {
-                            tracing::warn!(
-                                target: "tx_trace",
-                                error = %e,
-                                "Failed to flush transaction trace file"
-                            );
+                        // Increment write count
+                        let count = self.inner.write_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        
+                        // Flush periodically: every FLUSH_INTERVAL_WRITES writes or every FLUSH_INTERVAL_SECONDS seconds
+                        let should_flush = {
+                            let mut last_flush = self.inner.last_flush_time.lock().unwrap();
+                            let now = Instant::now();
+                            let time_since_flush = now.duration_since(*last_flush);
+                            
+                            if count % FLUSH_INTERVAL_WRITES == 0 || time_since_flush.as_secs() >= FLUSH_INTERVAL_SECONDS {
+                                *last_flush = now;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        
+                        if should_flush {
+                            if let Err(e) = file.flush() {
+                                tracing::warn!(
+                                    target: "tx_trace",
+                                    error = %e,
+                                    "Failed to flush transaction trace file"
+                                );
+                            }
                         }
                     }
                 }
@@ -195,6 +228,30 @@ impl TransactionTracer {
                     target: "tx_trace",
                     error = %e,
                     "Failed to acquire lock for transaction trace file"
+                );
+            }
+        }
+    }
+    
+    /// Force flush the trace file (used on shutdown to ensure no logs are lost)
+    pub fn flush(&self) {
+        match self.inner.output_file.lock() {
+            Ok(mut file_guard) => {
+                if let Some(ref mut file) = *file_guard {
+                    if let Err(e) = file.flush() {
+                        tracing::warn!(
+                            target: "tx_trace",
+                            error = %e,
+                            "Failed to flush transaction trace file on shutdown"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "tx_trace",
+                    error = %e,
+                    "Failed to acquire lock for flushing transaction trace file"
                 );
             }
         }
@@ -286,6 +343,13 @@ pub fn init_global_tracer(enabled: bool, output_path: Option<PathBuf>) {
 /// Get the global transaction tracer
 pub fn get_global_tracer() -> Option<Arc<TransactionTracer>> {
     GLOBAL_TRACER.get().cloned()
+}
+
+/// Flush the global transaction tracer (should be called on shutdown)
+pub fn flush_global_tracer() {
+    if let Some(tracer) = get_global_tracer() {
+        tracer.flush();
+    }
 }
 
 /// Block tracing functions for monitoring block lifecycle
