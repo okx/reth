@@ -7804,7 +7804,6 @@ dependencies = [
  "reth-db",
  "serde_json",
  "shellexpand",
- "tracing",
 ]
 
 [[package]]
@@ -9616,7 +9615,6 @@ dependencies = [
  "serde_json",
  "tar-no-std",
  "thiserror 2.0.17",
- "tracing",
 ]
 
 [[package]]
