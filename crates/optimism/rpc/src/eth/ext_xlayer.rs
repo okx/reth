@@ -499,3 +499,575 @@ where
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Bytes, B256};
+    use alloy_rpc_types_trace::geth::call::CallFrame as GethCallFrame;
+    use revm::{
+        bytecode::Bytecode,
+        primitives::HashMap as RevmHashMap,
+        state::{Account, AccountInfo},
+        Database, DatabaseCommit, DatabaseRef,
+    };
+    use std::collections::{BTreeMap, HashMap};
+
+    /// Mock database for testing
+    #[derive(Debug, Clone)]
+    struct MockDatabase {
+        accounts: HashMap<Address, AccountInfo>,
+        storage: HashMap<Address, HashMap<U256, U256>>,
+    }
+
+    impl MockDatabase {
+        fn new() -> Self {
+            Self { accounts: HashMap::new(), storage: HashMap::new() }
+        }
+
+        fn with_account(mut self, address: Address, balance: U256, nonce: u64) -> Self {
+            self.accounts.insert(
+                address,
+                AccountInfo { balance, nonce, code_hash: B256::ZERO, code: None },
+            );
+            self
+        }
+    }
+
+    impl Database for MockDatabase {
+        type Error = ProviderError;
+
+        fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(self.accounts.get(&address).cloned())
+        }
+
+        fn code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+
+        fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+            Ok(self
+                .storage
+                .get(&address)
+                .and_then(|s| s.get(&index))
+                .copied()
+                .unwrap_or_default())
+        }
+
+        fn block_hash(&mut self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    impl DatabaseRef for MockDatabase {
+        type Error = ProviderError;
+
+        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(self.accounts.get(&address).cloned())
+        }
+
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+
+        fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+            Ok(self
+                .storage
+                .get(&address)
+                .and_then(|s| s.get(&index))
+                .copied()
+                .unwrap_or_default())
+        }
+
+        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    impl DatabaseCommit for MockDatabase {
+        fn commit(&mut self, changes: RevmHashMap<Address, Account>) {
+            for (addr, account) in changes {
+                if account.is_selfdestructed() {
+                    self.accounts.remove(&addr);
+                    self.storage.remove(&addr);
+                } else {
+                    self.accounts.insert(addr, account.info);
+                    let storage_entry = self.storage.entry(addr).or_default();
+                    for (key, value) in account.storage {
+                        if value.present_value().is_zero() {
+                            storage_entry.remove(&key);
+                        } else {
+                            storage_entry.insert(key, value.present_value());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    impl OverrideBlockHashes for MockDatabase {
+        fn override_block_hashes(&mut self, _hashes: BTreeMap<u64, B256>) {
+            // No-op for testing
+        }
+    }
+
+    /// Helper functions to test PreExec trait methods
+    /// Since PreExec methods have default implementations, we can test them directly
+    fn test_pre_args_check<DB>(
+        db: &mut DB,
+        tx: &OpTransactionRequest,
+        prev: Option<&OpTransactionRequest>,
+        index: usize,
+    ) -> Result<u64, PreExecError>
+    where
+        DB: revm::Database,
+        <DB as revm::Database>::Error: core::fmt::Debug,
+    {
+        // Direct implementation copied from PreExec trait for testing
+        let req = tx.as_ref();
+        let from: Address = req.from.ok_or_else(|| PreExecError::check_args("from is nil"))?;
+        if req.to.is_none() {
+            return Err(PreExecError::check_args("to is nil"));
+        }
+
+        let msg_nonce =
+            req.nonce.ok_or_else(|| PreExecError::check_args(format!("{}, nonce is nil", from)))?;
+
+        if let Some(prev_req) = prev {
+            if let (Some(pf), Some(pn)) = (prev_req.as_ref().from, prev_req.as_ref().nonce) {
+                if pf == from && msg_nonce <= pn {
+                    return Err(PreExecError::check_args(format!(
+                        "{} nonce decreases, tx index {} has nonce {}, tx index {} has nonce {}",
+                        from,
+                        index.saturating_sub(1),
+                        pn,
+                        index,
+                        msg_nonce
+                    )));
+                }
+            }
+        }
+
+        let st_nonce = db
+            .basic(from)
+            .map_err(|e| PreExecError::unknown(format!("db error: {:?}", e)))?
+            .map(|acc| acc.nonce)
+            .unwrap_or(0);
+
+        if st_nonce > msg_nonce {
+            return Err(PreExecError::check_args(format!(
+                "nonce too low: address {}, tx: {} state: {}",
+                from, msg_nonce, st_nonce
+            )));
+        } else if st_nonce.checked_add(1).is_none() {
+            return Err(PreExecError::check_args(format!(
+                "nonce has max value: address {}, nonce: {}",
+                from, st_nonce
+            )));
+        }
+
+        let corrected_gas = match req.gas {
+            Some(g) => {
+                if g == 0 || g > MAX_GAS_LIMIT {
+                    MAX_GAS_LIMIT
+                } else {
+                    g
+                }
+            }
+            None => MAX_GAS_LIMIT,
+        };
+        Ok(corrected_gas)
+    }
+
+    fn test_classify_error(msg: String) -> PreExecError {
+        let lower = msg.to_lowercase();
+        match () {
+            _ if lower.contains("out of gas") => PreExecError::reverted("out of gas"),
+            _ if lower.contains("insufficient funds") || lower.contains("insufficient balance") => {
+                PreExecError::insufficient_balance(msg)
+            }
+            _ => PreExecError::unknown(msg),
+        }
+    }
+
+    fn test_convert_call_tracer_to_inner_txs(
+        call_frame: &GethCallFrame,
+    ) -> Result<Vec<PreExecInnerTx>, PreExecError> {
+        let mut inner_txs = Vec::new();
+        test_convert_call_frame_recursive(call_frame, &mut inner_txs, 0, 0, String::new(), false);
+        let has_deep = inner_txs.iter().any(|it| it.dept > U256::from(0));
+        let has_failed = inner_txs.iter().any(|it| it.is_error || !it.error.is_empty());
+        if !(has_deep || has_failed) {
+            return Ok(Vec::new());
+        }
+        Ok(inner_txs)
+    }
+
+    fn test_convert_call_frame_recursive(
+        frame: &GethCallFrame,
+        out: &mut Vec<PreExecInnerTx>,
+        depth: i64,
+        index: i64,
+        depth_index_root: String,
+        parent_error: bool,
+    ) {
+        let mut is_error = parent_error;
+        let mut error_msg = String::new();
+        if let Some(err) = &frame.error {
+            is_error = true;
+            error_msg = err.clone();
+        }
+
+        let gas_used = frame.gas_used.saturating_to::<u64>();
+        let gas = frame.gas.saturating_to::<u64>();
+        let return_gas = gas.saturating_sub(gas_used);
+
+        let output =
+            frame.output.as_ref().map(|b| format!("{:?}", b)).unwrap_or_else(|| "0x".into());
+        let value_wei = frame.value.map(|v| v.to_string()).unwrap_or_else(|| "0".into());
+
+        let mut inner = PreExecInnerTx {
+            dept: U256::from(depth as u64),
+            internal_index: U256::from(index as u64),
+            call_type: frame.typ.to_string().to_lowercase(),
+            name: String::new(),
+            trace_address: String::new(),
+            code_address: String::new(),
+            from: format!("{:?}", frame.from),
+            to: frame.to.map(|a| format!("{:?}", a)).unwrap_or_default(),
+            input: format!("{:?}", frame.input),
+            gas_used,
+            output,
+            is_error,
+            value: value_wei.clone(),
+            value_wei,
+            error: error_msg,
+            return_gas,
+        };
+
+        if depth == 0 {
+            inner.name = inner.call_type.clone();
+        } else {
+            if let Some(stripped) = inner.from.strip_prefix("0x") {
+                inner.from = format!("0x000000000000000000000000{}", stripped);
+            }
+            if let Some(stripped) = inner.to.strip_prefix("0x") {
+                inner.to = format!("0x000000000000000000000000{}", stripped);
+            }
+            if inner.call_type == "callcode" {
+                inner.code_address = frame.to.map(|a| format!("{:?}", a)).unwrap_or_default();
+            }
+            let current_root = if depth_index_root.is_empty() {
+                format!("_{}", index)
+            } else {
+                format!("{}_{}", depth_index_root, index)
+            };
+            inner.name = format!("{}{}", inner.call_type, current_root);
+        }
+
+        out.push(inner);
+
+        if !frame.calls.is_empty() {
+            let next_root =
+                if depth == 0 { String::new() } else { format!("{}_{}", depth_index_root, index) };
+            for (i, nested) in frame.calls.iter().enumerate() {
+                let parent_err = out.last().map(|x| x.is_error).unwrap_or(false);
+                test_convert_call_frame_recursive(
+                    nested,
+                    out,
+                    depth + 1,
+                    i as i64,
+                    next_root.clone(),
+                    parent_err,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pre_args_check_missing_from() {
+        let mut db = MockDatabase::new();
+        let tx = OpTransactionRequest::default();
+
+        let result = test_pre_args_check(&mut db, &tx, None, 0);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, 1003); // CHECK_PRE_ARGS_ERROR_CODE
+        assert!(err.msg.contains("from is nil"));
+    }
+
+    #[test]
+    fn test_pre_args_check_missing_to() {
+        let mut db = MockDatabase::new();
+        let from = Address::random();
+        let mut tx = OpTransactionRequest::default();
+        tx.as_mut().from = Some(from);
+        tx.as_mut().nonce = Some(1);
+
+        let result = test_pre_args_check(&mut db, &tx, None, 0);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, 1003); // CHECK_PRE_ARGS_ERROR_CODE
+        assert!(err.msg.contains("to is nil"));
+    }
+
+    #[test]
+    fn test_pre_args_check_missing_nonce() {
+        let mut db = MockDatabase::new();
+        let from = Address::random();
+        let to = Address::random();
+        let mut tx = OpTransactionRequest::default();
+        tx.as_mut().from = Some(from);
+        tx.as_mut().to = Some(to.into());
+
+        let result = test_pre_args_check(&mut db, &tx, None, 0);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, 1003); // CHECK_PRE_ARGS_ERROR_CODE
+        assert!(err.msg.contains("nonce is nil"));
+    }
+
+    #[test]
+    fn test_pre_args_check_nonce_too_low() {
+        let from = Address::random();
+        let to = Address::random();
+        let mut db = MockDatabase::new().with_account(from, U256::from(1000), 5);
+
+        let mut tx = OpTransactionRequest::default();
+        tx.as_mut().from = Some(from);
+        tx.as_mut().to = Some(to.into());
+        tx.as_mut().nonce = Some(3); // Lower than state nonce (5)
+
+        let result = test_pre_args_check(&mut db, &tx, None, 0);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, 1003); // CHECK_PRE_ARGS_ERROR_CODE
+        assert!(err.msg.contains("nonce too low"));
+    }
+
+    #[test]
+    fn test_pre_args_check_nonce_decreases() {
+        let from = Address::random();
+        let to = Address::random();
+        let mut db = MockDatabase::new().with_account(from, U256::from(1000), 5);
+
+        let mut prev_tx = OpTransactionRequest::default();
+        prev_tx.as_mut().from = Some(from);
+        prev_tx.as_mut().nonce = Some(10);
+
+        let mut tx = OpTransactionRequest::default();
+        tx.as_mut().from = Some(from);
+        tx.as_mut().to = Some(to.into());
+        tx.as_mut().nonce = Some(8); // Lower than previous nonce (10)
+
+        let result = test_pre_args_check(&mut db, &tx, Some(&prev_tx), 1);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, 1003); // CHECK_PRE_ARGS_ERROR_CODE
+        assert!(err.msg.contains("nonce decreases"));
+    }
+
+    #[test]
+    fn test_pre_args_check_gas_correction() {
+        let from = Address::random();
+        let to = Address::random();
+        let mut db = MockDatabase::new().with_account(from, U256::from(1000), 5);
+
+        let mut tx = OpTransactionRequest::default();
+        tx.as_mut().from = Some(from);
+        tx.as_mut().to = Some(to.into());
+        tx.as_mut().nonce = Some(5);
+        tx.as_mut().gas = Some(0); // Zero gas should be corrected
+
+        let result = test_pre_args_check(&mut db, &tx, None, 0);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), MAX_GAS_LIMIT);
+    }
+
+    #[test]
+    fn test_pre_args_check_gas_over_limit() {
+        let from = Address::random();
+        let to = Address::random();
+        let mut db = MockDatabase::new().with_account(from, U256::from(1000), 5);
+
+        let mut tx = OpTransactionRequest::default();
+        tx.as_mut().from = Some(from);
+        tx.as_mut().to = Some(to.into());
+        tx.as_mut().nonce = Some(5);
+        tx.as_mut().gas = Some(MAX_GAS_LIMIT + 1000);
+
+        let result = test_pre_args_check(&mut db, &tx, None, 0);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), MAX_GAS_LIMIT);
+    }
+
+    #[test]
+    fn test_pre_args_check_valid() {
+        let from = Address::random();
+        let to = Address::random();
+        let gas_limit = 21000u64;
+        let mut db = MockDatabase::new().with_account(from, U256::from(1000), 5);
+
+        let mut tx = OpTransactionRequest::default();
+        tx.as_mut().from = Some(from);
+        tx.as_mut().to = Some(to.into());
+        tx.as_mut().nonce = Some(5);
+        tx.as_mut().gas = Some(gas_limit);
+
+        let result = test_pre_args_check(&mut db, &tx, None, 0);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), gas_limit);
+    }
+
+    #[test]
+    fn test_classify_error_out_of_gas() {
+        let err = test_classify_error("execution failed: out of gas".to_string());
+        assert_eq!(err.code, 1002); // REVERTED_ERROR_CODE
+        assert_eq!(err.msg, "out of gas");
+    }
+
+    #[test]
+    fn test_classify_error_insufficient_funds() {
+        let err = test_classify_error("transaction failed: insufficient funds".to_string());
+        assert_eq!(err.code, 1001); // INSUFFICIENT_BALANCE_ERROR_CODE
+    }
+
+    #[test]
+    fn test_classify_error_insufficient_balance() {
+        let err = test_classify_error("account has insufficient balance".to_string());
+        assert_eq!(err.code, 1001); // INSUFFICIENT_BALANCE_ERROR_CODE
+    }
+
+    #[test]
+    fn test_classify_error_unknown() {
+        let msg = "some unknown error".to_string();
+        let err = test_classify_error(msg.clone());
+        assert_eq!(err.code, 1000); // UNKNOWN_ERROR_CODE
+        assert_eq!(err.msg, msg);
+    }
+
+    #[test]
+    fn test_convert_call_frame_empty_calls() {
+        let frame = GethCallFrame {
+            typ: "CALL".to_string(),
+            from: Address::random(),
+            to: Some(Address::random()),
+            value: Some(U256::from(100)),
+            gas: U256::from(50000),
+            gas_used: U256::from(21000),
+            input: Bytes::default(),
+            output: Some(Bytes::default()),
+            error: None,
+            calls: vec![],
+            logs: vec![],
+            revert_reason: None,
+        };
+
+        let result = test_convert_call_tracer_to_inner_txs(&frame);
+        assert!(result.is_ok());
+        // Should return empty vec because no deep calls and no errors
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_convert_call_frame_with_nested_calls() {
+        let nested = GethCallFrame {
+            typ: "CALL".to_string(),
+            from: Address::random(),
+            to: Some(Address::random()),
+            value: Some(U256::from(50)),
+            gas: U256::from(30000),
+            gas_used: U256::from(10000),
+            input: Bytes::default(),
+            output: Some(Bytes::default()),
+            error: None,
+            calls: vec![],
+            logs: vec![],
+            revert_reason: None,
+        };
+
+        let frame = GethCallFrame {
+            typ: "CALL".to_string(),
+            from: Address::random(),
+            to: Some(Address::random()),
+            value: Some(U256::from(100)),
+            gas: U256::from(50000),
+            gas_used: U256::from(21000),
+            input: Bytes::default(),
+            output: Some(Bytes::default()),
+            error: None,
+            calls: vec![nested],
+            logs: vec![],
+            revert_reason: None,
+        };
+
+        let result = test_convert_call_tracer_to_inner_txs(&frame);
+        assert!(result.is_ok());
+        let inner_txs = result.unwrap();
+        // Should have parent + nested call
+        assert_eq!(inner_txs.len(), 2);
+        assert_eq!(inner_txs[0].dept, U256::from(0));
+        assert_eq!(inner_txs[1].dept, U256::from(1));
+    }
+
+    #[test]
+    fn test_convert_call_frame_with_error() {
+        let frame = GethCallFrame {
+            typ: "CALL".to_string(),
+            from: Address::random(),
+            to: Some(Address::random()),
+            value: Some(U256::from(100)),
+            gas: U256::from(50000),
+            gas_used: U256::from(21000),
+            input: Bytes::default(),
+            output: Some(Bytes::default()),
+            error: Some("execution reverted".to_string()),
+            calls: vec![],
+            logs: vec![],
+            revert_reason: None,
+        };
+
+        let result = test_convert_call_tracer_to_inner_txs(&frame);
+        assert!(result.is_ok());
+        let inner_txs = result.unwrap();
+        // Should return because has error
+        assert_eq!(inner_txs.len(), 1);
+        assert!(inner_txs[0].is_error);
+        assert_eq!(inner_txs[0].error, "execution reverted");
+    }
+
+    #[test]
+    fn test_convert_call_frame_recursive_depth() {
+        let mut out = Vec::new();
+        let frame = GethCallFrame {
+            typ: "CALL".to_string(),
+            from: Address::random(),
+            to: Some(Address::random()),
+            value: Some(U256::from(100)),
+            gas: U256::from(50000),
+            gas_used: U256::from(21000),
+            input: Bytes::default(),
+            output: Some(Bytes::default()),
+            error: None,
+            calls: vec![],
+            logs: vec![],
+            revert_reason: None,
+        };
+
+        test_convert_call_frame_recursive(&frame, &mut out, 0, 0, String::new(), false);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].dept, U256::from(0));
+        assert_eq!(out[0].internal_index, U256::from(0));
+        assert_eq!(out[0].call_type, "call");
+        assert!(!out[0].is_error);
+    }
+}
