@@ -10293,6 +10293,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-sdk"
+version = "1.8.3"
+dependencies = [
+ "alloy-genesis",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
+ "alloy-signer-local",
+ "alloy-transport-http",
+ "anyhow",
+ "clap",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.20",
+]
+
+[[package]]
 name = "reth-stages"
 version = "1.8.3"
 dependencies = [

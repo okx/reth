@@ -174,6 +174,7 @@ members = [
     "testing/testing-utils",
     "testing/runner",
     "crates/tracing-otlp",
+    "crates/sdk",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]

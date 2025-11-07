@@ -1,0 +1,32 @@
+[package]
+name = "reth-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+alloy-genesis.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-network.workspace = true
+alloy-signer-local.workspace = true
+alloy-primitives.workspace = true
+alloy-transport-http.workspace = true
+
+# async
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# tracing
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+# misc
+clap = { workspace = true, features = ["derive"] }
+anyhow.workspace=true
