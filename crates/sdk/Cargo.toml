@@ -19,6 +19,7 @@ alloy-network.workspace = true
 alloy-signer-local.workspace = true
 alloy-primitives.workspace = true
 alloy-transport-http.workspace = true
+alloy-sol-types.workspace = true
 
 # async
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

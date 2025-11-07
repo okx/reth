@@ -10302,6 +10302,7 @@ dependencies = [
  "alloy-provider",
  "alloy-rpc-types-eth",
  "alloy-signer-local",
+ "alloy-sol-types",
  "alloy-transport-http",
  "anyhow",
  "clap",
