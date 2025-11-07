@@ -89,7 +89,7 @@ impl EngineApiMetrics {
 
                     // State processing start
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_start(tx_hash, TransactionProcessId::StateProcessStart, "Processing state");
+                        tracer.log_transaction_start(tx_hash, TransactionProcessId::RPCTxExecutionStart, "RPCTx Execution Start");
                     }
 
                     let span =
@@ -100,7 +100,7 @@ impl EngineApiMetrics {
 
                     // State processing end
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::StateProcessEnd, true, "State processing completed");
+                        tracer.log_transaction_end(tx_hash, TransactionProcessId::RPCTxExecutionEnd, true, "RPCTx Execution Completed");
                     }
                 }
 
@@ -111,7 +111,7 @@ impl EngineApiMetrics {
                 if let Some(tracer) = get_global_tracer() {
                     for tx in &transactions {
                         let tx_hash = *tx.tx().tx_hash();
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::StateCommitEnd, true, "State commit completed");
+                        tracer.log_transaction_end(tx_hash, TransactionProcessId::RPCTxCommitEnd, true, "RPCTx Commit Completed");
                     }
                 }
 

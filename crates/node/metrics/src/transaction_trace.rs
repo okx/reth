@@ -22,7 +22,7 @@ pub enum TransactionProcessId {
     RpcForwardStart = 50012,
     RpcForwardEnd = 50013,
     
-    // TxPool stage (50020-50022)
+    // TxPool stage (50020-50024)
     TxPoolAddStart = 50020,
     TxPoolValidateStart = 50021,
     TxPoolValidateEnd = 50022,
@@ -32,17 +32,17 @@ pub enum TransactionProcessId {
     MinerSelectStart = 50030,
     MinerSelectEnd = 50031,
     
-    // Tx Execution stage (50033-50035)
+    // Tx Execution stage (50040-50042)
     TxExecutionStart = 50040,
     TxExecutionEnd = 50041,
     TxPackagingEnd = 50042,
     
-    // State Process stage (50040-50043)
-    StateProcessStart = 50050,
-    StateProcessEnd = 50051,
-    StateCommitEnd = 50052,
+    // RPC Tx Process stage (50050-50052)
+    RPCTxExecutionStart = 50050,
+    RPCTxExecutionEnd = 50051,
+    RPCTxCommitEnd = 50052,
     
-    // Block Insert stage (50050-50052)
+    // Block Insert stage (50060-50061)
     BlockInsertStart = 50060,
     BlockInsertEnd = 50061,
 }
@@ -63,9 +63,9 @@ impl TransactionProcessId {
             TransactionProcessId::TxExecutionStart => "Tx Execution Start",
             TransactionProcessId::TxExecutionEnd => "Tx Execution End",
             TransactionProcessId::TxPackagingEnd => "Tx Packaging End",
-            TransactionProcessId::StateProcessStart => "State Process Start",
-            TransactionProcessId::StateProcessEnd => "State Process End",
-            TransactionProcessId::StateCommitEnd => "State Commit End",
+            TransactionProcessId::RPCTxExecutionStart => "RPC Tx Execution Start",
+            TransactionProcessId::RPCTxExecutionEnd => "RPC Tx Execution End",
+            TransactionProcessId::RPCTxCommitEnd => "RPC Tx Commit End",
             TransactionProcessId::BlockInsertStart => "Block Insert Start",
             TransactionProcessId::BlockInsertEnd => "Block Insert End",
         }
@@ -78,7 +78,7 @@ impl TransactionProcessId {
             TransactionProcessId::TxPoolAddStart | TransactionProcessId::TxPoolValidateStart | TransactionProcessId::TxPoolValidateEnd | TransactionProcessId::TxPoolAddEnd => 50020,
             TransactionProcessId::MinerSelectStart | TransactionProcessId::MinerSelectEnd => 50030,
             TransactionProcessId::TxExecutionStart | TransactionProcessId::TxExecutionEnd | TransactionProcessId::TxPackagingEnd => 50040,
-            TransactionProcessId::StateProcessStart | TransactionProcessId::StateProcessEnd | TransactionProcessId::StateCommitEnd => 50050,
+            TransactionProcessId::RPCTxExecutionStart | TransactionProcessId::RPCTxExecutionEnd | TransactionProcessId::RPCTxCommitEnd => 50050,
             TransactionProcessId::BlockInsertStart | TransactionProcessId::BlockInsertEnd => 50060,
         }
     }
