@@ -175,6 +175,14 @@ where
             tx_trace,
         } = self;
 
+        // XLayer: Auto-derive legacy cutoff block from genesis if legacy RPC is configured
+        let mut rpc = rpc;
+        if rpc.legacy_rpc_url.is_some() {
+            let genesis_block_number = chain.as_ref().genesis().number.unwrap_or_default();
+            rpc.legacy_cutoff_block = Some(genesis_block_number);
+            tracing::info!(target: "reth::cli::xlayer", genesis_block = genesis_block_number, "Using genesis block as legacy cutoff");
+        }
+
         // Initialize transaction tracer if enabled
         if tx_trace.enable {
             use reth_node_metrics::transaction_trace::init_global_tracer;

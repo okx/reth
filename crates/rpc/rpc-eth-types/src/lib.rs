@@ -15,6 +15,7 @@ pub mod error;
 pub mod fee_history;
 pub mod gas_oracle;
 pub mod id_provider;
+pub mod legacy_xlayer;
 pub mod logs_utils;
 pub mod pending_block;
 pub mod receipt;
@@ -22,6 +23,7 @@ pub mod simulate;
 pub mod transaction;
 pub mod tx_forward;
 pub mod utils;
+pub mod pre_exec_xlayer;
 
 pub use builder::config::{EthConfig, EthFilterConfig};
 pub use cache::{
@@ -34,6 +36,7 @@ pub use gas_oracle::{
     GasCap, GasPriceOracle, GasPriceOracleConfig, GasPriceOracleResult, RPC_DEFAULT_GAS_CAP,
 };
 pub use id_provider::EthSubscriptionIdProvider;
+pub use legacy_xlayer::{LegacyRpcClient, LegacyRpcConfig};
 pub use pending_block::{PendingBlock, PendingBlockEnv, PendingBlockEnvOrigin};
 pub use transaction::TransactionSource;
 pub use tx_forward::ForwardConfig;
