@@ -41,6 +41,7 @@ mod dev;
 mod op;
 mod op_sepolia;
 mod xlayer_mainnet;
+mod xlayer_testnet;
 
 #[cfg(feature = "superchain-configs")]
 mod superchain;
@@ -54,6 +55,7 @@ pub use dev::OP_DEV;
 pub use op::OP_MAINNET;
 pub use op_sepolia::OP_SEPOLIA;
 pub use xlayer_mainnet::XLAYER_MAINNET;
+pub use xlayer_testnet::XLAYER_TESTNET;
 
 /// Re-export for convenience
 pub use reth_optimism_forks::*;
