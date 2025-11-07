@@ -157,48 +157,11 @@ where
     // use transaction to insert genesis header
     let provider_rw = factory.database_provider_rw()?;
 
-    let hashes_start = std::time::Instant::now();
     insert_genesis_hashes(&provider_rw, alloc.iter())?;
-    info!(
-        target: "reth::storage::genesis",
-        elapsed_ms = hashes_start.elapsed().as_millis(),
-        "Genesis hashes inserted"
-    );
-
-    let history_start = std::time::Instant::now();
     insert_genesis_history(&provider_rw, alloc.iter())?;
-    info!(
-        target: "reth::storage::genesis",
-        elapsed_ms = history_start.elapsed().as_millis(),
-        "Genesis history inserted"
-    );
-
-    // Insert header
-    let header_start = std::time::Instant::now();
     insert_genesis_header(&provider_rw, &chain)?;
-    info!(
-        target: "reth::storage::genesis",
-        elapsed_ms = header_start.elapsed().as_millis(),
-        "Genesis header inserted"
-    );
-
-    let state_start = std::time::Instant::now();
     insert_genesis_state(&provider_rw, alloc.iter())?;
-    info!(
-        target: "reth::storage::genesis",
-        elapsed_ms = state_start.elapsed().as_millis(),
-        accounts = alloc.len(),
-        "Genesis state inserted"
-    );
-
-    // compute state root to populate trie tables
-    let state_root_start = std::time::Instant::now();
     compute_state_root(&provider_rw, None)?;
-    info!(
-        target: "reth::storage::genesis",
-        elapsed_ms = state_root_start.elapsed().as_millis(),
-        "Genesis state root computed"
-    );
 
     // set stage checkpoint to genesis block number for all stages
     let checkpoint = StageCheckpoint { block_number: genesis_block_number, ..Default::default() };
@@ -220,13 +183,7 @@ where
 
     // `commit_unwind`` will first commit the DB and then the static file provider, which is
     // necessary on `init_genesis`.
-    let commit_start = std::time::Instant::now();
     UnifiedStorageWriter::commit_unwind(provider_rw)?;
-    info!(
-        target: "reth::storage::genesis",
-        elapsed_ms = commit_start.elapsed().as_millis(),
-        "Genesis database commit completed"
-    );
 
     info!(
         target: "reth::storage::genesis",
