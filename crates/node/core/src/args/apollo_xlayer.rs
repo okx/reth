@@ -4,7 +4,7 @@ use clap::Args;
 #[derive(Clone, Debug, Default, Args)]
 pub struct ApolloArgs {
     /// Enable Apollo
-    #[arg(id = "apollo.enable", long = "apollo.enable", default_value_t = false)]
+    #[arg(id = "apollo.enabled", long = "apollo.enabled", default_value_t = false)]
     pub enabled: bool,
 
     /// Configure Apollo app ID.
