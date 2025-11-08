@@ -10,6 +10,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, sol};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::str::FromStr;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 // Define ERC20 interface using sol! macro
@@ -19,9 +20,46 @@ sol! {
     }
 }
 
+/// Address type that handles addresses with an optional "X" prefix
+/// The "X" prefix is stripped when converting to Address for chain operations
+/// Examples: "X1234..." or "0x1234..." or "1234..." (all valid)
+#[derive(Debug, Clone)]
+pub struct XAddress {
+    address: Address,
+}
+
+impl FromStr for XAddress {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let addr_str = s.strip_prefix('X').unwrap_or(s);
+        let addr_with_prefix = if addr_str.starts_with("0x") {
+            addr_str.to_string()
+        } else {
+            format!("0x{}", addr_str)
+        };
+
+        let address = addr_with_prefix.parse::<Address>()
+            .context("Failed to parse address")?;
+        Ok(XAddress { address })
+    }
+}
+
+impl From<XAddress> for Address {
+    fn from(x_addr: XAddress) -> Self {
+        x_addr.address
+    }
+}
+
+impl std::fmt::Display for XAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.address)
+    }
+}
+
 /// Common fields shared across transfer commands
 #[derive(Parser, Debug)]
-struct CommonTransferArgs {
+pub struct CommonTransferArgs {
     /// RPC URL
     #[arg(long)]
     rpc_url: String,
@@ -29,7 +67,6 @@ struct CommonTransferArgs {
     #[arg(long)]
     private_key: String,
 }
-
 
 /// Create a provider with wallet from RPC URL and private key
 async fn create_provider_with_wallet(
@@ -130,25 +167,27 @@ struct XlayerCli {
 pub enum XlayerCommands {
     /// Transfer native assets (ETH) to a specified address.
     Transfer {
+        /// Common transfer arguments (RPC URL and private key)
         #[command(flatten)]
         common: CommonTransferArgs,
-        /// Recipient address
+        /// Recipient address (supports optional "X" prefix, e.g., "X1234..." or "0x1234...")
         #[arg(long)]
-        to: Address,
+        to: XAddress,
         /// Amount to send in wei (optional, defaults to 0)
         #[arg(long)]
         amount: Option<U256>,
     },
     /// Transfer ERC20 tokens using transfer(address,uint256) function.
     TokenTransfer {
+        /// Common transfer arguments (RPC URL and private key)
         #[command(flatten)]
         common: CommonTransferArgs,
-        /// Token contract address
+        /// Token contract address (supports optional "X" prefix, e.g., "X1234..." or "0x1234...")
         #[arg(long)]
-        token: Address,
-        /// Recipient address
+        token: XAddress,
+        /// Recipient address (supports optional "X" prefix, e.g., "X1234..." or "0x1234...")
         #[arg(long)]
-        to: Address,
+        to: XAddress,
         /// Amount to transfer (in token's smallest unit, e.g., wei for 18 decimals)
         #[arg(long)]
         amount: U256,
@@ -164,16 +203,17 @@ async fn main() -> Result<()> {
 
     let cli = XlayerCli::parse();
 
-
     match cli.command {
         XlayerCommands::Transfer { common, to, amount } => {
-            transfer_native_asset(&common.rpc_url, &common.private_key, to, amount).await?;
+            let to_address: Address = to.into();
+            transfer_native_asset(&common.rpc_url, &common.private_key, to_address, amount).await?;
         }
         XlayerCommands::TokenTransfer { common, token, to, amount } => {
-            transfer_token(&common.rpc_url, &common.private_key, token, to, amount).await?;
+            let token_address: Address = token.into();
+            let to_address: Address = to.into();
+            transfer_token(&common.rpc_url, &common.private_key, token_address, to_address, amount).await?;
         }
     }
-
 
     Ok(())
 }
