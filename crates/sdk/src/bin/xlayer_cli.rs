@@ -29,7 +29,7 @@ struct XlayerCli {
 /// CLI commands for X Layer operations.
 #[derive(Subcommand, Debug)]
 pub enum XlayerCommands {
-    /// Transfer native assets (ETH) to a specified address.
+    /// Transfer native assets (OKB) to a specified address.
     Transfer {
         /// Common transfer arguments (RPC URL and private key)
         #[command(flatten)]

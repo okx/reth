@@ -80,7 +80,7 @@ pub async fn create_provider(rpc_url: &str) -> Result<impl Provider<alloy_networ
     Ok(provider)
 }
 
-/// Transfer native assets (ETH) to an address
+/// Transfer native assets (OKB) to an address
 pub async fn transfer_native_asset(
     rpc_url: &str,
     private_key: &str,
