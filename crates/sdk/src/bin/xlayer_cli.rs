@@ -84,6 +84,13 @@ async fn create_provider_with_wallet(
     Ok(provider)
 }
 
+/// Create a provider without wallet (for read-only operations)
+async fn create_provider(rpc_url: &str) -> Result<impl Provider<alloy_network::Ethereum> + Clone> {
+    let provider = ProviderBuilder::new()
+        .connect_http(rpc_url.parse().context("Invalid RPC URL")?);
+    Ok(provider)
+}
+
 /// Transfer native assets (ETH) to an address
 async fn transfer_native_asset(
     rpc_url: &str,
@@ -155,6 +162,22 @@ async fn transfer_token(
     Ok(())
 }
 
+/// Get the balance of an address
+async fn get_balance(
+    rpc_url: &str,
+    address: Address,
+) -> Result<()> {
+    let provider = create_provider(rpc_url).await?;
+
+    let balance = provider.get_balance(address)
+        .await
+        .context("Failed to get balance")?;
+
+    println!("Balance: {} wei", balance);
+
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct XlayerCli {
@@ -192,6 +215,15 @@ pub enum XlayerCommands {
         #[arg(long)]
         amount: U256,
     },
+    /// Get the balance of an address (equivalent to eth_getBalance).
+    Balance {
+        /// RPC URL
+        #[arg(long)]
+        rpc_url: String,
+        /// Address to query balance for (supports optional "X" prefix, e.g., "X1234..." or "0x1234...")
+        #[arg(long)]
+        address: XAddress,
+    },
 }
 
 #[tokio::main]
@@ -212,6 +244,10 @@ async fn main() -> Result<()> {
             let token_address: Address = token.into();
             let to_address: Address = to.into();
             transfer_token(&common.rpc_url, &common.private_key, token_address, to_address, amount).await?;
+        }
+        XlayerCommands::Balance { rpc_url, address } => {
+            let address: Address = address.into();
+            get_balance(&rpc_url, address).await?;
         }
     }
 
