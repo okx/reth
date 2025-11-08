@@ -17,6 +17,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 sol! {
     interface IERC20 {
         function transfer(address to, uint256 amount) external returns (bool);
+        function balanceOf(address account) external view returns (uint256);
     }
 }
 
@@ -178,6 +179,39 @@ async fn get_balance(
     Ok(())
 }
 
+/// Get the ERC20 token balance of an address
+async fn get_token_balance(
+    rpc_url: &str,
+    token_address: Address,
+    account_address: Address,
+) -> Result<()> {
+    let provider = create_provider(rpc_url).await?;
+
+    let call = IERC20::balanceOfCall { account: account_address };
+    let calldata = call.abi_encode();
+
+    let result = provider
+        .call(
+            alloy_rpc_types_eth::TransactionRequest {
+                to: Some(alloy_primitives::TxKind::Call(token_address)),
+                input: alloy_rpc_types_eth::TransactionInput {
+                    input: None,
+                    data: Some(Bytes::from(calldata)),
+                },
+                ..Default::default()
+            }
+        )
+        .await
+        .context("Failed to call balanceOf")?;
+
+    let balance = IERC20::balanceOfCall::abi_decode_returns(&result.0)
+        .context("Failed to decode balanceOf return value")?;
+
+    println!("Token Balance: {} (raw units)", balance);
+
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct XlayerCli {
@@ -224,6 +258,18 @@ pub enum XlayerCommands {
         #[arg(long)]
         address: XAddress,
     },
+    /// Get the ERC20 token balance of an address (equivalent to calling balanceOf(address)).
+    TokenBalance {
+        /// RPC URL
+        #[arg(long)]
+        rpc_url: String,
+        /// Token contract address (supports optional "X" prefix, e.g., "X1234..." or "0x1234...")
+        #[arg(long)]
+        token: XAddress,
+        /// Account address to query balance for (supports optional "X" prefix, e.g., "X1234..." or "0x1234...")
+        #[arg(long)]
+        account: XAddress,
+    },
 }
 
 #[tokio::main]
@@ -248,6 +294,11 @@ async fn main() -> Result<()> {
         XlayerCommands::Balance { rpc_url, address } => {
             let address: Address = address.into();
             get_balance(&rpc_url, address).await?;
+        }
+        XlayerCommands::TokenBalance { rpc_url, token, account } => {
+            let token_address: Address = token.into();
+            let account_address: Address = account.into();
+            get_token_balance(&rpc_url, token_address, account_address).await?;
         }
     }
 
