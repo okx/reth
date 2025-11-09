@@ -10,9 +10,6 @@ use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
 use tracing::info;
 
-use std::{path::Path, sync::Arc};
-use tracing::error;
-
 fn main() {
     reth_cli_util::sigsegv_handler::install();
 
