@@ -26,7 +26,7 @@ pub fn create_test_client() -> HttpClient {
 ///
 /// # Arguments
 /// * `rpc_url` - The RPC endpoint URL
-/// * `from_private_key` - The private key to send from (with or without 0x prefix)
+/// * `from_private_key` - The private key to send from
 /// * `amount` - The amount of tokens to send (in wei)
 /// * `to_address` - The recipient address
 ///
@@ -42,28 +42,22 @@ pub async fn transfer_token_with_from(
     let signer = PrivateKeySigner::from_str(key_str)
         .map_err(|e| eyre!("Failed to parse private key: {}", e))?;
 
-    // Get the from address
     let from_address = signer.address();
 
-    // Create wallet from signer
     let wallet = EthereumWallet::from(signer);
 
-    // Build provider with wallet
     let provider = ProviderBuilder::new()
         .wallet(wallet)
         .connect_http(rpc_url.parse()?);
 
-    // Parse recipient address
     let to = Address::from_str(to_address)
         .map_err(|e| eyre!("Failed to parse recipient address: {}", e))?;
 
-    // Get chain ID
     let chain_id = provider
         .get_chain_id()
         .await
         .map_err(|e| eyre!("Failed to get chain ID: {}", e))?;
 
-    // Get nonce (including pending transactions)
     let nonce = provider
         .get_transaction_count(from_address)
         .pending()
@@ -73,7 +67,6 @@ pub async fn transfer_token_with_from(
     println!("Sending transaction: from={:#x}, to={:#x}, amount={}, nonce={}", 
              from_address, to, amount, nonce);
 
-    // Estimate gas
     let gas_estimate = provider
         .estimate_gas(
             TransactionRequest::default()
@@ -84,13 +77,11 @@ pub async fn transfer_token_with_from(
         .await
         .map_err(|e| eyre!("Failed to estimate gas: {}", e))?;
 
-    // Get gas price
     let gas_price = provider
         .get_gas_price()
         .await
         .map_err(|e| eyre!("Failed to get gas price: {}", e))?;
 
-    // Build the transaction
     let tx = TransactionRequest::default()
         .with_from(from_address)
         .with_to(to)
@@ -100,13 +91,11 @@ pub async fn transfer_token_with_from(
         .with_gas_limit(gas_estimate)
         .with_gas_price(gas_price);
 
-    // Send the transaction
     let pending_tx = provider
         .send_transaction(tx)
         .await
         .map_err(|e| eyre!("Failed to send transaction: {}", e))?;
 
-    // Get the transaction hash
     let tx_hash = *pending_tx.tx_hash();
     println!("Transaction sent: {:#x}, waiting for confirmation...", tx_hash);
 
@@ -117,7 +106,6 @@ pub async fn transfer_token_with_from(
         .map_err(|_| eyre!("Timeout waiting for transaction {:#x} to be mined", tx_hash))?
         .map_err(|e| eyre!("Failed to get transaction receipt: {}", e))?;
 
-    // Check if transaction was successful
     if !receipt.status() {
         return Err(eyre!("Transaction failed"));
     }
@@ -143,7 +131,7 @@ pub async fn transfer_token(rpc_url: &str, amount: U256, to_address: &str) -> Re
 ///
 /// # Arguments
 /// * `rpc_url` - The RPC endpoint URL
-/// * `private_key` - The private key to deploy from (with or without 0x prefix)
+/// * `private_key` - The private key to deploy from
 /// * `bytecode_hex` - The contract bytecode as hex string
 /// * `constructor_args` - Optional constructor arguments as encoded bytes
 ///
@@ -626,7 +614,7 @@ async fn get_transaction_receipt(
 ///
 /// # Arguments
 /// * `rpc_url` - The RPC endpoint URL
-/// * `private_key` - The private key to sign with (with or without 0x prefix)
+/// * `private_key` - The private key to sign with
 /// * `tx_request` - The transaction request to send
 ///
 /// # Returns
@@ -636,20 +624,16 @@ pub async fn sign_and_send_transaction(
     private_key: &str,
     tx_request: TransactionRequest,
 ) -> Result<(String, serde_json::Value)> {
-    // Parse the private key (strip 0x prefix if present)
     let key_str = private_key.trim_start_matches("0x");
     let signer = PrivateKeySigner::from_str(key_str)
         .map_err(|e| eyre!("Failed to parse private key: {}", e))?;
 
-    // Create wallet from signer
     let wallet = EthereumWallet::from(signer);
 
-    // Build provider with wallet
     let provider = ProviderBuilder::new()
         .wallet(wallet)
         .connect_http(rpc_url.parse()?);
 
-    // Send the transaction (it will be automatically signed by the wallet)
     let pending_tx = provider
         .send_transaction(tx_request)
         .await
@@ -658,13 +642,10 @@ pub async fn sign_and_send_transaction(
     let tx_hash = *pending_tx.tx_hash();
     println!("tx sent: {:#x}", tx_hash);
 
-    // Wait for transaction to be mined
     wait_for_transaction_receipt(rpc_url, &format!("{:#x}", tx_hash), DEFAULT_TIMEOUT_TX_TO_BE_MINED).await?;
 
-    // Get the receipt
     let receipt = get_transaction_receipt(rpc_url, &format!("{:#x}", tx_hash)).await?;
 
-    // Verify transaction succeeded
     let status = receipt["status"]
         .as_str()
         .ok_or_else(|| eyre!("Receipt missing status field"))?;

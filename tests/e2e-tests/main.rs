@@ -931,7 +931,6 @@ async fn test_new_transaction_types(#[case] test_name: &str) {
             println!("EIP-3529 test passed: SELFDESTRUCT refund is 0");
         }
         "Eip4844BlobFields" => {
-            // Test for EIP-4844 (Blob transactions - fields present in blocks)
             let block = operations::eth_get_block_by_number(
                 &client,
                 operations::eth_block_number(&client).await.unwrap(),
@@ -941,7 +940,7 @@ async fn test_new_transaction_types(#[case] test_name: &str) {
             .expect("Failed to get latest block");
 
             // OP Stack disables EIP-4844 blob transactions on Layer 2
-            // But the fields should still be present in block data
+            // So we check if blob fields are present in block data
             let blob_gas_used = block["blobGasUsed"]
                 .as_str()
                 .expect("Block should have blobGasUsed field");
