@@ -19,11 +19,13 @@ reth-evm.workspace = true
 reth-errors.workspace = true
 reth-revm.workspace = true
 reth-rpc-convert.workspace = true
+reth-storage-api.workspace = true
 
 revm-context-interface.workspace = true
 revm-database.workspace = true
 
 alloy-primitives.workspace = true
+alloy-eips.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-network-primitives.workspace = true
 

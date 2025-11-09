@@ -28,9 +28,17 @@ pub struct InternalTransaction {
     is_error: bool,
     gas: u64,
     gas_used: u64,
+    value: String,
     value_wei: String,
+    call_value_wei: String,
     error: String,
-    return_gas: u64,
+}
+
+impl InternalTransaction {
+    pub fn set_transaction_gas(&mut self, gas_limit: u64, gas_used: u64) {
+        self.gas = gas_limit;
+        self.gas_used = gas_used;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +50,6 @@ pub struct TraceCollector {
     // internal_index
     last_depth: usize,
     sibling_count: Vec<usize>,
-    // op 进去的时候收 traces 的 index，出来的时候需要知道哪一个 trace 需要改
     trace_stack: Vec<usize>,
 }
 
@@ -60,14 +67,39 @@ impl Default for TraceCollector {
 }
 
 impl TraceCollector {
+    fn format_error(result: &reth_revm::interpreter::InstructionResult) -> String {
+        use reth_revm::interpreter::InstructionResult;
+
+        match result {
+            InstructionResult::Revert => "execution reverted".to_string(),
+            // InstructionResult::OutOfGas => "out of gas".to_string(),
+            // InstructionResult::OutOfFund => "insufficient funds".to_string(),
+            // InstructionResult::CallTooDeep => "call depth exceeded".to_string(),
+            // InstructionResult::OpcodeNotFound => "invalid opcode".to_string(),
+            // InstructionResult::InvalidJump => "invalid jump destination".to_string(),
+            // InstructionResult::InvalidFEOpcode => "invalid 0xfe opcode".to_string(),
+            // InstructionResult::StackOverflow => "stack overflow".to_string(),
+            // InstructionResult::StackUnderflow => "stack underflow".to_string(),
+            // InstructionResult::OutOfOffset => "out of offset".to_string(),
+            // InstructionResult::CreateCollision => "contract address collision".to_string(),
+            // InstructionResult::OverflowPayment => "payment overflow".to_string(),
+            // InstructionResult::PrecompileError => "precompile error".to_string(),
+            // InstructionResult::NonceOverflow => "nonce overflow".to_string(),
+            // InstructionResult::CreateContractSizeLimit => "contract size limit exceeded".to_string(),
+            // InstructionResult::CreateContractStartingWithEF => "contract starts with 0xEF".to_string(),
+            // InstructionResult::CreateInitCodeSizeLimit => "init code size limit exceeded".to_string(),
+            _ => format!("{:?}", result),
+        }
+    }
+
     fn init_op(
         &mut self,
         call_type: String,
         from: String,
         to: String,
         input: Bytes,
-        mut value_wei: String,
-        gas_used: u64,
+        value_wei: String,
+        gas_limit: u64,
         code_address: String,
     ) {
         self.traces.push(InternalTransaction::default());
@@ -76,37 +108,22 @@ impl TraceCollector {
         txn.call_type = call_type;
         txn.from = from.clone();
         txn.input = input;
+        txn.is_error = false;
+        txn.gas = gas_limit;
+        txn.value_wei = if value_wei.is_empty() { "0" } else { &value_wei }.to_string();
+        txn.call_value_wei = if let Ok(value) = value_wei.parse::<u128>() {
+            format!("0x{:x}", value)
+        } else {
+            String::from("0x0")
+        };
 
-        if value_wei.is_empty() {
-            value_wei = String::from("0");
-        }
-
+        txn.to = to;
         match txn.call_type.as_str() {
-            "call" | "create" | "create2" | "custom" => {
-                txn.value_wei = value_wei;
-                txn.gas_used = gas_used;
-                txn.to = to;
-            }
-            "staticcall" => {
-                txn.gas_used = gas_used;
-                txn.to = to;
-            }
             "delegatecall" => {
-                txn.value_wei = value_wei;
-                txn.gas_used = gas_used;
-                txn.from = to;
-                txn.to = code_address;
-                txn.trace_address = from;
+                txn.trace_address = txn.from.clone();
             }
             "callcode" => {
-                txn.value_wei = value_wei;
-                txn.gas_used = gas_used;
-                txn.to = code_address.clone();
                 txn.code_address = code_address;
-            }
-            "selfdestruct" => {
-                txn.value_wei = value_wei;
-                txn.to = to;
             }
             _ => {}
         }
@@ -177,8 +194,8 @@ where
     fn call(&mut self, ctx: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         let call_type = match inputs.scheme {
             reth_revm::interpreter::CallScheme::Call => "call".to_string(),
-            reth_revm::interpreter::CallScheme::CallCode => "callcode".to_string(), // code_address
-            reth_revm::interpreter::CallScheme::DelegateCall => "delegatecall".to_string(), /* trace_address (contract caller), code_address (contract to) */
+            reth_revm::interpreter::CallScheme::CallCode => "callcode".to_string(),
+            reth_revm::interpreter::CallScheme::DelegateCall => "delegatecall".to_string(),
             reth_revm::interpreter::CallScheme::StaticCall => "staticcall".to_string(),
         };
 
@@ -210,19 +227,12 @@ where
         let trace_index = self.trace_stack.pop().unwrap_or_default();
         let (_before, after) = self.traces.split_at_mut(trace_index);
         let (txn, remainder) = after.split_first_mut().unwrap();
-        txn.gas = outcome.result.gas.limit();
         txn.gas_used = outcome.result.gas.spent();
-        txn.return_gas = outcome.result.gas.remaining();
         txn.output = outcome.result.output.clone();
         txn.is_error = !outcome.result.is_ok();
         txn.error =
-            if txn.is_error { format!("{:?}", outcome.result.result) } else { String::new() };
-
+            if txn.is_error { Self::format_error(&outcome.result.result) } else { String::new() };
         if txn.is_error {
-            if outcome.result.is_error() {
-                txn.gas_used = txn.gas;
-                txn.return_gas = 0;
-            }
             for within in remainder {
                 within.is_error = txn.is_error;
                 within.error = txn.error.clone();
@@ -242,11 +252,11 @@ where
         self.init_op(
             call_type,
             inputs.caller.to_string(),
-            Address::ZERO.to_string(),
+            "".to_string(),
             inputs.init_code.clone(),
             inputs.value.to_string(),
             inputs.gas_limit,
-            Address::ZERO.to_string(),
+            "".to_string(),
         );
 
         self.before_op();
@@ -258,22 +268,14 @@ where
         let trace_index = self.trace_stack.pop().unwrap_or_default();
         let (_before, after) = self.traces.split_at_mut(trace_index);
         let (txn, remainder) = after.split_first_mut().unwrap();
-        if trace_index != 0 {
-            txn.to = outcome.address.unwrap_or_default().to_string();
-        }
-        txn.gas = outcome.result.gas.limit();
+        txn.to = outcome.address.unwrap_or_default().to_string();
         txn.gas_used = outcome.result.gas.spent();
-        txn.return_gas = outcome.result.gas.remaining();
         txn.output = outcome.result.output.clone();
         txn.is_error = !outcome.result.is_ok();
         txn.error =
-            if txn.is_error { format!("{:?}", outcome.result.result) } else { String::new() };
+            if txn.is_error { Self::format_error(&outcome.result.result) } else { String::new() };
 
         if txn.is_error {
-            if outcome.result.is_error() {
-                txn.gas_used = txn.gas;
-                txn.return_gas = 0;
-            }
             for within in remainder {
                 within.is_error = txn.is_error;
                 within.error = txn.error.clone();
@@ -291,7 +293,7 @@ where
             Bytes::default(),
             value.to_string(),
             0,
-            Address::ZERO.to_string(),
+            "".to_string(),
         );
 
         self.before_op();

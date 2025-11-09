@@ -45,9 +45,9 @@ impl TableInfo for TxTable {
 }
 
 #[derive(Debug)]
-pub struct OKDBTables;
+pub struct DBTables;
 
-impl TableSet for OKDBTables {
+impl TableSet for DBTables {
     fn tables() -> Box<dyn Iterator<Item = Box<dyn TableInfo>>> {
         let v: Vec<Box<dyn TableInfo>> = vec![Box::new(BlockTable), Box::new(TxTable)];
 

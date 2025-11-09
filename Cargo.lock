@@ -14018,6 +14018,7 @@ dependencies = [
 name = "xlayer-rpc"
 version = "1.8.3"
 dependencies = [
+ "alloy-eips",
  "alloy-network-primitives",
  "alloy-primitives",
  "alloy-rpc-types-eth",
@@ -14035,6 +14036,7 @@ dependencies = [
  "reth-rpc-convert",
  "reth-rpc-eth-api",
  "reth-rpc-server-types",
+ "reth-storage-api",
  "revm-context-interface",
  "revm-database",
  "serde",

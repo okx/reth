@@ -1,3 +1,4 @@
+use alloy_consensus::Transaction;
 use alloy_consensus::{transaction::TxHashRef, TxReceipt};
 use alloy_evm::block::BlockExecutor;
 use alloy_rlp::encode;
@@ -49,16 +50,27 @@ where
     executor.set_state_hook(None);
     let output = executor.execute_block(block.transactions_recovered())?;
 
-    let internal_transactions = inspector.get();
+    let mut internal_transactions = inspector.get();
     let mut tx_hashes = Vec::<TxHash>::default();
 
     let (rw_tx, rw_db) = rw_batch_start::<TxTable>()?;
 
+    let mut prev_cumulative_gas = 0u64;
     for (index, tx) in block.transactions_recovered().enumerate() {
         let success = output.receipts[index].status();
 
-        if !success || (!internal_transactions.is_empty() && internal_transactions[index].len() > 1)
+        let current_cumulative_gas = output.receipts[index].cumulative_gas_used();
+        let tx_gas_used = current_cumulative_gas - prev_cumulative_gas;
+        prev_cumulative_gas = current_cumulative_gas;
+
+        if !success || (!internal_transactions.is_empty() && internal_transactions[index].len() > 0)
         {
+            if !internal_transactions.is_empty() && !internal_transactions[index].is_empty() {
+                if let Some(first_inner_tx) = internal_transactions[index].first_mut() {
+                    first_inner_tx.set_transaction_gas(tx.gas_limit(), tx_gas_used);
+                }
+            }
+
             tx_hashes.push(*tx.tx_hash());
             rw_batch_write::<TxTable>(
                 &rw_tx,

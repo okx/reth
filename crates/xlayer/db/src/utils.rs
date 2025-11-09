@@ -6,7 +6,7 @@ use std::{fmt::Debug, path::PathBuf};
 
 use crate::{
     internal_transaction_inspector::InternalTransaction,
-    structs::{BlockTable, OKDBTables, TxTable},
+    structs::{BlockTable, DBTables, TxTable},
 };
 use reth_db::{
     create_db,
@@ -15,7 +15,7 @@ use reth_db::{
     DatabaseEnv,
 };
 
-static OKDB: OnceCell<DatabaseEnv> = OnceCell::new();
+static XLAYERDB: OnceCell<DatabaseEnv> = OnceCell::new();
 
 /*
     Default directories:
@@ -39,12 +39,12 @@ pub fn initialize(db_path: PathBuf) -> Result<(), Report> {
 
     let mut db = db_create_result.unwrap();
 
-    let tables_create_result = db.create_and_track_tables_for::<OKDBTables>();
+    let tables_create_result = db.create_and_track_tables_for::<DBTables>();
     if let Err(err) = tables_create_result {
         return Err(Into::<Report>::into(err).wrap_err("ok okdb tables creation failed"));
     }
 
-    let db_set_result = OKDB.set(db);
+    let db_set_result = XLAYERDB.set(db);
     if db_set_result.is_err() {
         return Err(Report::msg("ok okdb was initialized more than once"));
     }
@@ -53,7 +53,7 @@ pub fn initialize(db_path: PathBuf) -> Result<(), Report> {
 }
 
 pub fn write_single<T: Table, P: Encodable + Debug>(key: Vec<u8>, value: P) -> Result<(), Report> {
-    let txn_begin_result = OKDB.get().unwrap().begin_rw_txn();
+    let txn_begin_result = XLAYERDB.get().unwrap().begin_rw_txn();
     if let Err(err) = txn_begin_result {
         return Err(Into::<Report>::into(err).wrap_err("ok write single txn begin failed"));
     }
@@ -85,7 +85,7 @@ pub fn write_single<T: Table, P: Encodable + Debug>(key: Vec<u8>, value: P) -> R
 }
 
 pub fn read_single<T: Table>(key: Vec<u8>) -> Result<Vec<u8>, Report> {
-    let txn_begin_result = OKDB.get().unwrap().begin_ro_txn();
+    let txn_begin_result = XLAYERDB.get().unwrap().begin_ro_txn();
     if let Err(err) = txn_begin_result {
         return Err(Into::<Report>::into(err).wrap_err("ok read single txn begin failed"));
     }
@@ -109,7 +109,7 @@ pub fn read_single<T: Table>(key: Vec<u8>) -> Result<Vec<u8>, Report> {
 }
 
 pub fn delete_single<T: Table>(key: Vec<u8>) -> Result<(), Report> {
-    let txn_begin_result = OKDB.get().unwrap().begin_rw_txn();
+    let txn_begin_result = XLAYERDB.get().unwrap().begin_rw_txn();
     if let Err(err) = txn_begin_result {
         return Err(Into::<Report>::into(err).wrap_err("ok delete single txn begin failed"));
     }
@@ -138,7 +138,7 @@ pub fn delete_single<T: Table>(key: Vec<u8>) -> Result<(), Report> {
 }
 
 pub fn rw_batch_start<T: Table>() -> Result<(Transaction<RW>, Database), Report> {
-    let txn_begin_result = OKDB.get().unwrap().begin_rw_txn();
+    let txn_begin_result = XLAYERDB.get().unwrap().begin_rw_txn();
     if let Err(err) = txn_begin_result {
         return Err(Into::<Report>::into(err).wrap_err("ok rw batch start begin failed"));
     }
