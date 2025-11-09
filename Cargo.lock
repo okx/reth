@@ -10848,10 +10848,14 @@ dependencies = [
 name = "reth-xlayer-txpool"
 version = "1.8.3"
 dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
  "parking_lot",
+ "reth-chainspec",
  "reth-optimism-txpool",
  "reth-primitives-traits",
  "reth-rpc-eth-api",
+ "reth-storage-api",
  "reth-transaction-pool",
  "tracing",
 ]
