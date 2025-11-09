@@ -6,7 +6,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(clippy::useless_let_if_seq)]
 
 extern crate alloc;
@@ -54,3 +54,10 @@ where
         )
     }
 }
+
+mod builder_xlayer;
+mod intercept_xlayer;
+
+pub use intercept_xlayer::{
+    intercept_bridge_transaction_if_need, BridgeInterceptConfig, BridgeInterceptError,
+};

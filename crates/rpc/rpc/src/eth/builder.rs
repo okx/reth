@@ -43,7 +43,9 @@ pub struct EthApiBuilder<N: RpcNodeCore, Rpc, NextEnv = ()> {
     max_batch_size: usize,
     pending_block_kind: PendingBlockKind,
     raw_tx_forwarder: ForwardConfig,
+    legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
     send_raw_transaction_sync_timeout: Duration,
+    evm_memory_limit: u64,
 }
 
 impl<Provider, Pool, Network, EvmConfig, ChainSpec>
@@ -93,7 +95,9 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
             send_raw_transaction_sync_timeout,
+            evm_memory_limit,
         } = self;
         EthApiBuilder {
             components,
@@ -113,7 +117,9 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
             send_raw_transaction_sync_timeout,
+            evm_memory_limit,
         }
     }
 }
@@ -144,7 +150,9 @@ where
             max_batch_size: 1,
             pending_block_kind: PendingBlockKind::Full,
             raw_tx_forwarder: ForwardConfig::default(),
+            legacy_rpc_config: None,
             send_raw_transaction_sync_timeout: Duration::from_secs(30),
+            evm_memory_limit: (1 << 32) - 1,
         }
     }
 }
@@ -156,6 +164,15 @@ where
     /// Configures the task spawner used to spawn additional tasks.
     pub fn task_spawner(mut self, spawner: impl TaskSpawner + 'static) -> Self {
         self.task_spawner = Box::new(spawner);
+        self
+    }
+
+    /// Configures legacy RPC support for routing historical data.
+    pub fn with_legacy_rpc_config(
+        mut self,
+        config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
+    ) -> Self {
+        self.legacy_rpc_config = config;
         self
     }
 
@@ -182,7 +199,9 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
             send_raw_transaction_sync_timeout,
+            evm_memory_limit,
         } = self;
         EthApiBuilder {
             components,
@@ -202,7 +221,9 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
             send_raw_transaction_sync_timeout,
+            evm_memory_limit,
         }
     }
 
@@ -229,7 +250,9 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
             send_raw_transaction_sync_timeout,
+            evm_memory_limit,
         } = self;
         EthApiBuilder {
             components,
@@ -249,7 +272,9 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
             send_raw_transaction_sync_timeout,
+            evm_memory_limit,
         }
     }
 
@@ -476,7 +501,9 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder,
+            legacy_rpc_config,
             send_raw_transaction_sync_timeout,
+            evm_memory_limit,
         } = self;
 
         let provider = components.provider().clone();
@@ -516,7 +543,9 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder.forwarder_client(),
+            legacy_rpc_config,
             send_raw_transaction_sync_timeout,
+            evm_memory_limit,
         )
     }
 
@@ -539,6 +568,12 @@ where
     /// Sets the timeout for `send_raw_transaction_sync` RPC method.
     pub const fn send_raw_transaction_sync_timeout(mut self, timeout: Duration) -> Self {
         self.send_raw_transaction_sync_timeout = timeout;
+        self
+    }
+
+    /// Sets the maximum memory the EVM can allocate per RPC request.
+    pub const fn evm_memory_limit(mut self, memory_limit: u64) -> Self {
+        self.evm_memory_limit = memory_limit;
         self
     }
 }

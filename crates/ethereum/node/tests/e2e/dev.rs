@@ -3,7 +3,7 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{b256, hex, Address};
 use futures::StreamExt;
 use reth_chainspec::ChainSpec;
-use reth_node_api::{BlockBody, FullNodeComponents, FullNodePrimitives, NodeTypes};
+use reth_node_api::{BlockBody, FullNodeComponents};
 use reth_node_builder::{rpc::RethRpcAddOns, FullNode, NodeBuilder, NodeConfig, NodeHandle};
 use reth_node_core::args::DevArgs;
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
@@ -80,7 +80,7 @@ async fn can_run_dev_node_custom_attributes() -> eyre::Result<()> {
 async fn assert_chain_advances<N, AddOns>(node: &FullNode<N, AddOns>)
 where
     N: FullNodeComponents<Provider: CanonStateSubscriptions>,
-    AddOns: RethRpcAddOns<N, EthApi: EthTransactions>,
+    AddOns: RethRpcAddOns<N, EthApi: EthTransactions + reth_rpc_eth_api::helpers::LegacyRpc>,
     N::Types: NodeTypes<Primitives: FullNodePrimitives>,
 {
     let mut notifications = node.provider.canonical_state_stream();
