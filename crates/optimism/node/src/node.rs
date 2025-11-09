@@ -4,9 +4,10 @@ use crate::{
     args::RollupArgs,
     engine::OpEngineValidator,
     txpool::{OpTransactionPool, OpTransactionValidator},
-    OpEngineApiBuilder, OpEngineTypes,
+    OpEngineApiBuilder, OpEngineTypes, XLayerArgs,
 };
 use op_alloy_consensus::{interop::SafetyLevel, OpPooledTransaction};
+use op_alloy_rpc_types::OpTransactionRequest;
 use op_alloy_rpc_types_engine::OpExecutionData;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, Hardforks};
 use reth_engine_local::LocalPayloadAttributesBuilder;
@@ -44,7 +45,7 @@ use reth_optimism_payload_builder::{
 };
 use reth_optimism_primitives::{DepositReceipt, OpPrimitives};
 use reth_optimism_rpc::{
-    eth::{ext::OpEthExtApi, OpEthApiBuilder},
+    eth::{ext::OpEthExtApi, ext_xlayer::XLayerEthApiExt, OpEthApiBuilder},
     historical::{HistoricalRpc, HistoricalRpcClient},
     miner::{MinerApiExtServer, OpMinerExtApi},
     witness::{DebugExecutionWitnessApiServer, OpDebugWitnessApi},
@@ -56,7 +57,7 @@ use reth_optimism_txpool::{
     OpPooledTx,
 };
 use reth_provider::{providers::ProviderFactoryBuilder, CanonStateSubscriptions};
-use reth_rpc_api::{eth::RpcTypes, DebugApiServer, L2EthApiExtServer};
+use reth_rpc_api::{eth::{EthApiTypes, RpcTypes}, DebugApiServer, L2EthApiExtServer, XLayerEthApiExtServer};
 use reth_rpc_server_types::RethRpcModule;
 use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::{
@@ -118,6 +119,9 @@ pub struct OpNode {
     ///
     /// By default no throttling is applied.
     pub da_config: OpDAConfig,
+
+    /// X Layer specific configuration
+    pub xlayer_args: XLayerArgs,
 }
 
 /// A [`ComponentsBuilder`] with its generic arguments set to a stack of Optimism specific builders.
@@ -133,12 +137,19 @@ pub type OpNodeComponentBuilder<Node, Payload = OpPayloadBuilder> = ComponentsBu
 impl OpNode {
     /// Creates a new instance of the Optimism node type.
     pub fn new(args: RollupArgs) -> Self {
-        Self { args, da_config: OpDAConfig::default() }
+        let xlayer_args = args.xlayer_args.clone();
+        Self { args, da_config: OpDAConfig::default(), xlayer_args }
     }
 
     /// Configure the data availability configuration for the OP builder.
     pub fn with_da_config(mut self, da_config: OpDAConfig) -> Self {
         self.da_config = da_config;
+        self
+    }
+
+    /// Configure X Layer specific settings
+    pub fn with_xlayer_args(mut self, xlayer_args: XLayerArgs) -> Self {
+        self.xlayer_args = xlayer_args;
         self
     }
 
@@ -161,7 +172,9 @@ impl OpNode {
             )
             .executor(OpExecutorBuilder::default())
             .payload(BasicPayloadServiceBuilder::new(
-                OpPayloadBuilder::new(compute_pending_block).with_da_config(self.da_config.clone()),
+                OpPayloadBuilder::new(compute_pending_block)
+                    .with_da_config(self.da_config.clone())
+                    .with_xlayer_args(self.xlayer_args.clone()),
             ))
             .network(OpNetworkBuilder::new(disable_txpool_gossip, !discovery_v4))
             .consensus(OpConsensusBuilder::default())
@@ -486,6 +499,7 @@ where
     EVB: EngineValidatorBuilder<N>,
     RpcMiddleware: RethRpcMiddleware,
     Attrs: OpAttributes<Transaction = TxTy<N::Types>, RpcPayloadAttributes: DeserializeOwned>,
+    <EthB::EthApi as EthApiTypes>::NetworkTypes: RpcTypes<TransactionRequest = OpTransactionRequest>,
 {
     type Handle = RpcHandle<N, EthB::EthApi>;
 
@@ -584,6 +598,13 @@ where
                     )?;
                 }
 
+                // install the xlayer eth extension in the eth namespace
+                let xlayer_eth_ext = XLayerEthApiExt::new(registry.eth_api().clone());
+                modules.merge_if_module_configured(
+                    RethRpcModule::Eth,
+                    XLayerEthApiExtServer::<OpTransactionRequest>::into_rpc(xlayer_eth_ext),
+                )?;
+
                 Ok(())
             })
             .await
@@ -614,6 +635,7 @@ where
     EVB: EngineValidatorBuilder<N>,
     RpcMiddleware: RethRpcMiddleware,
     Attrs: OpAttributes<Transaction = TxTy<N::Types>, RpcPayloadAttributes: DeserializeOwned>,
+    <EthB::EthApi as EthApiTypes>::NetworkTypes: RpcTypes<TransactionRequest = OpTransactionRequest>,
 {
     type EthApi = EthB::EthApi;
 
@@ -1006,18 +1028,32 @@ pub struct OpPayloadBuilder<Txs = ()> {
     /// This data availability configuration specifies constraints for the payload builder
     /// when assembling payloads
     pub da_config: OpDAConfig,
+
+    /// X Layer specific configuration
+    pub xlayer_args: XLayerArgs,
 }
 
 impl OpPayloadBuilder {
     /// Create a new instance with the given `compute_pending_block` flag and data availability
     /// config.
     pub fn new(compute_pending_block: bool) -> Self {
-        Self { compute_pending_block, best_transactions: (), da_config: OpDAConfig::default() }
+        Self {
+            compute_pending_block,
+            best_transactions: (),
+            da_config: OpDAConfig::default(),
+            xlayer_args: XLayerArgs::default(),
+        }
     }
 
     /// Configure the data availability configuration for the OP payload builder.
     pub fn with_da_config(mut self, da_config: OpDAConfig) -> Self {
         self.da_config = da_config;
+        self
+    }
+
+    /// Configure X Layer specific settings
+    pub fn with_xlayer_args(mut self, xlayer_args: XLayerArgs) -> Self {
+        self.xlayer_args = xlayer_args;
         self
     }
 }
@@ -1026,8 +1062,8 @@ impl<Txs> OpPayloadBuilder<Txs> {
     /// Configures the type responsible for yielding the transactions that should be included in the
     /// payload.
     pub fn with_transactions<T>(self, best_transactions: T) -> OpPayloadBuilder<T> {
-        let Self { compute_pending_block, da_config, .. } = self;
-        OpPayloadBuilder { compute_pending_block, best_transactions, da_config }
+        let Self { compute_pending_block, da_config, xlayer_args, .. } = self;
+        OpPayloadBuilder { compute_pending_block, best_transactions, da_config, xlayer_args }
     }
 }
 
@@ -1064,10 +1100,21 @@ where
         pool: Pool,
         evm_config: Evm,
     ) -> eyre::Result<Self::PayloadBuilder> {
+        self.xlayer_args
+            .validate()
+            .map_err(|e| eyre::eyre!("X Layer configuration validation failed: {}", e))?;
+
+        let bridge_intercept = self
+            .xlayer_args
+            .intercept
+            .to_bridge_intercept_config()
+            .map_err(|e| eyre::eyre!("Failed to create bridge intercept config: {}", e))?;
+
         let payload_builder = reth_optimism_payload_builder::OpPayloadBuilder::with_builder_config(
             pool,
             ctx.provider().clone(),
             evm_config,
+            bridge_intercept,
             OpBuilderConfig { da_config: self.da_config.clone() },
         )
         .with_transactions(self.best_transactions.clone())
