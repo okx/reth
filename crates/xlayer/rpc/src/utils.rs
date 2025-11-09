@@ -1,9 +1,7 @@
-use clap::command;
 use reth_rpc::RpcTypes;
 
 use std::{collections::HashMap, sync::Arc};
 
-use reth_node_core::args::RessArgs;
 use reth_rpc_eth_api::{helpers::EthCall, EthApiTypes};
 
 use alloy_eips::BlockNumberOrTag;
@@ -24,7 +22,6 @@ use xlayer_db::{
 };
 
 use reth_ethereum::provider::TransactionsProvider;
-use reth_optimism_node::args::RollupArgs;
 use reth_storage_api::BlockIdReader;
 use tokio::{
     select,
@@ -40,14 +37,6 @@ fn string_to_b256(hex_str: String) -> Result<B256, FromHexError> {
     let hex = hex_str.strip_prefix("0x").unwrap_or(&hex_str);
     let fb: FixedBytes<32> = FixedBytes::from_hex(hex)?;
     Ok(B256::from(fb))
-}
-
-#[derive(Debug, Clone, Default, clap::Args)]
-pub struct CustomExt {
-    #[command(flatten)]
-    pub ress: RessArgs,
-    #[command(flatten)]
-    pub rollup_args: RollupArgs,
 }
 
 #[rpc(server, namespace = "eth", server_bounds(

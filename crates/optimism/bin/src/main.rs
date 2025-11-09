@@ -10,7 +10,7 @@ use std::{path::Path, sync::Arc};
 use tracing::error;
 use xlayer_db::utils::initialize;
 use xlayer_exex::utils::post_exec_exex;
-use xlayer_rpc::utils::{CustomExt, XlayerExt, XlayerExtApiServer};
+use xlayer_rpc::utils::{XlayerExt, XlayerExtApiServer};
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
@@ -26,7 +26,7 @@ fn main() {
     }
 
     if let Err(err) =
-        Cli::<OpChainSpecParser, CustomExt>::parse().run(async move |builder, args| {
+        Cli::<OpChainSpecParser, RollupArgs>::parse().run(async move |builder, rollup_args| {
             let data_dir = builder.config().datadir();
             let db_path = data_dir.db().parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
             let initialize_result = initialize(db_path);
@@ -69,7 +69,7 @@ fn main() {
 
 
             let handle = builder
-                .node(OpNode::new(args.rollup_args.clone()))
+                .node(OpNode::new(rollup_args.clone()))
                 .extend_rpc_modules(move |ctx| {
                     let new_op_eth_api = ctx.registry.eth_api().clone();
                     let custom_rpc = XlayerExt { backend: Arc::new(new_op_eth_api) };
