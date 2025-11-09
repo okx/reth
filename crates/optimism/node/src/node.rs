@@ -3,10 +3,10 @@
 use crate::{
     args::RollupArgs,
     engine::OpEngineValidator,
+    node_xlayer::{initialize_xlayer_gas_price_controller, XLayerValidatorAccess},
     txpool::OpTransactionValidator,
-    OpEngineApiBuilder, OpEngineTypes, XLayerArgs, XLayerGasPriceArgs,
+    OpEngineApiBuilder, OpEngineTypes, XLayerArgs,
 };
-use reth_xlayer_txpool::XLayerTransactionValidator;
 use op_alloy_consensus::{interop::SafetyLevel, OpPooledTransaction};
 use op_alloy_rpc_types::OpTransactionRequest;
 use op_alloy_rpc_types_engine::OpExecutionData;
@@ -31,7 +31,7 @@ use reth_node_builder::{
     rpc::{
         BasicEngineValidatorBuilder, EngineApiBuilder, EngineValidatorAddOn,
         EngineValidatorBuilder, EthApiBuilder, Identity, PayloadValidatorBuilder, RethRpcAddOns,
-        RethRpcMiddleware, RethRpcServerHandles, RpcAddOns, RpcContext, RpcHandle, RpcRegistry,
+        RethRpcMiddleware, RethRpcServerHandles, RpcAddOns, RpcContext, RpcHandle,
     },
     BuilderContext, DebugNode, Node, NodeAdapter, NodeComponentsBuilder,
 };
@@ -58,9 +58,9 @@ use reth_optimism_txpool::{
     OpPooledTx,
 };
 use reth_provider::{providers::ProviderFactoryBuilder, CanonStateSubscriptions};
-use reth_tasks::TaskExecutor;
 use reth_rpc_api::{eth::{EthApiTypes, RpcTypes}, DebugApiServer, L2EthApiExtServer, XLayerEthApiExtServer};
 use reth_rpc_server_types::RethRpcModule;
+use reth_xlayer_txpool::XLayerTransactionValidator;
 use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, CoinbaseTipOrdering, EthPoolTransaction, PoolPooledTx,
@@ -516,85 +516,6 @@ where
     }
 }
 
-/// Extension trait for accessing XLayer validator from the pool.
-trait XLayerValidatorAccess {
-    type Provider;
-    type Transaction: PoolTransaction;
-    
-    /// Get the XLayer validator from the pool.
-    fn get_xlayer_validator(&self) -> Arc<XLayerTransactionValidator<Self::Provider, Self::Transaction>>;
-}
-
-/// Implement the extension trait for the specific Pool type used in OpNode.
-impl<Client, Tx> XLayerValidatorAccess for reth_transaction_pool::Pool<
-    TransactionValidationTaskExecutor<XLayerTransactionValidator<Client, Tx>>,
-    CoinbaseTipOrdering<Tx>,
-    DiskFileBlobStore,
->
-where
-    Client: reth_provider::ChainSpecProvider + reth_provider::StateProviderFactory + reth_provider::BlockReaderIdExt + Send + Sync + 'static,
-    Client::ChainSpec: OpHardforks,
-    Tx: EthPoolTransaction + OpPooledTx,
-{
-    type Provider = Client;
-    type Transaction = Tx;
-    
-    fn get_xlayer_validator(&self) -> Arc<XLayerTransactionValidator<Client, Tx>> {
-        self.validator().validator_arc().clone()
-    }
-}
-
-/// Initialize XLayer gas price controller
-///
-/// This function sets up the gas price suggester, scheduler, and spawns the background task
-/// for managing XLayer gas prices.
-fn initialize_xlayer_gas_price_controller<Node, EthApi>(
-    gas_price: &XLayerGasPriceArgs,
-    registry: &mut RpcRegistry<Node, EthApi>,
-    task_executor: TaskExecutor,
-    validator: Arc<XLayerTransactionValidator<Node::Provider, <Node::Pool as TransactionPool>::Transaction>>,
-) where
-    Node: FullNodeComponents,
-    Node::Pool: TransactionPool,
-    EthApi: EthApiTypes + reth_rpc_eth_api::helpers::XLayerFees + reth_rpc_eth_api::helpers::LegacyRpc + Clone,
-{
-    info!(?gas_price, "Initializing XLayer gas price scheduler");
-    
-    // Create gas price suggester directly from args
-    let pricer = reth_xlayer_gasprice::suggester::new_l2_gas_price_suggester(gas_price);
-    
-    // Get EthApi to share with scheduler
-    let eth_api = registry.eth_api().clone();
-    
-    // Set pricer to XLayerFees
-    // OpEthApi implements XLayerFees, so we can call set_pricer
-    eth_api.set_pricer(pricer.clone());
-    
-    // Set pricer to XLayerTransactionValidator
-    validator.set_pricer(pricer.clone());
-    
-    // Create scheduler with EthApi (which contains the shared GasPriceOracle)
-    let scheduler = std::sync::Arc::new(
-        reth_xlayer_gasprice::scheduler::XLayerScheduler::with_eth_api(
-            pricer,
-            eth_api,
-            gas_price.default,
-            gas_price.update_period,
-            gas_price.congestion_threshold,
-        )
-    );
-    
-    // Spawn background task - run() will initialize and start the scheduler
-    task_executor.spawn_critical(
-        "xlayer-gas-price-scheduler",
-        Box::pin(async move {
-            scheduler.run().await;
-        })
-    );
-    
-    info!(target: "reth::cli", "XLayer gas price scheduler initialized");
-}
-
 impl<N, EthB, PVB, EB, EVB, Attrs, RpcMiddleware> NodeAddOns<N>
     for OpAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
 where
@@ -730,9 +651,8 @@ where
                     RethRpcModule::Eth,
                     XLayerEthApiExtServer::<OpTransactionRequest>::into_rpc(xlayer_eth_ext),
                 )?;
-                // Initialize XLayer gas price scheduler if configured
-                // This is done here (after RPC initialization) to ensure all components are ready
-                // Only initialize if price_type is specified and not empty
+                
+                // For xlayer: gas price controller
                 if let Some(ref price_type) = xlayer_args.gas_price.price_type {
                     if !price_type.is_empty() {
                         // Get validator from the transaction pool using the extension trait
@@ -1142,6 +1062,7 @@ where
                     // the L1 block info
                     .require_l1_data_gas_fee(!ctx.config().dev.dev)
                     .with_supervisor(supervisor_client.clone());
+                // For xlayer: wrap the op transaction validator within the xlayer transaction validator
                 XLayerTransactionValidator::new(op_validator)
             });
 

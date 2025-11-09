@@ -307,6 +307,7 @@ pub trait EthApi<
     #[method(name = "blobBaseFee")]
     async fn blob_base_fee(&self) -> RpcResult<U256>;
 
+    /// For xlayer
     /// Returns the minimum gas price for XLayer transactions.
     #[method(name = "minGasPrice")]
     async fn min_gas_price(&self) -> RpcResult<U256>;
@@ -824,6 +825,7 @@ where
         Ok(XLayerFees::blob_base_fee(self).await?)
     }
 
+    // For xlayer
     /// Handler for: `eth_minGasPrice`
     async fn min_gas_price(&self) -> RpcResult<U256> {
         trace!(target: "rpc::eth", "Serving eth_minGasPrice");

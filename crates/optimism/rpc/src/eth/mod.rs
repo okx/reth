@@ -7,6 +7,7 @@ pub mod ext_xlayer;
 
 mod block;
 mod call;
+mod mod_xlayer;
 mod pending_block;
 
 use crate::{
@@ -30,17 +31,17 @@ use reth_optimism_flashblocks::{
 use reth_rpc::eth::core::EthApiInner;
 use reth_rpc_eth_api::{
     helpers::{
-fee_xlayer::PricerStorage, pending_block::BuildPendingEnv, EthApiSpec, EthFees, EthState, LoadFee, LoadPendingBlock,
-        LoadState, SpawnBlocking, Trace, XLayerFees,
+        fee_xlayer::PricerStorage, pending_block::BuildPendingEnv, EthApiSpec, EthFees, EthState, LoadFee, LoadPendingBlock,
+        LoadState, SpawnBlocking, Trace,
     },
     EthApiTypes, FromEvmError, FullEthApiServer, RpcConvert, RpcConverter, RpcNodeCore,
     RpcNodeCoreExt, RpcTypes,
 };
 use reth_rpc_eth_types::{
-    EthStateCache, FeeHistoryCache, GasPriceOracle, PendingBlock, PendingBlockEnvOrigin,
+    EthStateCache, FeeHistoryCache, GasPriceOracle, PendingBlock,
     LegacyRpcClient,
 };
-use reth_storage_api::{BlockReaderIdExt, ProviderHeader, ProviderTx};
+use reth_storage_api::{BlockReaderIdExt, ProviderHeader};
 use reth_tasks::{
     pool::{BlockingTaskGuard, BlockingTaskPool},
     TaskSpawner,
@@ -329,21 +330,6 @@ where
     OpEthApiError: FromEvmError<N::Evm>,
     Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError>,
 {
-}
-
-impl<N, Rpc> XLayerFees for OpEthApi<N, Rpc>
-where
-    N: RpcNodeCore,
-    OpEthApiError: FromEvmError<N::Evm>,
-    Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError>,
-{
-    fn set_pricer(&self, pricer: Arc<dyn reth_rpc_eth_api::helpers::pricer::L2GasPricer>) {
-        *self.inner.pricer.write() = Some(pricer);
-    }
-
-    fn get_pricer(&self) -> Option<Arc<dyn reth_rpc_eth_api::helpers::pricer::L2GasPricer>> {
-        self.inner.pricer.read().clone()
-    }
 }
 
 impl<N, Rpc> Trace for OpEthApi<N, Rpc>

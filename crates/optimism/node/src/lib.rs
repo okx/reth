@@ -22,6 +22,8 @@ pub use engine::OpEngineTypes;
 pub mod node;
 pub use node::*;
 
+mod node_xlayer;
+
 pub mod rpc;
 pub use rpc::OpEngineApiBuilder;
 
