@@ -62,11 +62,6 @@ aquamarine.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 eyre.workspace = true
 
-# xlayer
-xlayer-rpc.workspace = true
-xlayer-db.workspace = true
-xlayer-exex.workspace = true
-
 [dev-dependencies]
 backon.workspace = true
 tempfile.workspace = true

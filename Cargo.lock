@@ -7267,9 +7267,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "xlayer-db",
- "xlayer-exex",
- "xlayer-rpc",
 ]
 
 [[package]]

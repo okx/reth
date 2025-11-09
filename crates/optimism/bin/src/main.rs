@@ -31,9 +31,9 @@ fn main() {
             let initialize_result = initialize(db_path);
 
             if let Err(e) = initialize_result {
-                error!(target: "reth::cli", "ok xlayerdb failed to initialize {:#?}", e);
+                error!(target: "reth::cli", "xlayer db failed to initialize {:#?}", e);
             } else {
-                info!(target: "reth::cli", "ok xlayerdb intitialized");
+                info!(target: "reth::cli", "xlayer db initialized");
             }
 
             info!(target: "reth::cli", "Launching node");
@@ -43,7 +43,7 @@ fn main() {
                     let new_op_eth_api = ctx.registry.eth_api().clone();
                     let custom_rpc = XlayerExt { backend: Arc::new(new_op_eth_api) };
                     ctx.modules.merge_configured(custom_rpc.into_rpc())?;
-                    info!(target:"reth::cli", "ok xlayeroprpc enabled");
+                    info!(target:"reth::cli", "xlayer op rpc enabled");
 
                     Ok(())
                 })

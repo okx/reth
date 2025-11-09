@@ -117,9 +117,11 @@ impl TraceCollector {
             String::from("0x0")
         };
 
-        txn.to = to;
+        txn.to = to.clone();
         match txn.call_type.as_str() {
             "delegatecall" => {
+                txn.from = to;
+                txn.to = code_address;
                 txn.trace_address = txn.from.clone();
             }
             "callcode" => {

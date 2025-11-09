@@ -187,8 +187,3 @@ pub mod ress;
 // re-export for convenience
 #[doc(inline)]
 pub use reth_cli_runner::{tokio_runtime, CliContext, CliRunner};
-
-// xlayer
-use xlayer_db as _;
-use xlayer_exex as _;
-use xlayer_rpc as _;
