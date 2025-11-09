@@ -3,9 +3,10 @@
 use crate::{
     args::RollupArgs,
     engine::OpEngineValidator,
-    txpool::{OpTransactionPool, OpTransactionValidator},
+    txpool::OpTransactionValidator,
     OpEngineApiBuilder, OpEngineTypes, XLayerArgs, XLayerGasPriceArgs,
 };
+use reth_xlayer_txpool::XLayerTransactionValidator;
 use op_alloy_consensus::{interop::SafetyLevel, OpPooledTransaction};
 use op_alloy_rpc_types_engine::OpExecutionData;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, Hardforks};
@@ -56,14 +57,14 @@ use reth_optimism_txpool::{
     OpPooledTx,
 };
 use reth_provider::{providers::ProviderFactoryBuilder, CanonStateSubscriptions};
+use reth_tasks::TaskExecutor;
 use reth_rpc_api::{eth::RpcTypes, DebugApiServer, L2EthApiExtServer};
 use reth_rpc_eth_api::EthApiTypes;
 use reth_rpc_server_types::RethRpcModule;
-use reth_tasks::TaskExecutor;
 use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::{
-    blobstore::DiskFileBlobStore, EthPoolTransaction, PoolPooledTx, PoolTransaction,
-    TransactionPool, TransactionValidationTaskExecutor,
+    blobstore::DiskFileBlobStore, CoinbaseTipOrdering, EthPoolTransaction, PoolPooledTx,
+    PoolTransaction, TransactionPool, TransactionValidationTaskExecutor,
 };
 use reth_trie_common::KeccakKeyHasher;
 use serde::de::DeserializeOwned;
@@ -487,6 +488,34 @@ where
     }
 }
 
+/// Extension trait for accessing XLayer validator from the pool.
+trait XLayerValidatorAccess {
+    type Provider;
+    type Transaction: PoolTransaction;
+    
+    /// Get the XLayer validator from the pool.
+    fn get_xlayer_validator(&self) -> Arc<XLayerTransactionValidator<Self::Provider, Self::Transaction>>;
+}
+
+/// Implement the extension trait for the specific Pool type used in OpNode.
+impl<Client, Tx> XLayerValidatorAccess for reth_transaction_pool::Pool<
+    TransactionValidationTaskExecutor<XLayerTransactionValidator<Client, Tx>>,
+    CoinbaseTipOrdering<Tx>,
+    DiskFileBlobStore,
+>
+where
+    Client: reth_provider::ChainSpecProvider + reth_provider::StateProviderFactory + reth_provider::BlockReaderIdExt + Send + Sync + 'static,
+    Client::ChainSpec: OpHardforks,
+    Tx: EthPoolTransaction + OpPooledTx,
+{
+    type Provider = Client;
+    type Transaction = Tx;
+    
+    fn get_xlayer_validator(&self) -> Arc<XLayerTransactionValidator<Client, Tx>> {
+        self.validator().validator_arc().clone()
+    }
+}
+
 /// Initialize XLayer gas price controller
 ///
 /// This function sets up the gas price suggester, scheduler, and spawns the background task
@@ -495,9 +524,11 @@ fn initialize_xlayer_gas_price_controller<Node, EthApi>(
     gas_price: &XLayerGasPriceArgs,
     registry: &mut RpcRegistry<Node, EthApi>,
     task_executor: TaskExecutor,
+    validator: Arc<XLayerTransactionValidator<Node::Provider, <Node::Pool as TransactionPool>::Transaction>>,
 ) where
     Node: FullNodeComponents,
-    EthApi: EthApiTypes + reth_rpc_eth_api::helpers::XLayerFees + Clone,
+    Node::Pool: TransactionPool,
+    EthApi: EthApiTypes + reth_rpc_eth_api::helpers::XLayerFees + reth_rpc_eth_api::helpers::LegacyRpc + Clone,
 {
     info!(?gas_price, "Initializing XLayer gas price scheduler");
     
@@ -510,6 +541,9 @@ fn initialize_xlayer_gas_price_controller<Node, EthApi>(
     // Set pricer to XLayerFees
     // OpEthApi implements XLayerFees, so we can call set_pricer
     eth_api.set_pricer(pricer.clone());
+    
+    // Set pricer to XLayerTransactionValidator
+    validator.set_pricer(pricer.clone());
     
     // Create scheduler with EthApi (which contains the shared GasPriceOracle)
     let scheduler = std::sync::Arc::new(
@@ -549,7 +583,10 @@ where
                 <N::Types as NodeTypes>::ChainSpec,
             >,
         >,
-        Pool: TransactionPool<Transaction: OpPooledTx>,
+        Pool: TransactionPool<Transaction: OpPooledTx> + XLayerValidatorAccess<
+            Provider = N::Provider,
+            Transaction = <<N as FullNodeComponents>::Pool as TransactionPool>::Transaction,
+        >,
     >,
     EthB: EthApiBuilder<N>,
     PVB: Send,
@@ -662,10 +699,14 @@ where
                 // Only initialize if price_type is specified and not empty
                 if let Some(ref price_type) = xlayer_args.gas_price.price_type {
                     if !price_type.is_empty() {
+                        // Get validator from the transaction pool using the extension trait
+                        let validator = registry.pool().get_xlayer_validator();
+                        
                         initialize_xlayer_gas_price_controller(
                             &xlayer_args.gas_price,
                             registry,
                             task_executor,
+                            validator,
                         );
                     }
                 }
@@ -692,8 +733,11 @@ where
                 <N::Types as NodeTypes>::ChainSpec,
             >,
         >,
+        Pool: TransactionPool<Transaction: OpPooledTx> + XLayerValidatorAccess<
+            Provider = N::Provider,
+            Transaction = <<N as FullNodeComponents>::Pool as TransactionPool>::Transaction,
+        >,
     >,
-    <<N as FullNodeComponents>::Pool as TransactionPool>::Transaction: OpPooledTx,
     EthB: EthApiBuilder<N>,
     PVB: PayloadValidatorBuilder<N>,
     EB: EngineApiBuilder<N>,
@@ -1004,7 +1048,11 @@ where
     Node: FullNodeTypes<Types: NodeTypes<ChainSpec: OpHardforks>>,
     T: EthPoolTransaction<Consensus = TxTy<Node::Types>> + OpPooledTx,
 {
-    type Pool = OpTransactionPool<Node::Provider, DiskFileBlobStore, T>;
+    type Pool = reth_transaction_pool::Pool<
+        TransactionValidationTaskExecutor<XLayerTransactionValidator<Node::Provider, T>>,
+        CoinbaseTipOrdering<T>,
+        DiskFileBlobStore,
+    >;
 
     async fn build_pool(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Pool> {
         let Self { pool_config_overrides, .. } = self;
@@ -1039,11 +1087,12 @@ where
             )
             .build_with_tasks(ctx.task_executor().clone(), blob_store.clone())
             .map(|validator| {
-                OpTransactionValidator::new(validator)
+                let op_validator = OpTransactionValidator::new(validator)
                     // In --dev mode we can't require gas fees because we're unable to decode
                     // the L1 block info
                     .require_l1_data_gas_fee(!ctx.config().dev.dev)
-                    .with_supervisor(supervisor_client.clone())
+                    .with_supervisor(supervisor_client.clone());
+                XLayerTransactionValidator::new(op_validator)
             });
 
         let final_pool_config = pool_config_overrides.apply(ctx.pool_config());

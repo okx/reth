@@ -9429,6 +9429,7 @@ dependencies = [
  "reth-transaction-pool",
  "reth-trie-common",
  "reth-xlayer-gasprice",
+ "reth-xlayer-txpool",
  "revm",
  "serde",
  "serde_json",
@@ -10840,6 +10841,18 @@ dependencies = [
  "reth-rpc-eth-api",
  "reth-transaction-pool",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "reth-xlayer-txpool"
+version = "1.8.3"
+dependencies = [
+ "parking_lot",
+ "reth-optimism-txpool",
+ "reth-primitives-traits",
+ "reth-rpc-eth-api",
+ "reth-transaction-pool",
  "tracing",
 ]
 

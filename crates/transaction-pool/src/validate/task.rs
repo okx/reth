@@ -137,6 +137,12 @@ impl<V> TransactionValidationTaskExecutor<V> {
     pub fn validator(&self) -> &V {
         &self.validator
     }
+
+    /// Returns a reference to the inner validator wrapped in Arc.
+    /// This allows accessing the validator for operations that need shared ownership.
+    pub fn validator_arc(&self) -> &Arc<V> {
+        &self.validator
+    }
 }
 
 impl<Client, Tx> TransactionValidationTaskExecutor<EthTransactionValidator<Client, Tx>> {
