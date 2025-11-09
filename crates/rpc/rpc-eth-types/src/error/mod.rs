@@ -194,7 +194,7 @@ pub enum EthApiError {
     CallManyError {
         /// Bundle index where the error occurred
         bundle_index: usize,
-        /// Transaction index within the bundle where the error occurred  
+        /// Transaction index within the bundle where the error occurred
         tx_index: usize,
         /// The underlying error object
         error: jsonrpsee_types::ErrorObject<'static>,
@@ -459,7 +459,6 @@ impl From<reth_errors::ProviderError> for EthApiError {
             }
             ProviderError::BestBlockNotFound => Self::HeaderNotFound(BlockId::latest()),
             ProviderError::BlockNumberForTransactionIndexNotFound => Self::UnknownBlockOrTxIndex,
-            ProviderError::TotalDifficultyNotFound(num) => Self::HeaderNotFound(num.into()),
             ProviderError::FinalizedBlockNotFound => Self::HeaderNotFound(BlockId::finalized()),
             ProviderError::SafeBlockNotFound => Self::HeaderNotFound(BlockId::safe()),
             err => Self::Internal(err.into()),
@@ -972,20 +971,20 @@ impl From<RpcPoolError> for jsonrpsee_types::error::ErrorObject<'static> {
             RpcPoolError::TxPoolOverflow => {
                 rpc_error_with_code(EthRpcErrorCode::TransactionRejected.code(), error.to_string())
             }
-            RpcPoolError::AlreadyKnown |
-            RpcPoolError::InvalidSender |
-            RpcPoolError::Underpriced |
-            RpcPoolError::ReplaceUnderpriced |
-            RpcPoolError::ExceedsGasLimit |
-            RpcPoolError::MaxTxGasLimitExceeded |
-            RpcPoolError::ExceedsFeeCap { .. } |
-            RpcPoolError::NegativeValue |
-            RpcPoolError::OversizedData { .. } |
-            RpcPoolError::ExceedsMaxInitCodeSize |
-            RpcPoolError::PoolTransactionError(_) |
-            RpcPoolError::Eip4844(_) |
-            RpcPoolError::Eip7702(_) |
-            RpcPoolError::AddressAlreadyReserved => {
+            RpcPoolError::AlreadyKnown
+            | RpcPoolError::InvalidSender
+            | RpcPoolError::Underpriced
+            | RpcPoolError::ReplaceUnderpriced
+            | RpcPoolError::ExceedsGasLimit
+            | RpcPoolError::MaxTxGasLimitExceeded
+            | RpcPoolError::ExceedsFeeCap { .. }
+            | RpcPoolError::NegativeValue
+            | RpcPoolError::OversizedData { .. }
+            | RpcPoolError::ExceedsMaxInitCodeSize
+            | RpcPoolError::PoolTransactionError(_)
+            | RpcPoolError::Eip4844(_)
+            | RpcPoolError::Eip7702(_)
+            | RpcPoolError::AddressAlreadyReserved => {
                 rpc_error_with_code(EthRpcErrorCode::InvalidInput.code(), error.to_string())
             }
             RpcPoolError::Other(other) => internal_rpc_err(other.to_string()),
