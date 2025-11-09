@@ -615,7 +615,9 @@ where
         // Otherwise, we recalculate the whole stage checkpoint including the amount of gas
         // already processed, if there's any.
         _ => {
-            let processed = calculate_gas_used_from_headers(provider, 0..=start_block - 1)?;
+            // Start from genesis block which may be greater than 0
+            let min_block = provider.get_genesis_block_number();
+            let processed = calculate_gas_used_from_headers(provider, min_block..=start_block - 1)?;
 
             ExecutionCheckpoint {
                 block_range: CheckpointBlockRange { from: start_block, to: max_block },
