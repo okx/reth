@@ -8,7 +8,7 @@ use reth_optimism_txpool::supervisor::DEFAULT_SUPERVISOR_URL;
 use url::Url;
 
 /// Parameters for rollup configuration
-#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[derive(Debug, Clone, PartialEq, clap::Args)]
 #[command(next_help_heading = "Rollup")]
 pub struct RollupArgs {
     /// Endpoint for the sequencer mempool (can be both HTTP and WS)
