@@ -491,4 +491,114 @@ mod tests {
             panic!("Result should be a tuple");
         }
     }
+    #[test]
+    fn test_encode_args_with_dynamic_array() {
+        // Test dynamic array without brackets: address[]
+        // Function signature: testFunction(address[])(uint256)
+        // Args: XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7
+        // (comma-separated without brackets)
+        
+        let sig = "testFunction(address[])(uint256)";
+        let func = Function::parse(sig).unwrap();
+        
+        let args = vec!["XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7"];
+        
+        let result = encode_args(&func.inputs, args).unwrap();
+        
+        assert_eq!(result.len(), 1);
+        
+        if let DynSolValue::Array(array_values) = &result[0] {
+            assert_eq!(array_values.len(), 2);
+            
+            // Check first address (should have X prefix stripped)
+            if let DynSolValue::Address(addr1) = &array_values[0] {
+                assert_eq!(
+                    addr1.to_string(),
+                    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+                );
+            } else {
+                panic!("First element should be an address");
+            }
+            
+            // Check second address (should have X prefix stripped)
+            if let DynSolValue::Address(addr2) = &array_values[1] {
+                assert_eq!(
+                    addr2.to_string(),
+                    "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+                );
+            } else {
+                panic!("Second element should be an address");
+            }
+        } else {
+            panic!("Result should be an array");
+        }
+    }
+
+    #[test]
+    fn test_encode_args_with_fixed_array() {
+        // Test fixed-size array: address[3]
+        // Function signature: testFunction(address[3])(uint256)
+        // Args: [XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7,0x1234567890123456789012345678901234567890]
+        
+        let sig = "testFunction(address[3])(uint256)";
+        let func = Function::parse(sig).unwrap();
+        
+        let args = vec!["[XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7,0x1234567890123456789012345678901234567890]"];
+        
+        let result = encode_args(&func.inputs, args).unwrap();
+        
+        assert_eq!(result.len(), 1);
+        
+        if let DynSolValue::FixedArray(array_values) = &result[0] {
+            assert_eq!(array_values.len(), 3);
+            
+            // Check first address (should have X prefix stripped)
+            if let DynSolValue::Address(addr1) = &array_values[0] {
+                assert_eq!(
+                    addr1.to_string(),
+                    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+                );
+            } else {
+                panic!("First element should be an address");
+            }
+            
+            // Check second address (should have X prefix stripped)
+            if let DynSolValue::Address(addr2) = &array_values[1] {
+                assert_eq!(
+                    addr2.to_string(),
+                    "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+                );
+            } else {
+                panic!("Second element should be an address");
+            }
+            
+            // Check third address (without X prefix, should still work)
+            if let DynSolValue::Address(addr3) = &array_values[2] {
+                assert_eq!(
+                    addr3.to_string(),
+                    "0x1234567890123456789012345678901234567890"
+                );
+            } else {
+                panic!("Third element should be an address");
+            }
+        } else {
+            panic!("Result should be a fixed array");
+        }
+    }
+
+    #[test]
+    fn test_encode_args_with_fixed_array_wrong_length() {
+        // Test fixed-size array with wrong length: address[3] but only 2 elements provided
+        // This should fail with a length mismatch error
+        
+        let sig = "testFunction(address[3])(uint256)";
+        let func = Function::parse(sig).unwrap();
+        
+        let args = vec!["[XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7]"];
+        
+        let result = encode_args(&func.inputs, args);
+        
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Fixed array length mismatch"));
+    }
 }
