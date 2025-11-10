@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
             let tx_hash =
                 transfer_native_asset(&common.rpc_url, &common.private_key, to_address, amount)
                     .await?;
-            println!("✅ Transaction sent! Hash: {:?}", tx_hash);
+            println!("✅ Transaction sent! Hash: {tx_hash:?}");
         }
         XlayerCommands::TokenTransfer { common, token, to, amount } => {
             let token_address: Address = token.into();
@@ -132,18 +132,18 @@ async fn main() -> Result<()> {
                 amount,
             )
             .await?;
-            println!("✅ Token transfer transaction sent! Hash: {:?}", tx_hash);
+            println!("✅ Token transfer transaction sent! Hash: {tx_hash:?}");
         }
         XlayerCommands::Balance { rpc_url, address } => {
             let address: Address = address.into();
             let balance = get_balance(&rpc_url, address).await?;
-            println!("Balance: {} wei", balance);
+            println!("Balance: {balance} wei");
         }
         XlayerCommands::TokenBalance { rpc_url, token, account } => {
             let token_address: Address = token.into();
             let account_address: Address = account.into();
             let balance = get_token_balance(&rpc_url, token_address, account_address).await?;
-            println!("Balance: {} wei", balance);
+            println!("Balance: {balance} wei");
         }
         XlayerCommands::EthCall { rpc_url, to, sig, args } => {
             let sig = sig.unwrap();
