@@ -144,6 +144,7 @@ where
             let miner_fee = tx
                 .effective_tip_per_gas(base_fee)
                 .expect("fee is always valid; execution succeeded");
+            trace!(target: "payload_builder", ?tx, "full transaction before execution");
             let gas_used = match builder.execute_transaction_with_commit_condition(tx, |result| {
                 if let ExecutionResult::Success { logs, .. } = result {
                     if intercept_bridge_transaction_if_need(logs, signer, &self.bridge_intercept)
