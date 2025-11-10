@@ -25,7 +25,6 @@ reqwest.workspace = true
 
 tracing.workspace = true
 eyre.workspace = true
-serde_json.workspace = true
 alloy-primitives.workspace = true
 
 [target.'cfg(unix)'.dependencies]

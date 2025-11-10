@@ -28,8 +28,7 @@ use reth_payload_primitives::{
     BuiltPayload, EngineApiMessageVersion, NewPayloadError, PayloadBuilderAttributes, PayloadTypes,
 };
 use reth_primitives_traits::{
-    BlockBody, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
-    transaction::TxHashRef,
+    NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
 };
 use reth_provider::{
     BlockReader, DatabaseProviderFactory, HashedPostStateProvider, ProviderError, StateProviderBox,
@@ -512,7 +511,6 @@ where
         self.metrics.engine.new_payload_messages.increment(1);
 
         use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
-        let block_hash = payload.block_hash();
         let block_number = payload.block_number();
         let start = Instant::now();
 

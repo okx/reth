@@ -9533,7 +9533,6 @@ dependencies = [
  "reqwest 0.12.24",
  "reth-metrics",
  "reth-tasks",
- "serde_json",
  "socket2 0.5.10",
  "tempfile",
  "tikv-jemalloc-ctl",
