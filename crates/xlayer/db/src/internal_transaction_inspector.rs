@@ -72,6 +72,9 @@ impl TraceCollector {
 
         match result {
             InstructionResult::Revert => "execution reverted".to_string(),
+            // InstructionResult::ReentrancySentryOOG => {
+            //     "out of gas: not enough gas for reentrancy sentry".to_string()
+            // }
             // InstructionResult::OutOfGas => "out of gas".to_string(),
             // InstructionResult::OutOfFund => "insufficient funds".to_string(),
             // InstructionResult::CallTooDeep => "call depth exceeded".to_string(),
@@ -111,10 +114,9 @@ impl TraceCollector {
         txn.is_error = false;
         txn.gas = gas_limit;
         txn.value_wei = if value_wei.is_empty() { "0" } else { &value_wei }.to_string();
-        txn.call_value_wei = if let Ok(value) = value_wei.parse::<u128>() {
-            format!("0x{:x}", value)
-        } else {
-            String::from("0x0")
+        txn.call_value_wei = match value_wei.parse::<u128>() {
+            Ok(value) => format!("0x{:x}", value),
+            _ => String::from("0x0"),
         };
 
         txn.to = to.clone();
@@ -165,7 +167,7 @@ impl TraceCollector {
             txn.name.push_str(&suffix);
         }
 
-        txn.name = txn.call_type.clone() + txn.name.as_str();
+        txn.name = txn.call_type.clone() + &txn.name;
     }
 
     fn after_op(&mut self) {
@@ -195,11 +197,12 @@ where
 {
     fn call(&mut self, ctx: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         let call_type = match inputs.scheme {
-            reth_revm::interpreter::CallScheme::Call => "call".to_string(),
-            reth_revm::interpreter::CallScheme::CallCode => "callcode".to_string(),
-            reth_revm::interpreter::CallScheme::DelegateCall => "delegatecall".to_string(),
-            reth_revm::interpreter::CallScheme::StaticCall => "staticcall".to_string(),
-        };
+            reth_revm::interpreter::CallScheme::Call => "call",
+            reth_revm::interpreter::CallScheme::CallCode => "callcode",
+            reth_revm::interpreter::CallScheme::DelegateCall => "delegatecall",
+            reth_revm::interpreter::CallScheme::StaticCall => "staticcall",
+        }
+        .to_string();
 
         let call_input = match &inputs.input {
             CallInput::SharedBuffer(range) => ctx
