@@ -499,9 +499,6 @@ where
                     }
                 };
 
-                // Get tx_hash before moving transaction into ValidPoolTransaction
-                let tx_hash = *transaction.hash();
-
                 let tx = ValidPoolTransaction {
                     transaction,
                     transaction_id,

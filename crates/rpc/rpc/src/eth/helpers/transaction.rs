@@ -45,7 +45,6 @@ where
         let mut pool_transaction =
             <Self::Pool as TransactionPool>::Transaction::from_pooled(recovered);
 
-        let tx_hash = *pool_transaction.hash();
         // TODO: remove this after Osaka transition
         // Convert legacy blob sidecars to EIP-7594 format
         if pool_transaction.is_eip4844() {

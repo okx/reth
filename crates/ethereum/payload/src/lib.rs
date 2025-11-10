@@ -204,8 +204,6 @@ where
     let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp);
 
     while let Some(pool_tx) = best_txs.next() {
-        let tx_hash = *pool_tx.hash();
-        
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
             // we can't fit this transaction into the block, so we need to mark it as invalid
