@@ -438,12 +438,12 @@ impl<Txs> OpBuilder<'_, Txs> {
 
         let no_tx_pool = ctx.attributes().no_tx_pool();
 
-        let payload =
-            OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed));
-
         // X Layer: Log block build end (success)
         let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
+
+        let payload =
+            OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed));
         if let Some(tracer) = get_global_tracer() {
             tracer.log_block(
                 block_hash,
