@@ -116,13 +116,23 @@ async fn main() -> Result<()> {
     match cli.command {
         XlayerCommands::Transfer { common, to, amount } => {
             let to_address: Address = to.into();
-            transfer_native_asset(&common.rpc_url, &common.private_key, to_address, amount).await?;
+            let tx_hash =
+                transfer_native_asset(&common.rpc_url, &common.private_key, to_address, amount)
+                    .await?;
+            println!("✅ Transaction sent! Hash: {:?}", tx_hash);
         }
         XlayerCommands::TokenTransfer { common, token, to, amount } => {
             let token_address: Address = token.into();
             let to_address: Address = to.into();
-            transfer_token(&common.rpc_url, &common.private_key, token_address, to_address, amount)
-                .await?;
+            let tx_hash = transfer_token(
+                &common.rpc_url,
+                &common.private_key,
+                token_address,
+                to_address,
+                amount,
+            )
+            .await?;
+            println!("✅ Token transfer transaction sent! Hash: {:?}", tx_hash);
         }
         XlayerCommands::Balance { rpc_url, address } => {
             let address: Address = address.into();

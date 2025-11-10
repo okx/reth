@@ -6,7 +6,7 @@
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_json_abi::Param;
 use alloy_network::EthereumWallet;
-use alloy_primitives::{hex, Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
@@ -85,7 +85,7 @@ pub async fn transfer_native_asset(
     private_key: &str,
     to_address: Address,
     amount: Option<U256>,
-) -> Result<()> {
+) -> Result<B256> {
     let provider = create_provider_with_wallet(rpc_url, private_key).await?;
 
     let chain_id = provider.get_chain_id().await.context("Failed to get chain ID")?;
@@ -105,9 +105,7 @@ pub async fn transfer_native_asset(
 
     let receipt = pending_tx.get_receipt().await?;
 
-    println!("✅ Transaction sent! Hash: {:?}", receipt.transaction_hash);
-
-    Ok(())
+    Ok(receipt.transaction_hash)
 }
 
 /// Transfer ERC20 tokens using transfer(address,uint256) function
@@ -117,7 +115,7 @@ pub async fn transfer_token(
     token_address: Address,
     recipient: Address,
     amount: U256,
-) -> Result<()> {
+) -> Result<B256> {
     let provider = create_provider_with_wallet(rpc_url, private_key).await?;
 
     let chain_id = provider.get_chain_id().await.context("Failed to get chain ID")?;
@@ -145,9 +143,7 @@ pub async fn transfer_token(
 
     let receipt = pending_tx.get_receipt().await?;
 
-    println!("✅ Token transfer transaction sent! Hash: {:?}", receipt.transaction_hash);
-
-    Ok(())
+    Ok(receipt.transaction_hash)
 }
 
 /// Get the balance of an address
