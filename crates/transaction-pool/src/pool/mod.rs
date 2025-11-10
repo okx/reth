@@ -511,25 +511,9 @@ where
                     authority_ids: authorities.map(|auths| self.get_sender_ids(auths)),
                 };
                 
-                // Transaction pool add start
-                use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_transaction_start(tx_hash, TransactionProcessId::TxPoolAddStart, "Adding transaction to pool");
-                }
-                
-                // Transaction pool validation start
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_transaction_start(tx_hash, TransactionProcessId::TxPoolValidateStart, "Starting validation");
-                }
-                
                 let added = pool.add_transaction(tx, balance, state_nonce, bytecode_hash)?;
                 let hash = *added.hash();
                 let state = added.transaction_state();
-
-                // Transaction pool validation end (success)
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPoolValidateEnd, true, "Transaction validation successful");
-                }
 
                 // transaction was successfully inserted into the pool
                 if let Some(sidecar) = maybe_sidecar {
@@ -560,32 +544,14 @@ where
                 // Notify listeners for _all_ transactions
                 self.on_new_transaction(added.into_new_transaction_event());
 
-                // Transaction pool add successful
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPoolAddEnd, true, "Transaction added to pool, waiting for mining");
-                }
-
                 Ok(AddedTransactionOutcome { hash, state })
             }
             TransactionValidationOutcome::Invalid(tx, err) => {
-                let tx_hash = *tx.hash();
-                // Transaction pool validation failed
-                use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPoolValidateEnd, false, &format!("Transaction validation failed: {}", err));
-                    tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPoolAddEnd, false, &format!("Transaction rejected by pool: {}", err));
-                }
                 let mut listener = self.event_listener.write();
                 listener.invalid(tx.hash());
                 Err(PoolError::new(*tx.hash(), err))
             }
             TransactionValidationOutcome::Error(tx_hash, err) => {
-                // Transaction pool validation error
-                use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPoolValidateEnd, false, &format!("Validation error: {}", err));
-                    tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPoolAddEnd, false, &format!("Transaction rejected due to validation error: {}", err));
-                }
                 let mut listener = self.event_listener.write();
                 listener.discarded(&tx_hash);
                 Err(PoolError::other(tx_hash, err))

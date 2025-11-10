@@ -58,25 +58,14 @@ where
         if let Some(client) = self.raw_tx_forwarder().as_ref() {
             tracing::debug!(target: "rpc::eth", hash = %tx_hash, "forwarding raw transaction to sequencer");
             
-            // RPC forward start (RPC node forwarding to sequencer)
+            // RPC receive end (RPC node received transaction, ready to forward)
             if let Some(tracer) = get_global_tracer() {
-                tracer.log_transaction_start(tx_hash, TransactionProcessId::RpcForwardStart, "Forwarding transaction to sequencer");
+                tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveTxEnd, true, "RPC receive successful, ready to forward");
             }
             
-            let start = std::time::Instant::now();
             let hash = client.forward_raw_transaction(&tx).await.inspect_err(|err| {
                     tracing::debug!(target: "rpc::eth", %err, hash=%tx_hash, "failed to forward raw transaction");
-                    // RPC forward end (failed)
-                    if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcForwardEnd, false, &format!("Failed to forward transaction to sequencer: {}", err));
-                    }
                 })?;
-            
-            let duration = start.elapsed();
-            // RPC forward end (success)
-            if let Some(tracer) = get_global_tracer() {
-                tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcForwardEnd, true, &format!("Transaction forwarded to sequencer successfully, duration: {}ms", duration.as_millis()));
-            }
 
             // Retain tx in local tx pool after forwarding, for local RPC usage.
             let _ = self.inner.eth_api.add_pool_transaction(pool_transaction).await.inspect_err(|err| {
@@ -87,27 +76,16 @@ where
         }
 
         // Sequencer node receiving transaction (no forwarder configured).
-        // RPC receive start (Sequencer node receiving transaction)
-        if let Some(tracer) = get_global_tracer() {
-            tracer.log_transaction_start(tx_hash, TransactionProcessId::RpcReceiveStart, "Receiving transaction via RPC send_rawTransaction");
-        }
-
         // submit the transaction to the pool with a `Local` origin
         let AddedTransactionOutcome { hash, .. } = self
             .pool()
             .add_transaction(TransactionOrigin::Local, pool_transaction)
             .await
-            .map_err(|err| {
-                // RPC receive end (failed)
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveEnd, false, &format!("Failed to add to transaction pool: {}", err));
-                }
-                Self::Error::from_eth_err(err)
-            })?;
+            .map_err(Self::Error::from_eth_err)?;
 
-        // RPC receive end (success)
+        // SEQ receive end (successfully added to pool)
         if let Some(tracer) = get_global_tracer() {
-            tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveEnd, true, "RPC receive successful");
+            tracer.log_transaction_end(tx_hash, TransactionProcessId::SeqReceiveTxEnd, true, "SEQ receive successful, transaction added to pool");
         }
 
         Ok(hash)

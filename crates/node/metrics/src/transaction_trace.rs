@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 /// Number of log entries to write before forcing a flush
@@ -24,72 +24,40 @@ const FLUSH_INTERVAL_SECONDS: u64 = 1;
 /// This ensures each event has a unique process_id
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransactionProcessId {
-    // RPC Receive stage (50010-50011)
-    RpcReceiveStart = 50010,
-    RpcReceiveEnd = 50011,
+    // RPC Receive Tx stage
+    RpcReceiveTxEnd = 15010,
     
-    // RPC Forward stage (50012-50013)
-    RpcForwardStart = 50012,
-    RpcForwardEnd = 50013,
-    
-    // TxPool stage (50020-50024)
-    TxPoolAddStart = 50020,
-    TxPoolValidateStart = 50021,
-    TxPoolValidateEnd = 50022,
-    TxPoolAddEnd = 50023,
+    // SEQ Receive Tx stage - Sequencer node receiving transaction
+    SeqReceiveTxEnd = 15030,
 
-    // Miner Select stage (50030-50032)
-    MinerSelectStart = 50030,
-    MinerSelectEnd = 50031,
-    
-    // Tx Execution stage (50040-50042)
-    TxExecutionStart = 50040,
-    TxExecutionEnd = 50041,
-    TxPackagingEnd = 50042,
-    
-    // RPC Tx Process stage (50050-50052)
-    RPCTxExecutionStart = 50050,
-    RPCTxExecutionEnd = 50051,
-    RPCTxCommitEnd = 50052,
-    
+    BlockBuildStart = 15032,
+
+    // SEQ Tx Execution stage
+    SeqTxExecutionEnd = 15034,
+
+    SeqBlockBuildEnd = 15036,
+
+    // SEQ Block Send stage - Sequencer sending block to RPC
+    SeqBlockSendStart = 15042,
+
+    // RPC Block Receive stage - RPC node receiving block from sequencer
+    RpcBlockReceiveEnd = 15060,
+
     // Block Insert stage (50060-50061)
-    BlockInsertStart = 50060,
-    BlockInsertEnd = 50061,
+    RpcBlockInsertEnd = 15062,
 }
 
 impl TransactionProcessId {
     pub fn as_str(&self) -> &'static str {
         match self {
-            TransactionProcessId::RpcReceiveStart => "RPC Receive Start",
-            TransactionProcessId::RpcReceiveEnd => "RPC Receive End",
-            TransactionProcessId::RpcForwardStart => "RPC Forward Start",
-            TransactionProcessId::RpcForwardEnd => "RPC Forward End",
-            TransactionProcessId::TxPoolAddStart => "TxPool Add Start",
-            TransactionProcessId::TxPoolAddEnd => "TxPool Add End",
-            TransactionProcessId::TxPoolValidateStart => "TxPool Validate Progress",
-            TransactionProcessId::TxPoolValidateEnd => "TxPool Validate End",
-            TransactionProcessId::MinerSelectStart => "Miner Select Start",
-            TransactionProcessId::MinerSelectEnd => "Miner Select End",
-            TransactionProcessId::TxExecutionStart => "Tx Execution Start",
-            TransactionProcessId::TxExecutionEnd => "Tx Execution End",
-            TransactionProcessId::TxPackagingEnd => "Tx Packaging End",
-            TransactionProcessId::RPCTxExecutionStart => "RPC Tx Execution Start",
-            TransactionProcessId::RPCTxExecutionEnd => "RPC Tx Execution End",
-            TransactionProcessId::RPCTxCommitEnd => "RPC Tx Commit End",
-            TransactionProcessId::BlockInsertStart => "Block Insert Start",
-            TransactionProcessId::BlockInsertEnd => "Block Insert End",
-        }
-    }
-    
-    /// Get the base stage ID (for backward compatibility and grouping)
-    pub fn base_stage_id(&self) -> u32 {
-        match self {
-            TransactionProcessId::RpcReceiveStart | TransactionProcessId::RpcReceiveEnd | TransactionProcessId::RpcForwardStart | TransactionProcessId::RpcForwardEnd => 50010,
-            TransactionProcessId::TxPoolAddStart | TransactionProcessId::TxPoolValidateStart | TransactionProcessId::TxPoolValidateEnd | TransactionProcessId::TxPoolAddEnd => 50020,
-            TransactionProcessId::MinerSelectStart | TransactionProcessId::MinerSelectEnd => 50030,
-            TransactionProcessId::TxExecutionStart | TransactionProcessId::TxExecutionEnd | TransactionProcessId::TxPackagingEnd => 50040,
-            TransactionProcessId::RPCTxExecutionStart | TransactionProcessId::RPCTxExecutionEnd | TransactionProcessId::RPCTxCommitEnd => 50050,
-            TransactionProcessId::BlockInsertStart | TransactionProcessId::BlockInsertEnd => 50060,
+            TransactionProcessId::RpcReceiveTxEnd => "RPC Receive Tx End",
+            TransactionProcessId::SeqReceiveTxEnd => "SEQ Receive Tx End",
+            TransactionProcessId::SeqTxExecutionEnd => "SEQ Tx Execution End",
+            TransactionProcessId::RpcBlockInsertEnd => "RPC Block Insert End",
+            TransactionProcessId::BlockBuildStart => "Block Build Start",
+            TransactionProcessId::SeqBlockBuildEnd => "SEQ Block Build End",
+            TransactionProcessId::SeqBlockSendStart => "SEQ Block Send Start",
+            TransactionProcessId::RpcBlockReceiveEnd => "RPC Block Receive End",
         }
     }
 }
@@ -458,9 +426,10 @@ mod tests {
         let (tracer, temp_dir) = create_test_tracer();
         let tx_hash = B256::from([1u8; 32]);
 
-        tracer.log_transaction_start(
+        tracer.log_transaction_end(
             tx_hash,
-            TransactionProcessId::RpcReceiveStart,
+            TransactionProcessId::RpcReceiveTxEnd,
+            true,
             "Test transaction",
         );
 
@@ -474,7 +443,7 @@ mod tests {
             .unwrap();
 
         assert!(contents.contains("TX_TRACE"));
-        assert!(contents.contains("RPC Receive Start"));
+        assert!(contents.contains("RPC Receive End"));
         assert!(contents.contains(&format!("{:#x}", tx_hash)));
     }
 
@@ -485,7 +454,7 @@ mod tests {
 
         tracer.log_transaction_end(
             tx_hash,
-            TransactionProcessId::RpcReceiveEnd,
+            TransactionProcessId::RpcReceiveTxEnd,
             true,
             "Transaction completed",
         );
@@ -518,14 +487,56 @@ mod tests {
             let handle = thread::spawn(move || {
                 for i in 0..writes_per_thread {
                     let tx_hash = B256::from([thread_id as u8; 32]);
-                    let process_id = if i % 2 == 0 {
-                        TransactionProcessId::RpcReceiveStart
-                    } else {
-                        TransactionProcessId::RpcReceiveEnd
-                    };
-                    tracer_clone.log_transaction_start(
+                    let process_id = TransactionProcessId::RpcReceiveTxEnd;
+                    tracer_clone.log_transaction_end(
                         tx_hash,
                         process_id,
+                        true,
+                        "Test transaction",
+                    );
+                }
+            });
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut contents = String::new();
+        fs::File::open(&trace_file)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), num_threads * writes_per_thread);
+
+        // Verify all lines are valid JSON
+        for line in lines {
+            let _: serde_json::Value = serde_json::from_str(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_concurrent_write_to_file_old() {
+        let (tracer, temp_dir) = create_test_tracer();
+        let tracer = Arc::new(tracer);
+        let trace_file = temp_dir.path().join("trace.log");
+
+        let num_threads = 10;
+        let writes_per_thread = 100;
+        let mut handles = vec![];
+
+        for thread_id in 0..num_threads {
+            let tracer_clone = Arc::clone(&tracer);
+            let handle = thread::spawn(move || {
+                for i in 0..writes_per_thread {
+                    let tx_hash = B256::from([thread_id as u8; 32]);
+                    let process_id = TransactionProcessId::RpcReceiveTxEnd;
+                    tracer_clone.log_transaction_end(
+                        tx_hash,
+                        process_id,
+                        true,
                         &format!("Thread {} write {}", thread_id, i),
                     );
                 }
@@ -582,14 +593,9 @@ mod tests {
                 let tx_hash = B256::from(hash_bytes);
 
                 for _ in 0..50 {
-                    tracer_clone.log_transaction_start(
-                        tx_hash,
-                        TransactionProcessId::TxExecutionStart,
-                        "Concurrent execution test",
-                    );
                     tracer_clone.log_transaction_end(
                         tx_hash,
-                        TransactionProcessId::TxExecutionEnd,
+                        TransactionProcessId::SeqTxExecutionEnd,
                         true,
                         "Execution completed",
                     );

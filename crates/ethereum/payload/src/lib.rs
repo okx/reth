@@ -203,16 +203,8 @@ where
 
     let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp);
 
-    // Miner selection start
-    use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
-    
     while let Some(pool_tx) = best_txs.next() {
         let tx_hash = *pool_tx.hash();
-        
-        // Miner selecting transaction
-        if let Some(tracer) = get_global_tracer() {
-            tracer.log_transaction_start(tx_hash, TransactionProcessId::MinerSelectStart, "Miner selecting transaction");
-        }
         
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
@@ -303,31 +295,11 @@ where
             };
         }
 
-        // Miner selection end (transaction selected and ready for execution)
-        if let Some(tracer) = get_global_tracer() {
-            tracer.log_transaction_end(tx_hash, TransactionProcessId::MinerSelectEnd, true, "Transaction selected for execution");
-        }
-
-        // Transaction execution start
-        if let Some(tracer) = get_global_tracer() {
-            tracer.log_transaction_start(tx_hash, TransactionProcessId::TxExecutionStart, "Starting transaction execution");
-        }
-        
         let gas_used = match builder.execute_transaction(tx.clone()) {
-            Ok(gas_used) => {
-                // Transaction execution successful
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_transaction_end(tx_hash, TransactionProcessId::TxExecutionEnd, true, "Transaction execution successful");
-                }
-                gas_used
-            }
+            Ok(gas_used) => gas_used,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                 error, ..
             })) => {
-                // Transaction execution failed
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_transaction_end(tx_hash, TransactionProcessId::TxExecutionEnd, false, &format!("Transaction execution failed: {}", error));
-                }
                 if error.is_nonce_too_low() {
                     // if the nonce is too low, we can skip this transaction
                     trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
@@ -381,14 +353,6 @@ where
     }
 
     let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
-    
-    // Transaction packaging complete
-    if let Some(tracer) = get_global_tracer() {
-        for tx in block.body().transactions() {
-            let tx_hash = *tx.tx_hash();
-            tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPackagingEnd, true, "Transaction packaging completed");
-        }
-    }
 
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)

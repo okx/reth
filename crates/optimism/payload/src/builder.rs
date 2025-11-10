@@ -43,6 +43,7 @@ use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, Transac
 use revm::context::{Block, BlockEnv};
 use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, trace, warn};
+use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
 
 /// Optimism's payload builder
 #[derive(Debug)]
@@ -355,6 +356,18 @@ impl<Txs> OpBuilder<'_, Txs> {
         let Self { best } = self;
         debug!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
 
+        // Block build start
+        let parent_hash = ctx.parent().hash();
+        let parent_number = ctx.parent().number();
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_block_start(
+                parent_hash,
+                parent_number + 1,
+                TransactionProcessId::BlockBuildStart,
+                &format!("Starting block build, payload_id: {}", ctx.payload_id()),
+            );
+        }
+
         let mut db = State::builder().with_database(db).with_bundle_update().build();
 
         // Load the L1 block contract into the database cache. If the L1 block contract is not
@@ -377,11 +390,31 @@ impl<Txs> OpBuilder<'_, Txs> {
         if !ctx.attributes().no_tx_pool() {
             let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
             if ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?.is_some() {
+                // Block build end (cancelled)
+                if let Some(tracer) = get_global_tracer() {
+                    tracer.log_block_end(
+                        parent_hash,
+                        parent_number + 1,
+                        TransactionProcessId::SeqBlockBuildEnd,
+                        false,
+                        "Block build cancelled",
+                    );
+                }
                 return Ok(BuildOutcomeKind::Cancelled)
             }
 
             // check if the new payload is even more valuable
             if !ctx.is_better_payload(info.total_fees) {
+                // Block build end (aborted)
+                if let Some(tracer) = get_global_tracer() {
+                    tracer.log_block_end(
+                        parent_hash,
+                        parent_number + 1,
+                        TransactionProcessId::SeqBlockBuildEnd,
+                        false,
+                        "Block build aborted (not better payload)",
+                    );
+                }
                 // can skip building the block
                 return Ok(BuildOutcomeKind::Aborted { fees: info.total_fees })
             }
@@ -390,16 +423,6 @@ impl<Txs> OpBuilder<'_, Txs> {
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(state_provider)?;
 
-        // Transaction packaging complete
-        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
-        use alloy_consensus::transaction::TxHashRef;
-        if let Some(tracer) = get_global_tracer() {
-            // Use recovered_block to get all transactions (including system transactions)
-            for tx in block.body().transactions_iter() {
-                let tx_hash = *tx.tx_hash();
-                tracer.log_transaction_end(tx_hash, TransactionProcessId::TxPackagingEnd, true, "Transaction packaging completed");
-            }
-        }
 
         let sealed_block = Arc::new(block.sealed_block().clone());
         debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
@@ -423,6 +446,20 @@ impl<Txs> OpBuilder<'_, Txs> {
 
         let payload =
             OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed));
+
+        // Block build end (success)
+        let block_hash = sealed_block.hash();
+        let block_number = sealed_block.number();
+        if let Some(tracer) = get_global_tracer() {
+            let outcome = if no_tx_pool { "frozen" } else { "better" };
+            tracer.log_block_end(
+                block_hash,
+                block_number,
+                TransactionProcessId::SeqBlockBuildEnd,
+                true,
+                &format!("Block build completed ({})", outcome),
+            );
+        }
 
         if no_tx_pool {
             // if `no_tx_pool` is set only transactions from the payload attributes will be included
@@ -712,7 +749,6 @@ where
         Builder: BlockBuilder<Primitives = Evm::Primitives>,
         <<Builder::Executor as BlockExecutor>::Evm as AlloyEvm>::DB: Database,
     {
-        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
 
         let mut block_gas_limit = builder.evm_mut().block().gas_limit();
         if let Some(gas_limit_config) = self.builder_config.gas_limit_config.gas_limit() {
@@ -726,11 +762,6 @@ where
 
         while let Some(tx) = best_txs.next(()) {
             let tx_hash = *tx.hash();
-
-            // Miner selecting transaction
-            if let Some(tracer) = get_global_tracer() {
-                tracer.log_transaction_start(tx_hash, TransactionProcessId::MinerSelectStart, "Miner selecting transaction");
-            }
             let interop = tx.interop_deadline();
             let tx_da_size = tx.estimated_da_size();
             let tx = tx.into_consensus();
@@ -778,21 +809,11 @@ where
                 return Ok(Some(()))
             }
 
-            // Miner selection end (transaction selected and ready for execution)
-            if let Some(tracer) = get_global_tracer() {
-                tracer.log_transaction_end(tx_hash, TransactionProcessId::MinerSelectEnd, true, "Transaction selected for execution");
-            }
-
-            // Transaction execution start
-            if let Some(tracer) = get_global_tracer() {
-                tracer.log_transaction_start(tx_hash, TransactionProcessId::TxExecutionStart, "Starting transaction execution");
-            }
-
             let gas_used = match builder.execute_transaction(tx.clone()) {
                 Ok(gas_used) => {
                     // Transaction execution successful
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::TxExecutionEnd, true, "Transaction execution successful");
+                        tracer.log_transaction_end(tx_hash, TransactionProcessId::SeqTxExecutionEnd, true, "Transaction execution successful");
                     }
                     gas_used
                 }
@@ -802,7 +823,7 @@ where
                 })) => {
                     // Transaction execution failed
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::TxExecutionEnd, false, &format!("Transaction execution failed: {}", error));
+                        tracer.log_transaction_end(tx_hash, TransactionProcessId::SeqTxExecutionEnd, false, &format!("Transaction execution failed: {}", error));
                     }
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
@@ -818,7 +839,7 @@ where
                 Err(err) => {
                     // Transaction execution fatal error
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::TxExecutionEnd, false, &format!("Transaction execution fatal error: {}", err));
+                        tracer.log_transaction_end(tx_hash, TransactionProcessId::SeqTxExecutionEnd, false, &format!("Transaction execution fatal error: {}", err));
                     }
                     // this is an error that we should treat as fatal for this attempt
                     return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)))

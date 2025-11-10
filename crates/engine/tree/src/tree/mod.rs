@@ -512,6 +512,9 @@ where
         self.metrics.engine.new_payload_messages.increment(1);
 
         // start timing for the new payload process
+        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
+        let block_hash = payload.block_hash();
+        let block_number = payload.block_number();
         let start = Instant::now();
 
         // Ensures that the given payload does not violate any consensus rules that concern the
@@ -574,6 +577,28 @@ where
 
         // record total newPayload duration
         self.metrics.block_validation.total_duration.record(start.elapsed().as_secs_f64());
+
+        // Block receive end (success)
+        if let Some(tracer) = get_global_tracer() {
+            let is_valid = outcome.outcome.is_valid();
+            // Get status string from PayloadStatus
+            let status_str = if outcome.outcome.is_valid() {
+                "valid"
+            } else if outcome.outcome.is_syncing() {
+                "syncing"
+            } else if outcome.outcome.is_invalid() {
+                "invalid"
+            } else {
+                "accepted"
+            };
+            tracer.log_block_end(
+                block_hash,
+                block_number,
+                TransactionProcessId::RpcBlockReceiveEnd,
+                is_valid,
+                &format!("Block receive completed, status: {}", status_str),
+            );
+        }
 
         Ok(outcome)
     }
@@ -2492,15 +2517,6 @@ where
         let start = Instant::now();
 
         let executed = execute(&mut self.payload_validator, input, ctx)?;
-        
-        // Block insertion start
-        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
-        let block_hash = executed.recovered_block().hash();
-        let block_number = executed.recovered_block().number();
-        if let Some(tracer) = get_global_tracer() {
-            // Log block-level trace only (not per-transaction to avoid duplication)
-            tracer.log_block_start(block_hash, block_number, TransactionProcessId::BlockInsertStart, "Starting block insertion");
-        }
 
         // if the parent is the canonical head, we can insert the block as the pending block
         if self.state.tree_state.canonical_block_hash() == executed.recovered_block().parent_hash()
@@ -2521,12 +2537,16 @@ where
         };
         self.emit_event(EngineApiEvent::BeaconConsensus(engine_event));
 
+        // Block insertion end
+        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
         if let Some(tracer) = get_global_tracer() {
             let is_canonical = !is_fork;
             
             // Log block-level trace only (not per-transaction to avoid duplication)
             if is_canonical {
-                tracer.log_block_end(block_hash, block_number, TransactionProcessId::BlockInsertEnd, true, "Block insertion completed");
+                let block_hash = executed.recovered_block().hash();
+                let block_number = executed.recovered_block().number();
+                tracer.log_block_end(block_hash, block_number, TransactionProcessId::RpcBlockInsertEnd, true, "Block insertion completed");
             }
         }
 

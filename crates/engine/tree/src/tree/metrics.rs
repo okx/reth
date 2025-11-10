@@ -17,7 +17,6 @@ use reth_trie::updates::TrieUpdates;
 use revm::database::{states::bundle_state::BundleRetention, State};
 use std::time::Instant;
 use tracing::{debug_span, trace};
-use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
 
 /// Metrics for the `EngineApi`.
 #[derive(Debug, Default)]
@@ -85,35 +84,15 @@ impl EngineApiMetrics {
 
                 // First pass: execute all transactions
                 for tx in &transactions {
-                    let tx_hash = *tx.tx().tx_hash();
-
-                    // State processing start
-                    if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_start(tx_hash, TransactionProcessId::RPCTxExecutionStart, "RPCTx Execution Start");
-                    }
-
                     let span =
-                        debug_span!(target: "engine::tree", "execute_tx", tx_hash=?tx_hash);
+                        debug_span!(target: "engine::tree", "execute_tx", tx_hash=?tx.tx().tx_hash());
                     let _enter = span.enter();
                     trace!(target: "engine::tree", "Executing transaction");
                     executor.execute_transaction(tx)?;
-
-                    // State processing end
-                    if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::RPCTxExecutionEnd, true, "RPCTx Execution Completed");
-                    }
                 }
 
                 // State commit
                 let (db, result) = executor.finish().map(|(evm, result)| (evm.into_db(), result))?;
-
-                // Second pass: record state commit for all transactions
-                if let Some(tracer) = get_global_tracer() {
-                    for tx in &transactions {
-                        let tx_hash = *tx.tx().tx_hash();
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::RPCTxCommitEnd, true, "RPCTx Commit Completed");
-                    }
-                }
 
                 Ok((db, result))
             })();

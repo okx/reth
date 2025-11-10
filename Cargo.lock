@@ -10573,6 +10573,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-metrics",
  "reth-node-ethereum",
+ "reth-node-metrics",
  "reth-payload-builder",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
