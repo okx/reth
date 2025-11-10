@@ -188,6 +188,16 @@ pub struct RpcServerArgs {
     )]
     pub rpc_gas_cap: u64,
 
+    /// Maximum memory the EVM can allocate per RPC request.
+    #[arg(
+        long = "rpc.evm-memory-limit",
+        alias = "rpc-evm-memory-limit",
+        value_name = "MEMORY_LIMIT",
+        value_parser = MaxOr::new(RangedU64ValueParser::<u64>::new().range(1..)),
+        default_value_t = (1 << 32) - 1
+    )]
+    pub rpc_evm_memory_limit: u64,
+
     /// Maximum eth transaction fee (in ether) that can be sent via the RPC APIs (0 = no cap)
     #[arg(
         long = "rpc.txfeecap",
@@ -243,6 +253,18 @@ pub struct RpcServerArgs {
     /// Gas price oracle configuration.
     #[command(flatten)]
     pub gas_price_oracle: GasPriceOracleArgs,
+
+    /// XLayer: Legacy RPC endpoint URL for routing historical data
+    #[arg(long = "rpc.legacy-url", value_name = "URL")]
+    pub legacy_rpc_url: Option<String>,
+
+    /// XLayer: Timeout for legacy RPC requests
+    #[arg(long = "rpc.legacy-timeout", value_name = "DURATION", default_value = "30s", requires = "legacy_rpc_url")]
+    pub legacy_rpc_timeout: Option<String>,
+
+    /// XLayer: Cutoff block (auto-derived from genesis, internal use only)
+    #[arg(skip)]
+    pub legacy_cutoff_block: Option<u64>,
 
     /// Timeout for `send_raw_transaction_sync` RPC method.
     #[arg(
@@ -408,6 +430,7 @@ impl Default for RpcServerArgs {
             rpc_max_blocks_per_filter: constants::DEFAULT_MAX_BLOCKS_PER_FILTER.into(),
             rpc_max_logs_per_response: (constants::DEFAULT_MAX_LOGS_PER_RESPONSE as u64).into(),
             rpc_gas_cap: constants::gas_oracle::RPC_DEFAULT_GAS_CAP,
+            rpc_evm_memory_limit: (1 << 32) - 1,
             rpc_tx_fee_cap: constants::DEFAULT_TX_FEE_CAP_WEI,
             rpc_max_simulate_blocks: constants::DEFAULT_MAX_SIMULATE_BLOCKS,
             rpc_eth_proof_window: constants::DEFAULT_ETH_PROOF_WINDOW,
@@ -417,6 +440,9 @@ impl Default for RpcServerArgs {
             rpc_proof_permits: constants::DEFAULT_PROOF_PERMITS,
             rpc_forwarder: None,
             builder_disallow: Default::default(),
+            legacy_rpc_url: None,
+            legacy_cutoff_block: None,
+            legacy_rpc_timeout: None,
             rpc_send_raw_transaction_sync_timeout:
                 constants::RPC_DEFAULT_SEND_RAW_TX_SYNC_TIMEOUT_SECS,
         }

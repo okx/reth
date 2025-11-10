@@ -30,8 +30,8 @@ use reth_tasks::{
     TaskSpawner, TokioTaskExecutor,
 };
 use reth_transaction_pool::{
-    noop::NoopTransactionPool, AddedTransactionOutcome, BatchTxProcessor, BatchTxRequest,
-    TransactionPool,
+    blobstore::BlobSidecarConverter, noop::NoopTransactionPool, AddedTransactionOutcome,
+    BatchTxProcessor, BatchTxRequest, TransactionPool,
 };
 use tokio::sync::{broadcast, mpsc, Mutex};
 
@@ -154,7 +154,9 @@ where
         max_batch_size: usize,
         pending_block_kind: PendingBlockKind,
         raw_tx_forwarder: ForwardConfig,
+        legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
         send_raw_transaction_sync_timeout: Duration,
+        evm_memory_limit: u64,
     ) -> Self {
         let inner = EthApiInner::new(
             components,
@@ -172,7 +174,9 @@ where
             max_batch_size,
             pending_block_kind,
             raw_tx_forwarder.forwarder_client(),
+            legacy_rpc_config,
             send_raw_transaction_sync_timeout,
+            evm_memory_limit,
         );
 
         Self { inner: Arc::new(inner) }
@@ -315,6 +319,15 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
 
     /// Timeout duration for `send_raw_transaction_sync` RPC method.
     send_raw_transaction_sync_timeout: Duration,
+
+    /// Blob sidecar converter
+    blob_sidecar_converter: BlobSidecarConverter,
+
+    /// Maximum memory the EVM can allocate per RPC request.
+    evm_memory_limit: u64,
+
+    /// XLayer: Optional legacy RPC client for routing historical data.
+    pub(crate) legacy_rpc_client: Option<Arc<reth_rpc_eth_types::LegacyRpcClient>>,
 }
 
 impl<N, Rpc> EthApiInner<N, Rpc>
@@ -340,7 +353,9 @@ where
         max_batch_size: usize,
         pending_block_kind: PendingBlockKind,
         raw_tx_forwarder: Option<RpcClient>,
+        legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
         send_raw_transaction_sync_timeout: Duration,
+        evm_memory_limit: u64,
     ) -> Self {
         let signers = parking_lot::RwLock::new(Default::default());
         // get the block number of the latest block
@@ -360,6 +375,20 @@ where
         let (processor, tx_batch_sender) =
             BatchTxProcessor::new(components.pool().clone(), max_batch_size);
         task_spawner.spawn_critical("tx-batcher", Box::pin(processor));
+
+        // XLayer: Initialize legacy RPC client if configured
+        let legacy_rpc_client = legacy_rpc_config.and_then(|config| {
+            match reth_rpc_eth_types::LegacyRpcClient::from_config(&config) {
+                Ok(client) => {
+                    tracing::info!(cutoff = config.cutoff_block, endpoint = %config.endpoint, "Legacy RPC initialized");
+                    Some(Arc::new(client))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, endpoint = %config.endpoint, "Legacy RPC init failed");
+                    None
+                }
+            }
+        });
 
         Self {
             components,
@@ -381,7 +410,10 @@ where
             next_env_builder: Box::new(next_env),
             tx_batch_sender,
             pending_block_kind,
+            legacy_rpc_client,
             send_raw_transaction_sync_timeout,
+            blob_sidecar_converter: BlobSidecarConverter::new(),
+            evm_memory_limit,
         }
     }
 }
@@ -553,6 +585,18 @@ where
     pub const fn send_raw_transaction_sync_timeout(&self) -> Duration {
         self.send_raw_transaction_sync_timeout
     }
+
+    /// Returns a handle to the blob sidecar converter.
+    #[inline]
+    pub const fn blob_sidecar_converter(&self) -> &BlobSidecarConverter {
+        &self.blob_sidecar_converter
+    }
+
+    /// Returns the EVM memory limit.
+    #[inline]
+    pub const fn evm_memory_limit(&self) -> u64 {
+        self.evm_memory_limit
+    }
 }
 
 #[cfg(test)]
@@ -701,7 +745,7 @@ mod tests {
     /// Invalid block range
     #[tokio::test]
     async fn test_fee_history_empty() {
-        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _>>::fee_history(
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::fee_history(
             &build_test_eth_api(NoopProvider::default()),
             U64::from(1),
             BlockNumberOrTag::Latest,
@@ -723,7 +767,7 @@ mod tests {
         let (eth_api, _, _) =
             prepare_eth_api(newest_block, oldest_block, block_count, MockEthProvider::default());
 
-        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _>>::fee_history(
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::fee_history(
             &eth_api,
             U64::from(newest_block + 1),
             newest_block.into(),
@@ -746,7 +790,7 @@ mod tests {
         let (eth_api, _, _) =
             prepare_eth_api(newest_block, oldest_block, block_count, MockEthProvider::default());
 
-        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _>>::fee_history(
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::fee_history(
             &eth_api,
             U64::from(1),
             (newest_block + 1000).into(),
@@ -769,7 +813,7 @@ mod tests {
         let (eth_api, _, _) =
             prepare_eth_api(newest_block, oldest_block, block_count, MockEthProvider::default());
 
-        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _>>::fee_history(
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::fee_history(
             &eth_api,
             U64::from(0),
             newest_block.into(),

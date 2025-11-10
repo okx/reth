@@ -8,7 +8,7 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 /// CLI argument parsing for the optimism node.
@@ -42,6 +42,9 @@ pub use reth_optimism_payload_builder::{
 pub use reth_optimism_evm::*;
 
 pub use reth_optimism_storage::OpStorage;
+
+mod args_xlayer;
+pub use args_xlayer::XLayerArgs;
 
 use op_revm as _;
 use revm as _;
