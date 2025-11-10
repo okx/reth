@@ -35,11 +35,8 @@ impl FromStr for XAddress {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let addr_str = s.strip_prefix('X').unwrap_or(s);
-        let addr_with_prefix = if addr_str.starts_with("0x") {
-            addr_str.to_string()
-        } else {
-            format!("0x{addr_str}")
-        };
+        let addr_with_prefix =
+            if addr_str.starts_with("0x") { addr_str.to_string() } else { format!("0x{addr_str}") };
 
         let address = addr_with_prefix.parse::<Address>().context("Failed to parse address")?;
         Ok(Self { address })
@@ -370,8 +367,10 @@ mod tests {
         //     uint256 amountIn;
         //     uint160 sqrtPriceLimitX96;
         // }
-        // quoteExactInputSingle((address,address,uint256,uint24,uint160))(uint256,uint160,uint32,uint256)
-        // with args: (XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7,1000000000000000000,3000,0)
+        // quoteExactInputSingle((address,address,uint256,uint24,uint160))(uint256,uint160,uint32,
+        // uint256) with args:
+        // (XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7,
+        // 1000000000000000000,3000,0)
 
         let sig = "quoteExactInputSingle((address,address,uint256,uint24,uint160))(uint256,uint160,uint32,uint256)";
         let func = Function::parse(sig).unwrap();
@@ -387,20 +386,14 @@ mod tests {
 
             // Check first address (should have X prefix stripped)
             if let DynSolValue::Address(addr1) = &tuple_values[0] {
-                assert_eq!(
-                    addr1.to_string(),
-                    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-                );
+                assert_eq!(addr1.to_string(), "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
             } else {
                 panic!("First element should be an address");
             }
 
             // Check second address (should have X prefix stripped)
             if let DynSolValue::Address(addr2) = &tuple_values[1] {
-                assert_eq!(
-                    addr2.to_string(),
-                    "0xdAC17F958D2ee523a2206206994597C13D831ec7"
-                );
+                assert_eq!(addr2.to_string(), "0xdAC17F958D2ee523a2206206994597C13D831ec7");
             } else {
                 panic!("Second element should be an address");
             }
@@ -434,7 +427,8 @@ mod tests {
     fn test_encode_args_with_nested_tuple() {
         // Test nested tuple: (address,(address,uint256))
         // Function signature: testFunction((address,(address,uint256)))(uint256)
-        // Args: (XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,(XdAC17F958D2ee523a2206206994597C13D831ec7,1000))
+        // Args: (XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,
+        // (XdAC17F958D2ee523a2206206994597C13D831ec7,1000))
 
         let sig = "testFunction((address,(address,uint256)))(uint256)";
         let func = Function::parse(sig).unwrap();
@@ -450,10 +444,7 @@ mod tests {
 
             // Check first element (address)
             if let DynSolValue::Address(addr1) = &outer_tuple[0] {
-                assert_eq!(
-                    addr1.to_string(),
-                    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-                );
+                assert_eq!(addr1.to_string(), "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
             } else {
                 panic!("First element should be an address");
             }
@@ -464,10 +455,7 @@ mod tests {
 
                 // Check inner tuple's first element (address)
                 if let DynSolValue::Address(addr2) = &inner_tuple[0] {
-                    assert_eq!(
-                        addr2.to_string(),
-                        "0xdAC17F958D2ee523a2206206994597C13D831ec7"
-                    );
+                    assert_eq!(addr2.to_string(), "0xdAC17F958D2ee523a2206206994597C13D831ec7");
                 } else {
                     panic!("Inner tuple's first element should be an address");
                 }
@@ -495,7 +483,9 @@ mod tests {
         let sig = "testFunction(address[])(uint256)";
         let func = Function::parse(sig).unwrap();
 
-        let args = vec!["XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7"];
+        let args = vec![
+            "XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7",
+        ];
 
         let result = encode_args(&func.inputs, args).unwrap();
 
@@ -506,20 +496,14 @@ mod tests {
 
             // Check first address (should have X prefix stripped)
             if let DynSolValue::Address(addr1) = &array_values[0] {
-                assert_eq!(
-                    addr1.to_string(),
-                    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-                );
+                assert_eq!(addr1.to_string(), "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
             } else {
                 panic!("First element should be an address");
             }
 
             // Check second address (should have X prefix stripped)
             if let DynSolValue::Address(addr2) = &array_values[1] {
-                assert_eq!(
-                    addr2.to_string(),
-                    "0xdAC17F958D2ee523a2206206994597C13D831ec7"
-                );
+                assert_eq!(addr2.to_string(), "0xdAC17F958D2ee523a2206206994597C13D831ec7");
             } else {
                 panic!("Second element should be an address");
             }
@@ -532,7 +516,8 @@ mod tests {
     fn test_encode_args_with_fixed_array() {
         // Test fixed-size array: address[3]
         // Function signature: testFunction(address[3])(uint256)
-        // Args: [XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7,0x1234567890123456789012345678901234567890]
+        // Args: [XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,
+        // XdAC17F958D2ee523a2206206994597C13D831ec7,0x1234567890123456789012345678901234567890]
 
         let sig = "testFunction(address[3])(uint256)";
         let func = Function::parse(sig).unwrap();
@@ -548,30 +533,21 @@ mod tests {
 
             // Check first address (should have X prefix stripped)
             if let DynSolValue::Address(addr1) = &array_values[0] {
-                assert_eq!(
-                    addr1.to_string(),
-                    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-                );
+                assert_eq!(addr1.to_string(), "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
             } else {
                 panic!("First element should be an address");
             }
 
             // Check second address (should have X prefix stripped)
             if let DynSolValue::Address(addr2) = &array_values[1] {
-                assert_eq!(
-                    addr2.to_string(),
-                    "0xdAC17F958D2ee523a2206206994597C13D831ec7"
-                );
+                assert_eq!(addr2.to_string(), "0xdAC17F958D2ee523a2206206994597C13D831ec7");
             } else {
                 panic!("Second element should be an address");
             }
 
             // Check third address (without X prefix, should still work)
             if let DynSolValue::Address(addr3) = &array_values[2] {
-                assert_eq!(
-                    addr3.to_string(),
-                    "0x1234567890123456789012345678901234567890"
-                );
+                assert_eq!(addr3.to_string(), "0x1234567890123456789012345678901234567890");
             } else {
                 panic!("Third element should be an address");
             }
@@ -588,7 +564,9 @@ mod tests {
         let sig = "testFunction(address[3])(uint256)";
         let func = Function::parse(sig).unwrap();
 
-        let args = vec!["[XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7]"];
+        let args = vec![
+            "[XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7]",
+        ];
 
         let result = encode_args(&func.inputs, args);
 
