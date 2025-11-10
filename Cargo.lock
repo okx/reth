@@ -154,7 +154,8 @@ dependencies = [
 [[package]]
 name = "alloy-contract"
 version = "1.1.0"
-source = "git+https://github.com/alloy-rs/alloy?rev=35bc323cc23911e52cb1ec8f6a58ebb5d5869b27#35bc323cc23911e52cb1ec8f6a58ebb5d5869b27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5903097e4c131ad2dd80d87065f23c715ccb9cdb905fa169dffab8e1e798bae"
 dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
@@ -11637,7 +11638,7 @@ dependencies = [
  "regex",
  "relative-path",
  "rustc_version 0.4.1",
- "syn 2.0.108",
+ "syn 2.0.110",
  "unicode-ident",
 ]
 
@@ -14631,14 +14632,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "xsum"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0637d3a5566a82fa5214bae89087bc8c9fb94cd8e8a3c07feb691bb8d9c632db"
-
-[[package]]
 name = "xlayer-e2e-test"
-version = "1.8.3"
+version = "1.9.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -14664,6 +14659,12 @@ dependencies = [
  "tracing",
  "url",
 ]
+
+[[package]]
+name = "xsum"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0637d3a5566a82fa5214bae89087bc8c9fb94cd8e8a3c07feb691bb8d9c632db"
 
 [[package]]
 name = "yansi"
