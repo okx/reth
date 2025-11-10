@@ -128,7 +128,10 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         // C::parse returns Arc<ChainSpec> already
         let chain_spec = C::parse(&minimal_genesis_json)?;
 
-        // Step 7: Verify consistency
+        // Step 7: Verify chain ID consistency
+        // Note: We do NOT verify genesis_hash because the minimal genesis JSON lacks
+        // the alloc field, making it impossible to compute the correct state_root and
+        // genesis_hash. The database will verify genesis hash during initialization.
         if chain_spec.chain().id() != chain_info.chain_id {
             return Err(eyre::eyre!(
                 "Chain ID mismatch: .chain-info={}, genesis={}",
@@ -137,17 +140,10 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
             ))
         }
 
-        if chain_spec.genesis_hash() != chain_info.genesis_hash {
-            return Err(eyre::eyre!(
-                "Genesis hash mismatch: .chain-info={}, computed={}",
-                chain_info.genesis_hash,
-                chain_spec.genesis_hash()
-            ))
-        }
-
         info!(target: "reth::cli",
             chain_id = chain_info.chain_id,
-            "Chain loaded successfully from database"
+            genesis_hash = %chain_info.genesis_hash,
+            "Chain loaded successfully from database (minimal genesis)"
         );
 
         Ok(chain_spec)

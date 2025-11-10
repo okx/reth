@@ -27,16 +27,17 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     /// The chain this node is running.
     ///
     /// Possible values are either a built-in chain or the path to a chain specification file.
+    ///
+    /// If not specified, the chain will be loaded from the database (requires prior initialization).
     #[arg(
         long,
         value_name = "CHAIN_OR_PATH",
         long_help = C::help_message(),
-        default_value = C::default_value(),
         default_value_if("dev", "true", "dev"),
         value_parser = C::parser(),
         required = false,
     )]
-    pub chain: Arc<C::ChainSpec>,
+    pub chain: Option<Arc<C::ChainSpec>>,
 
     /// Prometheus metrics configuration.
     #[command(flatten)]
@@ -167,10 +168,78 @@ where
             era,
         } = self;
 
+        // Load chain from database if not provided via --chain parameter
+        let chain = if let Some(chain) = chain {
+            chain
+        } else {
+            // Load from .chain-info and database
+            use alloy_genesis::Genesis;
+            use reth_db::{Database, open_db_read_only};
+            use reth_db::transaction::DbTx;
+            use reth_node_core::dirs::ChainInfo;
+
+            let datadir_base = datadir.resolve_datadir_base()?;
+            let is_user_specified = datadir.datadir.is_some();
+            let chain_info = ChainInfo::read(&datadir_base)?;
+
+            tracing::info!(target: "reth::cli",
+                chain_id = chain_info.chain_id,
+                genesis_hash = %chain_info.genesis_hash,
+                "Loading chain from database"
+            );
+
+            let db_path = if is_user_specified {
+                datadir_base.join("db")
+            } else {
+                datadir_base.join(chain_info.chain_id.to_string()).join("db")
+            };
+
+            let db = Arc::new(open_db_read_only(&db_path, Default::default())?);
+            let tx = db.tx()?;
+
+            let genesis_bytes = tx
+                .get::<reth_db_api::tables::GenesisConfig>(chain_info.genesis_hash)?
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "Genesis config not found in database for hash: {}. \
+                         Please specify --chain parameter or run init first.",
+                        chain_info.genesis_hash
+                    )
+                })?;
+
+            let minimal_genesis_json = String::from_utf8(genesis_bytes)
+                .map_err(|e| eyre::eyre!("Invalid UTF-8 in genesis JSON: {}", e))?;
+            let _genesis: Genesis = serde_json::from_str(&minimal_genesis_json)?;
+
+            let chain_spec = C::parse(&minimal_genesis_json)?;
+
+            // Verify chain ID consistency
+            if chain_spec.chain().id() != chain_info.chain_id {
+                return Err(eyre::eyre!(
+                    "Chain ID mismatch: .chain-info={}, genesis={}",
+                    chain_info.chain_id,
+                    chain_spec.chain().id()
+                ))
+            }
+
+            // Note: We do NOT verify genesis_hash here because the minimal genesis JSON
+            // lacks the alloc field, making it impossible to compute the correct state_root
+            // and genesis_hash. The database itself will verify genesis hash consistency
+            // during initialization (see launch/engine.rs), using the hash stored in DB.
+
+            tracing::info!(target: "reth::cli",
+                chain_id = chain_info.chain_id,
+                genesis_hash = %chain_info.genesis_hash,
+                "Chain loaded successfully from database (minimal genesis)"
+            );
+
+            chain_spec
+        };
+
         // XLayer: Auto-derive legacy cutoff block from genesis if legacy RPC is configured
         let mut rpc = rpc;
         if rpc.legacy_rpc_url.is_some() {
-            let genesis_block_number = chain.as_ref().genesis().number.unwrap_or_default();
+            let genesis_block_number = chain.genesis().number.unwrap_or_default();
             rpc.legacy_cutoff_block = Some(genesis_block_number);
             tracing::info!(target: "reth::cli::xlayer", genesis_block = genesis_block_number, "Using genesis block as legacy cutoff");
         }
@@ -215,7 +284,7 @@ where
 impl<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> NodeCommand<C, Ext> {
     /// Returns the underlying chain being used to run this command
     pub fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
-        Some(&self.chain)
+        self.chain.as_ref()
     }
 }
 
