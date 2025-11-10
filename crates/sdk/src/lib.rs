@@ -14,6 +14,9 @@ use alloy_sol_types::{sol, SolCall};
 use anyhow::{Context, Result};
 use std::str::FromStr;
 
+/// Prefix character for X Layer addresses
+const X_ADDRESS_PREFIX: char = 'X';
+
 // Define ERC20 interface using sol! macro
 sol! {
     interface IERC20 {
@@ -34,7 +37,7 @@ impl FromStr for XAddress {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let addr_str = s.strip_prefix('X').unwrap_or(s);
+        let addr_str = s.strip_prefix(X_ADDRESS_PREFIX).unwrap_or(s);
         let addr_with_prefix =
             if addr_str.starts_with("0x") { addr_str.to_string() } else { format!("0x{addr_str}") };
 
@@ -252,7 +255,7 @@ fn coerce_value_recursive(ty: &DynSolType, arg: &str) -> Result<DynSolValue> {
         }
         DynSolType::Address => {
             // Strip X prefix from address
-            let addr_str = arg.strip_prefix('X').unwrap_or(arg);
+            let addr_str = arg.strip_prefix(X_ADDRESS_PREFIX).unwrap_or(arg);
             let addr_with_prefix = if addr_str.starts_with("0x") {
                 addr_str.to_string()
             } else {
