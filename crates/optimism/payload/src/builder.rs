@@ -355,16 +355,11 @@ impl<Txs> OpBuilder<'_, Txs> {
         let Self { best } = self;
         debug!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
 
-        // X Layer: Log block build start
-        let parent_hash = ctx.parent().hash();
-        let parent_number = ctx.parent().number();
-        if let Some(tracer) = get_global_tracer() {
-            tracer.log_block(
-                parent_hash,
-                parent_number + 1,
-                TransactionProcessId::SeqBlockBuildStart,
-            );
-        }
+        // X Layer: Save block build start timestamp
+        let build_start_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
 
         let mut db = State::builder().with_database(db).with_bundle_update().build();
 
@@ -388,27 +383,11 @@ impl<Txs> OpBuilder<'_, Txs> {
         if !ctx.attributes().no_tx_pool() {
             let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
             if ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?.is_some() {
-                // X Layer: Log block build end (cancelled)
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_block(
-                        parent_hash,
-                        parent_number + 1,
-                        TransactionProcessId::SeqBlockBuildEnd,
-                    );
-                }
                 return Ok(BuildOutcomeKind::Cancelled)
             }
 
             // check if the new payload is even more valuable
             if !ctx.is_better_payload(info.total_fees) {
-                // X Layer: Log block build end (aborted)
-                if let Some(tracer) = get_global_tracer() {
-                    tracer.log_block(
-                        parent_hash,
-                        parent_number + 1,
-                        TransactionProcessId::SeqBlockBuildEnd,
-                    );
-                }
                 // can skip building the block
                 return Ok(BuildOutcomeKind::Aborted { fees: info.total_fees })
             }
@@ -438,13 +417,22 @@ impl<Txs> OpBuilder<'_, Txs> {
 
         let no_tx_pool = ctx.attributes().no_tx_pool();
 
-        // X Layer: Log block build end (success)
+        // X Layer: Log block build start and end (success)
         let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
 
         let payload =
             OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed));
         if let Some(tracer) = get_global_tracer() {
+            // Log block build start using saved timestamp (now we have the block hash)
+            tracer.log_block_with_timestamp(
+                block_hash,
+                block_number,
+                TransactionProcessId::SeqBlockBuildStart,
+                build_start_timestamp,
+            );
+            
+            // Log block build end
             tracer.log_block(
                 block_hash,
                 block_number,

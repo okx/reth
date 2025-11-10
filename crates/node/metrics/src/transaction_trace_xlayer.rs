@@ -410,6 +410,42 @@ impl TransactionTracer {
         self.write_to_file(&csv_line);
     }
 
+    /// Log block event with a specific timestamp
+    /// 
+    /// This method is used when we need to log a block event with a timestamp
+    /// that was saved earlier (e.g., when block building started but block hash
+    /// was not yet available).
+    /// 
+    /// # Arguments
+    /// 
+    /// * `block_hash` - The hash of the block
+    /// * `block_number` - The number of the block
+    /// * `process_id` - The process ID for this event
+    /// * `timestamp_ms` - The timestamp in milliseconds to use for this log entry
+    pub fn log_block_with_timestamp(
+        &self,
+        block_hash: B256,
+        block_number: u64,
+        process_id: TransactionProcessId,
+        timestamp_ms: u128,
+    ) {
+        if !self.inner.enabled {
+            return;
+        }
+
+        let trace_hash = format!("{:#x}", block_hash);
+        
+        let csv_line = self.format_csv_line(
+            &trace_hash,
+            process_id,
+            timestamp_ms,
+            Some(block_hash),
+            Some(block_number),
+        );
+        
+        self.write_to_file(&csv_line);
+    }
+
 }
 
 
