@@ -80,5 +80,5 @@ pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
 mod transaction_trace;
 pub use transaction_trace::TransactionTraceArgs;
 
-mod error;
+
 pub mod types;
