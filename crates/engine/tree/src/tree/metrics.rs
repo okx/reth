@@ -28,7 +28,7 @@ pub(crate) struct EngineApiMetrics {
     pub(crate) executor: ExecutorMetrics,
     /// Metrics for block validation
     pub(crate) block_validation: BlockValidationMetrics,
-    /// A copy of legacy blockchain tree metrics, to be replaced when we replace the old tree
+    /// Canonical chain and reorg related metrics
     pub tree: TreeMetrics,
 }
 
@@ -150,6 +150,10 @@ pub(crate) struct TreeMetrics {
     pub reorgs: Counter,
     /// The latest reorg depth
     pub latest_reorg_depth: Gauge,
+    /// The current safe block height (this is required by optimism)
+    pub safe_block_height: Gauge,
+    /// The current finalized block height (this is required by optimism)
+    pub finalized_block_height: Gauge,
 }
 
 /// Metrics for the `EngineApi`.
@@ -338,6 +342,7 @@ mod tests {
                     receipts: vec![],
                     requests: Requests::default(),
                     gas_used: 1000,
+                    blob_gas_used: 0,
                 },
             ))
         }
