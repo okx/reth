@@ -167,7 +167,6 @@ pub async fn get_token_balance(
 
     let call = IERC20::balanceOfCall { account: account_address };
     let calldata = call.abi_encode();
-    println!("call data: 0x{}", hex::encode(&calldata));
     let result = provider
         .call(alloy_rpc_types_eth::TransactionRequest {
             to: Some(alloy_primitives::TxKind::Call(token_address)),

@@ -126,12 +126,14 @@ async fn main() -> Result<()> {
         }
         XlayerCommands::Balance { rpc_url, address } => {
             let address: Address = address.into();
-            get_balance(&rpc_url, address).await?;
+            let balance = get_balance(&rpc_url, address).await?;
+            println!("Balance: {} wei", balance);
         }
         XlayerCommands::TokenBalance { rpc_url, token, account } => {
             let token_address: Address = token.into();
             let account_address: Address = account.into();
-            get_token_balance(&rpc_url, token_address, account_address).await?;
+            let balance = get_token_balance(&rpc_url, token_address, account_address).await?;
+            println!("Balance: {} wei", balance);
         }
         XlayerCommands::EthCall { rpc_url, to, sig, args } => {
             let sig = sig.unwrap();
