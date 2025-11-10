@@ -20,6 +20,8 @@ alloy-signer-local.workspace = true
 alloy-primitives.workspace = true
 alloy-transport-http.workspace = true
 alloy-sol-types.workspace = true
+alloy-json-abi.workspace = true
+alloy-dyn-abi.workspace = true
 
 # async
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -31,3 +33,4 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 # misc
 clap = { workspace = true, features = ["derive"] }
 anyhow.workspace=true
+eyre.workspace=true

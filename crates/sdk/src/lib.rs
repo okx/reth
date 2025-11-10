@@ -4,7 +4,7 @@
 //! and interacting with the Reth chain via RPC.
 
 use alloy_network::EthereumWallet;
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, U256, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
@@ -177,7 +177,7 @@ pub async fn get_token_balance(
 
     let call = IERC20::balanceOfCall { account: account_address };
     let calldata = call.abi_encode();
-
+   println!("call data: 0x{}", hex::encode(&calldata));
     let result = provider
         .call(
             alloy_rpc_types_eth::TransactionRequest {
