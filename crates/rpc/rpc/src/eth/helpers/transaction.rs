@@ -93,7 +93,7 @@ where
                     })?;
         }
 
-        // forward the transaction to the specific endpoint if configured (RPC node forwarding to sequencer).
+        // forward the transaction to the specific endpoint if configured.
         if let Some(client) = self.raw_tx_forwarder() {
             tracing::debug!(target: "rpc::eth", hash = %pool_transaction.hash(), "forwarding raw transaction to forwarder");
             let rlp_hex = hex::encode_prefixed(&tx);
@@ -117,8 +117,7 @@ where
 
         // submit the transaction to the pool with a `Local` origin
         let AddedTransactionOutcome { hash, .. } =
-            self.inner.add_pool_transaction(pool_transaction).await
-                .map_err(|err| err)?;
+            self.inner.add_pool_transaction(pool_transaction).await?;
 
         Ok(hash)
     }

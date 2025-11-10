@@ -77,7 +77,7 @@ impl CliRunner {
             task_manager.graceful_shutdown_with_timeout(Duration::from_secs(5));
         }
         
-        // Flush transaction trace logs before exit to ensure no logs are lost
+        // X Layer: Flush transaction trace logs before exit to ensure no logs are lost
         reth_node_metrics::flush_global_tracer();
 
         // `drop(tokio_runtime)` would block the current thread until its pools

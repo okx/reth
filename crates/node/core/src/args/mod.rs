@@ -76,7 +76,7 @@ pub use ress_args::RessArgs;
 mod era;
 pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
 
-/// `TransactionTraceArgs` for configuring transaction tracing (X Layer)
+/// X Layer: `TransactionTraceArgs` for configuring transaction tracing (X Layer)
 mod transaction_trace_xlayer;
 pub use transaction_trace_xlayer::TransactionTraceArgs;
 

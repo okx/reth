@@ -1,4 +1,4 @@
-//! X Layer: Transaction tracing module for monitoring transaction lifecycle
+//! Transaction tracing module for monitoring transaction lifecycle
 
 use alloy_primitives::B256;
 use std::{
@@ -45,7 +45,7 @@ pub enum NodeType {
 }
 
 impl NodeType {
-    /// X Layer: Returns the string representation of the node type
+    /// Returns the string representation of the node type
     pub fn as_str(&self) -> &'static str {
         match self {
             NodeType::Sequencer => "sequencer",
@@ -55,7 +55,7 @@ impl NodeType {
     }
 }
 
-/// X Layer: Transaction process ID for tracking different stages in the transaction lifecycle
+/// Transaction process ID for tracking different stages in the transaction lifecycle
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransactionProcessId {
     /// RPC node: Transaction received and ready to forward
@@ -84,7 +84,7 @@ pub enum TransactionProcessId {
 }
 
 impl TransactionProcessId {
-    /// X Layer: Returns the string representation of the process ID
+    /// Returns the string representation of the process ID
     pub fn as_str(&self) -> &'static str {
         match self {
             TransactionProcessId::RpcReceiveTxEnd => "xlayer_rpc_receive_tx",
@@ -98,7 +98,7 @@ impl TransactionProcessId {
         }
     }
 
-    /// X Layer: Returns the service name based on the process ID
+    /// Returns the service name based on the process ID
     pub fn service_name(&self) -> &'static str {
         match self {
             // RPC-related process IDs
@@ -117,7 +117,7 @@ impl TransactionProcessId {
 }
 
 
-/// X Layer: Transaction tracer for monitoring transaction lifecycle
+/// Transaction tracer for monitoring transaction lifecycle
 #[derive(Clone, Debug)]
 pub struct TransactionTracer {
     inner: Arc<TransactionTracerInner>,
@@ -134,7 +134,7 @@ struct TransactionTracerInner {
 }
 
 impl TransactionTracer {
-    /// X Layer: Create a new transaction tracer
+    /// Create a new transaction tracer
     pub fn new(enabled: bool, output_path: Option<PathBuf>, node_type: NodeType) -> Self {
         let output_file = if let Some(ref path) = output_path {
             let file_path = if path.to_string_lossy().ends_with('/') || path.to_string_lossy().ends_with('\\') {
@@ -193,12 +193,12 @@ impl TransactionTracer {
         }
     }
 
-    /// X Layer: Check if tracing is enabled
+    /// Check if tracing is enabled
     pub fn is_enabled(&self) -> bool {
         self.inner.enabled
     }
 
-    /// X Layer: Write CSV line to trace file with periodic flush
+    /// Write CSV line to trace file with periodic flush
     fn write_to_file(&self, csv_line: &str) {
         match self.inner.output_file.lock() {
             Ok(mut file_guard) => {
@@ -247,7 +247,7 @@ impl TransactionTracer {
         }
     }
     
-    /// X Layer: Force flush the trace file
+    /// Force flush the trace file
     pub fn flush(&self) {
         match self.inner.output_file.lock() {
             Ok(mut file_guard) => {
@@ -271,7 +271,7 @@ impl TransactionTracer {
         }
     }
 
-    /// X Layer: Format CSV line with 23 fields
+    /// Format CSV line with 23 fields
     fn format_csv_line(
         &self,
         trace: &str,
@@ -323,7 +323,7 @@ impl TransactionTracer {
         )
     }
 
-    /// X Layer: Log transaction event at current time point
+    /// Log transaction event at current time point
     pub fn log_transaction(
         &self,
         tx_hash: B256,
@@ -359,30 +359,30 @@ impl Default for TransactionTracer {
     }
 }
 
-/// X Layer: Global transaction tracer instance
+/// Global transaction tracer instance
 static GLOBAL_TRACER: std::sync::OnceLock<Arc<TransactionTracer>> = std::sync::OnceLock::new();
 
-/// X Layer: Initialize the global transaction tracer
+/// Initialize the global transaction tracer
 pub fn init_global_tracer(enabled: bool, output_path: Option<PathBuf>, node_type: NodeType) {
     let tracer = TransactionTracer::new(enabled, output_path, node_type);
     GLOBAL_TRACER.set(Arc::new(tracer)).ok();
 }
 
-/// X Layer: Get the global transaction tracer
+/// Get the global transaction tracer
 pub fn get_global_tracer() -> Option<Arc<TransactionTracer>> {
     GLOBAL_TRACER.get().cloned()
 }
 
-/// X Layer: Flush the global transaction tracer
+/// Flush the global transaction tracer
 pub fn flush_global_tracer() {
     if let Some(tracer) = get_global_tracer() {
         tracer.flush();
     }
 }
 
-/// X Layer: Block tracing functions for monitoring block lifecycle
+/// Block tracing functions for monitoring block lifecycle
 impl TransactionTracer {
-    /// X Layer: Log block event at current time point
+    /// Log block event at current time point
     pub fn log_block(
         &self,
         block_hash: B256,

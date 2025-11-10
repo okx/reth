@@ -74,7 +74,7 @@ impl EngineApiMetrics {
 
         let mut executor = executor.with_state_hook(Some(Box::new(wrapper)));
 
-        // Collect all transactions into a reusable vector
+        // X Layer: Collect all transactions into a reusable vector
         let transactions: Vec<_> = transactions.collect::<Result<Vec<_>, _>>()?;
 
         // Use metered to execute and track timing/gas metrics

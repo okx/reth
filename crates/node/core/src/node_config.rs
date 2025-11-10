@@ -148,7 +148,7 @@ pub struct NodeConfig<ChainSpec> {
     /// All ERA import related arguments with --era prefix
     pub era: EraArgs,
 
-    /// All transaction trace related arguments with --tx-trace prefix
+    /// X Layer: All transaction trace related arguments with --tx-trace prefix
     pub tx_trace: TransactionTraceArgs,
 }
 

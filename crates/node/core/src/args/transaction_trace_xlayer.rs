@@ -1,17 +1,17 @@
-//! X Layer: Transaction trace arguments
+//! Transaction trace arguments
 
 use clap::Args;
 use std::path::PathBuf;
 
-/// X Layer: Transaction tracing parameters
+/// Transaction tracing parameters
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 #[command(next_help_heading = "Transaction Trace")]
 pub struct TransactionTraceArgs {
-    /// X Layer: Enable transaction tracing
+    /// Enable transaction tracing
     #[arg(long = "tx-trace.enable", help_heading = "Transaction Trace")]
     pub enable: bool,
 
-    /// X Layer: Path to write transaction trace output file
+    /// Path to write transaction trace output file
     ///
     /// If the path ends with a directory separator or has no extension, `trace.log` will be appended.
     /// Otherwise, the path is used directly as the output file.
