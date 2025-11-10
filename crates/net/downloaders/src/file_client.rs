@@ -263,7 +263,7 @@ impl<B: FullBlock<Header: reth_primitives_traits::BlockHeader>> FromReader
                 if let Some(parent) = &parent_header {
                     // For X Layer
                     // When we start from a custom genesis block, the parent number is the same as
-                    // the block number
+                    // the block number and we skip validation
                     if parent.number() == block.number() {
                         continue;
                     }

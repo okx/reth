@@ -614,8 +614,9 @@ where
         // already processed, if there's any.
         _ => {
             // Start from genesis block which may be greater than 0
-            let min_block = provider.get_genesis_block_number();
-            let processed = calculate_gas_used_from_headers(provider, min_block..=start_block - 1)?;
+            let range_start_block = provider.get_genesis_block_number();
+            let range_end_block = if start_block > range_start_block { start_block - 1 } else { 0 };
+            let processed = calculate_gas_used_from_headers(provider, range_start_block..=range_end_block)?;
 
             ExecutionCheckpoint {
                 block_range: CheckpointBlockRange { from: start_block, to: max_block },
