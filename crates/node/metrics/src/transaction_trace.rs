@@ -24,6 +24,15 @@ const CHAIN_NAME: &str = "X Layer";
 /// Fixed business name
 const BUSINESS_NAME: &str = "X Layer";
 
+/// Fixed chain ID
+const CHAIN_ID: &str = "196";
+
+/// RPC service name
+const RPC_SERVICE_NAME: &str = "okx-defi-xlayer-rpcpay-pro";
+
+/// Sequencer service name
+const SEQ_SERVICE_NAME: &str = "okx-defi-xlayer-egseqz-pro";
+
 /// Node type for identifying sequencer vs RPC node
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeType {
@@ -68,7 +77,7 @@ pub enum TransactionProcessId {
 
     // RPC Block Receive stage - RPC node receiving block from sequencer
     RpcBlockReceiveEnd = 15060,
-
+    
     // Block Insert stage (50060-50061)
     RpcBlockInsertEnd = 15062,
 }
@@ -84,6 +93,25 @@ impl TransactionProcessId {
             TransactionProcessId::SeqBlockSendStart => "xlayer_seq_ds_sent",
             TransactionProcessId::RpcBlockReceiveEnd => "xlayer_rpc_receive_block",
             TransactionProcessId::RpcBlockInsertEnd => "xlayer_rpc_finish_block",
+        }
+    }
+
+    /// Returns the service name based on the process ID
+    /// RPC-related process IDs return RPC_SERVICE_NAME
+    /// Seq-related process IDs return SEQ_SERVICE_NAME
+    pub fn service_name(&self) -> &'static str {
+        match self {
+            // RPC-related process IDs
+            TransactionProcessId::RpcReceiveTxEnd
+            | TransactionProcessId::RpcBlockReceiveEnd
+            | TransactionProcessId::RpcBlockInsertEnd => RPC_SERVICE_NAME,
+            
+            // Seq-related process IDs
+            TransactionProcessId::SeqReceiveTxEnd
+            | TransactionProcessId::SeqBlockBuildStart
+            | TransactionProcessId::SeqTxExecutionEnd
+            | TransactionProcessId::SeqBlockBuildEnd
+            | TransactionProcessId::SeqBlockSendStart => SEQ_SERVICE_NAME,
         }
     }
 }
@@ -258,8 +286,7 @@ impl TransactionTracer {
     fn format_csv_line(
         &self,
         trace: &str,
-        process_id: u32,
-        process_word: &str,
+        process_id: TransactionProcessId,
         current_time: u128,
         block_hash: Option<B256>,
         block_number: Option<u64>,
@@ -276,12 +303,12 @@ impl TransactionTracer {
         let chain = CHAIN_NAME; // 链名 (固定为 "X Layer")
         let trace_hash = trace.to_lowercase(); // 交易hash (小写)
         let status_str = "";
-        let service_name = self.inner.node_type.as_str(); // 服务名 (节点类型: sequencer/rpc/unknown)
+        let service_name = process_id.service_name(); // 服务名 (根据 processId 判断: RPC 或 Seq)
         let business = BUSINESS_NAME; // 业务名 (固定为 "X Layer")
         let client = ""; // 客户端
-        let chainld = ""; // 链ID
-        let process_str = process_id.to_string(); // 处理阶段(步骤) - process ID 数值
-        let process_word_str = process_word; // 处理阶段关键字 - process ID 字符串
+        let chainld = CHAIN_ID; // 链ID (固定为 "196")
+        let process_str = (process_id as u32).to_string(); // 处理阶段(步骤) - process ID 数值
+        let process_word_str = process_id.as_str(); // 处理阶段关键字 - process ID 字符串
         let index = ""; // 代币交易序号
         let inner_index = ""; // 内部交易序号
         let current_time_str = current_time.to_string(); // 当前时间戳(13位)
@@ -326,13 +353,10 @@ impl TransactionTracer {
             .unwrap_or_default();
         let timestamp_ms = timestamp_duration.as_millis();
         let trace_hash = format!("{:#x}", tx_hash);
-        let process_id_value = process_id as u32;
-        let process_word = process_id.as_str();
         
         let csv_line = self.format_csv_line(
             &trace_hash,
-            process_id_value,
-            process_word,
+            process_id,
             timestamp_ms,
             None,
             block_number,
@@ -390,13 +414,10 @@ impl TransactionTracer {
             .unwrap_or_default();
         let timestamp_ms = timestamp_duration.as_millis();
         let trace_hash = format!("{:#x}", block_hash);
-        let process_id_value = process_id as u32;
-        let process_word = process_id.as_str();
         
         let csv_line = self.format_csv_line(
             &trace_hash,
-            process_id_value,
-            process_word,
+            process_id,
             timestamp_ms,
             Some(block_hash),
             Some(block_number),
