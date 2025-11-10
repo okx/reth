@@ -43,7 +43,7 @@ use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, Transac
 use revm::context::{Block, BlockEnv};
 use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, trace, warn};
-use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
+use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
 
 /// Optimism's payload builder
 #[derive(Debug)]
@@ -356,7 +356,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         let Self { best } = self;
         debug!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
 
-        // Block build start
+        // X Layer: Log block build start
         let parent_hash = ctx.parent().hash();
         let parent_number = ctx.parent().number();
         if let Some(tracer) = get_global_tracer() {
@@ -389,7 +389,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         if !ctx.attributes().no_tx_pool() {
             let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
             if ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?.is_some() {
-                // Block build end (cancelled)
+                // X Layer: Log block build end (cancelled)
                 if let Some(tracer) = get_global_tracer() {
                     tracer.log_block(
                         parent_hash,
@@ -402,7 +402,7 @@ impl<Txs> OpBuilder<'_, Txs> {
 
             // check if the new payload is even more valuable
             if !ctx.is_better_payload(info.total_fees) {
-                // Block build end (aborted)
+                // X Layer: Log block build end (aborted)
                 if let Some(tracer) = get_global_tracer() {
                     tracer.log_block(
                         parent_hash,
@@ -442,7 +442,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         let payload =
             OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed));
 
-        // Block build end (success)
+        // X Layer: Log block build end (success)
         let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
         if let Some(tracer) = get_global_tracer() {
@@ -804,7 +804,7 @@ where
 
             let gas_used = match builder.execute_transaction(tx.clone()) {
                 Ok(gas_used) => {
-                    // Transaction execution successful
+                    // X Layer: Log transaction execution end (success)
                     if let Some(tracer) = get_global_tracer() {
                         tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
                     }
@@ -814,7 +814,7 @@ where
                     error,
                     ..
                 })) => {
-                    // Transaction execution failed
+                    // X Layer: Log transaction execution end (failed)
                     if let Some(tracer) = get_global_tracer() {
                         tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
                     }
@@ -830,7 +830,7 @@ where
                     continue
                 }
                 Err(err) => {
-                    // Transaction execution fatal error
+                    // X Layer: Log transaction execution end (fatal error)
                     if let Some(tracer) = get_global_tracer() {
                         tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
                     }

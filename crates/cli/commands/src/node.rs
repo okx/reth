@@ -180,11 +180,9 @@ where
             tracing::info!(target: "reth::cli::xlayer", genesis_block = genesis_block_number, "Using genesis block as legacy cutoff");
         }
 
-        // Initialize transaction tracer if enabled
-        // Node type will be determined at runtime based on process_id in the logs
-        // For now, we use Unknown and it can be inferred from the process_id (RpcReceiveTxEnd vs SeqReceiveTxEnd)
+        // X Layer: Initialize transaction tracer if enabled
         if tx_trace.enable {
-            use reth_node_metrics::transaction_trace::{init_global_tracer, NodeType};
+            use reth_node_metrics::transaction_trace_xlayer::{init_global_tracer, NodeType};
             init_global_tracer(tx_trace.enable, tx_trace.output_path.clone(), NodeType::Unknown);
             if let Some(ref path) = tx_trace.output_path {
                 tracing::info!(target: "reth::cli", ?path, "Transaction tracing enabled, output path configured");

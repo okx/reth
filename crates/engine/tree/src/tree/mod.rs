@@ -511,8 +511,7 @@ where
         trace!(target: "engine::tree", "invoked new payload");
         self.metrics.engine.new_payload_messages.increment(1);
 
-        // start timing for the new payload process
-        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
+        use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
         let block_hash = payload.block_hash();
         let block_number = payload.block_number();
         let start = Instant::now();
@@ -578,7 +577,7 @@ where
         // record total newPayload duration
         self.metrics.block_validation.total_duration.record(start.elapsed().as_secs_f64());
 
-        // Block receive end
+        // X Layer: Log block receive end
         if let Some(tracer) = get_global_tracer() {
             tracer.log_block(
                 block_hash,
@@ -2524,12 +2523,11 @@ where
         };
         self.emit_event(EngineApiEvent::BeaconConsensus(engine_event));
 
-        // Block insertion end
-        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
+        // X Layer: Log block insertion end
+        use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
         if let Some(tracer) = get_global_tracer() {
             let is_canonical = !is_fork;
             
-            // Log block-level trace only (not per-transaction to avoid duplication)
             if is_canonical {
                 let block_hash = executed.recovered_block().hash();
                 let block_number = executed.recovered_block().number();

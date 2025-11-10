@@ -196,8 +196,8 @@ where
         &self,
         payload: PayloadT::ExecutionData,
     ) -> EngineApiResult<PayloadStatus> {
-        // Block send start (Sequencer sending block to RPC)
-        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
+        // X Layer: Log block send start
+        use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
         let block_hash = payload.block_hash();
         let block_number = payload.block_number();
         if let Some(tracer) = get_global_tracer() {
@@ -245,8 +245,8 @@ where
         &self,
         payload: PayloadT::ExecutionData,
     ) -> RpcResult<PayloadStatus> {
-        // Block send start (Sequencer sending block to RPC)
-        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
+        // X Layer: Log block send start
+        use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
         let block_hash = payload.block_hash();
         let block_number = payload.block_number();
         if let Some(tracer) = get_global_tracer() {
@@ -294,8 +294,8 @@ where
         &self,
         payload: PayloadT::ExecutionData,
     ) -> RpcResult<PayloadStatus> {
-        // Block send start (Sequencer sending block to RPC)
-        use reth_node_metrics::transaction_trace::{get_global_tracer, TransactionProcessId};
+        // X Layer: Log block send start
+        use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
         let block_hash = payload.block_hash();
         let block_number = payload.block_number();
         if let Some(tracer) = get_global_tracer() {
