@@ -10,7 +10,7 @@ use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, NetworkArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TransactionTraceArgs, TxPoolArgs,
+        MetricArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TransactionTraceArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
