@@ -67,7 +67,8 @@ pub enum XlayerCommands {
         /// RPC URL
         #[arg(long)]
         rpc_url: String,
-        /// Address to query balance for (supports optional "X" prefix, e.g., "X1234..." or "0x1234...")
+        /// Address to query balance for (supports optional "X" prefix, e.g., "X1234..." or
+        /// "0x1234...")
         #[arg(long)]
         address: XAddress,
     },
@@ -79,7 +80,8 @@ pub enum XlayerCommands {
         /// Token contract address (supports optional "X" prefix, e.g., "X1234..." or "0x1234...")
         #[arg(long)]
         token: XAddress,
-        /// Account address to query balance for (supports optional "X" prefix, e.g., "X1234..." or "0x1234...")
+        /// Account address to query balance for (supports optional "X" prefix, e.g., "X1234..." or
+        /// "0x1234...")
         #[arg(long)]
         account: XAddress,
     },

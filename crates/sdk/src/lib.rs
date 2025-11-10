@@ -3,14 +3,14 @@
 //! This crate provides utilities and functions for sending transactions
 //! and interacting with the Reth chain via RPC.
 
+use alloy_dyn_abi::{DynSolType, DynSolValue};
+use alloy_json_abi::Param;
 use alloy_network::EthereumWallet;
-use alloy_primitives::{Address, Bytes, U256, hex};
+use alloy_primitives::{hex, Address, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{SolCall, sol};
-use alloy_json_abi::Param;
-use alloy_dyn_abi::{DynSolType, DynSolValue};
+use alloy_sol_types::{sol, SolCall};
 use anyhow::{Context, Result};
 use std::str::FromStr;
 
@@ -41,8 +41,7 @@ impl FromStr for XAddress {
             format!("0x{}", addr_str)
         };
 
-        let address = addr_with_prefix.parse::<Address>()
-            .context("Failed to parse address")?;
+        let address = addr_with_prefix.parse::<Address>().context("Failed to parse address")?;
         Ok(XAddress { address })
     }
 }
@@ -76,9 +75,10 @@ pub async fn create_provider_with_wallet(
 }
 
 /// Create a provider without wallet (for read-only operations)
-pub async fn create_provider(rpc_url: &str) -> Result<impl Provider<alloy_network::Ethereum> + Clone> {
-    let provider = ProviderBuilder::new()
-        .connect_http(rpc_url.parse().context("Invalid RPC URL")?);
+pub async fn create_provider(
+    rpc_url: &str,
+) -> Result<impl Provider<alloy_network::Ethereum> + Clone> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse().context("Invalid RPC URL")?);
     Ok(provider)
 }
 
@@ -154,15 +154,10 @@ pub async fn transfer_token(
 }
 
 /// Get the balance of an address
-pub async fn get_balance(
-    rpc_url: &str,
-    address: Address,
-) -> Result<()> {
+pub async fn get_balance(rpc_url: &str, address: Address) -> Result<()> {
     let provider = create_provider(rpc_url).await?;
 
-    let balance = provider.get_balance(address)
-        .await
-        .context("Failed to get balance")?;
+    let balance = provider.get_balance(address).await.context("Failed to get balance")?;
 
     println!("Balance: {} wei", balance);
 
@@ -179,18 +174,16 @@ pub async fn get_token_balance(
 
     let call = IERC20::balanceOfCall { account: account_address };
     let calldata = call.abi_encode();
-   println!("call data: 0x{}", hex::encode(&calldata));
+    println!("call data: 0x{}", hex::encode(&calldata));
     let result = provider
-        .call(
-            alloy_rpc_types_eth::TransactionRequest {
-                to: Some(alloy_primitives::TxKind::Call(token_address)),
-                input: alloy_rpc_types_eth::TransactionInput {
-                    input: None,
-                    data: Some(Bytes::from(calldata)),
-                },
-                ..Default::default()
-            }
-        )
+        .call(alloy_rpc_types_eth::TransactionRequest {
+            to: Some(alloy_primitives::TxKind::Call(token_address)),
+            input: alloy_rpc_types_eth::TransactionInput {
+                input: None,
+                data: Some(Bytes::from(calldata)),
+            },
+            ..Default::default()
+        })
         .await
         .context("Failed to call balanceOf")?;
 
@@ -211,7 +204,11 @@ where
     let args: Vec<S> = args.into_iter().collect();
 
     if inputs.len() != args.len() {
-        anyhow::bail!("encode length mismatch: expected {} types, got {}", inputs.len(), args.len());
+        anyhow::bail!(
+            "encode length mismatch: expected {} types, got {}",
+            inputs.len(),
+            args.len()
+        );
     }
 
     std::iter::zip(inputs, args)
@@ -238,7 +235,11 @@ fn coerce_value_recursive(ty: &DynSolType, arg: &str) -> Result<DynSolValue> {
             let args = parse_tuple_args(arg)?;
 
             if tuple_types.len() != args.len() {
-                anyhow::bail!("Tuple length mismatch: expected {} elements, got {}", tuple_types.len(), args.len());
+                anyhow::bail!(
+                    "Tuple length mismatch: expected {} elements, got {}",
+                    tuple_types.len(),
+                    args.len()
+                );
             }
 
             // Recursively process each element
@@ -255,10 +256,8 @@ fn coerce_value_recursive(ty: &DynSolType, arg: &str) -> Result<DynSolValue> {
             let args = parse_array_args(arg)?;
 
             // Recursively process each element
-            let values: Result<Vec<_>> = args
-                .iter()
-                .map(|arg_str| coerce_value_recursive(inner_ty, arg_str))
-                .collect();
+            let values: Result<Vec<_>> =
+                args.iter().map(|arg_str| coerce_value_recursive(inner_ty, arg_str)).collect();
 
             Ok(DynSolValue::Array(values?))
         }
@@ -267,14 +266,16 @@ fn coerce_value_recursive(ty: &DynSolType, arg: &str) -> Result<DynSolValue> {
             let args = parse_array_args(arg)?;
 
             if args.len() != *size {
-                anyhow::bail!("Fixed array length mismatch: expected {} elements, got {}", size, args.len());
+                anyhow::bail!(
+                    "Fixed array length mismatch: expected {} elements, got {}",
+                    size,
+                    args.len()
+                );
             }
 
             // Recursively process each element
-            let values: Result<Vec<_>> = args
-                .iter()
-                .map(|arg_str| coerce_value_recursive(inner_ty, arg_str))
-                .collect();
+            let values: Result<Vec<_>> =
+                args.iter().map(|arg_str| coerce_value_recursive(inner_ty, arg_str)).collect();
 
             Ok(DynSolValue::FixedArray(values?))
         }
@@ -291,8 +292,7 @@ fn coerce_value_recursive(ty: &DynSolType, arg: &str) -> Result<DynSolValue> {
         }
         _ => {
             // For non-tuple, non-address types, use normal coercion
-            DynSolType::coerce_str(ty, arg)
-                .context("Failed to coerce value")
+            DynSolType::coerce_str(ty, arg).context("Failed to coerce value")
         }
     }
 }
@@ -304,7 +304,7 @@ fn parse_tuple_args(s: &str) -> Result<Vec<String>> {
         anyhow::bail!("Tuple argument must start with '(' and end with ')'");
     }
 
-    let inner = &s[1..s.len()-1]; // Remove outer parentheses
+    let inner = &s[1..s.len() - 1]; // Remove outer parentheses
     let mut args = Vec::new();
     let mut current = String::new();
     let mut depth = 0;
@@ -339,23 +339,19 @@ fn parse_tuple_args(s: &str) -> Result<Vec<String>> {
 /// Parse array arguments from a string (comma-separated, optionally wrapped in brackets)
 fn parse_array_args(s: &str) -> Result<Vec<String>> {
     let s = s.trim();
-    
+
     // Remove optional brackets
-    let inner = if s.starts_with('[') && s.ends_with(']') {
-        &s[1..s.len()-1]
-    } else {
-        s
-    };
-    
+    let inner = if s.starts_with('[') && s.ends_with(']') { &s[1..s.len() - 1] } else { s };
+
     if inner.is_empty() {
         return Ok(Vec::new());
     }
-    
+
     // Split by comma, handling nested structures
     let mut args = Vec::new();
     let mut current = String::new();
     let mut depth = 0;
-    
+
     for ch in inner.chars() {
         match ch {
             '(' | '[' => {
@@ -375,10 +371,10 @@ fn parse_array_args(s: &str) -> Result<Vec<String>> {
             }
         }
     }
-    
+
     if !current.is_empty() {
         args.push(current.trim().to_string());
     }
-    
+
     Ok(args)
 }
