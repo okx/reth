@@ -62,7 +62,7 @@ pub enum XlayerCommands {
         #[arg(long)]
         amount: U256,
     },
-    /// Get the balance of an address (equivalent to eth_getBalance).
+    /// Get the balance of an address (equivalent to `eth_getBalance`).
     Balance {
         /// RPC URL
         #[arg(long)]
@@ -85,7 +85,7 @@ pub enum XlayerCommands {
         #[arg(long)]
         account: XAddress,
     },
-    /// Call a contract function using eth_call RPC method.
+    /// Call a contract function using `eth_call` RPC method.
     EthCall {
         /// RPC URL
         #[arg(long)]
@@ -159,10 +159,10 @@ async fn main() -> Result<()> {
 
                 match func.abi_decode_output(result.as_ref()) {
                     Ok(decoded) => {
-                        println!("Result: decoded {:?}", decoded);
+                        println!("Result: decoded {decoded:?}");
                     }
                     Err(err) => {
-                        eprintln!("error in decode: {:?}", err);
+                        eprintln!("error in decode: {err:?}");
                     }
                 };
             } else {
