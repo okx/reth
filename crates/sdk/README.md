@@ -30,14 +30,3 @@ cargo run -p reth-sdk --bin xlayer_cli -- eth-call --rpc-url https://maximum-yol
 ```
 cargo expand -p reth-sdk --bin xlayer_cli > expanded.rs
 ```
-
-# appendix
-```
-struct QuoteExactInputSingleParams {
-    address tokenIn;
-    address tokenOut;
-    uint24 fee;
-    uint256 amountIn;
-    uint160 sqrtPriceLimitX96;
-}
-```

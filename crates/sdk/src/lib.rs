@@ -218,12 +218,7 @@ where
 
 /// Helper function to coerce a value to a [DynSolValue] given a type string
 pub fn coerce_value(ty: &str, arg: &str) -> Result<DynSolValue> {
-    println!("type {:?}, arg: {:?}", ty, arg);
-
-    // Parse the type first to see if it's a tuple
     let parsed_ty = DynSolType::parse(ty)?;
-
-    // Recursively process based on the type structure
     coerce_value_recursive(&parsed_ty, arg)
 }
 
@@ -231,7 +226,6 @@ pub fn coerce_value(ty: &str, arg: &str) -> Result<DynSolValue> {
 fn coerce_value_recursive(ty: &DynSolType, arg: &str) -> Result<DynSolValue> {
     match ty {
         DynSolType::Tuple(tuple_types) => {
-            // Parse tuple arguments (handle nested tuples)
             let args = parse_tuple_args(arg)?;
 
             if tuple_types.len() != args.len() {
@@ -241,8 +235,6 @@ fn coerce_value_recursive(ty: &DynSolType, arg: &str) -> Result<DynSolValue> {
                     args.len()
                 );
             }
-
-            // Recursively process each element
             let values: Result<Vec<_>> = tuple_types
                 .iter()
                 .zip(args.iter())
@@ -252,19 +244,14 @@ fn coerce_value_recursive(ty: &DynSolType, arg: &str) -> Result<DynSolValue> {
             Ok(DynSolValue::Tuple(values?))
         }
         DynSolType::Array(inner_ty) => {
-            // Parse array arguments (comma-separated, optionally wrapped in brackets)
             let args = parse_array_args(arg)?;
-
-            // Recursively process each element
             let values: Result<Vec<_>> =
                 args.iter().map(|arg_str| coerce_value_recursive(inner_ty, arg_str)).collect();
 
             Ok(DynSolValue::Array(values?))
         }
         DynSolType::FixedArray(inner_ty, size) => {
-            // Parse fixed array arguments (comma-separated, optionally wrapped in brackets)
             let args = parse_array_args(arg)?;
-
             if args.len() != *size {
                 anyhow::bail!(
                     "Fixed array length mismatch: expected {} elements, got {}",
@@ -272,8 +259,6 @@ fn coerce_value_recursive(ty: &DynSolType, arg: &str) -> Result<DynSolValue> {
                     args.len()
                 );
             }
-
-            // Recursively process each element
             let values: Result<Vec<_>> =
                 args.iter().map(|arg_str| coerce_value_recursive(inner_ty, arg_str)).collect();
 
@@ -339,15 +324,12 @@ fn parse_tuple_args(s: &str) -> Result<Vec<String>> {
 /// Parse array arguments from a string (comma-separated, optionally wrapped in brackets)
 fn parse_array_args(s: &str) -> Result<Vec<String>> {
     let s = s.trim();
-
-    // Remove optional brackets
     let inner = if s.starts_with('[') && s.ends_with(']') { &s[1..s.len() - 1] } else { s };
 
     if inner.is_empty() {
         return Ok(Vec::new());
     }
-
-    // Split by comma, handling nested structures
+    
     let mut args = Vec::new();
     let mut current = String::new();
     let mut depth = 0;
@@ -377,4 +359,136 @@ fn parse_array_args(s: &str) -> Result<Vec<String>> {
     }
 
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_json_abi::Function;
+
+    #[test]
+    fn test_encode_args_with_xaddress_in_tuple() {
+        // Test the example from the CLI command:
+        // struct QuoteExactInputSingleParams {
+        //     address tokenIn;
+        //     address tokenOut;
+        //     uint24 fee;
+        //     uint256 amountIn;
+        //     uint160 sqrtPriceLimitX96;
+        // }
+        // quoteExactInputSingle((address,address,uint256,uint24,uint160))(uint256,uint160,uint32,uint256)
+        // with args: (XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7,1000000000000000000,3000,0)
+        
+        let sig = "quoteExactInputSingle((address,address,uint256,uint24,uint160))(uint256,uint160,uint32,uint256)";
+        let func = Function::parse(sig).unwrap();
+        
+        let args = vec!["(XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,XdAC17F958D2ee523a2206206994597C13D831ec7,1000000000000000000,3000,0)"];
+        
+        let result = encode_args(&func.inputs, args).unwrap();
+
+        assert_eq!(result.len(), 1);
+        
+        if let DynSolValue::Tuple(tuple_values) = &result[0] {
+            assert_eq!(tuple_values.len(), 5);
+            
+            // Check first address (should have X prefix stripped)
+            if let DynSolValue::Address(addr1) = &tuple_values[0] {
+                assert_eq!(
+                    addr1.to_string(),
+                    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+                );
+            } else {
+                panic!("First element should be an address");
+            }
+            
+            // Check second address (should have X prefix stripped)
+            if let DynSolValue::Address(addr2) = &tuple_values[1] {
+                assert_eq!(
+                    addr2.to_string(),
+                    "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+                );
+            } else {
+                panic!("Second element should be an address");
+            }
+            
+            // Check uint256
+            if let DynSolValue::Uint(amount, 256) = &tuple_values[2] {
+                assert_eq!(amount.to_string(), "1000000000000000000");
+            } else {
+                panic!("Third element should be uint256");
+            }
+            
+            // Check uint24
+            if let DynSolValue::Uint(fee, 24) = &tuple_values[3] {
+                assert_eq!(fee.to_string(), "3000");
+            } else {
+                panic!("Fourth element should be uint24");
+            }
+            
+            // Check uint160
+            if let DynSolValue::Uint(sqrt_price, 160) = &tuple_values[4] {
+                assert_eq!(sqrt_price.to_string(), "0");
+            } else {
+                panic!("Fifth element should be uint160");
+            }
+        } else {
+            panic!("Result should be a tuple");
+        }
+    }
+
+    #[test]
+    fn test_encode_args_with_nested_tuple() {
+        // Test nested tuple: (address,(address,uint256))
+        // Function signature: testFunction((address,(address,uint256)))(uint256)
+        // Args: (XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,(XdAC17F958D2ee523a2206206994597C13D831ec7,1000))
+        
+        let sig = "testFunction((address,(address,uint256)))(uint256)";
+        let func = Function::parse(sig).unwrap();
+        
+        let args = vec!["(XC02aaa39b223FE8D0A0e5C4F27eAD9083C756Cc2,(XdAC17F958D2ee523a2206206994597C13D831ec7,1000))"];
+        
+        let result = encode_args(&func.inputs, args).unwrap();
+        
+        assert_eq!(result.len(), 1);
+        
+        if let DynSolValue::Tuple(outer_tuple) = &result[0] {
+            assert_eq!(outer_tuple.len(), 2);
+            
+            // Check first element (address)
+            if let DynSolValue::Address(addr1) = &outer_tuple[0] {
+                assert_eq!(
+                    addr1.to_string(),
+                    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+                );
+            } else {
+                panic!("First element should be an address");
+            }
+            
+            // Check second element (nested tuple)
+            if let DynSolValue::Tuple(inner_tuple) = &outer_tuple[1] {
+                assert_eq!(inner_tuple.len(), 2);
+                
+                // Check inner tuple's first element (address)
+                if let DynSolValue::Address(addr2) = &inner_tuple[0] {
+                    assert_eq!(
+                        addr2.to_string(),
+                        "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+                    );
+                } else {
+                    panic!("Inner tuple's first element should be an address");
+                }
+                
+                // Check inner tuple's second element (uint256)
+                if let DynSolValue::Uint(amount, 256) = &inner_tuple[1] {
+                    assert_eq!(amount.to_string(), "1000");
+                } else {
+                    panic!("Inner tuple's second element should be uint256");
+                }
+            } else {
+                panic!("Second element should be a tuple");
+            }
+        } else {
+            panic!("Result should be a tuple");
+        }
+    }
 }

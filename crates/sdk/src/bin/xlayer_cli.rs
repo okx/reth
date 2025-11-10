@@ -165,6 +165,8 @@ async fn main() -> Result<()> {
                         eprintln!("error in decode: {:?}", err);
                     }
                 };
+            } else {
+                panic!("signature needs contains ()");
             }
         }
     }
