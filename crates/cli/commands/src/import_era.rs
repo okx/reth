@@ -87,10 +87,10 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> ImportEraC
         } else {
             let url = match self.import.url {
                 Some(url) => url,
-                None => self.env.chain.chain().kind().try_to_url()?,
+                None => self.env.chain.as_ref().expect("Chain must be set").chain().kind().try_to_url()?,
             };
             let folder =
-                self.env.datadir.resolve_datadir(self.env.chain.chain()).data_dir().join("era");
+                self.env.datadir.resolve_datadir(self.env.chain.as_ref().expect("Chain must be set").chain()).data_dir().join("era");
 
             fs::create_dir_all(&folder)?;
 
@@ -108,6 +108,6 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> ImportEraC
 impl<C: ChainSpecParser> ImportEraCommand<C> {
     /// Returns the underlying chain being used to run this command
     pub fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
-        Some(&self.env.chain)
+        self.env.chain.as_ref()
     }
 }

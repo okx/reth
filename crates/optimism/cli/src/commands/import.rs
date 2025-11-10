@@ -164,6 +164,6 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> ImportOpCommand<C> {
 impl<C: ChainSpecParser> ImportOpCommand<C> {
     /// Returns the underlying chain being used to run this command
     pub const fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
-        Some(&self.env.chain)
+        self.env.chain.as_ref()
     }
 }

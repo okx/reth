@@ -35,6 +35,23 @@ impl DatadirArgs {
         let datadir = self.datadir.clone();
         datadir.unwrap_or_chain_default(chain, self)
     }
+
+    /// Resolves the base datadir path (without chain subdirectory).
+    ///
+    /// This is used to read the .chain-info file before knowing which chain to load.
+    pub fn resolve_datadir_base(&self) -> eyre::Result<PathBuf> {
+        use std::path::Path;
+        let path_buf = self.datadir.as_ref()
+            .map(|p| {
+                let path: &Path = p.as_ref();
+                path.to_path_buf()
+            })
+            .unwrap_or_else(|| {
+                crate::dirs::data_dir()
+                    .expect("Failed to determine default data directory")
+            });
+        Ok(path_buf)
+    }
 }
 
 #[cfg(test)]

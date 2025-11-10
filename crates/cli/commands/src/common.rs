@@ -1,6 +1,9 @@
 //! Contains common `reth` arguments
 
+use std::path::Path;
 use alloy_primitives::B256;
+use alloy_genesis::Genesis;
+use reth_db::{Database, transaction::DbTx};
 use clap::Parser;
 use reth_chainspec::EthChainSpec;
 use reth_cli::chainspec::ChainSpecParser;
@@ -44,15 +47,17 @@ pub struct EnvironmentArgs<C: ChainSpecParser> {
     /// The chain this node is running.
     ///
     /// Possible values are either a built-in chain or the path to a chain specification file.
+    ///
+    /// If not specified, the chain will be loaded from the database (requires prior initialization).
     #[arg(
         long,
         value_name = "CHAIN_OR_PATH",
         long_help = C::help_message(),
-        default_value = C::default_value(),
         value_parser = C::parser(),
-        global = true
+        global = true,
+        required = false
     )]
-    pub chain: Arc<C::ChainSpec>,
+    pub chain: Option<Arc<C::ChainSpec>>,
 
     /// All database related arguments
     #[command(flatten)]
@@ -60,13 +65,113 @@ pub struct EnvironmentArgs<C: ChainSpecParser> {
 }
 
 impl<C: ChainSpecParser> EnvironmentArgs<C> {
+    /// Load chain spec from database using .chain-info file.
+    ///
+    /// This function breaks the circular dependency between needing the chain to determine
+    /// the datadir path and needing the datadir path to load the chain from the database.
+    fn load_chain_from_db<N>(
+        datadir_base: &Path,
+        is_user_specified: bool,
+    ) -> eyre::Result<Arc<N::ChainSpec>>
+    where
+        N: CliNodeTypes,
+        C: ChainSpecParser<ChainSpec = N::ChainSpec>,
+    {
+        use reth_node_core::dirs::ChainInfo;
+
+        // Step 1: Read .chain-info to get chain_id
+        let chain_info = ChainInfo::read(datadir_base)?;
+        info!(target: "reth::cli",
+            chain_id = chain_info.chain_id,
+            genesis_hash = %chain_info.genesis_hash,
+            "Loading chain from database"
+        );
+
+        // Step 2: Determine db path
+        // If user specified datadir, db is directly under it: /path/db
+        // If using default datadir, db is under chain_id subdirectory: ~/.local/share/reth/<chain_id>/db
+        let db_path = if is_user_specified {
+            // User specified path: /data/op-reth/db
+            datadir_base.join("db")
+        } else {
+            // Default path: ~/.local/share/reth/196/db
+            datadir_base.join(chain_info.chain_id.to_string()).join("db")
+        };
+
+        // Step 3: Open database (read-only)
+        let db = Arc::new(open_db_read_only(&db_path, Default::default())?);
+        let tx = db.tx()?;
+
+        // Step 4: Read minimal genesis JSON (WITHOUT alloc, only ~2KB!)
+        let genesis_bytes = tx
+            .get::<reth_db_api::tables::GenesisConfig>(chain_info.genesis_hash)?
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "Genesis config not found in database for hash: {}. \
+                     Please specify --chain parameter or run init first.",
+                    chain_info.genesis_hash
+                )
+            })?;
+
+        info!(target: "reth::cli",
+            genesis_size = genesis_bytes.len(),
+            "Read minimal genesis from database"
+        );
+
+        // Step 5: Deserialize (fast, only ~2KB!)
+        let minimal_genesis_json = String::from_utf8(genesis_bytes)
+            .map_err(|e| eyre::eyre!("Invalid UTF-8 in genesis JSON: {}", e))?;
+        let _genesis: Genesis = serde_json::from_str(&minimal_genesis_json)?;
+
+        // Step 6: Convert to ChainSpec (fast, no alloc processing!)
+        // Use the same conversion logic as when loading from file
+        // C::parse returns Arc<ChainSpec> already
+        let chain_spec = C::parse(&minimal_genesis_json)?;
+
+        // Step 7: Verify consistency
+        if chain_spec.chain().id() != chain_info.chain_id {
+            return Err(eyre::eyre!(
+                "Chain ID mismatch: .chain-info={}, genesis={}",
+                chain_info.chain_id,
+                chain_spec.chain().id()
+            ))
+        }
+
+        if chain_spec.genesis_hash() != chain_info.genesis_hash {
+            return Err(eyre::eyre!(
+                "Genesis hash mismatch: .chain-info={}, computed={}",
+                chain_info.genesis_hash,
+                chain_spec.genesis_hash()
+            ))
+        }
+
+        info!(target: "reth::cli",
+            chain_id = chain_info.chain_id,
+            "Chain loaded successfully from database"
+        );
+
+        Ok(chain_spec)
+    }
+
     /// Initializes environment according to [`AccessRights`] and returns an instance of
     /// [`Environment`].
     pub fn init<N: CliNodeTypes>(&self, access: AccessRights) -> eyre::Result<Environment<N>>
     where
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     {
-        let data_dir = self.datadir.clone().resolve_datadir(self.chain.chain());
+        // Determine the chain to use: from parameter or database
+        let chain = if let Some(chain) = &self.chain {
+            // Use provided chain (--chain parameter)
+            chain.clone()
+        } else {
+            // Try to load from database
+            let datadir_base = self.datadir.resolve_datadir_base()?;
+            // Check if user specified a datadir (vs using default)
+            let is_user_specified = self.datadir.datadir.is_some();
+            Self::load_chain_from_db::<N>(&datadir_base, is_user_specified)?
+        };
+
+        let data_dir = self.datadir.clone().resolve_datadir(chain.chain());
         let db_path = data_dir.db();
         let sf_path = data_dir.static_files();
 
@@ -103,10 +208,27 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
             ),
         };
 
-        let provider_factory = self.create_provider_factory(&config, db, sfp)?;
+        let provider_factory = self.create_provider_factory(&config, db, sfp, chain.clone())?;
         if access.is_read_write() {
-            debug!(target: "reth::cli", chain=%self.chain.chain(), genesis=?self.chain.genesis_hash(), "Initializing genesis");
+            debug!(target: "reth::cli", chain=%chain.chain(), genesis=?chain.genesis_hash(), "Initializing genesis");
             init_genesis(&provider_factory)?;
+
+            // Write .chain-info file for future startups without --chain parameter
+            use reth_node_core::dirs::ChainInfo;
+            let chain_info = ChainInfo {
+                chain_id: chain.chain().id(),
+                genesis_hash: chain.genesis_hash(),
+                genesis_block_number: chain.genesis().number.unwrap_or(0),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    .to_string(),
+            };
+            // Write to the actual data directory (works for both user-specified and default paths)
+            // - User specified: /data/op-reth/.chain-info
+            // - Default: ~/.local/share/reth/<chain_id>/.chain-info
+            chain_info.write(data_dir.data_dir())?;
         }
 
         Ok(Environment { config, provider_factory, data_dir })
@@ -122,6 +244,7 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         config: &Config,
         db: Arc<DatabaseEnv>,
         static_file_provider: StaticFileProvider<N::Primitives>,
+        chain: Arc<N::ChainSpec>,
     ) -> eyre::Result<ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>>
     where
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
@@ -130,10 +253,10 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         let prune_modes = config.prune.segments.clone();
         let factory = ProviderFactory::<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>::new(
             db,
-            self.chain.clone(),
+            chain.clone(),
             static_file_provider,
         )
-        .with_prune_modes(prune_modes.clone()).with_genesis_block_number(self.chain.genesis().number.unwrap());
+        .with_prune_modes(prune_modes.clone()).with_genesis_block_number(chain.genesis().number.unwrap());
 
         // Check for consistency between database and static files.
         if let Some(unwind_target) = factory

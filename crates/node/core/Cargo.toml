@@ -48,6 +48,8 @@ eyre.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 humantime.workspace = true
 rand.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
 derive_more.workspace = true
 toml.workspace = true
 serde.workspace = true

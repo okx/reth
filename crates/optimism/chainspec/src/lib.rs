@@ -57,12 +57,13 @@ pub use op_sepolia::OP_SEPOLIA;
 pub use reth_optimism_forks::*;
 
 use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::collections::BTreeMap;
 use alloy_chains::Chain;
 use alloy_consensus::{proofs::storage_root_unhashed, BlockHeader, Header};
 use alloy_eips::eip7840::BlobParams;
 use alloy_genesis::Genesis;
 use alloy_hardforks::Hardfork;
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, U256};
 use derive_more::{Constructor, Deref, From, Into};
 use reth_chainspec::{
     BaseFeeParams, BaseFeeParamsKind, ChainSpec, ChainSpecBuilder, DepositContract,
@@ -1451,4 +1452,35 @@ mod tests {
             assert!(!content.contains(eth_hf.name()));
         }
     }
+}
+
+/// Create a minimal genesis JSON without alloc field for database storage.
+///
+/// This function creates a minimal version of the genesis JSON by excluding the alloc field,
+/// which typically contains millions of accounts and makes up most of the file size.
+/// The alloc data is already stored in the database during initialization, so we only need
+/// the chain configuration and other metadata for subsequent startups.
+///
+/// This reduces the genesis size from ~6GB to ~2KB, enabling fast loading from database.
+pub fn create_minimal_genesis_json(genesis: &Genesis) -> eyre::Result<alloc::string::String> {
+    // Create a new Genesis with empty alloc
+    let minimal_genesis = Genesis {
+        config: genesis.config.clone(),
+        nonce: genesis.nonce,
+        timestamp: genesis.timestamp,
+        extra_data: genesis.extra_data.clone(),
+        gas_limit: genesis.gas_limit,
+        difficulty: genesis.difficulty,
+        mix_hash: genesis.mix_hash,
+        coinbase: genesis.coinbase,
+        number: genesis.number,
+        parent_hash: genesis.parent_hash,
+        base_fee_per_gas: genesis.base_fee_per_gas,
+        excess_blob_gas: genesis.excess_blob_gas,
+        blob_gas_used: genesis.blob_gas_used,
+        // Empty alloc - this is the key to reducing size
+        alloc: BTreeMap::<Address, alloy_genesis::GenesisAccount>::default(),
+    };
+
+    serde_json::to_string(&minimal_genesis).map_err(|e| eyre::eyre!("Failed to serialize minimal genesis: {}", e))
 }

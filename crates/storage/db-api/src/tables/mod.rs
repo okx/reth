@@ -540,6 +540,16 @@ tables! {
         type Key = ChainStateKey;
         type Value = BlockNumber;
     }
+
+    /// Stores the minimal genesis JSON for chain initialization.
+    /// This allows loading the chain spec from database without external files.
+    /// The genesis JSON is stored without the alloc field to keep it small (~2KB).
+    /// Key: genesis hash
+    /// Value: minimal genesis.json content (Vec<u8>, without alloc field)
+    table GenesisConfig {
+        type Key = B256;
+        type Value = Vec<u8>;
+    }
 }
 
 /// Keys for the `ChainState` table.

@@ -174,6 +174,26 @@ where
     static_file_provider.get_writer(genesis_block_number, segment)?
         .user_header_mut().set_block_range(genesis_block_number, genesis_block_number);
 
+    // Store minimal genesis JSON to database (geth-style: enable loading chain from database)
+    // We exclude the alloc field to reduce size from ~6GB to ~2KB
+    {
+        use reth_optimism_chainspec::create_minimal_genesis_json;
+
+        let minimal_genesis_json = create_minimal_genesis_json(genesis)
+            .map_err(|e| {
+                ProviderError::Database(DatabaseError::Other(e.to_string()))
+            })?;
+
+        let genesis_bytes = minimal_genesis_json.as_bytes().to_vec();
+        provider_rw.tx_ref().put::<tables::GenesisConfig>(hash, genesis_bytes.clone())?;
+
+        info!(target: "reth::init",
+            genesis_hash = %hash,
+            genesis_size = genesis_bytes.len(),
+            "Stored minimal genesis to database"
+        );
+    }
+
     // `commit_unwind`` will first commit the DB and then the static file provider, which is
     // necessary on `init_genesis`.
     provider_rw.commit()?;

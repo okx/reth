@@ -56,13 +56,13 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> ExportEraC
             None => self
                 .env
                 .datadir
-                .resolve_datadir(self.env.chain.chain())
+                .resolve_datadir(self.env.chain.as_ref().expect("Chain must be set").chain())
                 .data_dir()
                 .join(ERA1_EXPORT_FOLDER_NAME),
         };
 
         let export_config = era1::ExportConfig {
-            network: self.env.chain.chain().to_string(),
+            network: self.env.chain.as_ref().expect("Chain must be set").chain().to_string(),
             first_block_number: self.export.first_block_number.unwrap_or(0),
             last_block_number: self
                 .export
@@ -104,6 +104,6 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> ExportEraC
 impl<C: ChainSpecParser> ExportEraCommand<C> {
     /// Returns the underlying chain being used to run this command
     pub fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
-        Some(&self.env.chain)
+        self.env.chain.as_ref()
     }
 }

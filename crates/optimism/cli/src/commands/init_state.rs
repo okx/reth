@@ -44,7 +44,7 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitStateCommandOp<C> {
         // If using --without-ovm for OP mainnet, handle the special case with hardcoded Bedrock
         // header. Otherwise delegate to the base InitStateCommand implementation.
         if self.without_ovm {
-            if self.init_state.env.chain.is_optimism_mainnet() {
+            if self.init_state.env.chain.as_ref().expect("Chain must be set").is_optimism_mainnet() {
                 return self.execute_with_bedrock_header::<N>();
             }
 

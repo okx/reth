@@ -23,6 +23,7 @@ reth-fs-util.workspace = true
 reth-node-types.workspace = true
 reth-static-file-types.workspace = true
 reth-execution-errors.workspace = true
+reth-optimism-chainspec.workspace = true
 
 # eth
 alloy-consensus.workspace = true

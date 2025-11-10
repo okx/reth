@@ -58,6 +58,7 @@ reth-discv5.workspace = true
 
 # ethereum
 alloy-eips.workspace = true
+alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 alloy-consensus.workspace = true

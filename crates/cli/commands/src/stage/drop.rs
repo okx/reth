@@ -73,7 +73,7 @@ impl<C: ChainSpecParser> Command<C> {
                 tx.clear::<tables::HeaderNumbers>()?;
                 reset_stage_checkpoint(tx, StageId::Headers)?;
 
-                insert_genesis_header(&provider_rw, &self.env.chain)?;
+                insert_genesis_header(&provider_rw, self.env.chain.as_ref().expect("Chain must be set"))?;
             }
             StageEnum::Bodies => {
                 tx.clear::<tables::BlockBodyIndices>()?;
@@ -84,7 +84,7 @@ impl<C: ChainSpecParser> Command<C> {
                 tx.clear::<tables::BlockWithdrawals>()?;
                 reset_stage_checkpoint(tx, StageId::Bodies)?;
 
-                insert_genesis_header(&provider_rw, &self.env.chain)?;
+                insert_genesis_header(&provider_rw, self.env.chain.as_ref().expect("Chain must be set"))?;
             }
             StageEnum::Senders => {
                 tx.clear::<tables::TransactionSenders>()?;
@@ -104,7 +104,7 @@ impl<C: ChainSpecParser> Command<C> {
                 reset_prune_checkpoint(tx, PruneSegment::ContractLogs)?;
                 reset_stage_checkpoint(tx, StageId::Execution)?;
 
-                let alloc = &self.env.chain.genesis().alloc;
+                let alloc = &self.env.chain.as_ref().expect("Chain must be set").genesis().alloc;
                 insert_genesis_state(&provider_rw, alloc.iter())?;
             }
             StageEnum::AccountHashing => {
@@ -147,14 +147,14 @@ impl<C: ChainSpecParser> Command<C> {
                 reset_stage_checkpoint(tx, StageId::IndexAccountHistory)?;
                 reset_stage_checkpoint(tx, StageId::IndexStorageHistory)?;
 
-                insert_genesis_history(&provider_rw, self.env.chain.genesis().alloc.iter())?;
+                insert_genesis_history(&provider_rw, self.env.chain.as_ref().expect("Chain must be set").genesis().alloc.iter())?;
             }
             StageEnum::TxLookup => {
                 tx.clear::<tables::TransactionHashNumbers>()?;
                 reset_prune_checkpoint(tx, PruneSegment::TransactionLookup)?;
 
                 reset_stage_checkpoint(tx, StageId::TransactionLookup)?;
-                insert_genesis_header(&provider_rw, &self.env.chain)?;
+                insert_genesis_header(&provider_rw, self.env.chain.as_ref().expect("Chain must be set"))?;
             }
         }
 
@@ -166,7 +166,7 @@ impl<C: ChainSpecParser> Command<C> {
     }
     /// Returns the underlying chain being used to run this command
     pub fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
-        Some(&self.env.chain)
+        self.env.chain.as_ref()
     }
 }
 

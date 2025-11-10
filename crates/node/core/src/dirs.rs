@@ -1,5 +1,8 @@
 //! reth data directories.
 
+mod chain_info;
+pub use chain_info::ChainInfo;
+
 use crate::{args::DatadirArgs, utils::parse_path};
 use reth_chainspec::Chain;
 use std::{

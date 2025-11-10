@@ -131,7 +131,7 @@ pub struct DownloadCommand<C: ChainSpecParser> {
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> DownloadCommand<C> {
     pub async fn execute<N>(self) -> Result<()> {
-        let data_dir = self.env.datadir.resolve_datadir(self.env.chain.chain());
+        let data_dir = self.env.datadir.resolve_datadir(self.env.chain.as_ref().expect("Chain must be set").chain());
         fs::create_dir_all(&data_dir)?;
 
         let url = match self.url {
@@ -144,7 +144,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> DownloadCo
         };
 
         info!(target: "reth::cli",
-            chain = %self.env.chain.chain(),
+            chain = %self.env.chain.as_ref().expect("Chain must be set").chain(),
             dir = ?data_dir.data_dir(),
             url = %url,
             "Starting snapshot download and extraction"
@@ -160,7 +160,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> DownloadCo
 impl<C: ChainSpecParser> DownloadCommand<C> {
     /// Returns the underlying chain being used to run this command
     pub fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
-        Some(&self.env.chain)
+        self.env.chain.as_ref()
     }
 }
 
