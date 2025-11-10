@@ -7,7 +7,7 @@ use crate::{
     builder::{ExecutionInfo, OpPayloadBuilderCtx},
     intercept_bridge_transaction_if_need, OpAttributes, OpPayloadPrimitives,
 };
-use alloy_consensus::{Transaction, Typed2718};
+use alloy_consensus::{Transaction, Typed2718, transaction::TxHashRef};
 use alloy_evm::{
     block::CommitChanges,
     Evm as AlloyEvm,
@@ -141,25 +141,25 @@ where
             // Execute transaction with conditional commit based on bridge interception check.
             // This ensures that intercepted transactions are not committed to the block state,
             // preventing tx number inconsistencies in static files.
-            let gas_used = match builder.execute_transaction_with_commit_condition(
-                tx.clone(),
-                |result| {
-                    if let ExecutionResult::Success { logs, .. } = result {
-                        if intercept_bridge_transaction_if_need(
-                            logs,
-                            tx.signer(),
-                            &self.bridge_intercept,
-                        )
-                            .is_err()
-                        {
-                            // Bridge transaction intercepted, do not commit
-                            return CommitChanges::No
-                        }
+            let signer = tx.signer();
+            let nonce = tx.nonce();
+            let tx_hash = *tx.tx_hash();
+            let miner_fee = tx
+                .effective_tip_per_gas(base_fee)
+                .expect("fee is always valid; execution succeeded");
+            trace!(target: "payload_builder", ?tx, "full transaction before execution");
+            let gas_used = match builder.execute_transaction_with_commit_condition(tx, |result| {
+                if let ExecutionResult::Success { logs, .. } = result {
+                    if intercept_bridge_transaction_if_need(logs, signer, &self.bridge_intercept)
+                        .is_err()
+                    {
+                        // Bridge transaction intercepted, do not commit
+                        return CommitChanges::No;
                     }
-                    // Normal transaction or non-success result, commit changes
-                    CommitChanges::Yes
-                },
-            ) {
+                }
+                // Normal transaction or non-success result, commit changes
+                CommitChanges::Yes
+            }) {
                 Ok(Some(gas_used)) => {
                     // X Layer: Log transaction execution end (success)
                     if let Some(tracer) = get_global_tracer() {
@@ -173,28 +173,28 @@ where
                     if let Some(tracer) = get_global_tracer() {
                         tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
                     }
-                    trace!(target: "payload_builder", ?tx, "bridge transaction intercepted, marking invalid");
-                    best_txs.mark_invalid(tx.signer(), tx.nonce());
-                    continue
+                    trace!(target: "payload_builder", ?tx_hash, "bridge transaction intercepted, marking invalid");
+                    best_txs.mark_invalid(signer, nonce);
+                    continue;
                 }
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-                                                        error,
-                                                        ..
-                                                    })) => {
+                    error,
+                    ..
+                })) => {
                     // X Layer: Log transaction execution end (failed)
                     if let Some(tracer) = get_global_tracer() {
                         tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
                     }
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
-                        trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
+                        trace!(target: "payload_builder", %error, ?tx_hash, "skipping nonce too low transaction");
                     } else {
                         // if the transaction is invalid, we can skip it and all of its
                         // descendants
-                        trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
-                        best_txs.mark_invalid(tx.signer(), tx.nonce());
+                        trace!(target: "payload_builder", %error, ?tx_hash, "skipping invalid transaction and its descendants");
+                        best_txs.mark_invalid(signer, nonce);
                     }
-                    continue
+                    continue;
                 }
                 Err(err) => {
                     // X Layer: Log transaction execution end (fatal error)
@@ -202,7 +202,7 @@ where
                         tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
                     }
                     // this is an error that we should treat as fatal for this attempt
-                    return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)))
+                    return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)));
                 }
             };
 
@@ -212,9 +212,6 @@ where
             info.cumulative_da_bytes_used += tx_da_size;
 
             // update and add to total fees
-            let miner_fee = tx
-                .effective_tip_per_gas(base_fee)
-                .expect("fee is always valid; execution succeeded");
             info.total_fees += U256::from(miner_fee) * U256::from(gas_used);
         }
 
