@@ -578,25 +578,12 @@ where
         // record total newPayload duration
         self.metrics.block_validation.total_duration.record(start.elapsed().as_secs_f64());
 
-        // Block receive end (success)
+        // Block receive end
         if let Some(tracer) = get_global_tracer() {
-            let is_valid = outcome.outcome.is_valid();
-            // Get status string from PayloadStatus
-            let status_str = if outcome.outcome.is_valid() {
-                "valid"
-            } else if outcome.outcome.is_syncing() {
-                "syncing"
-            } else if outcome.outcome.is_invalid() {
-                "invalid"
-            } else {
-                "accepted"
-            };
-            tracer.log_block_end(
+            tracer.log_block(
                 block_hash,
                 block_number,
                 TransactionProcessId::RpcBlockReceiveEnd,
-                is_valid,
-                &format!("Block receive completed, status: {}", status_str),
             );
         }
 
@@ -2546,7 +2533,7 @@ where
             if is_canonical {
                 let block_hash = executed.recovered_block().hash();
                 let block_number = executed.recovered_block().number();
-                tracer.log_block_end(block_hash, block_number, TransactionProcessId::RpcBlockInsertEnd, true, "Block insertion completed");
+                tracer.log_block(block_hash, block_number, TransactionProcessId::RpcBlockInsertEnd);
             }
         }
 

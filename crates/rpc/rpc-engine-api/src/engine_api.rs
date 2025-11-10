@@ -201,11 +201,10 @@ where
         let block_hash = payload.block_hash();
         let block_number = payload.block_number();
         if let Some(tracer) = get_global_tracer() {
-            tracer.log_block_start(
+            tracer.log_block(
                 block_hash,
                 block_number,
                 TransactionProcessId::SeqBlockSendStart,
-                "Sequencer sending block to RPC via engine_newPayload",
             );
         }
         
@@ -251,11 +250,10 @@ where
         let block_hash = payload.block_hash();
         let block_number = payload.block_number();
         if let Some(tracer) = get_global_tracer() {
-            tracer.log_block_start(
+            tracer.log_block(
                 block_hash,
                 block_number,
                 TransactionProcessId::SeqBlockSendStart,
-                "Sequencer sending block to RPC via engine_newPayload",
             );
         }
         
@@ -301,11 +299,10 @@ where
         let block_hash = payload.block_hash();
         let block_number = payload.block_number();
         if let Some(tracer) = get_global_tracer() {
-            tracer.log_block_start(
+            tracer.log_block(
                 block_hash,
                 block_number,
                 TransactionProcessId::SeqBlockSendStart,
-                "Sequencer sending block to RPC via engine_newPayload",
             );
         }
         

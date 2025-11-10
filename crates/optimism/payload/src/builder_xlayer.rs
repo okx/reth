@@ -86,6 +86,7 @@ where
         let block_da_limit = self.builder_config.da_config.max_da_block_size();
         let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
         let base_fee = builder.evm_mut().block().basefee();
+        let block_number = builder.evm_mut().block().number().saturating_to();
 
         while let Some(tx) = best_txs.next(()) {
             let interop = tx.interop_deadline();

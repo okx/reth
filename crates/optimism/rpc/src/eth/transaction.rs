@@ -60,7 +60,7 @@ where
             
             // RPC receive end (RPC node received transaction, ready to forward)
             if let Some(tracer) = get_global_tracer() {
-                tracer.log_transaction_end(tx_hash, TransactionProcessId::RpcReceiveTxEnd, true, "RPC receive successful, ready to forward");
+                tracer.log_transaction(tx_hash, TransactionProcessId::RpcReceiveTxEnd, None);
             }
             
             let hash = client.forward_raw_transaction(&tx).await.inspect_err(|err| {
@@ -85,7 +85,7 @@ where
 
         // SEQ receive end (successfully added to pool)
         if let Some(tracer) = get_global_tracer() {
-            tracer.log_transaction_end(tx_hash, TransactionProcessId::SeqReceiveTxEnd, true, "SEQ receive successful, transaction added to pool");
+            tracer.log_transaction(tx_hash, TransactionProcessId::SeqReceiveTxEnd, None);
         }
 
         Ok(hash)

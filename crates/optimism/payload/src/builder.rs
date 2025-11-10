@@ -360,11 +360,10 @@ impl<Txs> OpBuilder<'_, Txs> {
         let parent_hash = ctx.parent().hash();
         let parent_number = ctx.parent().number();
         if let Some(tracer) = get_global_tracer() {
-            tracer.log_block_start(
+            tracer.log_block(
                 parent_hash,
                 parent_number + 1,
-                TransactionProcessId::BlockBuildStart,
-                &format!("Starting block build, payload_id: {}", ctx.payload_id()),
+                TransactionProcessId::SeqBlockBuildStart,
             );
         }
 
@@ -392,12 +391,10 @@ impl<Txs> OpBuilder<'_, Txs> {
             if ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?.is_some() {
                 // Block build end (cancelled)
                 if let Some(tracer) = get_global_tracer() {
-                    tracer.log_block_end(
+                    tracer.log_block(
                         parent_hash,
                         parent_number + 1,
                         TransactionProcessId::SeqBlockBuildEnd,
-                        false,
-                        "Block build cancelled",
                     );
                 }
                 return Ok(BuildOutcomeKind::Cancelled)
@@ -407,12 +404,10 @@ impl<Txs> OpBuilder<'_, Txs> {
             if !ctx.is_better_payload(info.total_fees) {
                 // Block build end (aborted)
                 if let Some(tracer) = get_global_tracer() {
-                    tracer.log_block_end(
+                    tracer.log_block(
                         parent_hash,
                         parent_number + 1,
                         TransactionProcessId::SeqBlockBuildEnd,
-                        false,
-                        "Block build aborted (not better payload)",
                     );
                 }
                 // can skip building the block
@@ -451,13 +446,10 @@ impl<Txs> OpBuilder<'_, Txs> {
         let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
         if let Some(tracer) = get_global_tracer() {
-            let outcome = if no_tx_pool { "frozen" } else { "better" };
-            tracer.log_block_end(
+            tracer.log_block(
                 block_hash,
                 block_number,
                 TransactionProcessId::SeqBlockBuildEnd,
-                true,
-                &format!("Block build completed ({})", outcome),
             );
         }
 
@@ -759,6 +751,7 @@ where
         let block_da_limit = self.builder_config.da_config.max_da_block_size();
         let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
         let base_fee = builder.evm_mut().block().basefee();
+        let block_number = builder.evm_mut().block().number().saturating_to();
 
         while let Some(tx) = best_txs.next(()) {
             let tx_hash = *tx.hash();
@@ -813,7 +806,7 @@ where
                 Ok(gas_used) => {
                     // Transaction execution successful
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::SeqTxExecutionEnd, true, "Transaction execution successful");
+                        tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
                     }
                     gas_used
                 }
@@ -823,7 +816,7 @@ where
                 })) => {
                     // Transaction execution failed
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::SeqTxExecutionEnd, false, &format!("Transaction execution failed: {}", error));
+                        tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
                     }
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
@@ -839,7 +832,7 @@ where
                 Err(err) => {
                     // Transaction execution fatal error
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction_end(tx_hash, TransactionProcessId::SeqTxExecutionEnd, false, &format!("Transaction execution fatal error: {}", err));
+                        tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
                     }
                     // this is an error that we should treat as fatal for this attempt
                     return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)))
