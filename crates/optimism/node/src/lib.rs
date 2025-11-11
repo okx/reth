@@ -22,7 +22,6 @@ pub use engine::OpEngineTypes;
 pub mod node;
 pub use node::*;
 
-mod node_xlayer;
 
 pub mod rpc;
 pub use rpc::OpEngineApiBuilder;
@@ -45,6 +44,7 @@ pub use reth_optimism_evm::*;
 
 pub use reth_optimism_storage::OpStorage;
 
+mod node_xlayer;
 mod args_xlayer;
 pub use args_xlayer::{XLayerArgs, XLayerGasPriceArgs};
 

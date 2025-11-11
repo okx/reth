@@ -1,10 +1,11 @@
 use alloy_primitives::U256;
 use clap::Args;
 use reth_optimism_payload_builder::BridgeInterceptConfig;
+use rust_decimal::Decimal;
 use std::time::Duration;
 
 /// X Layer specific configuration flags
-#[derive(Debug, Clone, Args, PartialEq, Default)]
+#[derive(Debug, Clone, Args, PartialEq, Eq, Default)]
 #[command(next_help_heading = "X Layer")]
 pub struct XLayerArgs {
     /// Bridge transaction interception configuration
@@ -26,6 +27,7 @@ impl XLayerArgs {
     /// Validate all X Layer configurations
     pub fn validate(&self) -> Result<(), String> {
         self.intercept.validate()?;
+        self.gas_price.validate()?;
         // self.another_feature.validate()?;
         Ok(())
     }
@@ -156,7 +158,7 @@ pub struct ApolloArgs {
 }
 
 /// XLayer gas price configuration
-#[derive(Debug, Clone, Args, PartialEq)]
+#[derive(Debug, Clone, Args, PartialEq, Eq, Default)]
 #[command(next_help_heading = "XLayer Gas Price")]
 pub struct XLayerGasPriceArgs {
     /// Gas price calculation type: "default", "follower", or "fixed"
@@ -170,7 +172,7 @@ pub struct XLayerGasPriceArgs {
 
     /// Gas price calculation factor
     #[arg(long = "xlayer.gasprice.factor")]
-    pub factor: Option<f64>,
+    pub factor: Option<Decimal>,
 
     /// Kafka URL for gas price updates
     #[arg(long = "xlayer.gasprice.kafka-url")]
@@ -206,15 +208,15 @@ pub struct XLayerGasPriceArgs {
 
     /// Default L1 coin price (fallback value)
     #[arg(long = "xlayer.gasprice.default-l1-coin-price")]
-    pub default_l1_coin_price: Option<f64>,
+    pub default_l1_coin_price: Option<Decimal>,
 
     /// Default L2 coin price (fallback value)
     #[arg(long = "xlayer.gasprice.default-l2-coin-price")]
-    pub default_l2_coin_price: Option<f64>,
+    pub default_l2_coin_price: Option<Decimal>,
 
     /// Fixed gas price in USDT (for "fixed" type)
     #[arg(long = "xlayer.gasprice.gas-price-usdt")]
-    pub gas_price_usdt: Option<f64>,
+    pub gas_price_usdt: Option<Decimal>,
 
     /// Congestion threshold for dynamic gas price adjustment
     #[arg(long = "xlayer.gasprice.congestion-threshold")]
@@ -222,7 +224,7 @@ pub struct XLayerGasPriceArgs {
 
     /// Default gas price for XLayer (in wei)
     #[arg(long = "xlayer.gasprice.default")]
-    pub default: Option<U256>,
+    pub default_gas_price: Option<U256>,
 }
 
 /// Helper function to parse duration from string
@@ -250,26 +252,68 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     }
 }
 
-impl Default for XLayerGasPriceArgs {
-    fn default() -> Self {
-        Self {
-            price_type: None,
-            update_period: None,
-            factor: None,
-            kafka_url: None,
-            topic: None,
-            group_id: None,
-            username: None,
-            password: None,
-            root_ca_path: None,
-            l1_coin_id: None,
-            l2_coin_id: None,
-            default_l1_coin_price: None,
-            default_l2_coin_price: None,
-            gas_price_usdt: None,
-            congestion_threshold: None,
-            default: None,
+impl XLayerGasPriceArgs {
+    /// Validate gas price configuration
+    pub fn validate(&self) -> Result<(), String> {
+        // If price_type is not specified, no validation needed
+        let Some(price_type) = &self.price_type else {
+            return Ok(());
+        };
+
+        // Validate price_type is one of the supported types
+        match price_type.as_str() {
+            "default" | "follower" | "fixed" => {}
+            _ => {
+                return Err(format!(
+                    "Invalid gas price type '{}'. Must be 'default', 'follower', or 'fixed'",
+                    price_type
+                ))
+            }
         }
+
+        // Validate update_period if specified
+        if let Some(period) = self.update_period {
+            if period.is_zero() {
+                return Err("Gas price update period must be greater than zero".to_string());
+            }
+        }
+
+        // Validate factor if specified
+        if let Some(factor) = self.factor {
+            if factor <= Decimal::ZERO {
+                return Err("Gas price factor must be greater than zero".to_string());
+            }
+        }
+
+        // Validate coin IDs if specified
+        if let Some(l1_coin_id) = self.l1_coin_id {
+            if l1_coin_id < 0 {
+                return Err("L1 coin ID must be non-negative".to_string());
+            }
+        }
+
+        if let Some(l2_coin_id) = self.l2_coin_id {
+            if l2_coin_id < 0 {
+                return Err("L2 coin ID must be non-negative".to_string());
+            }
+        }
+
+        // Validate default coin prices if specified
+        if let Some(price) = self.default_l1_coin_price {
+            if price <= Decimal::ZERO {
+                return Err("Default L1 coin price must be greater than zero".to_string());
+            }
+        }
+
+        if let Some(price) = self.default_l2_coin_price {
+            if price <= Decimal::ZERO {
+                return Err("Default L2 coin price must be greater than zero".to_string());
+            }
+        }
+
+        // TODO: add follower and fixed type validation
+
+        Ok(())
     }
 }
 
@@ -279,7 +323,7 @@ impl reth_xlayer_gasprice::suggester::XLayerGasPriceArgsTrait for XLayerGasPrice
     }
 
     fn default(&self) -> Option<alloy_primitives::U256> {
-        self.default
+        self.default_gas_price
     }
 }
 
@@ -486,6 +530,7 @@ mod tests {
 
     #[test]
     fn test_parse_xlayer_gas_price_args() {
+        use std::str::FromStr;
         let args = CommandParser::<XLayerGasPriceArgs>::parse_from([
             "reth",
             "--xlayer.gasprice.type",
@@ -495,7 +540,7 @@ mod tests {
         ])
         .args;
         assert_eq!(args.price_type, Some("follower".to_string()));
-        assert_eq!(args.factor, Some(1.5));
+        assert_eq!(args.factor, Some(Decimal::from_str("1.5").unwrap()));
     }
 
     #[test]
@@ -505,5 +550,131 @@ mod tests {
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert!(parse_duration("invalid").is_err());
+    }
+
+    #[test]
+    fn test_gas_price_validate_no_type() {
+        let args = XLayerGasPriceArgs::default();
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gas_price_validate_invalid_type() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("invalid".to_string()),
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_gas_price_validate_fixed_without_usdt() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("fixed".to_string()),
+            gas_price_usdt: None,
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_gas_price_validate_fixed_with_valid_usdt() {
+        use std::str::FromStr;
+        let args = XLayerGasPriceArgs {
+            price_type: Some("fixed".to_string()),
+            gas_price_usdt: Some(Decimal::from_str("0.001").unwrap()),
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gas_price_validate_fixed_with_zero_usdt() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("fixed".to_string()),
+            gas_price_usdt: Some(Decimal::ZERO),
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_gas_price_validate_follower_without_kafka() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("follower".to_string()),
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_gas_price_validate_follower_with_kafka() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("follower".to_string()),
+            kafka_url: Some("localhost:9092".to_string()),
+            topic: Some("gas-price".to_string()),
+            group_id: Some("reth-consumer".to_string()),
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gas_price_validate_default_type() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("default".to_string()),
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gas_price_validate_negative_coin_id() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("default".to_string()),
+            l1_coin_id: Some(-1),
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_gas_price_validate_zero_factor() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("default".to_string()),
+            factor: Some(Decimal::ZERO),
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_gas_price_validate_zero_update_period() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("default".to_string()),
+            update_period: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_gas_price_validate_negative_congestion_threshold() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("default".to_string()),
+            congestion_threshold: Some(-1),
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_gas_price_validate_zero_default_coin_price() {
+        let args = XLayerGasPriceArgs {
+            price_type: Some("default".to_string()),
+            default_l1_coin_price: Some(Decimal::ZERO),
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
     }
 }

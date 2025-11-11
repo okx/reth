@@ -46,8 +46,8 @@ pub fn new_l2_gas_price_suggester<T: XLayerGasPriceArgsTrait>(args: &T) -> Arc<d
         //     Arc::new(FixedGasPricer::new(args))
         // }
         _ => {
-            tracing::error!("Invalid gas price type: {}", price_type);
-            panic!("Invalid gas price type: {}", price_type);
+            tracing::warn!("Invalid gas price type: {}, use default mode", price_type);
+            Arc::new(DefaultGasPricer::new(args.default()))
         }
     }
 }

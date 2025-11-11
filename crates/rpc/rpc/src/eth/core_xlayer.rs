@@ -30,3 +30,19 @@ where
     }
 }
 
+/// XLayer: Implement XLayerFees trait for EthApi with default L1 behavior
+///
+/// For L1 Ethereum nodes, XLayer-specific features are not needed:
+/// - No L2 gas pricer
+/// - No sequencer forwarding
+/// - Uses standard EthFees implementations
+impl<N, Rpc> reth_rpc_eth_api::helpers::XLayerFees for EthApi<N, Rpc>
+where
+    N: RpcNodeCore,
+    reth_rpc_eth_types::EthApiError: reth_rpc_eth_api::FromEvmError<N::Evm>,
+    Rpc: RpcConvert<Primitives = N::Primitives, Error = reth_rpc_eth_types::EthApiError>,
+{
+    /// L1 nodes don't need sequencer forwarding
+    type SequencerClient = ();
+}
+

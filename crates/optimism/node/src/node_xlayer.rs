@@ -77,7 +77,7 @@ pub(crate) fn initialize_xlayer_gas_price_controller<Node, EthApi>(
         reth_xlayer_gasprice::scheduler::XLayerScheduler::with_eth_api(
             pricer,
             eth_api,
-            gas_price.default,
+            gas_price.default_gas_price,
             gas_price.update_period,
             gas_price.congestion_threshold,
         )

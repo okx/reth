@@ -571,6 +571,7 @@ parking_lot = "0.12"
 paste = "1.0"
 rand = "0.9"
 rayon = "1.7"
+rust_decimal = { version = "1.39", default-features = false, features = ["std"] }
 rustc-hash = { version = "2.0", default-features = false }
 schnellru = "0.2"
 serde = { version = "1.0", default-features = false }
