@@ -9,7 +9,7 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
-reth-db.workspace = true
+reth-db = { workspace = true, features = ["mdbx"] }
 reth-revm.workspace = true
 
 revm-context-interface.workspace = true
