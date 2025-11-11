@@ -197,18 +197,6 @@ macro_rules! try_local_then_legacy {
     }};
 }
 
-/// Route to legacy if configured, otherwise use local (for stateless queries)
-#[macro_export]
-macro_rules! route_if_legacy_configured {
-    ($self:ident, $legacy_call:expr, $local_expr:expr) => {{
-        if let Some(_legacy_client) = $self.legacy_rpc_client() {
-            tracing::info!(target: "rpc::eth::legacy", "→ legacy");
-            return $crate::helpers::exec_legacy("", $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc);
-        }
-        $local_expr
-    }};
-}
-
 /// Conditional route by block_id with type conversion (for eth_call, eth_estimateGas, etc.)
 #[macro_export]
 macro_rules! route_conditional_with_convert {
