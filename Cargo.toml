@@ -87,6 +87,8 @@ members = [
     "crates/optimism/rpc/",
     "crates/optimism/storage",
     "crates/optimism/txpool/",
+    "crates/xlayer/gasprice/",
+    "crates/xlayer/txpool/",
     "crates/payload/basic/",
     "crates/payload/builder/",
     "crates/payload/builder-primitives/",
@@ -421,6 +423,8 @@ reth-optimism-primitives = { path = "crates/optimism/primitives", default-featur
 reth-optimism-rpc = { path = "crates/optimism/rpc" }
 reth-optimism-storage = { path = "crates/optimism/storage" }
 reth-optimism-txpool = { path = "crates/optimism/txpool" }
+reth-xlayer-gasprice = { path = "crates/xlayer/gasprice" }
+reth-xlayer-txpool = { path = "crates/xlayer/txpool" }
 reth-payload-builder = { path = "crates/payload/builder" }
 reth-payload-builder-primitives = { path = "crates/payload/builder-primitives" }
 reth-payload-primitives = { path = "crates/payload/primitives" }
@@ -567,6 +571,7 @@ parking_lot = "0.12"
 paste = "1.0"
 rand = "0.9"
 rayon = "1.7"
+rust_decimal = { version = "1.39", default-features = false, features = ["std"] }
 rustc-hash = { version = "2.0", default-features = false }
 schnellru = "0.2"
 serde = { version = "1.0", default-features = false }
@@ -781,7 +786,6 @@ vergen-git2 = "1.0.5"
 
 [patch.crates-io]
 alloy-consensus = { git = "https://github.com/alloy-rs/alloy", rev = "35bc323cc23911e52cb1ec8f6a58ebb5d5869b27" }
-alloy-contract = { git = "https://github.com/alloy-rs/alloy", rev = "35bc323cc23911e52cb1ec8f6a58ebb5d5869b27" }
 alloy-eips = { git = "https://github.com/alloy-rs/alloy", rev = "35bc323cc23911e52cb1ec8f6a58ebb5d5869b27" }
 alloy-genesis = { git = "https://github.com/alloy-rs/alloy", rev = "35bc323cc23911e52cb1ec8f6a58ebb5d5869b27" }
 alloy-json-rpc = { git = "https://github.com/alloy-rs/alloy", rev = "35bc323cc23911e52cb1ec8f6a58ebb5d5869b27" }

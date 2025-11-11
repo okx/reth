@@ -7,6 +7,7 @@ pub mod ext_xlayer;
 
 mod block;
 mod call;
+mod mod_xlayer;
 mod pending_block;
 
 use crate::{
@@ -30,7 +31,7 @@ use reth_optimism_flashblocks::{
 use reth_rpc::eth::core::EthApiInner;
 use reth_rpc_eth_api::{
     helpers::{
-        pending_block::BuildPendingEnv, EthApiSpec, EthFees, EthState, LoadFee, LoadPendingBlock,
+        fee_xlayer::PricerStorage, pending_block::BuildPendingEnv, EthApiSpec, EthFees, EthState, LoadFee, LoadPendingBlock,
         LoadState, SpawnBlocking, Trace,
     },
     EthApiTypes, FromEvmError, FullEthApiServer, RpcConvert, RpcConverter, RpcNodeCore,
@@ -94,6 +95,7 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
             sequencer_client,
             min_suggested_priority_fee,
             flashblocks,
+            pricer: PricerStorage::default(),
         });
         Self { inner }
     }
@@ -359,6 +361,8 @@ pub struct OpEthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     ///
     /// If set, provides receivers for pending blocks, flashblock sequences, and build status.
     flashblocks: Option<FlashblocksListeners<N::Primitives>>,
+    /// L2 gas price pricer storage for XLayer support.
+    pricer: PricerStorage,
 }
 
 impl<N: RpcNodeCore, Rpc: RpcConvert> fmt::Debug for OpEthApiInner<N, Rpc> {

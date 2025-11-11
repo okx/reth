@@ -3,7 +3,8 @@
 use crate::{
     args::RollupArgs,
     engine::OpEngineValidator,
-    txpool::{OpTransactionPool, OpTransactionValidator},
+    node_xlayer::{initialize_xlayer_gas_price_controller, XLayerValidatorAccess},
+    txpool::OpTransactionValidator,
     OpEngineApiBuilder, OpEngineTypes, XLayerArgs,
 };
 use op_alloy_consensus::{interop::SafetyLevel, OpPooledTransaction};
@@ -59,10 +60,11 @@ use reth_optimism_txpool::{
 use reth_provider::{providers::ProviderFactoryBuilder, CanonStateSubscriptions};
 use reth_rpc_api::{eth::{EthApiTypes, RpcTypes}, DebugApiServer, L2EthApiExtServer, XLayerEthApiExtServer};
 use reth_rpc_server_types::RethRpcModule;
+use reth_xlayer_txpool::XLayerTransactionValidator;
 use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::{
-    blobstore::DiskFileBlobStore, EthPoolTransaction, PoolPooledTx, PoolTransaction,
-    TransactionPool, TransactionValidationTaskExecutor,
+    blobstore::DiskFileBlobStore, CoinbaseTipOrdering, EthPoolTransaction, PoolPooledTx,
+    PoolTransaction, TransactionPool, TransactionValidationTaskExecutor,
 };
 use reth_trie_common::KeccakKeyHasher;
 use serde::de::DeserializeOwned;
@@ -207,6 +209,7 @@ impl OpNode {
             .with_min_suggested_priority_fee(self.args.min_suggested_priority_fee)
             .with_historical_rpc(self.args.historical_rpc.clone())
             .with_flashblocks(self.args.flashblocks_url.clone())
+            .with_xlayer_args(self.args.xlayer_args.clone())
     }
 
     /// Instantiates the [`ProviderFactoryBuilder`] for an opstack node.
@@ -330,6 +333,8 @@ pub struct OpAddOns<
     /// Enable transaction conditionals.
     enable_tx_conditional: bool,
     min_suggested_priority_fee: u64,
+    /// XLayer arguments
+    xlayer_args: XLayerArgs,
 }
 
 impl<N, EthB, PVB, EB, EVB, RpcMiddleware> OpAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
@@ -348,6 +353,7 @@ where
         historical_rpc: Option<String>,
         enable_tx_conditional: bool,
         min_suggested_priority_fee: u64,
+        xlayer_args: XLayerArgs,
     ) -> Self {
         Self {
             rpc_add_ons,
@@ -358,6 +364,7 @@ where
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
         }
     }
 }
@@ -409,6 +416,7 @@ where
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
             ..
         } = self;
         OpAddOns::new(
@@ -420,6 +428,7 @@ where
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
         )
     }
 
@@ -437,6 +446,7 @@ where
             enable_tx_conditional,
             min_suggested_priority_fee,
             historical_rpc,
+            xlayer_args,
             ..
         } = self;
         OpAddOns::new(
@@ -448,6 +458,7 @@ where
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
         )
     }
 
@@ -468,6 +479,7 @@ where
             enable_tx_conditional,
             min_suggested_priority_fee,
             historical_rpc,
+            xlayer_args,
             ..
         } = self;
         OpAddOns::new(
@@ -479,6 +491,7 @@ where
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
         )
     }
 
@@ -519,7 +532,10 @@ where
                 <N::Types as NodeTypes>::ChainSpec,
             >,
         >,
-        Pool: TransactionPool<Transaction: OpPooledTx>,
+        Pool: TransactionPool<Transaction: OpPooledTx> + XLayerValidatorAccess<
+            Provider = N::Provider,
+            Transaction = <<N as FullNodeComponents>::Pool as TransactionPool>::Transaction,
+        >,
     >,
     EthB: EthApiBuilder<N>,
     PVB: Send,
@@ -543,6 +559,7 @@ where
             sequencer_headers,
             enable_tx_conditional,
             historical_rpc,
+            xlayer_args,
             ..
         } = self;
 
@@ -593,6 +610,7 @@ where
             ctx.node.provider().clone(),
         );
 
+        let task_executor = ctx.node.task_executor().clone();
         rpc_add_ons
             .launch_add_ons_with(ctx, move |container| {
                 let reth_node_builder::rpc::RpcModuleContainer { modules, auth_module, registry } =
@@ -633,6 +651,21 @@ where
                     RethRpcModule::Eth,
                     XLayerEthApiExtServer::<OpTransactionRequest>::into_rpc(xlayer_eth_ext),
                 )?;
+                
+                // For xlayer: gas price controller
+                if let Some(ref price_type) = xlayer_args.gas_price.price_type {
+                    if !price_type.is_empty() {
+                        // Get validator from the transaction pool using the extension trait
+                        let validator = registry.pool().get_xlayer_validator();
+                        
+                        initialize_xlayer_gas_price_controller(
+                            &xlayer_args.gas_price,
+                            registry,
+                            task_executor,
+                            validator,
+                        );
+                    }
+                }
 
                 Ok(())
             })
@@ -656,8 +689,11 @@ where
                 <N::Types as NodeTypes>::ChainSpec,
             >,
         >,
+        Pool: TransactionPool<Transaction: OpPooledTx> + XLayerValidatorAccess<
+            Provider = N::Provider,
+            Transaction = <<N as FullNodeComponents>::Pool as TransactionPool>::Transaction,
+        >,
     >,
-    <<N as FullNodeComponents>::Pool as TransactionPool>::Transaction: OpPooledTx,
     EthB: EthApiBuilder<N>,
     PVB: PayloadValidatorBuilder<N>,
     EB: EngineApiBuilder<N>,
@@ -717,6 +753,8 @@ pub struct OpAddOnsBuilder<NetworkT, RpcMiddleware = Identity> {
     tokio_runtime: Option<tokio::runtime::Handle>,
     /// A URL pointing to a secure websocket service that streams out flashblocks.
     flashblocks_url: Option<Url>,
+    /// XLayer arguments
+    xlayer_args: XLayerArgs,
 }
 
 impl<NetworkT> Default for OpAddOnsBuilder<NetworkT> {
@@ -733,6 +771,7 @@ impl<NetworkT> Default for OpAddOnsBuilder<NetworkT> {
             rpc_middleware: Identity::new(),
             tokio_runtime: None,
             flashblocks_url: None,
+            xlayer_args: XLayerArgs::default(),
         }
     }
 }
@@ -801,6 +840,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             tokio_runtime,
             _nt,
             flashblocks_url,
+            xlayer_args,
             ..
         } = self;
         OpAddOnsBuilder {
@@ -815,12 +855,19 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             rpc_middleware,
             tokio_runtime,
             flashblocks_url,
+            xlayer_args,
         }
     }
 
     /// With a URL pointing to a flashblocks secure websocket subscription.
     pub fn with_flashblocks(mut self, flashblocks_url: Option<Url>) -> Self {
         self.flashblocks_url = flashblocks_url;
+        self
+    }
+    
+    /// With XLayer arguments.
+    pub fn with_xlayer_args(mut self, xlayer_args: XLayerArgs) -> Self {
+        self.xlayer_args = xlayer_args;
         self
     }
 }
@@ -848,6 +895,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             rpc_middleware,
             tokio_runtime,
             flashblocks_url,
+            xlayer_args,
             ..
         } = self;
 
@@ -871,6 +919,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             historical_rpc,
             enable_tx_conditional,
             min_suggested_priority_fee,
+            xlayer_args,
         )
     }
 }
@@ -969,7 +1018,11 @@ where
     Node: FullNodeTypes<Types: NodeTypes<ChainSpec: OpHardforks>>,
     T: EthPoolTransaction<Consensus = TxTy<Node::Types>> + OpPooledTx,
 {
-    type Pool = OpTransactionPool<Node::Provider, DiskFileBlobStore, T>;
+    type Pool = reth_transaction_pool::Pool<
+        TransactionValidationTaskExecutor<XLayerTransactionValidator<Node::Provider, T>>,
+        CoinbaseTipOrdering<T>,
+        DiskFileBlobStore,
+    >;
 
     async fn build_pool(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Pool> {
         let Self { pool_config_overrides, .. } = self;
@@ -1004,11 +1057,13 @@ where
             )
             .build_with_tasks(ctx.task_executor().clone(), blob_store.clone())
             .map(|validator| {
-                OpTransactionValidator::new(validator)
+                let op_validator = OpTransactionValidator::new(validator)
                     // In --dev mode we can't require gas fees because we're unable to decode
                     // the L1 block info
                     .require_l1_data_gas_fee(!ctx.config().dev.dev)
-                    .with_supervisor(supervisor_client.clone())
+                    .with_supervisor(supervisor_client.clone());
+                // For xlayer: wrap the op transaction validator within the xlayer transaction validator
+                XLayerTransactionValidator::new(op_validator)
             });
 
         let final_pool_config = pool_config_overrides.apply(ctx.pool_config());

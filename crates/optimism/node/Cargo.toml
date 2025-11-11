@@ -25,12 +25,13 @@ reth-transaction-pool.workspace = true
 reth-network.workspace = true
 reth-evm.workspace = true
 reth-rpc-server-types.workspace = true
-reth-tasks = { workspace = true, optional = true }
+reth-tasks.workspace = true
 reth-trie-common.workspace = true
 reth-node-core.workspace = true
 reth-rpc-engine-api.workspace = true
 reth-engine-local = { workspace = true, features = ["op"] }
 reth-rpc-api.workspace = true
+reth-rpc-eth-api.workspace = true
 
 # op-reth
 reth-optimism-payload-builder.workspace = true
@@ -42,6 +43,10 @@ reth-optimism-chainspec.workspace = true
 reth-optimism-consensus = { workspace = true, features = ["std"] }
 reth-optimism-forks.workspace = true
 reth-optimism-primitives = { workspace = true, features = ["serde", "serde-bincode-compat", "reth-codec"] }
+
+# xlayer
+reth-xlayer-gasprice.workspace = true
+reth-xlayer-txpool.workspace = true
 
 # revm with required optimism features
 # Note: this must be kept to ensure all features are properly enabled/forwarded
@@ -65,6 +70,7 @@ clap.workspace = true
 serde.workspace = true
 eyre.workspace = true
 url.workspace = true
+rust_decimal.workspace = true
 
 # test-utils dependencies
 reth-e2e-test-utils = { workspace = true, optional = true }
@@ -101,7 +107,6 @@ js-tracer = [
     "reth-rpc-eth-types/js-tracer",
 ]
 test-utils = [
-    "reth-tasks",
     "reth-e2e-test-utils",
     "alloy-genesis",
     "serde_json",

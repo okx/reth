@@ -8,6 +8,8 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+use reth_rpc_convert as _;
+
 pub mod engine;
 pub mod error;
 pub mod eth;

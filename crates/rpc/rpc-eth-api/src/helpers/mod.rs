@@ -21,7 +21,9 @@ pub mod config;
 pub mod estimate;
 pub mod fee;
 pub mod legacy_xlayer;
+pub mod fee_xlayer;
 pub mod pending_block;
+pub mod pricer;
 pub mod receipt;
 pub mod signer;
 pub mod spec;
@@ -37,7 +39,9 @@ pub use legacy_xlayer::{
     boxed_err_to_rpc, convert_option_via_serde, convert_via_serde, exec_legacy, internal_rpc_err,
     should_route_block_id_to_legacy, should_route_to_legacy, LegacyRpc,
 };
+pub use fee_xlayer::{PricerStorage, XLayerFees};
 pub use pending_block::LoadPendingBlock;
+pub use pricer::{GasPriceCacheTrait, L2GasPricer};
 pub use receipt::LoadReceipt;
 pub use signer::EthSigner;
 pub use spec::EthApiSpec;
@@ -62,7 +66,7 @@ pub trait FullEthApi:
     + EthBlocks
     + EthState
     + EthCall
-    + EthFees
+    + XLayerFees
     + Trace
     + LoadReceipt
 {
@@ -75,7 +79,7 @@ impl<T> FullEthApi for T where
         + EthBlocks
         + EthState
         + EthCall
-        + EthFees
+        + XLayerFees
         + Trace
         + LoadReceipt
 {
