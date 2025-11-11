@@ -29,16 +29,11 @@ fn main() {
         Cli::<OpChainSpecParser, RollupArgs>::parse().run(async move |builder, rollup_args| {
             let data_dir = builder.config().datadir();
             let db_path = data_dir.db().parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
-            let initialize_result = initialize(db_path);
-
-            if let Err(e) = initialize_result {
-                error!(target: "reth::cli", "xlayer db failed to initialize {:#?}", e);
-            } else {
-                info!(target: "reth::cli", "xlayer db initialized");
+            match initialize(db_path) {
+                Ok(_) =>  info!(target: "reth::cli", "xlayer db initialized"),
+                Err(e) => error!(target: "reth::cli", "xlayer db failed to initialize {:#?}", e),
             }
-
             info!(target: "reth::cli", "Launching node");
-
 
             // For X Layer
             if rollup_args.xlayer_args.apollo.enabled {

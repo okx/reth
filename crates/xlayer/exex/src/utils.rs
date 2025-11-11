@@ -88,7 +88,6 @@ where
     Ok(())
 }
 
-// block 的 type 从 evm_config 来 infer eth/op
 fn remove_block<E, N>(_: E, block: RecoveredBlock<<N as NodePrimitives>::Block>) -> Result<()>
 where
     E: ConfigureEvm<Primitives = N> + Send + Sync + 'static,
@@ -111,16 +110,16 @@ pub async fn post_exec_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>
     while let Some(notif) = ctx.notifications.try_next().await? {
         match &notif {
             ExExNotification::ChainCommitted { new } => {
-                info!(target:"reth::cli", "ok exex chainCommitted new range {:#?}", new.range());
+                info!(target:"reth::cli", "xlayer exex chainCommitted new range {:#?}", new.range());
 
                 for block in new.blocks_iter() {
-                    info!(target:"reth::cli", "ok exex chainCommitted new block {:#?}", block.hash());
+                    info!(target:"reth::cli", "xlayer exex chainCommitted new block {:#?}", block.hash());
 
                     let provider = ctx.provider().clone();
                     let evm_config = ctx.evm_config().clone();
 
                     if let Err(err) = replay_and_index_block(provider, evm_config, block.clone()) {
-                        error!(target:"reth::cli", "ok exex chainCommitted failed to process new block {:#?} with error {:#?}", block.hash(), err);
+                        error!(target:"reth::cli", "xlayer exex chainCommitted failed to process new block {:#?} with error {:#?}", block.hash(), err);
                     }
                 }
 
@@ -128,41 +127,41 @@ pub async fn post_exec_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>
                 ctx.events.send(ExExEvent::FinishedHeight(new.tip().num_hash()))?;
             }
             ExExNotification::ChainReorged { old, new } => {
-                info!(target:"reth::cli", "ok exex chainReorged old range {:#?} new range {:#?}", old.range(), new.range());
+                info!(target:"reth::cli", "xlayer exex chainReorged old range {:#?} new range {:#?}", old.range(), new.range());
 
                 for block in old.blocks_iter() {
-                    info!(target:"reth::cli", "ok exex chainReorged old block {:#?}", block.hash());
+                    info!(target:"reth::cli", "xlayer exex chainReorged old block {:#?}", block.hash());
 
                     let evm_config = ctx.evm_config().clone();
 
                     if let Err(err) = remove_block(evm_config, block.clone()) {
-                        error!(target:"reth::cli", "ok exex chainReorged failed to reorg old block {:#?} with error {:#?}", block.hash(), err);
+                        error!(target:"reth::cli", "xlayer exex chainReorged failed to reorg old block {:#?} with error {:#?}", block.hash(), err);
                     }
                 }
 
                 for block in new.blocks_iter() {
-                    info!(target:"reth::cli", "ok exex chainReorged new block {:#?}", block.hash());
+                    info!(target:"reth::cli", "xlayer exex chainReorged new block {:#?}", block.hash());
 
                     let provider = ctx.provider().clone();
                     let evm_config = ctx.evm_config().clone();
 
                     if let Err(err) = replay_and_index_block(provider, evm_config, block.clone()) {
-                        error!(target:"reth::cli", "ok exex chainReorged failed to process new block {:#?} with error {:#?}", block.hash(), err);
+                        error!(target:"reth::cli", "xlayer exex chainReorged failed to process new block {:#?} with error {:#?}", block.hash(), err);
                     }
                 }
 
                 ctx.events.send(ExExEvent::FinishedHeight(new.tip().num_hash()))?;
             }
             ExExNotification::ChainReverted { old } => {
-                info!(target:"reth::cli", "ok exex chainReverted old range {:#?}", old.range());
+                info!(target:"reth::cli", "xlayer exex chainReverted old range {:#?}", old.range());
 
                 for block in old.blocks_iter() {
-                    info!(target:"reth::cli", "ok exex chainReverted old block {:#?}", block.hash());
+                    info!(target:"reth::cli", "xlayer exex chainReverted old block {:#?}", block.hash());
 
                     let evm_config = ctx.evm_config().clone();
 
                     if let Err(err) = remove_block(evm_config, block.clone()) {
-                        error!(target:"reth::cli", "ok exex chainReverted failed to revert old block {:#?} with error {:#?}", block.hash(), err);
+                        error!(target:"reth::cli", "xlayer exex chainReverted failed to revert old block {:#?} with error {:#?}", block.hash(), err);
                     }
                 }
             }

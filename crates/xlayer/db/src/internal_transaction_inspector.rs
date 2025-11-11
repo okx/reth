@@ -240,7 +240,6 @@ where
         if txn.is_error {
             for within in remainder {
                 within.is_error = txn.is_error;
-                within.error = txn.error.clone();
             }
         }
 
@@ -279,11 +278,9 @@ where
         txn.is_error = !outcome.result.is_ok();
         txn.error =
             if txn.is_error { Self::format_error(&outcome.result.result) } else { String::new() };
-
         if txn.is_error {
             for within in remainder {
                 within.is_error = txn.is_error;
-                within.error = txn.error.clone();
             }
         }
 
