@@ -127,13 +127,29 @@ macro_rules! route_by_number {
 #[macro_export]
 macro_rules! route_by_block_id {
     ($method:literal, $self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
-        if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), Some($block_id)) {
-            tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$block_id, "→ legacy");
-            let result = $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc)?;
-            $crate::helpers::convert_option_via_serde(result)
-        } else {
-            $local_expr
+        if let Some(_legacy_client) = $self.legacy_rpc_client() {
+            // For BlockId::Number, check cutoff and route directly
+            if let ::alloy_eips::BlockId::Number(number) = &$block_id {
+                if $crate::helpers::should_route_to_legacy(Some(_legacy_client), (*number).clone()) {
+                    tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$block_id, "→ legacy");
+                    let result = $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc)?;
+                    return $crate::helpers::convert_option_via_serde(result);
+                }
+            }
+
+            // For BlockId::Hash, try local first, fallback to legacy if None
+            if let ::alloy_eips::BlockId::Hash(_) = &$block_id {
+                let local_result = $local_expr;
+                if local_result.as_ref().ok().and_then(|v| v.as_ref()).is_none() {
+                    tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$block_id, "→ legacy (fallback)");
+                    let result = $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc)?;
+                    return $crate::helpers::convert_option_via_serde(result);
+                }
+                return local_result;
+            }
         }
+
+        $local_expr
     }};
 }
 
@@ -141,12 +157,27 @@ macro_rules! route_by_block_id {
 #[macro_export]
 macro_rules! route_by_block_id_opt {
     ($method:literal, $self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
-        if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), $block_id) {
-            tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$block_id, "→ legacy");
-            $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc)
-        } else {
-            $local_expr
+        if let Some(_legacy_client) = $self.legacy_rpc_client() {
+            // For Some(BlockId::Number), check cutoff and route directly
+            if let Some(::alloy_eips::BlockId::Number(number)) = $block_id.as_ref() {
+                if $crate::helpers::should_route_to_legacy(Some(_legacy_client), (*number).clone()) {
+                    tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$block_id, "→ legacy");
+                    return $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc);
+                }
+            }
+
+            // For Some(BlockId::Hash), try local first, fallback to legacy on error
+            if matches!($block_id.as_ref(), Some(::alloy_eips::BlockId::Hash(_))) {
+                let local_result = $local_expr;
+                if local_result.is_err() {
+                    tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$block_id, "→ legacy (fallback)");
+                    return $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc);
+                }
+                return local_result;
+            }
         }
+
+        $local_expr
     }};
 }
 
