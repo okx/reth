@@ -191,7 +191,7 @@ pub enum EthApiError {
     CallManyError {
         /// Bundle index where the error occurred
         bundle_index: usize,
-        /// Transaction index within the bundle where the error occurred
+        /// Transaction index within the bundle where the error occurred  
         tx_index: usize,
         /// The underlying error object
         error: jsonrpsee_types::ErrorObject<'static>,
@@ -1106,7 +1106,7 @@ mod tests {
             EthApiError::HeaderNotFound(BlockId::hash(b256!(
                 "0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
             )))
-                .into();
+            .into();
         assert_eq!(
             err.message(),
             "block not found: hash 0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
@@ -1115,7 +1115,7 @@ mod tests {
             EthApiError::HeaderNotFound(BlockId::hash_canonical(b256!(
                 "0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
             )))
-                .into();
+            .into();
         assert_eq!(
             err.message(),
             "block not found: canonical hash 0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
@@ -1140,7 +1140,7 @@ mod tests {
             EthApiError::ReceiptsNotFound(BlockId::hash(b256!(
                 "0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
             )))
-                .into();
+            .into();
         assert_eq!(
             err.message(),
             "block not found: hash 0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
@@ -1149,7 +1149,7 @@ mod tests {
             EthApiError::ReceiptsNotFound(BlockId::hash_canonical(b256!(
                 "0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
             )))
-                .into();
+            .into();
         assert_eq!(
             err.message(),
             "block not found: canonical hash 0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
