@@ -197,22 +197,6 @@ macro_rules! try_local_then_legacy {
     }};
 }
 
-/// Conditional route by block_id with type conversion (for eth_call, eth_estimateGas, etc.)
-#[macro_export]
-macro_rules! route_conditional_with_convert {
-    ($self:ident, $condition:expr, $block_id:ident, $request:ident, $legacy_method:ident, $local_expr:expr) => {{
-        if $condition {
-            if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), $block_id) {
-                tracing::info!(target: "rpc::eth::legacy", block = ?$block_id, "→ legacy");
-                let tx_req = $crate::helpers::convert_via_serde($request)?;
-                let legacy_fut = $self.legacy_rpc_client().unwrap().$legacy_method(tx_req, $block_id);
-                return $crate::helpers::exec_legacy("", legacy_fut).await.map_err($crate::helpers::boxed_err_to_rpc);
-            }
-        }
-        $local_expr
-    }};
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
