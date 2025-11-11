@@ -5,7 +5,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod chain;
 /// The metrics hooks for prometheus.
@@ -14,6 +14,11 @@ pub mod recorder;
 /// The metric server serving the metrics.
 pub mod server;
 pub mod version;
+/// Transaction tracing for monitoring transaction lifecycle (X Layer)
+pub mod transaction_trace_xlayer;
 
 pub use metrics_exporter_prometheus::*;
 pub use metrics_process::*;
+pub use transaction_trace_xlayer::TransactionTracer;
+// Re-export transaction trace module items for convenience
+pub use transaction_trace_xlayer::{get_global_tracer, init_global_tracer, flush_global_tracer, TransactionProcessId};

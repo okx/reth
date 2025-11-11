@@ -1,23 +1,23 @@
 //! Optimism payload builder implementation.
-
 use crate::{
-    config::{OpBuilderConfig, OpDAConfig},
-    error::OpPayloadBuilderError,
-    payload::OpBuiltPayload,
-    OpAttributes, OpPayloadBuilderAttributes, OpPayloadPrimitives,
+    config::OpBuilderConfig, error::OpPayloadBuilderError, payload::OpBuiltPayload, OpAttributes,
+    OpPayloadBuilderAttributes, OpPayloadPrimitives,intercept_xlayer::BridgeInterceptConfig,
 };
 use alloy_consensus::{BlockHeader, Transaction, Typed2718};
+use alloy_evm::Evm as AlloyEvm;
 use alloy_primitives::{B256, U256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_rpc_types_engine::PayloadId;
 use reth_basic_payload_builder::*;
-use reth_chain_state::{ExecutedBlock, ExecutedBlockWithTrieUpdates, ExecutedTrieUpdates};
+use reth_chain_state::ExecutedBlock;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_evm::{
+    block::BlockExecutorFor,
     execute::{
         BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockExecutor, BlockValidationError,
     },
-    ConfigureEvm, Database, Evm,
+    op_revm::{constants::L1_BLOCK_CONTRACT, L1BlockInfo},
+    ConfigureEvm, Database,
 };
 use reth_execution_types::ExecutionOutcome;
 use reth_optimism_forks::OpHardforks;
@@ -42,6 +42,7 @@ use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, Transac
 use revm::context::{Block, BlockEnv};
 use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, trace, warn};
+use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
 
 /// Optimism's payload builder
 #[derive(Debug)]
@@ -63,6 +64,8 @@ pub struct OpPayloadBuilder<
     pub client: Client,
     /// Settings for the builder, e.g. DA settings.
     pub config: OpBuilderConfig,
+    /// Bridge transaction interception configuration
+    pub bridge_intercept: BridgeInterceptConfig,
     /// The type responsible for yielding the best transactions for the payload if mempool
     /// transactions are allowed.
     pub best_transactions: Txs,
@@ -83,6 +86,7 @@ where
             pool: self.pool.clone(),
             client: self.client.clone(),
             config: self.config.clone(),
+            bridge_intercept: self.bridge_intercept.clone(),
             best_transactions: self.best_transactions.clone(),
             compute_pending_block: self.compute_pending_block,
             _pd: PhantomData,
@@ -95,7 +99,13 @@ impl<Pool, Client, Evm, Attrs> OpPayloadBuilder<Pool, Client, Evm, (), Attrs> {
     ///
     /// Configures the builder with the default settings.
     pub fn new(pool: Pool, client: Client, evm_config: Evm) -> Self {
-        Self::with_builder_config(pool, client, evm_config, Default::default())
+        Self::with_builder_config(
+            pool,
+            client,
+            evm_config,
+            BridgeInterceptConfig::default(),
+            Default::default(),
+        )
     }
 
     /// Configures the builder with the given [`OpBuilderConfig`].
@@ -103,6 +113,7 @@ impl<Pool, Client, Evm, Attrs> OpPayloadBuilder<Pool, Client, Evm, (), Attrs> {
         pool: Pool,
         client: Client,
         evm_config: Evm,
+        bridge_intercept: BridgeInterceptConfig,
         config: OpBuilderConfig,
     ) -> Self {
         Self {
@@ -111,6 +122,7 @@ impl<Pool, Client, Evm, Attrs> OpPayloadBuilder<Pool, Client, Evm, (), Attrs> {
             compute_pending_block: true,
             evm_config,
             config,
+            bridge_intercept,
             best_transactions: (),
             _pd: PhantomData,
         }
@@ -130,12 +142,15 @@ impl<Pool, Client, Evm, Txs, Attrs> OpPayloadBuilder<Pool, Client, Evm, Txs, Att
         self,
         best_transactions: T,
     ) -> OpPayloadBuilder<Pool, Client, Evm, T, Attrs> {
-        let Self { pool, client, compute_pending_block, evm_config, config, .. } = self;
+        let Self {
+            pool, client, compute_pending_block, evm_config, config, bridge_intercept, ..
+        } = self;
         OpPayloadBuilder {
             pool,
             client,
             compute_pending_block,
             evm_config,
+            bridge_intercept,
             best_transactions,
             config,
             _pd: PhantomData,
@@ -185,7 +200,8 @@ where
 
         let ctx = OpPayloadBuilderCtx {
             evm_config: self.evm_config.clone(),
-            da_config: self.config.da_config.clone(),
+            builder_config: self.config.clone(),
+            bridge_intercept: self.bridge_intercept.clone(),
             chain_spec: self.client.chain_spec(),
             config,
             cancel,
@@ -221,9 +237,10 @@ where
         let config = PayloadConfig { parent_header: Arc::new(parent), attributes };
         let ctx = OpPayloadBuilderCtx {
             evm_config: self.evm_config.clone(),
-            da_config: self.config.da_config.clone(),
+            builder_config: self.config.clone(),
             chain_spec: self.client.chain_spec(),
             config,
+            bridge_intercept: self.bridge_intercept.clone(),
             cancel: Default::default(),
             best_payload: Default::default(),
         };
@@ -338,7 +355,18 @@ impl<Txs> OpBuilder<'_, Txs> {
         let Self { best } = self;
         debug!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
 
+        // X Layer: Save block build start timestamp
+        let build_start_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+
         let mut db = State::builder().with_database(db).with_bundle_update().build();
+
+        // Load the L1 block contract into the database cache. If the L1 block contract is not
+        // pre-loaded the database will panic when trying to fetch the DA footprint gas
+        // scalar.
+        db.load_cache_account(L1_BLOCK_CONTRACT).map_err(BlockExecutionError::other)?;
 
         let mut builder = ctx.block_builder(&mut db)?;
 
@@ -354,7 +382,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         // 3. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool() {
             let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
-            if ctx.execute_best_transactions(&mut info, &mut builder, best_txs)?.is_some() {
+            if ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?.is_some() {
                 return Ok(BuildOutcomeKind::Cancelled)
             }
 
@@ -368,6 +396,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(state_provider)?;
 
+
         let sealed_block = Arc::new(block.sealed_block().clone());
         debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
 
@@ -379,19 +408,37 @@ impl<Txs> OpBuilder<'_, Txs> {
         );
 
         // create the executed block data
-        let executed: ExecutedBlockWithTrieUpdates<N> = ExecutedBlockWithTrieUpdates {
-            block: ExecutedBlock {
-                recovered_block: Arc::new(block),
-                execution_output: Arc::new(execution_outcome),
-                hashed_state: Arc::new(hashed_state),
-            },
-            trie: ExecutedTrieUpdates::Present(Arc::new(trie_updates)),
+        let executed: ExecutedBlock<N> = ExecutedBlock {
+            recovered_block: Arc::new(block),
+            execution_output: Arc::new(execution_outcome),
+            hashed_state: Arc::new(hashed_state),
+            trie_updates: Arc::new(trie_updates),
         };
 
         let no_tx_pool = ctx.attributes().no_tx_pool();
 
+        // X Layer: Log block build start and end (success)
+        let block_hash = sealed_block.hash();
+        let block_number = sealed_block.number();
+
         let payload =
             OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed));
+        if let Some(tracer) = get_global_tracer() {
+            // Log block build start using saved timestamp (now we have the block hash)
+            tracer.log_block_with_timestamp(
+                block_hash,
+                block_number,
+                TransactionProcessId::SeqBlockBuildStart,
+                build_start_timestamp,
+            );
+            
+            // Log block build end
+            tracer.log_block(
+                block_hash,
+                block_number,
+                TransactionProcessId::SeqBlockBuildEnd,
+            );
+        }
 
         if no_tx_pool {
             // if `no_tx_pool` is set only transactions from the payload attributes will be included
@@ -511,15 +558,25 @@ impl ExecutionInfo {
         tx_data_limit: Option<u64>,
         block_data_limit: Option<u64>,
         tx_gas_limit: u64,
+        da_footprint_gas_scalar: Option<u16>,
     ) -> bool {
         if tx_data_limit.is_some_and(|da_limit| tx_da_size > da_limit) {
             return true;
         }
 
-        if block_data_limit
-            .is_some_and(|da_limit| self.cumulative_da_bytes_used + tx_da_size > da_limit)
-        {
+        let total_da_bytes_used = self.cumulative_da_bytes_used.saturating_add(tx_da_size);
+
+        if block_data_limit.is_some_and(|da_limit| total_da_bytes_used > da_limit) {
             return true;
+        }
+
+        // Post Jovian: the tx DA footprint must be less than the block gas limit
+        if let Some(da_footprint_gas_scalar) = da_footprint_gas_scalar {
+            let tx_da_footprint =
+                total_da_bytes_used.saturating_mul(da_footprint_gas_scalar as u64);
+            if tx_da_footprint > block_gas_limit {
+                return true;
+            }
         }
 
         self.cumulative_gas_used + tx_gas_limit > block_gas_limit
@@ -535,12 +592,14 @@ pub struct OpPayloadBuilderCtx<
 > {
     /// The type that knows how to perform system calls and configure the evm.
     pub evm_config: Evm,
-    /// The DA config for the payload builder
-    pub da_config: OpDAConfig,
+    /// Additional config for the builder/sequencer, e.g. DA and gas limit
+    pub builder_config: OpBuilderConfig,
     /// The chainspec
     pub chain_spec: Arc<ChainSpec>,
     /// How to build the payload.
     pub config: PayloadConfig<Attrs, HeaderTy<Evm::Primitives>>,
+    /// Bridge transaction interception configuration
+    pub bridge_intercept: BridgeInterceptConfig,
     /// Marker to check whether the job has been cancelled.
     pub cancel: CancelOnDrop,
     /// The currently best payload.
@@ -556,7 +615,7 @@ where
     ChainSpec: EthChainSpec + OpHardforks,
     Attrs: OpAttributes<Transaction = TxTy<Evm::Primitives>>,
 {
-    /// Returns the parent block the payload will be build on.
+    /// Returns the parent block the payload will be built on.
     pub fn parent(&self) -> &SealedHeaderFor<Evm::Primitives> {
         self.config.parent_header.as_ref()
     }
@@ -567,9 +626,9 @@ where
     }
 
     /// Returns the current fee settings for transactions from the mempool
-    pub fn best_transaction_attributes(&self, block_env: &BlockEnv) -> BestTransactionsAttributes {
+    pub fn best_transaction_attributes(&self, block_env: impl Block) -> BestTransactionsAttributes {
         BestTransactionsAttributes::new(
-            block_env.basefee,
+            block_env.basefee(),
             block_env.blob_gasprice().map(|p| p as u64),
         )
     }
@@ -588,7 +647,13 @@ where
     pub fn block_builder<'a, DB: Database>(
         &'a self,
         db: &'a mut State<DB>,
-    ) -> Result<impl BlockBuilder<Primitives = Evm::Primitives> + 'a, PayloadBuilderError> {
+    ) -> Result<
+        impl BlockBuilder<
+                Primitives = Evm::Primitives,
+                Executor: BlockExecutorFor<'a, Evm::BlockExecutorFactory, DB>,
+            > + 'a,
+        PayloadBuilderError,
+    > {
         self.evm_config
             .builder_for_next_block(
                 db,
@@ -651,29 +716,52 @@ where
     /// Executes the given best transactions and updates the execution info.
     ///
     /// Returns `Ok(Some(())` if the job was cancelled.
-    pub fn execute_best_transactions(
+    pub fn execute_best_transactions<Builder>(
         &self,
         info: &mut ExecutionInfo,
-        builder: &mut impl BlockBuilder<Primitives = Evm::Primitives>,
+        builder: &mut Builder,
         mut best_txs: impl PayloadTransactions<
             Transaction: PoolTransaction<Consensus = TxTy<Evm::Primitives>> + OpPooledTx,
         >,
-    ) -> Result<Option<()>, PayloadBuilderError> {
-        let block_gas_limit = builder.evm_mut().block().gas_limit;
-        let block_da_limit = self.da_config.max_da_block_size();
-        let tx_da_limit = self.da_config.max_da_tx_size();
-        let base_fee = builder.evm_mut().block().basefee;
+    ) -> Result<Option<()>, PayloadBuilderError>
+    where
+        Builder: BlockBuilder<Primitives = Evm::Primitives>,
+        <<Builder::Executor as BlockExecutor>::Evm as AlloyEvm>::DB: Database,
+    {
+
+        let mut block_gas_limit = builder.evm_mut().block().gas_limit();
+        if let Some(gas_limit_config) = self.builder_config.gas_limit_config.gas_limit() {
+            // If a gas limit is configured, use that limit as target if it's smaller, otherwise use
+            // the block's actual gas limit.
+            block_gas_limit = gas_limit_config.min(block_gas_limit);
+        };
+        let block_da_limit = self.builder_config.da_config.max_da_block_size();
+        let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
+        let base_fee = builder.evm_mut().block().basefee();
+        let block_number = builder.evm_mut().block().number().saturating_to();
 
         while let Some(tx) = best_txs.next(()) {
+            let tx_hash = *tx.hash();
             let interop = tx.interop_deadline();
             let tx_da_size = tx.estimated_da_size();
             let tx = tx.into_consensus();
+
+            let da_footprint_gas_scalar = self
+                .chain_spec
+                .is_jovian_active_at_timestamp(self.attributes().timestamp())
+                .then_some(
+                    L1BlockInfo::fetch_da_footprint_gas_scalar(builder.evm_mut().db_mut()).expect(
+                        "DA footprint should always be available from the database post jovian",
+                    ),
+                );
+
             if info.is_tx_over_limits(
                 tx_da_size,
                 block_gas_limit,
                 tx_da_limit,
                 block_da_limit,
                 tx.gas_limit(),
+                da_footprint_gas_scalar,
             ) {
                 // we can't fit this transaction into the block, so we need to mark it as
                 // invalid which also removes all dependent transaction from
@@ -702,11 +790,21 @@ where
             }
 
             let gas_used = match builder.execute_transaction(tx.clone()) {
-                Ok(gas_used) => gas_used,
+                Ok(gas_used) => {
+                    // X Layer: Log transaction execution end (success)
+                    if let Some(tracer) = get_global_tracer() {
+                        tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
+                    }
+                    gas_used
+                }
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
                     ..
                 })) => {
+                    // X Layer: Log transaction execution end (failed)
+                    if let Some(tracer) = get_global_tracer() {
+                        tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
+                    }
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
                         trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
@@ -719,6 +817,10 @@ where
                     continue
                 }
                 Err(err) => {
+                    // X Layer: Log transaction execution end (fatal error)
+                    if let Some(tracer) = get_global_tracer() {
+                        tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
+                    }
                     // this is an error that we should treat as fatal for this attempt
                     return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)))
                 }

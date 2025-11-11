@@ -5,7 +5,7 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -40,6 +40,8 @@ pub mod constants;
 mod dev;
 mod op;
 mod op_sepolia;
+mod xlayer_mainnet;
+mod xlayer_testnet;
 
 #[cfg(feature = "superchain-configs")]
 mod superchain;
@@ -52,6 +54,8 @@ pub use basefee::*;
 pub use dev::OP_DEV;
 pub use op::OP_MAINNET;
 pub use op_sepolia::OP_SEPOLIA;
+pub use xlayer_mainnet::XLAYER_MAINNET;
+pub use xlayer_testnet::XLAYER_TESTNET;
 
 /// Re-export for convenience
 pub use reth_optimism_forks::*;
@@ -338,7 +342,14 @@ impl OpHardforks for OpChainSpec {
 }
 
 impl From<Genesis> for OpChainSpec {
-    fn from(genesis: Genesis) -> Self {
+    fn from(mut genesis: Genesis) -> Self {
+
+        // If legacyXLayerBlock is specified in config, override genesis.number
+        if let Some(legacy_block_value) = genesis.config.extra_fields.get("legacyXLayerBlock") {
+            if let Some(legacy_block) = legacy_block_value.as_u64() {
+                genesis.number = Some(legacy_block);
+            }
+        }
         use reth_optimism_forks::OpHardfork;
         let optimism_genesis_info = OpGenesisInfo::extract_from(&genesis);
         let genesis_info =
@@ -517,9 +528,12 @@ pub fn make_op_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> 
 
 #[cfg(test)]
 mod tests {
-    use alloc::string::String;
+    use alloc::string::{String, ToString};
     use alloy_genesis::{ChainConfig, Genesis};
-    use alloy_primitives::b256;
+    use alloy_op_hardforks::{
+        BASE_MAINNET_JOVIAN_TIMESTAMP, OP_MAINNET_JOVIAN_TIMESTAMP, OP_SEPOLIA_JOVIAN_TIMESTAMP,
+    };
+    use alloy_primitives::{b256, hex};
     use reth_chainspec::{test_fork_ids, BaseFeeParams, BaseFeeParamsKind};
     use reth_ethereum_forks::{EthereumHardfork, ForkCondition, ForkHash, ForkId, Head};
     use reth_optimism_forks::{OpHardfork, OpHardforks};
@@ -529,7 +543,7 @@ mod tests {
     #[test]
     fn test_storage_root_consistency() {
         use alloy_primitives::{B256, U256};
-        use std::str::FromStr;
+        use core::str::FromStr;
 
         let k1 =
             B256::from_str("0x0000000000000000000000000000000000000000000000000000000000000001")
@@ -611,13 +625,20 @@ mod tests {
                 // Isthmus
                 (
                     Head { number: 0, timestamp: 1746806401, ..Default::default() },
-                    ForkId { hash: ForkHash([0x86, 0x72, 0x8b, 0x4e]), next: 0 }, /* TODO: update timestamp when Jovian is planned */
+                    ForkId {
+                        hash: ForkHash([0x86, 0x72, 0x8b, 0x4e]),
+                        next: BASE_MAINNET_JOVIAN_TIMESTAMP,
+                    },
                 ),
-                // // Jovian
-                // (
-                //     Head { number: 0, timestamp: u64::MAX, ..Default::default() }, /* TODO:
-                // update timestamp when Jovian is planned */     ForkId { hash:
-                // ForkHash([0xef, 0x0e, 0x58, 0x33]), next: 0 }, ),
+                // Jovian
+                (
+                    Head {
+                        number: 0,
+                        timestamp: BASE_MAINNET_JOVIAN_TIMESTAMP,
+                        ..Default::default()
+                    },
+                    BASE_MAINNET.hardfork_fork_id(OpHardfork::Jovian).unwrap(),
+                ),
             ],
         );
     }
@@ -670,13 +691,20 @@ mod tests {
                 // Isthmus
                 (
                     Head { number: 0, timestamp: 1744905600, ..Default::default() },
-                    ForkId { hash: ForkHash([0x6c, 0x62, 0x5e, 0xe1]), next: 0 }, /* TODO: update timestamp when Jovian is planned */
+                    ForkId {
+                        hash: ForkHash([0x6c, 0x62, 0x5e, 0xe1]),
+                        next: OP_SEPOLIA_JOVIAN_TIMESTAMP,
+                    },
                 ),
-                // // Jovian
-                // (
-                //     Head { number: 0, timestamp: u64::MAX, ..Default::default() }, /* TODO:
-                // update timestamp when Jovian is planned */     ForkId { hash:
-                // ForkHash([0x04, 0x2a, 0x5c, 0x14]), next: 0 }, ),
+                // Jovian
+                (
+                    Head {
+                        number: 0,
+                        timestamp: OP_SEPOLIA_JOVIAN_TIMESTAMP,
+                        ..Default::default()
+                    },
+                    OP_SEPOLIA.hardfork_fork_id(OpHardfork::Jovian).unwrap(),
+                ),
             ],
         );
     }
@@ -739,13 +767,20 @@ mod tests {
                 // Isthmus
                 (
                     Head { number: 105235063, timestamp: 1746806401, ..Default::default() },
-                    ForkId { hash: ForkHash([0x37, 0xbe, 0x75, 0x8f]), next: 0 }, /* TODO: update timestamp when Jovian is planned */
+                    ForkId {
+                        hash: ForkHash([0x37, 0xbe, 0x75, 0x8f]),
+                        next: OP_MAINNET_JOVIAN_TIMESTAMP,
+                    },
                 ),
                 // Jovian
-                // (
-                //     Head { number: 105235063, timestamp: u64::MAX, ..Default::default() }, /*
-                // TODO: update timestamp when Jovian is planned */     ForkId {
-                // hash: ForkHash([0x26, 0xce, 0xa1, 0x75]), next: 0 }, ),
+                (
+                    Head {
+                        number: 105235063,
+                        timestamp: OP_MAINNET_JOVIAN_TIMESTAMP,
+                        ..Default::default()
+                    },
+                    OP_MAINNET.hardfork_fork_id(OpHardfork::Jovian).unwrap(),
+                ),
             ],
         );
     }
@@ -798,13 +833,20 @@ mod tests {
                 // Isthmus
                 (
                     Head { number: 0, timestamp: 1744905600, ..Default::default() },
-                    ForkId { hash: ForkHash([0x06, 0x0a, 0x4d, 0x1d]), next: 0 }, /* TODO: update timestamp when Jovian is planned */
+                    ForkId {
+                        hash: ForkHash([0x06, 0x0a, 0x4d, 0x1d]),
+                        next: OP_SEPOLIA_JOVIAN_TIMESTAMP,
+                    }, /* TODO: update timestamp when Jovian is planned */
                 ),
-                // // Jovian
-                // (
-                //     Head { number: 0, timestamp: u64::MAX, ..Default::default() }, /* TODO:
-                // update timestamp when Jovian is planned */     ForkId { hash:
-                // ForkHash([0xcd, 0xfd, 0x39, 0x99]), next: 0 }, ),
+                // Jovian
+                (
+                    Head {
+                        number: 0,
+                        timestamp: OP_SEPOLIA_JOVIAN_TIMESTAMP,
+                        ..Default::default()
+                    },
+                    BASE_SEPOLIA.hardfork_fork_id(OpHardfork::Jovian).unwrap(),
+                ),
             ],
         );
     }
@@ -848,7 +890,7 @@ mod tests {
     #[test]
     fn latest_base_mainnet_fork_id() {
         assert_eq!(
-            ForkId { hash: ForkHash([0x86, 0x72, 0x8b, 0x4e]), next: 0 },
+            ForkId { hash: ForkHash(hex!("1cfeafc9")), next: 0 },
             BASE_MAINNET.latest_fork_id()
         )
     }
@@ -857,7 +899,7 @@ mod tests {
     fn latest_base_mainnet_fork_id_with_builder() {
         let base_mainnet = OpChainSpecBuilder::base_mainnet().build();
         assert_eq!(
-            ForkId { hash: ForkHash([0x86, 0x72, 0x8b, 0x4e]), next: 0 },
+            ForkId { hash: ForkHash(hex!("1cfeafc9")), next: 0 },
             base_mainnet.latest_fork_id()
         )
     }
@@ -938,6 +980,106 @@ mod tests {
         assert!(chain_spec.is_fork_active_at_timestamp(OpHardfork::Fjord, 50));
         assert!(chain_spec.is_fork_active_at_timestamp(OpHardfork::Granite, 51));
         assert!(chain_spec.is_fork_active_at_timestamp(OpHardfork::Holocene, 52));
+    }
+
+    #[test]
+    fn test_legacy_xlayer_block_overrides_genesis_header_number() {
+        let geth_genesis = r#"
+    {
+      "config": {
+        "chainId": 901,
+        "homesteadBlock": 0,
+        "eip150Block": 0,
+        "eip155Block": 0,
+        "eip158Block": 0,
+        "byzantiumBlock": 0,
+        "constantinopleBlock": 0,
+        "petersburgBlock": 0,
+        "istanbulBlock": 0,
+        "berlinBlock": 0,
+        "londonBlock": 0,
+        "optimism": {
+          "eip1559Elasticity": 6,
+          "eip1559Denominator": 50
+        },
+        "legacyXLayerBlock": 1000
+      },
+      "nonce": "0x0",
+      "timestamp": "0x0",
+      "extraData": "0x",
+      "gasLimit": "0x1c9c380",
+      "difficulty": "0x0",
+      "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "coinbase": "0x0000000000000000000000000000000000000000",
+      "alloc": {},
+      "number": "0x0",
+      "gasUsed": "0x0",
+      "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "baseFeePerGas": "0x3b9aca00"
+    }
+    "#;
+        let genesis: Genesis = serde_json::from_str(geth_genesis).unwrap();
+
+        // Verify legacyXLayerBlock is parsed correctly
+        let actual_legacy_block = genesis.config.extra_fields.get("legacyXLayerBlock");
+        assert_eq!(actual_legacy_block, Some(serde_json::Value::from(1000)).as_ref());
+
+        // Convert to OpChainSpec
+        let chain_spec: OpChainSpec = genesis.into();
+
+        // Verify genesis_header number is overridden by legacyXLayerBlock
+        assert_eq!(chain_spec.genesis_header().number(), 1000);
+
+        // Verify that genesis.number is also updated to match legacyXLayerBlock
+        assert_eq!(chain_spec.genesis().number, Some(1000));
+    }
+
+    #[test]
+    fn test_legacy_xlayer_block_without_field_uses_genesis_number() {
+        let geth_genesis = r#"
+    {
+      "config": {
+        "chainId": 901,
+        "homesteadBlock": 0,
+        "eip150Block": 0,
+        "eip155Block": 0,
+        "eip158Block": 0,
+        "byzantiumBlock": 0,
+        "constantinopleBlock": 0,
+        "petersburgBlock": 0,
+        "istanbulBlock": 0,
+        "berlinBlock": 0,
+        "londonBlock": 0,
+        "optimism": {
+          "eip1559Elasticity": 6,
+          "eip1559Denominator": 50
+        }
+      },
+      "nonce": "0x0",
+      "timestamp": "0x0",
+      "extraData": "0x",
+      "gasLimit": "0x1c9c380",
+      "difficulty": "0x0",
+      "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "coinbase": "0x0000000000000000000000000000000000000000",
+      "alloc": {},
+      "number": "0x0",
+      "gasUsed": "0x0",
+      "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "baseFeePerGas": "0x3b9aca00"
+    }
+    "#;
+        let genesis: Genesis = serde_json::from_str(geth_genesis).unwrap();
+
+        // Verify legacyXLayerBlock is not present
+        let actual_legacy_block = genesis.config.extra_fields.get("legacyXLayerBlock");
+        assert_eq!(actual_legacy_block, None);
+
+        // Convert to OpChainSpec
+        let chain_spec: OpChainSpec = genesis.into();
+
+        // Verify genesis_header number uses default genesis.number (0)
+        assert_eq!(chain_spec.genesis_header().number(), 0);
     }
 
     #[test]

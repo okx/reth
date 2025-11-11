@@ -27,6 +27,7 @@ reth-payload-primitives = { workspace = true, features = ["op"] }
 reth-basic-payload-builder.workspace = true
 reth-chain-state.workspace = true
 reth-payload-validator.workspace = true
+reth-node-metrics.workspace = true
 
 # op-reth
 reth-optimism-evm.workspace = true
@@ -44,6 +45,7 @@ op-alloy-consensus.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-debug.workspace = true
 alloy-consensus.workspace = true
+alloy-evm.workspace = true
 
 # misc
 derive_more.workspace = true
