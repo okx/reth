@@ -27,12 +27,6 @@ fn main() {
 
     if let Err(err) =
         Cli::<OpChainSpecParser, RollupArgs>::parse().run(async move |builder, rollup_args| {
-            let data_dir = builder.config().datadir();
-            let db_path = data_dir.db().parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
-            match initialize(db_path) {
-                Ok(_) =>  info!(target: "reth::cli", "xlayer db initialized"),
-                Err(e) => error!(target: "reth::cli", "xlayer db failed to initialize {:#?}", e),
-            }
             info!(target: "reth::cli", "Launching node");
 
             // For X Layer
@@ -62,20 +56,32 @@ fn main() {
                 }
             }
 
+            let enable_inner_tx = rollup_args.xlayer_args.enable_inner_tx;
+            // Conditionally initialize InnerTx database before consuming builder
+            if enable_inner_tx {
+                let data_dir = builder.config().datadir();
+                let db_path = data_dir.db().parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
+                match initialize(db_path) {
+                    Ok(_) => info!(target: "reth::cli", "xlayer db initialized"),
+                    Err(e) => error!(target: "reth::cli", "xlayer db failed to initialize {:#?}", e),
+                }
+            }
 
-            let handle = builder
-                .node(OpNode::new(rollup_args.clone()))
-                .extend_rpc_modules(move |ctx| {
-                    let new_op_eth_api = ctx.registry.eth_api().clone();
-                    let custom_rpc = XlayerExt { backend: Arc::new(new_op_eth_api) };
-                    ctx.modules.merge_configured(custom_rpc.into_rpc())?;
-                    info!(target:"reth::cli", "xlayer op rpc enabled");
+            let mut node_builder = builder.node(OpNode::new(rollup_args));
 
-                    Ok(())
-                })
-                .install_exex("post_exec_exex", |ctx| async move { Ok(post_exec_exex(ctx)) })
-                .launch_with_debug_capabilities()
-                .await?;
+            if enable_inner_tx {
+                node_builder = node_builder
+                    .extend_rpc_modules(move |ctx| {
+                        let new_op_eth_api = ctx.registry.eth_api().clone();
+                        let custom_rpc = XlayerExt { backend: Arc::new(new_op_eth_api) };
+                        ctx.modules.merge_configured(custom_rpc.into_rpc())?;
+                        info!(target:"reth::cli", "xlayer innertx rpc enabled");
+                        Ok(())
+                    })
+                    .install_exex("post_exec_exex", |ctx| async move { Ok(post_exec_exex(ctx)) });
+            }
+
+            let handle = node_builder.launch_with_debug_capabilities().await?;
 
             handle.node_exit_future.await
         })
