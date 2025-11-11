@@ -465,18 +465,13 @@ where
         N: ProviderNodeTypes<DB = DB, ChainSpec = ChainSpec>,
         Evm: ConfigureEvm<Primitives = N::Primitives> + 'static,
     {
-        // XLayer: Set genesis block number before ProviderFactory creation.
-        // Required for non-zero genesis block; must be set before Arc wrapping.
-        let mut static_file_provider = StaticFileProvider::read_write(self.data_dir().static_files())?;
-        static_file_provider.set_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default());
-
         let factory = ProviderFactory::new(
             self.right().clone(),
             self.chain_spec(),
-            static_file_provider,
+            StaticFileProvider::read_write(self.data_dir().static_files())?,
         )
         .with_prune_modes(self.prune_modes())
-        .with_static_files_metrics();
+        .with_static_files_metrics().with_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default());
 
         let has_receipt_pruning = self.toml_config().prune.has_receipts_pruning();
 

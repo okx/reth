@@ -129,17 +129,12 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         let has_receipt_pruning = config.prune.has_receipts_pruning();
         let prune_modes = config.prune.segments.clone();
 
-        // XLayer: Set genesis block number before ProviderFactory creation.
-        // Required for non-zero genesis block; must be set before Arc wrapping.
-        let mut static_file_provider = static_file_provider;
-        static_file_provider.set_genesis_block_number(self.chain.genesis().number.unwrap_or_default());
-
         let factory = ProviderFactory::<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>::new(
             db,
             self.chain.clone(),
             static_file_provider,
         )
-        .with_prune_modes(prune_modes.clone());
+        .with_prune_modes(prune_modes.clone()).with_genesis_block_number(self.chain.genesis().number.unwrap());
 
         // Check for consistency between database and static files.
         if let Some(unwind_target) = factory
