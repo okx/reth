@@ -128,7 +128,6 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
     {
         let has_receipt_pruning = config.prune.has_receipts_pruning();
         let prune_modes = config.prune.segments.clone();
-
         let factory = ProviderFactory::<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>::new(
             db,
             self.chain.clone(),
