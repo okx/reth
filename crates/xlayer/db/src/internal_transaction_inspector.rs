@@ -7,7 +7,7 @@ use alloy_primitives::{Address, Bytes, U256};
 use reth_revm::{
     interpreter::{
         interpreter::EthInterpreter, CallInput, CallInputs, CallOutcome, CreateInputs,
-        CreateOutcome,
+        CreateOutcome, InstructionResult,
     },
     Inspector,
 };
@@ -67,30 +67,68 @@ impl Default for TraceCollector {
 }
 
 impl TraceCollector {
-    fn format_error(result: &reth_revm::interpreter::InstructionResult) -> String {
-        use reth_revm::interpreter::InstructionResult;
-
+    fn format_error(result: &InstructionResult) -> String {
         match result {
             InstructionResult::Revert => "execution reverted".to_string(),
-            // InstructionResult::ReentrancySentryOOG => {
-            //     "out of gas: not enough gas for reentrancy sentry".to_string()
-            // }
-            // InstructionResult::OutOfGas => "out of gas".to_string(),
-            // InstructionResult::OutOfFund => "insufficient funds".to_string(),
-            // InstructionResult::CallTooDeep => "call depth exceeded".to_string(),
-            // InstructionResult::OpcodeNotFound => "invalid opcode".to_string(),
-            // InstructionResult::InvalidJump => "invalid jump destination".to_string(),
-            // InstructionResult::InvalidFEOpcode => "invalid 0xfe opcode".to_string(),
-            // InstructionResult::StackOverflow => "stack overflow".to_string(),
-            // InstructionResult::StackUnderflow => "stack underflow".to_string(),
-            // InstructionResult::OutOfOffset => "out of offset".to_string(),
-            // InstructionResult::CreateCollision => "contract address collision".to_string(),
-            // InstructionResult::OverflowPayment => "payment overflow".to_string(),
-            // InstructionResult::PrecompileError => "precompile error".to_string(),
-            // InstructionResult::NonceOverflow => "nonce overflow".to_string(),
-            // InstructionResult::CreateContractSizeLimit => "contract size limit exceeded".to_string(),
-            // InstructionResult::CreateContractStartingWithEF => "contract starts with 0xEF".to_string(),
-            // InstructionResult::CreateInitCodeSizeLimit => "init code size limit exceeded".to_string(),
+            InstructionResult::CallTooDeep => "max call depth exceeded".to_string(),
+            InstructionResult::OutOfGas => "out of gas".to_string(),
+            InstructionResult::NonceOverflow => "nonce uint64 overflow".to_string(),
+            InstructionResult::InvalidJump => "invalid jump destination".to_string(),
+            InstructionResult::CreateCollision => "contract address collision".to_string(),
+            InstructionResult::OutOfFunds => "insufficient balance for transfer".to_string(),
+            InstructionResult::CreateInitCodeSizeLimit => "max initcode size exceeded".to_string(),
+            InstructionResult::OpcodeNotFound => "invalid opcode".to_string(),
+            InstructionResult::ReentrancySentryOOG => {
+                "not enough gas for reentrancy sentry".to_string()
+            }
+            InstructionResult::StackUnderflow => "stack underflow".to_string(),
+            InstructionResult::StackOverflow => "stack overflow".to_string(),
+            InstructionResult::CreateInitCodeStartingEF00 => {
+                "CREATE/CREATE2 starts with 0xEF00".to_string()
+            }
+            InstructionResult::InvalidEOFInitCode => {
+                "invalid EVM Object Format (EOF) init code".to_string()
+            }
+            InstructionResult::InvalidExtDelegateCallTarget => {
+                "extDelegateCall calling a non EOF contract".to_string()
+            }
+            InstructionResult::MemoryOOG => {
+                "out of gas error encountered during memory expansion".to_string()
+            }
+            InstructionResult::MemoryLimitOOG => {
+                "the memory limit of the EVM has been exceeded".to_string()
+            }
+            InstructionResult::PrecompileOOG => {
+                "out of gas error encountered during the execution of a precompiled contract"
+                    .to_string()
+            }
+            InstructionResult::InvalidOperandOOG => {
+                "out of gas error encountered while calling an invalid operand".to_string()
+            }
+            InstructionResult::CallNotAllowedInsideStatic => {
+                "invalid CALL with value transfer in static context".to_string()
+            }
+            InstructionResult::StateChangeDuringStaticCall => {
+                "invalid state modification in static call".to_string()
+            }
+            InstructionResult::InvalidFEOpcode => {
+                "an undefined bytecode value encountered during execution".to_string()
+            }
+            InstructionResult::NotActivated => {
+                "the feature or opcode is not activated in this version of the EVM".to_string()
+            }
+            InstructionResult::OutOfOffset => "invalid memory or storage offset".to_string(),
+            InstructionResult::OverflowPayment => "payment amount overflow".to_string(),
+            InstructionResult::PrecompileError => {
+                "error in precompiled contract execution".to_string()
+            }
+            InstructionResult::CreateContractSizeLimit => {
+                "exceeded contract size limit during creation".to_string()
+            }
+            InstructionResult::CreateContractStartingWithEF => {
+                "created contract starts with invalid bytes 0xEF".to_string()
+            }
+            InstructionResult::FatalExternalError => "fatal external error".to_string(),
             _ => format!("{:?}", result),
         }
     }
