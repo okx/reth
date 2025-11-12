@@ -300,10 +300,10 @@ use alloy_eips::{
 };
 use alloy_primitives::{Address, TxHash, B256, U256};
 use aquamarine as _;
-use reth_node_metrics as _;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_eth_wire_types::HandleMempoolData;
 use reth_execution_types::ChangedAccount;
+use reth_node_metrics as _;
 use reth_primitives_traits::{Block, Recovered};
 use reth_storage_api::StateProviderFactory;
 use std::{collections::HashSet, sync::Arc};

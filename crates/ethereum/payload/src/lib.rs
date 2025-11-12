@@ -25,6 +25,7 @@ use reth_evm::{
     ConfigureEvm, Evm, NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::EthEvmConfig;
+use reth_node_metrics as _;
 use reth_payload_builder::{BlobSidecars, EthBuiltPayload, EthPayloadBuilderAttributes};
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::PayloadBuilderAttributes;
@@ -37,7 +38,6 @@ use reth_transaction_pool::{
     ValidPoolTransaction,
 };
 use revm::context_interface::Block as _;
-use reth_node_metrics as _;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
