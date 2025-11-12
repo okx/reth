@@ -26,7 +26,7 @@ pub struct LegacyRpcConfig {
 
 impl LegacyRpcConfig {
     /// Create a new legacy RPC configuration.
-    pub fn new(cutoff_block: BlockNumber, endpoint: String, timeout: Duration) -> Self {
+    pub const fn new(cutoff_block: BlockNumber, endpoint: String, timeout: Duration) -> Self {
         Self { cutoff_block, endpoint, timeout }
     }
 }
@@ -51,7 +51,7 @@ impl LegacyRpcClient {
 
     /// Get the cutoff block number.
     #[inline]
-    pub fn cutoff_block(&self) -> BlockNumber {
+    pub const fn cutoff_block(&self) -> BlockNumber {
         self.cutoff_block
     }
 
@@ -63,7 +63,7 @@ impl LegacyRpcClient {
         result.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
-    /// Forward eth_getBlockByNumber to legacy RPC.
+    /// Forward `eth_getBlockByNumber` to legacy RPC.
     pub async fn get_block_by_number(
         &self,
         block_number: BlockNumberOrTag,
@@ -72,7 +72,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getBlockByNumber", (block_number, full)).await)
     }
 
-    /// Forward eth_getBlockByHash to legacy RPC.
+    /// Forward `eth_getBlockByHash` to legacy RPC.
     pub async fn get_block_by_hash(
         &self,
         hash: BlockHash,
@@ -81,7 +81,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getBlockByHash", (hash, full)).await)
     }
 
-    /// Forward eth_getTransactionByHash to legacy RPC.
+    /// Forward `eth_getTransactionByHash` to legacy RPC.
     pub async fn get_transaction_by_hash(
         &self,
         hash: TxHash,
@@ -89,7 +89,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getTransactionByHash", (hash,)).await)
     }
 
-    /// Forward eth_getTransactionReceipt to legacy RPC.
+    /// Forward `eth_getTransactionReceipt` to legacy RPC.
     pub async fn get_transaction_receipt(
         &self,
         hash: TxHash,
@@ -97,7 +97,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getTransactionReceipt", (hash,)).await)
     }
 
-    /// Forward eth_getLogs to legacy RPC.
+    /// Forward `eth_getLogs` to legacy RPC.
     pub async fn get_logs(
         &self,
         filter: Filter,
@@ -105,7 +105,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getLogs", (filter,)).await)
     }
 
-    /// Forward eth_getBlockTransactionCountByNumber to legacy RPC.
+    /// Forward `eth_getBlockTransactionCountByNumber` to legacy RPC.
     pub async fn get_block_transaction_count_by_number(
         &self,
         block_number: BlockNumberOrTag,
@@ -115,7 +115,7 @@ impl LegacyRpcClient {
         )
     }
 
-    /// Forward eth_getBlockTransactionCountByHash to legacy RPC.
+    /// Forward `eth_getBlockTransactionCountByHash` to legacy RPC.
     pub async fn get_block_transaction_count_by_hash(
         &self,
         hash: BlockHash,
@@ -123,7 +123,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getBlockTransactionCountByHash", (hash,)).await)
     }
 
-    /// Forward eth_getBalance to legacy RPC.
+    /// Forward `eth_getBalance` to legacy RPC.
     pub async fn get_balance(
         &self,
         address: Address,
@@ -132,7 +132,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getBalance", (address, block_id)).await)
     }
 
-    /// Forward eth_getCode to legacy RPC.
+    /// Forward `eth_getCode` to legacy RPC.
     pub async fn get_code(
         &self,
         address: Address,
@@ -141,7 +141,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getCode", (address, block_id)).await)
     }
 
-    /// Forward eth_getStorageAt to legacy RPC.
+    /// Forward `eth_getStorageAt` to legacy RPC.
     pub async fn get_storage_at(
         &self,
         address: Address,
@@ -151,7 +151,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getStorageAt", (address, index, block_id)).await)
     }
 
-    /// Forward eth_getTransactionCount to legacy RPC.
+    /// Forward `eth_getTransactionCount` to legacy RPC.
     pub async fn get_transaction_count(
         &self,
         address: Address,
@@ -160,7 +160,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getTransactionCount", (address, block_id)).await)
     }
 
-    /// Forward eth_getTransactionByBlockHashAndIndex to legacy RPC.
+    /// Forward `eth_getTransactionByBlockHashAndIndex` to legacy RPC.
     pub async fn get_transaction_by_block_hash_and_index(
         &self,
         hash: BlockHash,

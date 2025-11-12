@@ -509,7 +509,7 @@ impl RpcModuleValidator for DefaultRpcModuleValidator {
         if let RpcModuleSelection::Selection(modules) = &selection {
             for module in modules {
                 if let RethRpcModule::Other(name) = module {
-                    return Err(format!("Unknown RPC module: '{}'", name));
+                    return Err(format!("Unknown RPC module: '{name}'" ));
                 }
             }
         }
@@ -526,7 +526,7 @@ pub struct LenientRpcModuleValidator;
 
 impl RpcModuleValidator for LenientRpcModuleValidator {
     fn parse_selection(s: &str) -> Result<RpcModuleSelection, String> {
-        RpcModuleSelection::from_str(s).map_err(|e| format!("Failed to parse RPC modules: {}", e))
+        RpcModuleSelection::from_str(s).map_err(|e| format!("Failed to parse RPC modules: {e}"))
     }
 }
 
