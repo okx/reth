@@ -64,7 +64,10 @@ where
     T: Serialize,
     U: for<'de> Deserialize<'de>,
 {
-    value.map(convert_via_serde).transpose()
+    match value {
+        Some(v) => Ok(Some(convert_via_serde(v)?)),
+        None => Ok(None),
+    }
 }
 
 /// Helper to convert any error to internal RPC error
