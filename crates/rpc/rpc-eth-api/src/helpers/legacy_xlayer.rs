@@ -27,11 +27,6 @@ pub fn should_route_to_legacy(
 }
 
 /// Check if a BlockId should be routed to legacy RPC
-///
-/// For `BlockId::Number`: checks if block number < cutoff_block
-/// For `BlockId::Hash`: checks if block hash does not exist locally
-///
-/// Returns `Ok(true)` if should route to legacy, `Ok(false)` otherwise
 #[inline]
 pub fn should_route_block_id_to_legacy<Provider>(
     legacy_client: Option<&std::sync::Arc<reth_rpc_eth_types::LegacyRpcClient>>,
@@ -45,22 +40,11 @@ where
         return Ok(false);
     };
 
-    match block_id {
-        Some(BlockId::Number(number)) => {
-            // Check if block number is below cutoff
-            Ok(should_route_to_legacy(Some(client), number.clone()))
-        }
-        Some(BlockId::Hash(hash)) => {
-            // Check if block exists locally
-            let block_exists = provider
-                .block_number(hash.block_hash)
-                .map_err(internal_rpc_err)?
-                .is_some();
-
-            Ok(!block_exists)
-        }
-        None => Ok(false),
-    }
+    Ok(match block_id {
+        Some(BlockId::Number(number)) => should_route_to_legacy(Some(client), *number),
+        Some(BlockId::Hash(hash)) => !provider.block_number(hash.block_hash).map_err(internal_rpc_err)?.is_some(),
+        None => false,
+    })
 }
 
 /// Convert any value through serde JSON (for type system compatibility)
@@ -363,55 +347,25 @@ mod tests {
 
         // BlockId::Number below cutoff
         let block_id = BlockId::Number(BlockNumberOrTag::Number(100));
-        assert!(
-            should_route_block_id_to_legacy(
-                Some(&client),
-                &provider_missing,
-                Some(&block_id)
-            )
-            .unwrap()
-        );
+        assert!(should_route_block_id_to_legacy(Some(&client), &provider_missing, Some(&block_id)).unwrap());
 
         // BlockId::Number above cutoff
         let block_id = BlockId::Number(BlockNumberOrTag::Number(1000001));
-        assert!(
-            !should_route_block_id_to_legacy(
-                Some(&client),
-                &provider_missing,
-                Some(&block_id)
-            )
-            .unwrap()
-        );
+        assert!(!should_route_block_id_to_legacy(Some(&client), &provider_missing, Some(&block_id)).unwrap());
 
         // BlockId::Hash - routes if missing locally
         let missing_hash = BlockId::Hash(B256::from([1u8; 32]).into());
-        assert!(
-            should_route_block_id_to_legacy(
-                Some(&client),
-                &provider_missing,
-                Some(&missing_hash)
-            )
-            .unwrap()
-        );
+        assert!(should_route_block_id_to_legacy(Some(&client), &provider_missing, Some(&missing_hash)).unwrap());
 
         // BlockId::Hash - stays local if present
         let present_hash_value = B256::from([2u8; 32]);
         let mut provider_present = MockBlockProvider::default();
         provider_present.insert_hash(present_hash_value, 0);
         let present_hash = BlockId::Hash(present_hash_value.into());
-        assert!(
-            !should_route_block_id_to_legacy(
-                Some(&client),
-                &provider_present,
-                Some(&present_hash)
-            )
-            .unwrap()
-        );
+        assert!(!should_route_block_id_to_legacy(Some(&client), &provider_present, Some(&present_hash)).unwrap());
 
         // None - should NOT route
-        assert!(
-            !should_route_block_id_to_legacy(Some(&client), &provider_missing, None).unwrap()
-        );
+        assert!(!should_route_block_id_to_legacy(Some(&client), &provider_missing, None).unwrap());
     }
 
     #[test]

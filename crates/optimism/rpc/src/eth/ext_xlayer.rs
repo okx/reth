@@ -522,21 +522,10 @@ where
     ) -> RpcResult<Vec<PreExecResult>> {
         let block_id = block_number.unwrap_or_default();
 
-        if should_route_block_id_to_legacy(
-            self.eth_api.legacy_rpc_client(),
-            self.eth_api.provider(),
-            Some(&block_id),
-        )? {
-            return exec_legacy(
-                "eth_transactionPreExec",
-                self.eth_api.legacy_rpc_client().unwrap().transaction_pre_exec(
-                    &args,
-                    Some(block_id),
-                    state_overrides.as_ref(),
-                ),
-            )
-            .await
-            .map_err(boxed_err_to_rpc);
+        // XLayer: Route to legacy RPC if block number is below cutoff
+        if should_route_block_id_to_legacy(self.eth_api.legacy_rpc_client(), self.eth_api.provider(), Some(&block_id))? {
+            let client = self.eth_api.legacy_rpc_client().unwrap();
+            return exec_legacy("eth_transactionPreExec", client.transaction_pre_exec(&args, Some(block_id), state_overrides.as_ref())).await.map_err(boxed_err_to_rpc);
         }
 
         let (evm_env, at) = match self.eth_api.evm_env_at(block_id).await {
