@@ -268,16 +268,18 @@ where
 
     fn call_end(&mut self, _ctx: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
         let trace_index = self.trace_stack.pop().unwrap_or_default();
-        let (_before, after) = self.traces.split_at_mut(trace_index);
-        let (txn, remainder) = after.split_first_mut().unwrap();
-        txn.gas_used = outcome.result.gas.spent();
-        txn.output = outcome.result.output.clone();
-        txn.is_error = !outcome.result.is_ok();
-        txn.error =
-            if txn.is_error { Self::format_error(&outcome.result.result) } else { String::new() };
-        if txn.is_error {
-            for within in remainder {
-                within.is_error = txn.is_error;
+        let (_, after) = self.traces.split_at_mut(trace_index);
+
+        if let Some((txn, remainder)) = after.split_first_mut() {
+            txn.gas_used = outcome.result.gas.spent();
+            txn.output = outcome.result.output.clone();
+            txn.is_error = !outcome.result.is_ok();
+            txn.error =
+                if txn.is_error { Self::format_error(&outcome.result.result) } else { String::new() };
+            if txn.is_error {
+                for within in remainder {
+                    within.is_error = txn.is_error;
+                }
             }
         }
 
@@ -308,17 +310,19 @@ where
 
     fn create_end(&mut self, _ctx: &mut CTX, _inputs: &CreateInputs, outcome: &mut CreateOutcome) {
         let trace_index = self.trace_stack.pop().unwrap_or_default();
-        let (_before, after) = self.traces.split_at_mut(trace_index);
-        let (txn, remainder) = after.split_first_mut().unwrap();
-        txn.to = outcome.address.unwrap_or_default().to_string();
-        txn.gas_used = outcome.result.gas.spent();
-        txn.output = outcome.result.output.clone();
-        txn.is_error = !outcome.result.is_ok();
-        txn.error =
-            if txn.is_error { Self::format_error(&outcome.result.result) } else { String::new() };
-        if txn.is_error {
-            for within in remainder {
-                within.is_error = txn.is_error;
+        let (_, after) = self.traces.split_at_mut(trace_index);
+
+        if let Some((txn, remainder)) = after.split_first_mut() {
+            txn.to = outcome.address.unwrap_or_default().to_string();
+            txn.gas_used = outcome.result.gas.spent();
+            txn.output = outcome.result.output.clone();
+            txn.is_error = !outcome.result.is_ok();
+            txn.error =
+                if txn.is_error { Self::format_error(&outcome.result.result) } else { String::new() };
+            if txn.is_error {
+                for within in remainder {
+                    within.is_error = txn.is_error;
+                }
             }
         }
 
