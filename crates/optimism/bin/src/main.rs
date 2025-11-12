@@ -31,45 +31,21 @@ fn main() {
 
             // For X Layer
             if rollup_args.xlayer_args.apollo.enabled {
-                tracing::info!(target: "reth::apollo", "[Apollo] Apollo enabled: {:?}", rollup_args.xlayer_args.apollo.enabled);
-                tracing::info!(target: "reth::apollo", "[Apollo] Apollo app ID: {:?}", rollup_args.xlayer_args.apollo.apollo_app_id);
-                tracing::info!(target: "reth::apollo", "[Apollo] Apollo IP: {:?}", rollup_args.xlayer_args.apollo.apollo_ip);
-                tracing::info!(target: "reth::apollo", "[Apollo] Apollo cluster: {:?}", rollup_args.xlayer_args.apollo.apollo_cluster);
-                tracing::info!(target: "reth::apollo", "[Apollo] Apollo namespace: {:?}", rollup_args.xlayer_args.apollo.apollo_namespace);
-
-                // Create Apollo config from args
-                let apollo_config = ApolloConfig {
-                    meta_server: vec![rollup_args.xlayer_args.apollo.apollo_ip.to_string()],
-                    app_id: rollup_args.xlayer_args.apollo.apollo_app_id.to_string(),
-                    cluster_name: rollup_args.xlayer_args.apollo.apollo_cluster.to_string(),
-                    namespaces: Some(rollup_args.xlayer_args.apollo.apollo_namespace.split(',').map(|s| s.to_string()).collect()),
-                    secret: None,
-                };
-
-                tracing::info!(target: "reth::apollo", "[Apollo] Creating Apollo config");
-
-                // Initialize Apollo singleton
-                if let Err(e) = ApolloService::try_initialize(apollo_config).await {
-                    tracing::error!(target: "reth::apollo", "[Apollo] Failed to initialize Apollo: {:?}; Proceeding with node launch without Apollo", e);
-                } else {
-                    tracing::info!(target: "reth::apollo", "[Apollo] Apollo initialized successfully")
-                }
+                run_apollo(&rollup_args).await;
             }
 
             let enable_inner_tx = rollup_args.xlayer_args.enable_inner_tx;
-            // Conditionally initialize InnerTx database before consuming builder
+            let data_dir = builder.config().datadir();
+            let mut node_builder = builder.node(OpNode::new(rollup_args));
+
             if enable_inner_tx {
-                let data_dir = builder.config().datadir();
+                // Conditionally initialize InnerTx database before consuming builder
                 let db_path = data_dir.db().parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
                 match initialize(db_path) {
                     Ok(_) => info!(target: "reth::cli", "xlayer db initialized"),
                     Err(e) => error!(target: "reth::cli", "xlayer db failed to initialize {:#?}", e),
                 }
-            }
 
-            let mut node_builder = builder.node(OpNode::new(rollup_args));
-
-            if enable_inner_tx {
                 node_builder = node_builder
                     .extend_rpc_modules(move |ctx| {
                         let new_op_eth_api = ctx.registry.eth_api().clone();
@@ -88,5 +64,31 @@ fn main() {
     {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
+    }
+}
+
+async fn run_apollo(rollup_args: &RollupArgs) {
+    tracing::info!(target: "reth::apollo", "[Apollo] Apollo enabled: {:?}", rollup_args.xlayer_args.apollo.enabled);
+    tracing::info!(target: "reth::apollo", "[Apollo] Apollo app ID: {:?}", rollup_args.xlayer_args.apollo.apollo_app_id);
+    tracing::info!(target: "reth::apollo", "[Apollo] Apollo IP: {:?}", rollup_args.xlayer_args.apollo.apollo_ip);
+    tracing::info!(target: "reth::apollo", "[Apollo] Apollo cluster: {:?}", rollup_args.xlayer_args.apollo.apollo_cluster);
+    tracing::info!(target: "reth::apollo", "[Apollo] Apollo namespace: {:?}", rollup_args.xlayer_args.apollo.apollo_namespace);
+
+    // Create Apollo config from args
+    let apollo_config = ApolloConfig {
+        meta_server: vec![rollup_args.xlayer_args.apollo.apollo_ip.to_string()],
+        app_id: rollup_args.xlayer_args.apollo.apollo_app_id.to_string(),
+        cluster_name: rollup_args.xlayer_args.apollo.apollo_cluster.to_string(),
+        namespaces: Some(rollup_args.xlayer_args.apollo.apollo_namespace.split(',').map(|s| s.to_string()).collect()),
+        secret: None,
+    };
+
+    tracing::info!(target: "reth::apollo", "[Apollo] Creating Apollo config");
+
+    // Initialize Apollo singleton
+    if let Err(e) = ApolloService::try_initialize(apollo_config).await {
+        tracing::error!(target: "reth::apollo", "[Apollo] Failed to initialize Apollo: {:?}; Proceeding with node launch without Apollo", e);
+    } else {
+        tracing::info!(target: "reth::apollo", "[Apollo] Apollo initialized successfully")
     }
 }
