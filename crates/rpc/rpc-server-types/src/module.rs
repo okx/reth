@@ -509,7 +509,7 @@ impl RpcModuleValidator for DefaultRpcModuleValidator {
         if let RpcModuleSelection::Selection(modules) = &selection {
             for module in modules {
                 if let RethRpcModule::Other(name) = module {
-                    return Err(format!("Unknown RPC module: '{name}'" ));
+                    return Err(format!("Unknown RPC module: '{name}'"));
                 }
             }
         }

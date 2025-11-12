@@ -102,9 +102,9 @@ impl TransactionProcessId {
     pub const fn service_name(&self) -> &'static str {
         match self {
             // RPC-related process IDs
-            Self::RpcReceiveTxEnd |
-            Self::RpcBlockReceiveEnd |
-            Self::RpcBlockInsertEnd => RPC_SERVICE_NAME,
+            Self::RpcReceiveTxEnd | Self::RpcBlockReceiveEnd | Self::RpcBlockInsertEnd => {
+                RPC_SERVICE_NAME
+            }
 
             // Sequencer-related process IDs
             Self::SeqReceiveTxEnd |
@@ -144,16 +144,16 @@ impl TransactionTracer {
             } else {
                 path.clone()
             };
-            if let Some(parent) = file_path.parent()
-                && let Err(e) = fs::create_dir_all(parent) {
-                    tracing::warn!(
-                        target: "tx_trace",
-                        ?parent,
-                        error = %e,
-                        "Failed to create transaction trace output directory"
-                    );
-                }
-
+            if let Some(parent) = file_path.parent() &&
+                let Err(e) = fs::create_dir_all(parent)
+            {
+                tracing::warn!(
+                    target: "tx_trace",
+                    ?parent,
+                    error = %e,
+                    "Failed to create transaction trace output directory"
+                );
+            }
 
             match OpenOptions::new().create(true).append(true).open(&file_path) {
                 Ok(file) => {
@@ -223,15 +223,13 @@ impl TransactionTracer {
                             }
                         };
 
-                        if should_flush
-                            && let Err(e) = file.flush() {
-                                tracing::warn!(
-                                    target: "tx_trace",
-                                    error = %e,
-                                    "Failed to flush transaction trace file"
-                                );
-                            }
-
+                        if should_flush && let Err(e) = file.flush() {
+                            tracing::warn!(
+                                target: "tx_trace",
+                                error = %e,
+                                "Failed to flush transaction trace file"
+                            );
+                        }
                     }
                 }
             }
@@ -249,15 +247,15 @@ impl TransactionTracer {
     pub fn flush(&self) {
         match self.inner.output_file.lock() {
             Ok(mut file_guard) => {
-                if let Some(ref mut file) = *file_guard
-                    && let Err(e) = file.flush() {
-                        tracing::warn!(
-                            target: "tx_trace",
-                            error = %e,
-                            "Failed to flush transaction trace file on shutdown"
-                        );
-                    }
-
+                if let Some(ref mut file) = *file_guard &&
+                    let Err(e) = file.flush()
+                {
+                    tracing::warn!(
+                        target: "tx_trace",
+                        error = %e,
+                        "Failed to flush transaction trace file on shutdown"
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(
