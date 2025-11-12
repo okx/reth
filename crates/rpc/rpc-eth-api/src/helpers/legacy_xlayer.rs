@@ -122,11 +122,7 @@ macro_rules! route_by_number {
 #[macro_export]
 macro_rules! route_by_block_id {
     ($method:literal, $self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
-        if $crate::helpers::should_route_block_id_to_legacy(
-            $self.legacy_rpc_client(),
-            $self.provider(),
-            Some(&$block_id),
-        )? {
+        if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), $self.provider(), Some(&$block_id))? {
             tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$block_id, "→ legacy");
             let result = $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc)?;
             return $crate::helpers::convert_option_via_serde(result);
@@ -140,11 +136,7 @@ macro_rules! route_by_block_id {
 #[macro_export]
 macro_rules! route_by_block_id_opt {
     ($method:literal, $self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
-        if $crate::helpers::should_route_block_id_to_legacy(
-            $self.legacy_rpc_client(),
-            $self.provider(),
-            $block_id.as_ref(),
-        )? {
+        if $crate::helpers::should_route_block_id_to_legacy($self.legacy_rpc_client(), $self.provider(), $block_id.as_ref())? {
             tracing::info!(target: "rpc::eth::legacy", method = $method, block = ?$block_id, "→ legacy");
             return $crate::helpers::exec_legacy($method, $legacy_call).await.map_err($crate::helpers::boxed_err_to_rpc);
         }
