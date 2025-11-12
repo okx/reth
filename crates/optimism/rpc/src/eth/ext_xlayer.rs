@@ -10,13 +10,17 @@ use alloy_rpc_types_trace::geth::pre_state::PreStateFrame;
 use alloy_rpc_types_trace::geth::{
     CallConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig, PreStateConfig,
 };
-use jsonrpsee::core::RpcResult;
+use jsonrpsee::types::ErrorObjectOwned;
+use jsonrpsee_core::RpcResult;
 use op_alloy_rpc_types::OpTransactionRequest;
 use reth_errors::ProviderError;
 use reth_evm::EvmEnvFor;
 use reth_rpc_eth_api::{
     ext_xlayer::XLayerEthApiExtServer,
-    helpers::{Call, LoadState, SpawnBlocking, Trace},
+    helpers::{
+        boxed_err_to_rpc, exec_legacy, should_route_block_id_to_legacy, Call, LegacyRpc, LoadState,
+        SpawnBlocking, Trace,
+    },
     EthApiTypes, RpcTypes,
 };
 use reth_rpc_eth_types::pre_exec_xlayer::{PreExecError, PreExecInnerTx, PreExecResult};
@@ -508,7 +512,7 @@ impl<EthApi> XLayerEthApiExt<EthApi> {
 #[async_trait::async_trait]
 impl<EthApi> XLayerEthApiExtServer<OpTransactionRequest> for XLayerEthApiExt<EthApi>
 where
-    EthApi: PreExec + 'static,
+    EthApi: PreExec + LegacyRpc + 'static,
     <EthApi as EthApiTypes>::NetworkTypes: RpcTypes<TransactionRequest = OpTransactionRequest>,
 {
     async fn transaction_pre_exec(
@@ -517,7 +521,22 @@ where
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
     ) -> RpcResult<Vec<PreExecResult>> {
-        let block_id = block_number.unwrap_or_default();
+        let block_id = block_number.clone().unwrap_or_default();
+
+        if should_route_block_id_to_legacy(
+            self.eth_api.legacy_rpc_client(),
+            self.eth_api.provider(),
+            Some(&block_id),
+        )? {
+            let legacy_client = self.eth_api.legacy_rpc_client().unwrap();
+            return exec_legacy(
+                "eth_transactionPreExec",
+                legacy_client.transaction_pre_exec(&args, block_number, state_overrides.as_ref()),
+            )
+            .await
+            .map_err(boxed_err_to_rpc);
+        }
+
         let (evm_env, at) = match self.eth_api.evm_env_at(block_id).await {
             Ok(env) => env,
             Err(e) => return Err(e.into()),

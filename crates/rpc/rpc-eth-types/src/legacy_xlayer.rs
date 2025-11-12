@@ -12,6 +12,8 @@ use jsonrpsee::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::pre_exec_xlayer::PreExecResult;
+
 /// Configuration for legacy RPC routing.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyRpcConfig {
@@ -267,6 +269,20 @@ impl LegacyRpcClient {
         Self::to_box_err(
             self.client
                 .request("eth_createAccessList", (request, block_id, state_overrides))
+                .await,
+        )
+    }
+
+    /// Forward eth_transactionPreExec to legacy RPC.
+    pub async fn transaction_pre_exec(
+        &self,
+        args: &(impl Serialize + Sync),
+        block_id: Option<BlockId>,
+        state_overrides: Option<&(impl Serialize + Sync)>,
+    ) -> Result<Vec<PreExecResult>, Box<dyn std::error::Error + Send + Sync>> {
+        Self::to_box_err(
+            self.client
+                .request("eth_transactionPreExec", (args, block_id, state_overrides))
                 .await,
         )
     }
