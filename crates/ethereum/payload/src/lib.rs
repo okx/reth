@@ -37,6 +37,7 @@ use reth_transaction_pool::{
     ValidPoolTransaction,
 };
 use revm::context_interface::Block as _;
+use reth_node_metrics as _;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 

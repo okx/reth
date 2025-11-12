@@ -30,6 +30,7 @@ use http_body as _;
 use hyper as _;
 use jsonwebtoken as _;
 use pin_project as _;
+use reth_node_metrics as _;
 use tower as _;
 
 mod admin;
