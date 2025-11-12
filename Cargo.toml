@@ -179,7 +179,6 @@ members = [
     "testing/runner",
     "tests/",
     "crates/tracing-otlp",
-    "crates/tracing-otlp",
     "crates/xlayer/db",
     "crates/xlayer/rpc",
     "crates/xlayer/exex",
