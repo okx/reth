@@ -460,10 +460,8 @@ mod tests {
         // Test error propagation with timing
         let result = exec_legacy("test_method", async {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            Err::<u64, _>(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Test error",
-            )) as Box<dyn std::error::Error + Send + Sync>)
+            Err::<u64, _>(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Test error"))
+                as Box<dyn std::error::Error + Send + Sync>)
         })
         .await;
 

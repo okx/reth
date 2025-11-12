@@ -80,5 +80,4 @@ pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
 mod transaction_trace_xlayer;
 pub use transaction_trace_xlayer::TransactionTraceArgs;
 
-
 pub mod types;

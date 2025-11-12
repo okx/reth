@@ -4,11 +4,9 @@ use alloy_eips::BlockId;
 use alloy_evm::overrides::{apply_state_overrides, OverrideBlockHashes};
 use alloy_primitives::{hex, Address, U256};
 use alloy_rpc_types_eth::{state::StateOverride, TransactionInfo};
-use alloy_rpc_types_trace::geth::call::CallFrame as GethCallFrame;
-use alloy_rpc_types_trace::geth::mux::MuxConfig;
-use alloy_rpc_types_trace::geth::pre_state::PreStateFrame;
 use alloy_rpc_types_trace::geth::{
-    CallConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig, PreStateConfig,
+    call::CallFrame as GethCallFrame, mux::MuxConfig, pre_state::PreStateFrame, CallConfig,
+    GethDebugBuiltInTracerType, GethDebugTracerConfig, PreStateConfig,
 };
 use jsonrpsee::core::RpcResult;
 use op_alloy_rpc_types::OpTransactionRequest;
@@ -20,9 +18,8 @@ use reth_rpc_eth_api::{
     EthApiTypes, RpcTypes,
 };
 use reth_rpc_eth_types::pre_exec_xlayer::{PreExecError, PreExecInnerTx, PreExecResult};
-use revm::context_interface::result::ExecutionResult;
 use revm::context_interface::block::Block; // for block_env.number()
-use revm::DatabaseCommit;
+use revm::{context_interface::result::ExecutionResult, DatabaseCommit};
 use revm_inspectors::tracing::MuxInspector;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -577,10 +574,8 @@ mod tests {
         }
 
         fn with_account(mut self, address: Address, balance: U256, nonce: u64) -> Self {
-            self.accounts.insert(
-                address,
-                AccountInfo { balance, nonce, code_hash: B256::ZERO, code: None },
-            );
+            self.accounts
+                .insert(address, AccountInfo { balance, nonce, code_hash: B256::ZERO, code: None });
             self
         }
     }
@@ -597,12 +592,7 @@ mod tests {
         }
 
         fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-            Ok(self
-                .storage
-                .get(&address)
-                .and_then(|s| s.get(&index))
-                .copied()
-                .unwrap_or_default())
+            Ok(self.storage.get(&address).and_then(|s| s.get(&index)).copied().unwrap_or_default())
         }
 
         fn block_hash(&mut self, _number: u64) -> Result<B256, Self::Error> {
@@ -622,12 +612,7 @@ mod tests {
         }
 
         fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-            Ok(self
-                .storage
-                .get(&address)
-                .and_then(|s| s.get(&index))
-                .copied()
-                .unwrap_or_default())
+            Ok(self.storage.get(&address).and_then(|s| s.get(&index)).copied().unwrap_or_default())
         }
 
         fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {

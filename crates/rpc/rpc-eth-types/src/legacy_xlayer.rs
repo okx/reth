@@ -40,15 +40,13 @@ pub struct LegacyRpcClient {
 
 impl LegacyRpcClient {
     /// Create a new legacy RPC client from configuration.
-    pub fn from_config(config: &LegacyRpcConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let client = HttpClientBuilder::default()
-            .request_timeout(config.timeout)
-            .build(&config.endpoint)?;
+    pub fn from_config(
+        config: &LegacyRpcConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let client =
+            HttpClientBuilder::default().request_timeout(config.timeout).build(&config.endpoint)?;
 
-        Ok(Self {
-            client,
-            cutoff_block: config.cutoff_block,
-        })
+        Ok(Self { client, cutoff_block: config.cutoff_block })
     }
 
     /// Get the cutoff block number.
@@ -112,7 +110,9 @@ impl LegacyRpcClient {
         &self,
         block_number: BlockNumberOrTag,
     ) -> Result<Option<U256>, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(self.client.request("eth_getBlockTransactionCountByNumber", (block_number,)).await)
+        Self::to_box_err(
+            self.client.request("eth_getBlockTransactionCountByNumber", (block_number,)).await,
+        )
     }
 
     /// Forward eth_getBlockTransactionCountByHash to legacy RPC.
@@ -166,7 +166,9 @@ impl LegacyRpcClient {
         hash: BlockHash,
         index: Index,
     ) -> Result<Option<Transaction>, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(self.client.request("eth_getTransactionByBlockHashAndIndex", (hash, index)).await)
+        Self::to_box_err(
+            self.client.request("eth_getTransactionByBlockHashAndIndex", (hash, index)).await,
+        )
     }
 
     /// Forward eth_getTransactionByBlockNumberAndIndex to legacy RPC.
@@ -175,7 +177,11 @@ impl LegacyRpcClient {
         block_number: BlockNumberOrTag,
         index: Index,
     ) -> Result<Option<Transaction>, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(self.client.request("eth_getTransactionByBlockNumberAndIndex", (block_number, index)).await)
+        Self::to_box_err(
+            self.client
+                .request("eth_getTransactionByBlockNumberAndIndex", (block_number, index))
+                .await,
+        )
     }
 
     /// Forward eth_getBlockReceipts to legacy RPC.
@@ -216,7 +222,9 @@ impl LegacyRpcClient {
         hash: BlockHash,
         index: Index,
     ) -> Result<Option<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(self.client.request("eth_getRawTransactionByBlockHashAndIndex", (hash, index)).await)
+        Self::to_box_err(
+            self.client.request("eth_getRawTransactionByBlockHashAndIndex", (hash, index)).await,
+        )
     }
 
     /// Forward eth_getRawTransactionByBlockNumberAndIndex to legacy RPC.
@@ -225,10 +233,13 @@ impl LegacyRpcClient {
         block_number: BlockNumberOrTag,
         index: Index,
     ) -> Result<Option<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(self.client.request("eth_getRawTransactionByBlockNumberAndIndex", (block_number, index)).await)
+        Self::to_box_err(
+            self.client
+                .request("eth_getRawTransactionByBlockNumberAndIndex", (block_number, index))
+                .await,
+        )
     }
 }
-
 
 #[cfg(test)]
 mod tests {
