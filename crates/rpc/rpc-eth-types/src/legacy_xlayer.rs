@@ -238,11 +238,7 @@ impl LegacyRpcClient {
         state_overrides: Option<&(impl Serialize + Sync)>,
         block_overrides: Option<&(impl Serialize + Sync)>,
     ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(
-            self.client
-                .request("eth_call", (request, block_id, state_overrides, block_overrides))
-                .await,
-        )
+        Self::to_box_err(self.client.request("eth_call", (request, block_id, state_overrides, block_overrides)).await)
     }
 
     /// Forward eth_estimateGas to legacy RPC.
@@ -252,11 +248,7 @@ impl LegacyRpcClient {
         block_id: Option<BlockId>,
         state_overrides: Option<&(impl Serialize + Sync)>,
     ) -> Result<U256, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(
-            self.client
-                .request("eth_estimateGas", (request, block_id, state_overrides))
-                .await,
-        )
+        Self::to_box_err(self.client.request("eth_estimateGas", (request, block_id, state_overrides)).await)
     }
 
     /// Forward eth_createAccessList to legacy RPC.
@@ -266,11 +258,7 @@ impl LegacyRpcClient {
         block_id: Option<BlockId>,
         state_overrides: Option<&(impl Serialize + Sync)>,
     ) -> Result<alloy_eips::eip2930::AccessListResult, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(
-            self.client
-                .request("eth_createAccessList", (request, block_id, state_overrides))
-                .await,
-        )
+        Self::to_box_err(self.client.request("eth_createAccessList", (request, block_id, state_overrides)).await)
     }
 
     /// Forward eth_transactionPreExec to legacy RPC.
@@ -280,11 +268,7 @@ impl LegacyRpcClient {
         block_id: Option<BlockId>,
         state_overrides: Option<&(impl Serialize + Sync)>,
     ) -> Result<Vec<PreExecResult>, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(
-            self.client
-                .request("eth_transactionPreExec", (args, block_id, state_overrides))
-                .await,
-        )
+        Self::to_box_err(self.client.request("eth_transactionPreExec", (args, block_id, state_overrides)).await)
     }
 }
 
