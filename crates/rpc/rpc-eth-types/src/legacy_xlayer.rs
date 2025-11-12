@@ -171,7 +171,7 @@ impl LegacyRpcClient {
         )
     }
 
-    /// Forward eth_getTransactionByBlockNumberAndIndex to legacy RPC.
+    /// Forward `eth_getTransactionByBlockNumberAndIndex` to legacy RPC.
     pub async fn get_transaction_by_block_number_and_index(
         &self,
         block_number: BlockNumberOrTag,
@@ -184,7 +184,7 @@ impl LegacyRpcClient {
         )
     }
 
-    /// Forward eth_getBlockReceipts to legacy RPC.
+    /// Forward `eth_getBlockReceipts` to legacy RPC.
     pub async fn get_block_receipts(
         &self,
         block_id: BlockId,
@@ -192,7 +192,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getBlockReceipts", (block_id,)).await)
     }
 
-    /// Forward eth_getHeaderByNumber to legacy RPC.
+    /// Forward `eth_getHeaderByNumber` to legacy RPC.
     pub async fn get_header_by_number(
         &self,
         block_number: BlockNumberOrTag,
@@ -200,7 +200,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getHeaderByNumber", (block_number,)).await)
     }
 
-    /// Forward eth_getHeaderByHash to legacy RPC.
+    /// Forward `eth_getHeaderByHash` to legacy RPC.
     pub async fn get_header_by_hash(
         &self,
         hash: BlockHash,
@@ -208,7 +208,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getHeaderByHash", (hash,)).await)
     }
 
-    /// Forward eth_getRawTransactionByHash to legacy RPC.
+    /// Forward `eth_getRawTransactionByHash` to legacy RPC.
     pub async fn get_raw_transaction_by_hash(
         &self,
         hash: TxHash,
@@ -216,7 +216,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getRawTransactionByHash", (hash,)).await)
     }
 
-    /// Forward eth_getRawTransactionByBlockHashAndIndex to legacy RPC.
+    /// Forward `eth_getRawTransactionByBlockHashAndIndex` to legacy RPC.
     pub async fn get_raw_transaction_by_block_hash_and_index(
         &self,
         hash: BlockHash,
@@ -227,7 +227,7 @@ impl LegacyRpcClient {
         )
     }
 
-    /// Forward eth_getRawTransactionByBlockNumberAndIndex to legacy RPC.
+    /// Forward `eth_getRawTransactionByBlockNumberAndIndex` to legacy RPC.
     pub async fn get_raw_transaction_by_block_number_and_index(
         &self,
         block_number: BlockNumberOrTag,

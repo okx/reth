@@ -231,7 +231,7 @@ where
         block_prefix: &str,
         block_number: u64,
     ) -> eyre::Result<()> {
-        let filename = format!("{}.witness.re_executed.json", block_prefix);
+        let filename = format!("{block_prefix}.witness.re_executed.json");
         let re_executed_witness_path = self.save_file(filename, witness)?;
 
         if let Some(healthy_node_client) = &self.healthy_node_client {
@@ -243,11 +243,11 @@ where
                 .await
             })?;
 
-            let filename = format!("{}.witness.healthy.json", block_prefix);
+            let filename = format!("{block_prefix}.witness.healthy.json");
             let healthy_path = self.save_file(filename, &healthy_node_witness)?;
 
             if witness != &healthy_node_witness {
-                let filename = format!("{}.witness.diff", block_prefix);
+                let filename = format!("{block_prefix}.witness.diff");
                 let diff_path = self.save_diff(filename, witness, &healthy_node_witness)?;
                 warn!(
                     target: "engine::invalid_block_hooks::witness",
@@ -269,15 +269,15 @@ where
         block_prefix: &str,
     ) -> eyre::Result<()> {
         if re_executed_state != original_state {
-            let original_filename = format!("{}.bundle_state.original.json", block_prefix);
+            let original_filename = format!("{block_prefix}.bundle_state.original.json");
             let original_path = self.save_file(original_filename, original_state)?;
-            let re_executed_filename = format!("{}.bundle_state.re_executed.json", block_prefix);
+            let re_executed_filename = format!("{block_prefix}.bundle_state.re_executed.json");
             let re_executed_path = self.save_file(re_executed_filename, re_executed_state)?;
 
             // Convert bundle state to sorted format for deterministic comparison
             let bundle_state_sorted = sort_bundle_state_for_comparison(re_executed_state);
             let output_state_sorted = sort_bundle_state_for_comparison(original_state);
-            let filename = format!("{}.bundle_state.diff", block_prefix);
+            let filename = format!("{block_prefix}.bundle_state.diff");
             let diff_path = self.save_diff(filename, &bundle_state_sorted, &output_state_sorted)?;
 
             warn!(
@@ -307,24 +307,24 @@ where
 
         if let Some((original_updates, original_root)) = trie_updates {
             if re_executed_root != original_root {
-                let filename = format!("{}.state_root.diff", block_prefix);
+                let filename = format!("{block_prefix}.state_root.diff");
                 let diff_path = self.save_diff(filename, &re_executed_root, &original_root)?;
                 warn!(target: "engine::invalid_block_hooks::witness", ?original_root, ?re_executed_root, diff_path = %diff_path.display(), "State root mismatch after re-execution");
             }
 
             if re_executed_root != block.state_root() {
-                let filename = format!("{}.header_state_root.diff", block_prefix);
+                let filename = format!("{block_prefix}.header_state_root.diff");
                 let diff_path = self.save_diff(filename, &re_executed_root, &block.state_root())?;
                 warn!(target: "engine::invalid_block_hooks::witness", header_state_root=?block.state_root(), ?re_executed_root, diff_path = %diff_path.display(), "Re-executed state root does not match block state root");
             }
 
             if &trie_output != original_updates {
                 let original_path = self.save_file(
-                    format!("{}.trie_updates.original.json", block_prefix),
+                    format!("{block_prefix}.trie_updates.original.json"),
                     &original_updates.into_sorted_ref(),
                 )?;
                 let re_executed_path = self.save_file(
-                    format!("{}.trie_updates.re_executed.json", block_prefix),
+                    format!("{block_prefix}.trie_updates.re_executed.json"),
                     &trie_output.into_sorted_ref(),
                 )?;
                 warn!(
