@@ -735,12 +735,9 @@ where
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<Bytes> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_overrides, ?block_overrides, "Serving eth_call");
-        // XLayer: Legacy RPC routing
-        let req_for_legacy = request.clone();
-        let overrides = EvmOverrides::new(state_overrides.clone(), block_overrides.clone());
         route_by_block_id_opt!("eth_call", self, block_number,
-            self.legacy_rpc_client().unwrap().call(&req_for_legacy, block_number, state_overrides.as_ref(), block_overrides.as_ref().map(|b| b.as_ref())),
-            Ok(EthCall::call(self, request, block_number, overrides).await?))
+            self.legacy_rpc_client().unwrap().call(&request, block_number, state_overrides.as_ref(), block_overrides.as_ref().map(|b| b.as_ref())),
+            Ok(EthCall::call(self, request, block_number, EvmOverrides::new(state_overrides, block_overrides)).await?))
     }
 
     /// Handler for: `eth_fillTransaction`
@@ -771,12 +768,9 @@ where
         state_override: Option<StateOverride>,
     ) -> RpcResult<AccessListResult> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_override, "Serving eth_createAccessList");
-        // XLayer: Legacy RPC routing
-        let req_for_legacy = request.clone();
-        let state_override_for_local = state_override.clone();
         route_by_block_id_opt!("eth_createAccessList", self, block_number,
-            self.legacy_rpc_client().unwrap().create_access_list(&req_for_legacy, block_number, state_override.as_ref()),
-            Ok(EthCall::create_access_list_at(self, request, block_number, state_override_for_local).await?))
+            self.legacy_rpc_client().unwrap().create_access_list(&request, block_number, state_override.as_ref()),
+            Ok(EthCall::create_access_list_at(self, request, block_number, state_override).await?))
     }
 
     /// Handler for: `eth_estimateGas`
@@ -787,12 +781,9 @@ where
         state_override: Option<StateOverride>,
     ) -> RpcResult<U256> {
         trace!(target: "rpc::eth", ?request, ?block_number, "Serving eth_estimateGas");
-        // XLayer: Legacy RPC routing
-        let req_for_legacy = request.clone();
-        let state_override_for_local = state_override.clone();
         route_by_block_id_opt!("eth_estimateGas", self, block_number,
-            self.legacy_rpc_client().unwrap().estimate_gas(&req_for_legacy, block_number, state_override.as_ref()),
-            Ok(EthCall::estimate_gas_at(self, request, block_number.unwrap_or_default(), state_override_for_local).await?))
+            self.legacy_rpc_client().unwrap().estimate_gas(&request, block_number, state_override.as_ref()),
+            Ok(EthCall::estimate_gas_at(self, request, block_number.unwrap_or_default(), state_override).await?))
     }
 
     /// Handler for: `eth_gasPrice`

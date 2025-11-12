@@ -10,7 +10,6 @@ use alloy_rpc_types_trace::geth::pre_state::PreStateFrame;
 use alloy_rpc_types_trace::geth::{
     CallConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig, PreStateConfig,
 };
-use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee_core::RpcResult;
 use op_alloy_rpc_types::OpTransactionRequest;
 use reth_errors::ProviderError;
@@ -521,17 +520,20 @@ where
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
     ) -> RpcResult<Vec<PreExecResult>> {
-        let block_id = block_number.clone().unwrap_or_default();
+        let block_id = block_number.unwrap_or_default();
 
         if should_route_block_id_to_legacy(
             self.eth_api.legacy_rpc_client(),
             self.eth_api.provider(),
             Some(&block_id),
         )? {
-            let legacy_client = self.eth_api.legacy_rpc_client().unwrap();
             return exec_legacy(
                 "eth_transactionPreExec",
-                legacy_client.transaction_pre_exec(&args, block_number, state_overrides.as_ref()),
+                self.eth_api.legacy_rpc_client().unwrap().transaction_pre_exec(
+                    &args,
+                    Some(block_id),
+                    state_overrides.as_ref(),
+                ),
             )
             .await
             .map_err(boxed_err_to_rpc);
