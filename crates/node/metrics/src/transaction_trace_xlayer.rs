@@ -145,8 +145,8 @@ impl TransactionTracer {
             } else {
                 path.clone()
             };
-            if let Some(parent) = file_path.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
+            if let Some(parent) = file_path.parent()
+                && let Err(e) = fs::create_dir_all(parent) {
                     tracing::warn!(
                         target: "tx_trace",
                         ?parent,
@@ -154,7 +154,7 @@ impl TransactionTracer {
                         "Failed to create transaction trace output directory"
                     );
                 }
-            }
+
 
             match OpenOptions::new().create(true).append(true).open(&file_path) {
                 Ok(file) => {
@@ -200,7 +200,7 @@ impl TransactionTracer {
         match self.inner.output_file.lock() {
             Ok(mut file_guard) => {
                 if let Some(ref mut file) = *file_guard {
-                    if let Err(e) = writeln!(file, "{}", csv_line) {
+                    if let Err(e) = writeln!(file, "{csv_line}") {
                         tracing::warn!(
                             target: "tx_trace",
                             error = %e,
@@ -224,15 +224,15 @@ impl TransactionTracer {
                             }
                         };
 
-                        if should_flush {
-                            if let Err(e) = file.flush() {
+                        if should_flush
+                            && let Err(e) = file.flush() {
                                 tracing::warn!(
                                     target: "tx_trace",
                                     error = %e,
                                     "Failed to flush transaction trace file"
                                 );
                             }
-                        }
+
                     }
                 }
             }
@@ -250,15 +250,15 @@ impl TransactionTracer {
     pub fn flush(&self) {
         match self.inner.output_file.lock() {
             Ok(mut file_guard) => {
-                if let Some(ref mut file) = *file_guard {
-                    if let Err(e) = file.flush() {
+                if let Some(ref mut file) = *file_guard
+                    && let Err(e) = file.flush() {
                         tracing::warn!(
                             target: "tx_trace",
                             error = %e,
                             "Failed to flush transaction trace file on shutdown"
                         );
                     }
-                }
+
             }
             Err(e) => {
                 tracing::warn!(
@@ -303,7 +303,7 @@ impl TransactionTracer {
         let contract_address = "";
         let block_height = block_number.map(|n| n.to_string()).unwrap_or_default();
         let block_hash_str =
-            block_hash.map(|h| format!("{:#x}", h).to_lowercase()).unwrap_or_default();
+            block_hash.map(|h| format!("{h:#x}").to_lowercase()).unwrap_or_default();
         let block_time = "";
         let deposit_confirm_height = "";
         let token_id = "";
@@ -354,7 +354,7 @@ impl TransactionTracer {
         let timestamp_duration =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let timestamp_ms = timestamp_duration.as_millis();
-        let trace_hash = format!("{:#x}", tx_hash);
+        let trace_hash = format!("{tx_hash:#x}");
 
         let csv_line =
             self.format_csv_line(&trace_hash, process_id, timestamp_ms, None, block_number);
@@ -401,7 +401,7 @@ impl TransactionTracer {
         let timestamp_duration =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let timestamp_ms = timestamp_duration.as_millis();
-        let trace_hash = format!("{:#x}", block_hash);
+        let trace_hash = format!("{block_hash:#x}");
 
         let csv_line = self.format_csv_line(
             &trace_hash,
@@ -437,7 +437,7 @@ impl TransactionTracer {
             return;
         }
 
-        let trace_hash = format!("{:#x}", block_hash);
+        let trace_hash = format!("{block_hash:#x}");
 
         let csv_line = self.format_csv_line(
             &trace_hash,

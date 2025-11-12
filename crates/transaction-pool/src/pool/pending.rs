@@ -357,8 +357,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
             Entry::Vacant(_) => {
                 debug_assert!(
                     false,
-                    "removed transaction without a tracked highest nonce {:?}",
-                    id
+                    "removed transaction without a tracked highest nonce {id:?}"
                 );
             }
         }
