@@ -143,9 +143,7 @@ impl TraceCollector {
         gas_limit: u64,
         code_address: String,
     ) {
-        self.traces.push(InternalTransaction::default());
-
-        let txn = self.traces.last_mut().unwrap();
+        let mut txn = InternalTransaction::default();
         txn.call_type = call_type;
         txn.from = from.clone();
         txn.input = input;
@@ -169,6 +167,8 @@ impl TraceCollector {
             }
             _ => {}
         }
+
+        self.traces.push(txn);
     }
 
     fn before_op(&mut self) {
