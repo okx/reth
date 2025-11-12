@@ -15,7 +15,7 @@ use revm_context_interface::{ContextTr, LocalContextTr};
 
 #[derive(Debug, Clone, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
 pub struct InternalTransaction {
-    depth: u64,
+    dept: u64,
     internal_index: u64,
     call_type: String,
     name: String,
@@ -190,7 +190,7 @@ impl TraceCollector {
         self.trace_stack.push(trace_index);
 
         let txn = &mut self.traces[trace_index];
-        txn.depth = depth as u64;
+        txn.dept = depth as u64;
         txn.internal_index = internal_index as u64;
 
         self.sibling_count[depth] += 1;
