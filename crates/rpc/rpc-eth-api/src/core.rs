@@ -741,7 +741,7 @@ where
     ) -> RpcResult<Bytes> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_overrides, ?block_overrides, "Serving eth_call");
         route_by_block_id_opt!("eth_call", self, block_number,
-            self.legacy_rpc_client().unwrap().call(&request, block_number, state_overrides.as_ref(), block_overrides.as_ref().map(|b| b.as_ref())),
+            self.legacy_rpc_client().unwrap().call(&request, block_number, state_overrides.as_ref()),
             Ok(EthCall::call(self, request, block_number, EvmOverrides::new(state_overrides, block_overrides)).await?))
     }
 
@@ -774,7 +774,7 @@ where
     ) -> RpcResult<AccessListResult> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_override, "Serving eth_createAccessList");
         route_by_block_id_opt!("eth_createAccessList", self, block_number,
-            self.legacy_rpc_client().unwrap().create_access_list(&request, block_number, state_override.as_ref()),
+            self.legacy_rpc_client().unwrap().create_access_list(&request, block_number, None),
             Ok(EthCall::create_access_list_at(self, request, block_number, state_override).await?))
     }
 
@@ -787,7 +787,7 @@ where
     ) -> RpcResult<U256> {
         trace!(target: "rpc::eth", ?request, ?block_number, "Serving eth_estimateGas");
         route_by_block_id_opt!("eth_estimateGas", self, block_number,
-            self.legacy_rpc_client().unwrap().estimate_gas(&request, block_number, state_override.as_ref()),
+            self.legacy_rpc_client().unwrap().estimate_gas(&request, block_number),
             Ok(EthCall::estimate_gas_at(self, request, block_number.unwrap_or_default(), state_override).await?))
     }
 
