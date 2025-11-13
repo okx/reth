@@ -331,8 +331,43 @@ jobs:
           fi
 
   ##############################################################################
-  # Phase 1.5: Security Audit
+  # Phase 1.5: Code Quality & Security Audit
   ##############################################################################
+
+  code-format:
+    needs: [sync-upstream]
+    name: Code Format Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Check code formatting
+        run: |
+          echo "## 🎨 Code Format Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if cargo +nightly fmt --all --check; then
+            echo "✅ **All code is properly formatted**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Code formatting issues detected**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Run the following command to fix formatting:" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo 'make fmt' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
 
   security-audit:
     needs: [sync-upstream]
@@ -550,6 +585,7 @@ jobs:
       - integration-tests
       - e2e-tests
       - ethereum-state-tests
+      - code-format
       - security-audit
       - cargo-deny
       - license-compliance
@@ -617,6 +653,13 @@ jobs:
             echo "| Ethereum State Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
           fi
 
+          # Code Format
+          if [[ "${{ needs.code-format.result }}" == "success" ]]; then
+            echo "| Code Format | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Code Format | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
           # Security Audit
           if [[ "${{ needs.security-audit.result }}" == "success" ]]; then
             echo "| Security Audit | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
@@ -645,7 +688,8 @@ jobs:
              [[ "${{ needs.unit-tests.result }}" == "success" ]] && \
              [[ "${{ needs.integration-tests.result }}" == "success" ]] && \
              [[ "${{ needs.e2e-tests.result }}" == "success" ]] && \
-             [[ "${{ needs.ethereum-state-tests.result }}" == "success" ]]; then
+             [[ "${{ needs.ethereum-state-tests.result }}" == "success" ]] && \
+             [[ "${{ needs.code-format.result }}" == "success" ]]; then
             echo "## ✅ Overall Status: SUCCESS" >> $GITHUB_STEP_SUMMARY
             echo "all_passed" > status.txt
           else
@@ -679,7 +723,7 @@ jobs:
   notify:
     name: Send Lark Notification
     runs-on: ubuntu-latest
-    needs: [summary, sync-upstream, unit-tests, integration-tests, e2e-tests, ethereum-state-tests, security-audit, cargo-deny, license-compliance]
+    needs: [summary, sync-upstream, unit-tests, integration-tests, e2e-tests, ethereum-state-tests, code-format, security-audit, cargo-deny, license-compliance]
     if: always()
     timeout-minutes: 10
     permissions:
@@ -725,6 +769,7 @@ jobs:
           INTEGRATION_ICON=$(get_status_icon "${{ needs.integration-tests.result }}")
           E2E_ICON=$(get_status_icon "${{ needs.e2e-tests.result }}")
           EF_ICON=$(get_status_icon "${{ needs.ethereum-state-tests.result }}")
+          FORMAT_ICON=$(get_status_icon "${{ needs.code-format.result }}")
           AUDIT_ICON=$(get_status_icon "${{ needs.security-audit.result }}")
           DENY_ICON=$(get_status_icon "${{ needs.cargo-deny.result }}")
           LICENSE_ICON=$(get_status_icon "${{ needs.license-compliance.result }}")
@@ -821,6 +866,13 @@ jobs:
                       "text": {
                         "tag": "lark_md",
                         "content": "${EF_ICON} Ethereum State Tests"
+                      }
+                    },
+                    {
+                      "is_short": true,
+                      "text": {
+                        "tag": "lark_md",
+                        "content": "${FORMAT_ICON} Code Format"
                       }
                     }
                   ]
