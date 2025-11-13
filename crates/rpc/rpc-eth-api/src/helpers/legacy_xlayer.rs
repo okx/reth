@@ -36,12 +36,12 @@ pub fn should_route_block_id_to_legacy<Provider>(
 where
     Provider: reth_storage_api::BlockNumReader,
 {
-    let Some(client) = legacy_client else {
+    if legacy_client.is_none() {
         return Ok(false);
-    };
+    }
 
     Ok(match block_id {
-        Some(BlockId::Number(number)) => should_route_to_legacy(Some(client), *number),
+        Some(BlockId::Number(number)) => should_route_to_legacy(legacy_client, *number),
         Some(BlockId::Hash(hash)) => !provider.block_number(hash.block_hash).map_err(internal_rpc_err)?.is_some(),
         None => false,
     })

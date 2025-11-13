@@ -10,7 +10,7 @@ use alloy_rpc_types_trace::geth::pre_state::PreStateFrame;
 use alloy_rpc_types_trace::geth::{
     CallConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig, PreStateConfig,
 };
-use jsonrpsee_core::RpcResult;
+use jsonrpsee::core::RpcResult;
 use op_alloy_rpc_types::OpTransactionRequest;
 use reth_errors::ProviderError;
 use reth_evm::EvmEnvFor;
@@ -520,14 +520,13 @@ where
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
     ) -> RpcResult<Vec<PreExecResult>> {
-        let block_id = block_number.unwrap_or_default();
-
         // XLayer: Route to legacy RPC if block number is below cutoff
-        if should_route_block_id_to_legacy(self.eth_api.legacy_rpc_client(), self.eth_api.provider(), Some(&block_id))? {
+        if should_route_block_id_to_legacy(self.eth_api.legacy_rpc_client(), self.eth_api.provider(), block_number.as_ref())? {
             let client = self.eth_api.legacy_rpc_client().unwrap();
-            return exec_legacy("eth_transactionPreExec", client.transaction_pre_exec(&args, Some(block_id), state_overrides.as_ref())).await.map_err(boxed_err_to_rpc);
+            return exec_legacy("eth_transactionPreExec", client.transaction_pre_exec(&args, block_number, state_overrides.as_ref())).await.map_err(boxed_err_to_rpc);
         }
 
+        let block_id = block_number.unwrap_or_default();
         let (evm_env, at) = match self.eth_api.evm_env_at(block_id).await {
             Ok(env) => env,
             Err(e) => return Err(e.into()),
