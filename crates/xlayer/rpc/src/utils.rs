@@ -88,14 +88,18 @@ where
             ErrorObjectOwned::owned(INVALID_PARAMS_CODE, "Invalid transaction hash", None::<()>)
         })?;
 
-        // Try legacy RPC if transaction not found locally
-        route_to_legacy_json!(
-            "eth_getInternalTransactions",
-            self.backend.provider().transaction_by_hash(hash).ok().flatten().is_none()
-                && self.backend.legacy_rpc_client().is_some(),
-            tx_hash,
-            self.backend.legacy_rpc_client().unwrap().get_internal_transactions(tx_hash)
-        );
+        match self.backend.provider().transaction_by_hash(hash) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                route_to_legacy_json!(
+                    "eth_getInternalTransactions",
+                    self.backend.legacy_rpc_client().is_some(), tx_hash,
+                    self.backend.legacy_rpc_client().unwrap().get_internal_transactions(tx_hash)
+                );
+                return Err(ErrorObjectOwned::owned(-32000, "Transaction not found", None::<()>));
+            }
+            Err(_) => return Err(ErrorObjectOwned::owned(-32603, "Internal error", None::<()>)),
+        }
 
         let deadline = Instant::now() + Duration::from_secs(TIMEOUT_DURATION_S);
         let mut tick = interval(Duration::from_millis(INTERVAL_DELAY_MS));
@@ -144,7 +148,7 @@ where
             self.backend.legacy_rpc_client().unwrap().get_block_internal_transactions(block_number)
         );
 
-        let hash = match self.backend.provider().block_hash_for_id(block_number.into()) {
+        let hash: FixedBytes<32> = match self.backend.provider().block_hash_for_id(block_number.into()) {
             Ok(Some(hash)) => hash,
             Ok(None) => return Err(ErrorObjectOwned::owned(-32000, "Block not found", None::<()>)),
             Err(_) => return Err(ErrorObjectOwned::owned(-32603, "Internal error", None::<()>)),
