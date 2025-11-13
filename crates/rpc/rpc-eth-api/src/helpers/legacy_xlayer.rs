@@ -166,7 +166,7 @@ macro_rules! try_local_then_legacy {
 
 /// Route to legacy RPC with JSON deserialization if condition is met
 #[macro_export]
-macro_rules! route_to_legacy_json {
+macro_rules! route_by_condition {
     ($method:literal, $condition:expr, $key:expr, $legacy_call:expr) => {{
         if $condition {
             tracing::info!(target: "rpc::eth::legacy", method = $method, key = ?$key, "→ legacy");

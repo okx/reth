@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use reth_rpc_eth_api::{
     helpers::{should_route_to_legacy, EthCall, LegacyRpc},
-    route_to_legacy_json, EthApiTypes,
+    route_by_condition, EthApiTypes,
 };
 
 use alloy_eips::BlockNumberOrTag;
@@ -91,7 +91,7 @@ where
         match self.backend.provider().transaction_by_hash(hash) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                route_to_legacy_json!(
+                route_by_condition!(
                     "eth_getInternalTransactions",
                     self.backend.legacy_rpc_client().is_some(), tx_hash,
                     self.backend.legacy_rpc_client().unwrap().get_internal_transactions(tx_hash)
@@ -141,7 +141,7 @@ where
         block_number: BlockNumberOrTag,
     ) -> RpcResult<HashMap<String, Vec<InternalTransaction>>> {
         // XLayer: Route to legacy RPC if block number is below cutoff
-        route_to_legacy_json!(
+        route_by_condition!(
             "eth_getBlockInternalTransactions",
             should_route_to_legacy(self.backend.legacy_rpc_client(), block_number), block_number,
             self.backend.legacy_rpc_client().unwrap().get_block_internal_transactions(block_number)
