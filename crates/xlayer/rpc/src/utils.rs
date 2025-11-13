@@ -143,8 +143,7 @@ where
         // XLayer: Route to legacy RPC if block number is below cutoff
         route_to_legacy_json!(
             "eth_getBlockInternalTransactions",
-            should_route_to_legacy(self.backend.legacy_rpc_client(), block_number),
-            block_number,
+            should_route_to_legacy(self.backend.legacy_rpc_client(), block_number), block_number,
             self.backend.legacy_rpc_client().unwrap().get_block_internal_transactions(block_number)
         );
 
