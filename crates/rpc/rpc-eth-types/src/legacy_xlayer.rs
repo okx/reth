@@ -270,6 +270,22 @@ impl LegacyRpcClient {
     ) -> Result<Vec<PreExecResult>, Box<dyn std::error::Error + Send + Sync>> {
         Self::to_box_err(self.client.request("eth_transactionPreExec", (args, block_id, state_overrides)).await)
     }
+
+    /// Forward eth_getInternalTransactions to legacy RPC.
+    pub async fn get_internal_transactions(
+        &self,
+        tx_hash: String,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        Self::to_box_err(self.client.request("eth_getInternalTransactions", (tx_hash,)).await)
+    }
+
+    /// Forward eth_getBlockInternalTransactions to legacy RPC.
+    pub async fn get_block_internal_transactions(
+        &self,
+        block_number: alloy_rpc_types_eth::BlockNumberOrTag,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        Self::to_box_err(self.client.request("eth_getBlockInternalTransactions", (block_number,)).await)
+    }
 }
 
 

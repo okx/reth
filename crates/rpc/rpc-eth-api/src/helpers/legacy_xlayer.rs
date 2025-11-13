@@ -164,6 +164,26 @@ macro_rules! try_local_then_legacy {
     }};
 }
 
+/// Route to legacy RPC with JSON deserialization if condition is met
+#[macro_export]
+macro_rules! route_to_legacy_json {
+    ($method:literal, $condition:expr, $key:expr, $legacy_call:expr) => {{
+        if $condition {
+            tracing::info!(target: "rpc::eth::legacy", method = $method, key = ?$key, "→ legacy");
+            let result = $crate::helpers::exec_legacy($method, $legacy_call)
+                .await
+                .map_err($crate::helpers::boxed_err_to_rpc)?;
+            return serde_json::from_value(result).map_err(|e| {
+                jsonrpsee::types::ErrorObjectOwned::owned(
+                    -32603,
+                    format!("Failed to deserialize legacy response: {}", e),
+                    None::<()>,
+                )
+            });
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
