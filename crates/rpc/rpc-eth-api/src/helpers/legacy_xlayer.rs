@@ -26,7 +26,7 @@ pub fn should_route_to_legacy(
     false
 }
 
-/// Check if a BlockId should be routed to legacy RPC
+/// Check if a BlockId should be routed to legacy RPC based on cutoff_block
 #[inline]
 pub fn should_route_block_id_to_legacy<Provider>(
     legacy_client: Option<&std::sync::Arc<reth_rpc_eth_types::LegacyRpcClient>>,
