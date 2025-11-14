@@ -291,6 +291,11 @@ pub trait EthApi<
     #[method(name = "gasPrice")]
     async fn gas_price(&self) -> RpcResult<U256>;
 
+    // For xlayer
+    /// Returns the minimum gas price (base fee + default suggested fee) in wei.
+    #[method(name = "minGasPrice")]
+    async fn min_gas_price(&self) -> RpcResult<U256>;
+
     /// Returns the account details by specifying an address and a block number/tag
     #[method(name = "getAccount")]
     async fn get_account(
@@ -827,13 +832,9 @@ where
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<Bytes> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_overrides, ?block_overrides, "Serving eth_call");
-        Ok(EthCall::call(
-            self,
-            request,
-            block_number,
-            EvmOverrides::new(state_overrides, block_overrides),
-        )
-        .await?)
+        route_by_block_id_opt!("eth_call", self, block_number,
+            self.legacy_rpc_client().unwrap().call(&request, block_number, state_overrides.as_ref()),
+            Ok(EthCall::call(self, request, block_number, EvmOverrides::new(state_overrides, block_overrides)).await?))
     }
 
     /// Handler for: `eth_fillTransaction`
@@ -864,7 +865,9 @@ where
         state_override: Option<StateOverride>,
     ) -> RpcResult<AccessListResult> {
         trace!(target: "rpc::eth", ?request, ?block_number, ?state_override, "Serving eth_createAccessList");
-        Ok(EthCall::create_access_list_at(self, request, block_number, state_override).await?)
+        route_by_block_id_opt!("eth_createAccessList", self, block_number,
+            self.legacy_rpc_client().unwrap().create_access_list(&request, block_number, None),
+            Ok(EthCall::create_access_list_at(self, request, block_number, state_override).await?))
     }
 
     /// Handler for: `eth_estimateGas`
@@ -875,19 +878,22 @@ where
         state_override: Option<StateOverride>,
     ) -> RpcResult<U256> {
         trace!(target: "rpc::eth", ?request, ?block_number, "Serving eth_estimateGas");
-        Ok(EthCall::estimate_gas_at(
-            self,
-            request,
-            block_number.unwrap_or_default(),
-            state_override,
-        )
-        .await?)
+        route_by_block_id_opt!("eth_estimateGas", self, block_number,
+            self.legacy_rpc_client().unwrap().estimate_gas(&request, block_number),
+            Ok(EthCall::estimate_gas_at(self, request, block_number.unwrap_or_default(), state_override).await?))
     }
 
     /// Handler for: `eth_gasPrice`
     async fn gas_price(&self) -> RpcResult<U256> {
         trace!(target: "rpc::eth", "Serving eth_gasPrice");
         Ok(EthFees::gas_price(self).await?)
+    }
+
+    // For xlayer
+    /// Handler for: `eth_minGasPrice`
+    async fn min_gas_price(&self) -> RpcResult<U256> {
+        trace!(target: "rpc::eth", "Serving eth_minGasPrice");
+        Ok(EthFees::min_gas_price(self).await?)
     }
 
     /// Handler for: `eth_getAccount`
