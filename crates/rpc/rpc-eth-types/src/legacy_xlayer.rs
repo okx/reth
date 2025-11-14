@@ -249,7 +249,9 @@ impl LegacyRpcClient {
         block_id: Option<BlockId>,
         state_overrides: Option<&(impl Serialize + Sync)>,
     ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(self.client.request("eth_call", (request, block_id, state_overrides)).await)
+        Self::to_box_err(
+            self.client.request("eth_call", (request, block_id, state_overrides)).await,
+        )
     }
 
     /// Forward eth_estimateGas to legacy RPC.
@@ -267,8 +269,11 @@ impl LegacyRpcClient {
         request: &(impl Serialize + Sync),
         block_id: Option<BlockId>,
         optimize_gas: Option<bool>,
-    ) -> Result<alloy_eips::eip2930::AccessListResult, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(self.client.request("eth_createAccessList", (request, block_id, optimize_gas)).await)
+    ) -> Result<alloy_eips::eip2930::AccessListResult, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Self::to_box_err(
+            self.client.request("eth_createAccessList", (request, block_id, optimize_gas)).await,
+        )
     }
 
     /// Forward eth_transactionPreExec to legacy RPC.
@@ -293,7 +298,9 @@ impl LegacyRpcClient {
         &self,
         block_number: alloy_rpc_types_eth::BlockNumberOrTag,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        Self::to_box_err(self.client.request("eth_getBlockInternalTransactions", (block_number,)).await)
+        Self::to_box_err(
+            self.client.request("eth_getBlockInternalTransactions", (block_number,)).await,
+        )
     }
 }
 

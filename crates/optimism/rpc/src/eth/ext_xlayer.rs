@@ -518,9 +518,18 @@ where
         state_overrides: Option<StateOverride>,
     ) -> RpcResult<Vec<PreExecResult>> {
         // XLayer: Route to legacy RPC if block number is below cutoff
-        if should_route_block_id_to_legacy(self.eth_api.legacy_rpc_client(), self.eth_api.provider(), block_number.as_ref())? {
+        if should_route_block_id_to_legacy(
+            self.eth_api.legacy_rpc_client(),
+            self.eth_api.provider(),
+            block_number.as_ref(),
+        )? {
             let client = self.eth_api.legacy_rpc_client().unwrap();
-            return exec_legacy("eth_transactionPreExec", client.transaction_pre_exec(&args, block_number)).await.map_err(boxed_err_to_rpc);
+            return exec_legacy(
+                "eth_transactionPreExec",
+                client.transaction_pre_exec(&args, block_number),
+            )
+            .await
+            .map_err(boxed_err_to_rpc);
         }
 
         let block_id = block_number.unwrap_or_default();
