@@ -18,6 +18,11 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+const CUSTOM_CHAINIDS: &[(&str, &str)] = &[
+  ("1952", "xlayer-testnet"),
+  ("196", "xlayer-mainnet"),
+];
+
 /// Manages reth node lifecycle and operations
 pub(crate) struct NodeManager {
     datadir: Option<String>,
@@ -123,8 +128,9 @@ impl NodeManager {
         let mut reth_args = vec![binary_path_str.to_string(), "node".to_string()];
 
         // Add chain argument (skip for mainnet as it's the default)
-        let chain_str = self.chain.to_string();
+        let mut chain_str = self.chain.to_string();
         if chain_str != "mainnet" {
+            chain_str = self.custom_chainname(chain_str, self.chain.is_id());
             reth_args.extend_from_slice(&["--chain".to_string(), chain_str.clone()]);
         }
 
@@ -456,8 +462,9 @@ impl NodeManager {
         };
 
         // Add chain argument (skip for mainnet as it's the default)
-        let chain_str = self.chain.to_string();
+        let mut chain_str = self.chain.to_string();
         if chain_str != "mainnet" {
+            chain_str = self.custom_chainname(chain_str, self.chain.is_id());
             cmd.args(["--chain", &chain_str]);
         }
 
@@ -507,5 +514,22 @@ impl NodeManager {
 
         info!("Unwound to block: {}", block_number);
         Ok(())
+    }
+
+    /// XLayer: custom chain names are not of `alloy` chain enum, and this name is passed
+    /// into reth node as arg. If we passed in a numerical value to `--chain`, the reth node
+    /// fails to start.
+    fn custom_chainname(&self, chain_str: String, is_id: bool) -> String {
+        // If id matches custom chain ids, map to chain name that is absent
+        // from alloy chain enum.
+        if is_id {
+            for (id, name) in CUSTOM_CHAINIDS {
+                if *id == chain_str {
+                    return (*name).into();
+                }
+            }
+        }
+
+       chain_str
     }
 }
