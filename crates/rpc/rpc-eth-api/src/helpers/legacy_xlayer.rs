@@ -109,7 +109,7 @@ where
     }
 }
 
-/// Route a request by BlockNumberOrTag to legacy RPC if below cutoff
+/// Route a request by `BlockNumberOrTag` to legacy RPC if below cutoff
 #[macro_export]
 macro_rules! route_by_number {
     ($method:literal, $self:ident, $number:ident, $legacy_call:expr, $local_expr:expr) => {{
@@ -123,7 +123,7 @@ macro_rules! route_by_number {
     }};
 }
 
-/// Route a request by BlockId to legacy RPC if below cutoff
+/// Route a request by `BlockId` to legacy RPC if below cutoff
 #[macro_export]
 macro_rules! route_by_block_id {
     ($method:literal, $self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
@@ -137,7 +137,7 @@ macro_rules! route_by_block_id {
     }};
 }
 
-/// Route by optional BlockId (for state queries)
+/// Route by optional `BlockId` (for state queries)
 #[macro_export]
 macro_rules! route_by_block_id_opt {
     ($method:literal, $self:ident, $block_id:ident, $legacy_call:expr, $local_expr:expr) => {{
