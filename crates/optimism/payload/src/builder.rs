@@ -1,7 +1,7 @@
 //! Optimism payload builder implementation.
 use crate::{
-    config::OpBuilderConfig, error::OpPayloadBuilderError, payload::OpBuiltPayload, OpAttributes,
-    OpPayloadBuilderAttributes, OpPayloadPrimitives,intercept_xlayer::BridgeInterceptConfig,
+    config::OpBuilderConfig, error::OpPayloadBuilderError, intercept_xlayer::BridgeInterceptConfig,
+    payload::OpBuiltPayload, OpAttributes, OpPayloadBuilderAttributes, OpPayloadPrimitives,
 };
 use alloy_consensus::{BlockHeader, Transaction, Typed2718};
 use alloy_evm::Evm as AlloyEvm;
@@ -20,6 +20,7 @@ use reth_evm::{
     ConfigureEvm, Database,
 };
 use reth_execution_types::ExecutionOutcome;
+use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::{transaction::OpTransaction, ADDRESS_L2_TO_L1_MESSAGE_PASSER};
 use reth_optimism_txpool::{
@@ -42,7 +43,6 @@ use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, Transac
 use revm::context::{Block, BlockEnv};
 use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, trace, warn};
-use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
 use reth_node_metrics::block_timing::{BlockTimingMetrics, BuildTiming, DeliverTxsTiming, store_block_timing};
 use std::time::Instant;
 
@@ -414,7 +414,6 @@ impl<Txs> OpBuilder<'_, Txs> {
         timing_metrics.build.total = build_start.elapsed();
         timing_metrics.deliver_txs.total = timing_metrics.deliver_txs.sequencer_txs + timing_metrics.deliver_txs.mempool_txs;
 
-
         let sealed_block = Arc::new(block.sealed_block().clone());
         debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
 
@@ -452,13 +451,9 @@ impl<Txs> OpBuilder<'_, Txs> {
                 TransactionProcessId::SeqBlockBuildStart,
                 build_start_timestamp,
             );
-            
+
             // Log block build end
-            tracer.log_block(
-                block_hash,
-                block_number,
-                TransactionProcessId::SeqBlockBuildEnd,
-            );
+            tracer.log_block(block_hash, block_number, TransactionProcessId::SeqBlockBuildEnd);
         }
 
         if no_tx_pool {
@@ -749,7 +744,6 @@ where
         Builder: BlockBuilder<Primitives = Evm::Primitives>,
         <<Builder::Executor as BlockExecutor>::Evm as AlloyEvm>::DB: Database,
     {
-
         let mut block_gas_limit = builder.evm_mut().block().gas_limit();
         if let Some(gas_limit_config) = self.builder_config.gas_limit_config.gas_limit() {
             // If a gas limit is configured, use that limit as target if it's smaller, otherwise use
@@ -814,7 +808,11 @@ where
                 Ok(gas_used) => {
                     // X Layer: Log transaction execution end (success)
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
+                        tracer.log_transaction(
+                            tx_hash,
+                            TransactionProcessId::SeqTxExecutionEnd,
+                            Some(block_number),
+                        );
                     }
                     gas_used
                 }
@@ -824,7 +822,11 @@ where
                 })) => {
                     // X Layer: Log transaction execution end (failed)
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
+                        tracer.log_transaction(
+                            tx_hash,
+                            TransactionProcessId::SeqTxExecutionEnd,
+                            Some(block_number),
+                        );
                     }
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
@@ -840,7 +842,11 @@ where
                 Err(err) => {
                     // X Layer: Log transaction execution end (fatal error)
                     if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction(tx_hash, TransactionProcessId::SeqTxExecutionEnd, Some(block_number));
+                        tracer.log_transaction(
+                            tx_hash,
+                            TransactionProcessId::SeqTxExecutionEnd,
+                            Some(block_number),
+                        );
                     }
                     // this is an error that we should treat as fatal for this attempt
                     return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)))
