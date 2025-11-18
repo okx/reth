@@ -210,8 +210,8 @@ pub async fn setup_test_environment(client: &HttpClient) -> Result<(String, u64)
         return Err(eyre!("No hash field found in block data"));
     };
 
-    if block_hash.is_empty()
-        || block_hash == "0x0000000000000000000000000000000000000000000000000000000000000000"
+    if block_hash.is_empty() ||
+        block_hash == "0x0000000000000000000000000000000000000000000000000000000000000000"
     {
         return Err(eyre!("Block hash should not be empty or zero"));
     }

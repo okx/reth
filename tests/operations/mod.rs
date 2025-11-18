@@ -7,8 +7,7 @@ pub mod manager;
 pub mod utils;
 
 pub use debug_rpc::*;
-pub use eth_rpc::BlockId;
-pub use eth_rpc::*;
+pub use eth_rpc::{BlockId, *};
 pub use manager::*;
 pub use utils::*;
 
