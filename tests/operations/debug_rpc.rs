@@ -7,12 +7,9 @@ use std::time::Duration;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// For debug_traceBlockByHash or debug_traceBlockByNumber
-pub async fn debug_trace_block(
-    client_rpc: &HttpClient,
-    block_id: Option<BlockId>,
-) -> Result<Value> {
+pub async fn debug_trace_block(client_rpc: &HttpClient, block_id: BlockId) -> Result<Value> {
     // debug_traceBlockByHash. Leave tracer unset
-    if let Some(BlockId::Hash(block_hash)) = block_id {
+    if let BlockId::Hash(block_hash) = block_id {
         let result: Value = tokio::time::timeout(
             RPC_TIMEOUT,
             client_rpc
@@ -23,7 +20,7 @@ pub async fn debug_trace_block(
     }
 
     // debug_traceBlockByNumber. Leave tracer unset
-    let block_id = block_id.unwrap_or(BlockId::Latest).to_rpc_param();
+    let block_id = block_id.to_rpc_param();
     let result: Value = tokio::time::timeout(
         RPC_TIMEOUT,
         client_rpc.request("debug_traceBlockByNumber", jsonrpsee::rpc_params![block_id, json!({})]),
