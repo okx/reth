@@ -387,8 +387,8 @@ impl<Txs> OpBuilder<'_, Txs> {
         // 2. execute sequencer transactions
         let seq_txs_start = Instant::now();
         let mut info = ctx.execute_sequencer_transactions(&mut builder)?;
-        timing_metrics.build.execute_sequencer_transactions = seq_txs_start.elapsed();
-        timing_metrics.deliver_txs.sequencer_txs = seq_txs_start.elapsed();
+        let seq_txs_elapsed = seq_txs_start.elapsed();
+        timing_metrics.build.execute_sequencer_transactions = seq_txs_elapsed;
 
         // 3. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool() {
@@ -397,8 +397,8 @@ impl<Txs> OpBuilder<'_, Txs> {
             if ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?.is_some() {
                 return Ok(BuildOutcomeKind::Cancelled)
             }
-            timing_metrics.build.execute_mempool_transactions = mempool_txs_start.elapsed();
-            timing_metrics.deliver_txs.mempool_txs = mempool_txs_start.elapsed();
+            let mempool_txs_elapsed = mempool_txs_start.elapsed();
+            timing_metrics.build.execute_mempool_transactions = mempool_txs_elapsed;
 
             // check if the new payload is even more valuable
             if !ctx.is_better_payload(info.total_fees) {
@@ -412,7 +412,8 @@ impl<Txs> OpBuilder<'_, Txs> {
             builder.finish(state_provider)?;
         timing_metrics.build.finish = finish_start.elapsed();
         timing_metrics.build.total = build_start.elapsed();
-        timing_metrics.deliver_txs.total = timing_metrics.deliver_txs.sequencer_txs + timing_metrics.deliver_txs.mempool_txs;
+        // Calculate DeliverTxs total from BuildTiming to avoid duplication
+        timing_metrics.deliver_txs.total = timing_metrics.build.execute_sequencer_transactions + timing_metrics.build.execute_mempool_transactions;
 
         let sealed_block = Arc::new(block.sealed_block().clone());
         debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");

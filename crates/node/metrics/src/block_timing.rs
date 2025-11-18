@@ -34,13 +34,13 @@ pub struct InsertTiming {
 }
 
 /// Timing metrics for transaction execution
+/// 
+/// Note: Individual transaction execution times (sequencer_txs, mempool_txs) are stored
+/// in `BuildTiming` to avoid duplication. This struct only stores the total time.
 #[derive(Debug, Clone, Default)]
 pub struct DeliverTxsTiming {
-    /// Time spent executing sequencer transactions
-    pub sequencer_txs: Duration,
-    /// Time spent executing mempool transactions
-    pub mempool_txs: Duration,
     /// Total transaction execution time
+    /// Note: Individual times are stored in BuildTiming (execute_sequencer_transactions, execute_mempool_transactions)
     pub total: Duration,
 }
 
@@ -62,29 +62,50 @@ impl BlockTimingMetrics {
     pub fn format_for_log(&self) -> String {
         let format_duration = |d: Duration| {
             let ms = d.as_millis();
-            if ms == 0 {
-                "0ms".to_string()
-            } else {
+            let us = d.as_micros();
+            if ms > 0 {
                 format!("{}ms", ms)
+            } else if us > 0 {
+                format!("{}µs", us)
+            } else {
+                format!("{}ns", d.as_nanos())
             }
         };
 
-        // Format similar to Cosmos example: Produce[Consensus<...>, ...], DeliverTxs[RunAnte<...>, ...]
-        format!(
-            "Produce[Build[applyPreExec<{}>, seqTxs<{}>, mempoolTxs<{}>, finish<{}>, total<{}>], Insert[validateExec<{}>, insertTree<{}>, total<{}>], total<{}>], DeliverTxs[seqTxs<{}>, mempoolTxs<{}>, total<{}>]",
-            format_duration(self.build.apply_pre_execution_changes),
-            format_duration(self.build.execute_sequencer_transactions),
-            format_duration(self.build.execute_mempool_transactions),
-            format_duration(self.build.finish),
-            format_duration(self.build.total),
-            format_duration(self.insert.validate_and_execute),
-            format_duration(self.insert.insert_to_tree),
-            format_duration(self.insert.total),
-            format_duration(self.total),
-            format_duration(self.deliver_txs.sequencer_txs),
-            format_duration(self.deliver_txs.mempool_txs),
-            format_duration(self.deliver_txs.total),
-        )
+        // Check if block was built locally (has build timing) or received from network
+        let is_locally_built = self.build.total.as_nanos() > 0;
+        
+        if is_locally_built {
+            // Block was built locally, show full timing including Build and DeliverTxs
+            let seq_txs_time = self.build.execute_sequencer_transactions;
+            let mempool_txs_time = self.build.execute_mempool_transactions;
+            let deliver_txs_total_time = seq_txs_time + mempool_txs_time;
+
+            format!(
+                "Produce[Build[applyPreExec<{}>, seqTxs<{}>, mempoolTxs<{}>, finish<{}>, total<{}>], Insert[validateExec<{}>, insertTree<{}>, total<{}>], total<{}>], DeliverTxs[seqTxs<{}>, mempoolTxs<{}>, total<{}>]",
+                format_duration(self.build.apply_pre_execution_changes),
+                format_duration(self.build.execute_sequencer_transactions),
+                format_duration(self.build.execute_mempool_transactions),
+                format_duration(self.build.finish),
+                format_duration(self.build.total),
+                format_duration(self.insert.validate_and_execute),
+                format_duration(self.insert.insert_to_tree),
+                format_duration(self.insert.total),
+                format_duration(self.total),
+                format_duration(seq_txs_time),
+                format_duration(mempool_txs_time),
+                format_duration(deliver_txs_total_time),
+            )
+        } else {
+            // Block was received from network, only show Insert timing
+            format!(
+                "Produce[Insert[validateExec<{}>, insertTree<{}>, total<{}>], total<{}>]",
+                format_duration(self.insert.validate_and_execute),
+                format_duration(self.insert.insert_to_tree),
+                format_duration(self.insert.total),
+                format_duration(self.total),
+            )
+        }
     }
 }
 

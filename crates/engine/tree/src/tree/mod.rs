@@ -2520,10 +2520,20 @@ where
         // X Layer: Update timing metrics with insert timing
         let block_hash = executed.recovered_block().hash();
         if let Some(mut timing_metrics) = get_block_timing(&block_hash) {
+            // Block was built locally, update insert timing
             timing_metrics.insert.validate_and_execute = validate_exec_elapsed;
             timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
             timing_metrics.insert.total = elapsed;
             timing_metrics.total = timing_metrics.build.total + elapsed;
+            store_block_timing(block_hash, timing_metrics);
+        } else {
+            // Block was received from network, create timing metrics with insert timing only
+            use reth_node_metrics::block_timing::BlockTimingMetrics;
+            let mut timing_metrics = BlockTimingMetrics::default();
+            timing_metrics.insert.validate_and_execute = validate_exec_elapsed;
+            timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
+            timing_metrics.insert.total = elapsed;
+            timing_metrics.total = elapsed;
             store_block_timing(block_hash, timing_metrics);
         }
         let engine_event = if is_fork {
