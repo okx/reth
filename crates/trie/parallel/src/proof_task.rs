@@ -444,7 +444,8 @@ where
         let decoded_result = raw_proof_result.and_then(|raw_proof| {
             raw_proof.try_into().map_err(|e: alloy_rlp::Error| {
                 ParallelStateRootError::Other(format!(
-                    "Failed to decode storage proof for {hashed_address}: {e}"
+                    "Failed to decode storage proof for {}: {}",
+                    hashed_address, e
                 ))
             })
         });
@@ -1375,8 +1376,8 @@ fn dispatch_storage_proofs(
             })
             .map_err(|_| {
                 ParallelStateRootError::Other(format!(
-                    "Failed to queue storage proof for {hashed_address}: storage worker pool unavailable"
-
+                    "Failed to queue storage proof for {}: storage worker pool unavailable",
+                    hashed_address
                 ))
             })?;
 

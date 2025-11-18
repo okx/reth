@@ -49,7 +49,6 @@ mod config;
 use alloy_evm::eth::spec::EthExecutorSpec;
 pub use config::{revm_spec, revm_spec_by_timestamp_and_block_number};
 use reth_ethereum_forks::Hardforks;
-use reth_node_metrics as _;
 
 /// Helper type with backwards compatible methods to obtain Ethereum executor
 /// providers.

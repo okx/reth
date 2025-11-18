@@ -86,7 +86,7 @@ impl OtlpProtocol {
             Self::Http => {
                 if !url.path().ends_with(HTTP_TRACE_ENDPOINT) {
                     let path = url.path().trim_end_matches('/');
-                    url.set_path(&format!("{path}{HTTP_TRACE_ENDPOINT}"));
+                    url.set_path(&format!("{}{}", path, HTTP_TRACE_ENDPOINT));
                 }
             }
             Self::Grpc => {
