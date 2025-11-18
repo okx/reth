@@ -255,24 +255,8 @@ impl NodeState {
                 }
                 
                 // X Layer: Get timing metrics for this block
-                use reth_node_metrics::block_timing::{get_block_timing, remove_block_timing, store_block_timing};
-                use std::time::Duration;
+                use reth_node_metrics::block_timing::{get_block_timing, remove_block_timing};
                 let block_hash = block.hash();
-                
-                // If timing metrics exist but insert time is 0, update it with event elapsed time
-                // This handles the case where block was already seen (AlreadySeen path)
-                if let Some(mut timing_metrics) = get_block_timing(&block_hash) {
-                    if timing_metrics.insert.total.as_nanos() == 0 && elapsed.as_nanos() > 0 {
-                        // Block was built locally but insert time wasn't recorded (AlreadySeen path)
-                        // Use the elapsed time from the event for insert.total
-                        // Note: We can't split elapsed into validate_exec and insert_tree, so assign all to validate_exec
-                        timing_metrics.insert.validate_and_execute = elapsed;
-                        timing_metrics.insert.insert_to_tree = Duration::from_nanos(0);
-                        timing_metrics.insert.total = elapsed;
-                        timing_metrics.total = timing_metrics.build.total + elapsed;
-                        store_block_timing(block_hash, timing_metrics.clone());
-                    }
-                }
                 
                 let timing_str = get_block_timing(&block_hash)
                     .map(|metrics| metrics.format_for_log())

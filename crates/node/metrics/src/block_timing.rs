@@ -78,11 +78,10 @@ impl BlockTimingMetrics {
         if is_locally_built {
             // Block was built locally, show full timing including Build and DeliverTxs
             // Note: DeliverTxs only shows total to avoid duplication with Build's seqTxs/mempoolTxs
-            // Note: Insert.total is omitted to avoid duplication with Produce.total
             let deliver_txs_total_time = self.build.execute_sequencer_transactions + self.build.execute_mempool_transactions;
 
             format!(
-                "Produce[Build[applyPreExec<{}>, seqTxs<{}>, mempoolTxs<{}>, finish<{}>, total<{}>], Insert[validateExec<{}>, insertTree<{}>], total<{}>], DeliverTxs[total<{}>]",
+                "Produce[Build[applyPreExec<{}>, seqTxs<{}>, mempoolTxs<{}>, finish<{}>, total<{}>], Insert[validateExec<{}>, insertTree<{}>, total<{}>], total<{}>], DeliverTxs[total<{}>]",
                 format_duration(self.build.apply_pre_execution_changes),
                 format_duration(self.build.execute_sequencer_transactions),
                 format_duration(self.build.execute_mempool_transactions),
@@ -90,15 +89,17 @@ impl BlockTimingMetrics {
                 format_duration(self.build.total),
                 format_duration(self.insert.validate_and_execute),
                 format_duration(self.insert.insert_to_tree),
+                format_duration(self.insert.total),
                 format_duration(self.total),
                 format_duration(deliver_txs_total_time),
             )
         } else {
             // Block was received from network, only show Insert timing
             format!(
-                "Produce[Insert[validateExec<{}>, insertTree<{}>], total<{}>]",
+                "Produce[Insert[validateExec<{}>, insertTree<{}>, total<{}>], total<{}>]",
                 format_duration(self.insert.validate_and_execute),
                 format_duration(self.insert.insert_to_tree),
+                format_duration(self.insert.total),
                 format_duration(self.total),
             )
         }
