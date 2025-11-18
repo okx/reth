@@ -18,11 +18,12 @@ pub fn should_route_to_legacy(
     legacy_client: Option<&std::sync::Arc<reth_rpc_eth_types::LegacyRpcClient>>,
     number: BlockNumberOrTag,
 ) -> bool {
-    if let Some(client) = legacy_client 
-        && let BlockNumberOrTag::Number(n) = number {
-            return n < client.cutoff_block();
-        }
-    
+    if let Some(client) = legacy_client &&
+        let BlockNumberOrTag::Number(n) = number
+    {
+        return n < client.cutoff_block();
+    }
+
     false
 }
 
