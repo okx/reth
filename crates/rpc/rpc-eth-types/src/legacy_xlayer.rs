@@ -242,7 +242,7 @@ impl LegacyRpcClient {
         )
     }
 
-    /// Forward eth_call to legacy RPC.
+    /// Forward `eth_call` to legacy RPC.
     pub async fn call(
         &self,
         request: &(impl Serialize + Sync),
@@ -254,7 +254,7 @@ impl LegacyRpcClient {
         )
     }
 
-    /// Forward eth_estimateGas to legacy RPC.
+    /// Forward `eth_estimateGas` to legacy RPC.
     pub async fn estimate_gas(
         &self,
         request: &(impl Serialize + Sync),
@@ -263,7 +263,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_estimateGas", (request, block_id)).await)
     }
 
-    /// Forward eth_createAccessList to legacy RPC.
+    /// Forward `eth_createAccessList` to legacy RPC.
     pub async fn create_access_list(
         &self,
         request: &(impl Serialize + Sync),
@@ -276,7 +276,7 @@ impl LegacyRpcClient {
         )
     }
 
-    /// Forward eth_transactionPreExec to legacy RPC.
+    /// Forward `eth_transactionPreExec` to legacy RPC.
     pub async fn transaction_pre_exec(
         &self,
         args: &(impl Serialize + Sync),
@@ -285,7 +285,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_transactionPreExec", (args, block_id)).await)
     }
 
-    /// Forward eth_getInternalTransactions to legacy RPC.
+    /// Forward `eth_getInternalTransactions` to legacy RPC.
     pub async fn get_internal_transactions(
         &self,
         tx_hash: String,
@@ -293,7 +293,7 @@ impl LegacyRpcClient {
         Self::to_box_err(self.client.request("eth_getInternalTransactions", (tx_hash,)).await)
     }
 
-    /// Forward eth_getBlockInternalTransactions to legacy RPC.
+    /// Forward `eth_getBlockInternalTransactions` to legacy RPC.
     pub async fn get_block_internal_transactions(
         &self,
         block_number: alloy_rpc_types_eth::BlockNumberOrTag,

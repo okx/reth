@@ -213,7 +213,7 @@ impl TransactionTracer {
                             let now = Instant::now();
                             let time_since_flush = now.duration_since(*last_flush);
 
-                            if count % FLUSH_INTERVAL_WRITES == 0 ||
+                            if count.is_multiple_of(FLUSH_INTERVAL_WRITES) ||
                                 time_since_flush.as_secs() >= FLUSH_INTERVAL_SECONDS
                             {
                                 *last_flush = now;
