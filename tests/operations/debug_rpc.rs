@@ -6,7 +6,7 @@ use std::time::Duration;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
-// For debug_traceBlockByHash or debug_traceBlockByNumber
+/// For debug_traceBlockByHash or debug_traceBlockByNumber
 pub async fn debug_trace_block(
     client_rpc: &HttpClient,
     block_id: Option<BlockId>,

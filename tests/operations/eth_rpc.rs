@@ -226,11 +226,11 @@ pub async fn eth_get_transaction_by_block_number_or_hash_and_index(
 /// For eth_getBlockByNumber or eth_getBlockByHash
 pub async fn eth_get_block_by_number_or_hash(
     client_rpc: &HttpClient,
-    block_id: Option<BlockId>,
+    block_id: BlockId,
     fulltx: bool,
 ) -> Result<Value> {
     // eth_getBlockByHash
-    if let Some(BlockId::Hash(block_hash)) = block_id {
+    if let BlockId::Hash(block_hash) = block_id {
         let result: Value = tokio::time::timeout(
             RPC_TIMEOUT,
             client_rpc.request("eth_getBlockByHash", jsonrpsee::rpc_params![block_hash, fulltx]),
@@ -240,7 +240,7 @@ pub async fn eth_get_block_by_number_or_hash(
     }
 
     // eth_getBlockByNumber
-    let block_id = block_id.unwrap_or(BlockId::Latest).to_rpc_param();
+    let block_id = block_id.to_rpc_param();
     let result: Value = tokio::time::timeout(
         RPC_TIMEOUT,
         client_rpc.request("eth_getBlockByNumber", jsonrpsee::rpc_params![block_id, fulltx]),
