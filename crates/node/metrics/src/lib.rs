@@ -16,9 +16,13 @@ pub mod server;
 pub mod version;
 /// Transaction tracing for monitoring transaction lifecycle (X Layer)
 pub mod transaction_trace_xlayer;
+/// Block timing metrics for tracking block production and execution times (X Layer)
+pub mod block_timing;
 
 pub use metrics_exporter_prometheus::*;
 pub use metrics_process::*;
 pub use transaction_trace_xlayer::TransactionTracer;
 // Re-export transaction trace module items for convenience
 pub use transaction_trace_xlayer::{get_global_tracer, init_global_tracer, flush_global_tracer, TransactionProcessId};
+// Re-export block timing module items for convenience
+pub use block_timing::{BlockTimingMetrics, BuildTiming, InsertTiming, DeliverTxsTiming, store_block_timing, get_block_timing, remove_block_timing};

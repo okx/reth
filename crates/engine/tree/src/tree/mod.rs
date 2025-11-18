@@ -2498,9 +2498,13 @@ where
 
         let ctx = TreeCtx::new(&mut self.state, &self.canonical_in_memory_state);
 
+        // X Layer: Track insert timing
+        use reth_node_metrics::block_timing::{get_block_timing, store_block_timing};
+        let validate_exec_start = Instant::now();
         let start = Instant::now();
 
         let executed = execute(&mut self.payload_validator, input, ctx)?;
+        let validate_exec_elapsed = validate_exec_start.elapsed();
 
         // if the parent is the canonical head, we can insert the block as the pending block
         if self.state.tree_state.canonical_block_hash() == executed.recovered_block().parent_hash()
@@ -2509,11 +2513,23 @@ where
             self.canonical_in_memory_state.set_pending_block(executed.clone());
         }
 
+        let insert_tree_start = Instant::now();
         self.state.tree_state.insert_executed(executed.clone());
+        let insert_tree_elapsed = insert_tree_start.elapsed();
         self.metrics.engine.executed_blocks.set(self.state.tree_state.block_count() as f64);
 
         // emit insert event
         let elapsed = start.elapsed();
+        
+        // X Layer: Update timing metrics with insert timing
+        let block_hash = executed.recovered_block().hash();
+        if let Some(mut timing_metrics) = get_block_timing(&block_hash) {
+            timing_metrics.insert.validate_and_execute = validate_exec_elapsed;
+            timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
+            timing_metrics.insert.total = elapsed;
+            timing_metrics.total = timing_metrics.build.total + elapsed;
+            store_block_timing(block_hash, timing_metrics);
+        }
         let engine_event = if is_fork {
             ConsensusEngineEvent::ForkBlockAdded(executed.clone(), elapsed)
         } else {

@@ -9516,6 +9516,7 @@ dependencies = [
  "pin-project",
  "reth-engine-primitives",
  "reth-network-api",
+ "reth-node-metrics",
  "reth-primitives-traits",
  "reth-prune-types",
  "reth-stages",
