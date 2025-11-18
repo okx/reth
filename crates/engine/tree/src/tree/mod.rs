@@ -2450,6 +2450,22 @@ where
                 // We now assume that we already have this block in the tree. However, we need to
                 // run the conversion to ensure that the block hash is valid.
                 convert_to_block(self, input)?;
+                
+                // X Layer: Even if block is already seen, update timing metrics if it was built locally
+                // Note: Insert timing will be updated later in event handler if elapsed > 0
+                use reth_node_metrics::block_timing::{get_block_timing, store_block_timing};
+                use std::time::Duration;
+                let block_hash = block_num_hash.hash;
+                if let Some(mut timing_metrics) = get_block_timing(&block_hash) {
+                    // Block was built locally but already exists in tree
+                    // Set insert timing to 0 for now, will be updated in event handler if elapsed > 0
+                    timing_metrics.insert.validate_and_execute = Duration::from_nanos(0);
+                    timing_metrics.insert.insert_to_tree = Duration::from_nanos(0);
+                    timing_metrics.insert.total = Duration::from_nanos(0);
+                    timing_metrics.total = timing_metrics.build.total;
+                    store_block_timing(block_hash, timing_metrics);
+                }
+                
                 return Ok(InsertPayloadOk::AlreadySeen(BlockStatus::Valid))
             }
             _ => {}
@@ -2496,6 +2512,7 @@ where
 
         // X Layer: Track insert timing
         use reth_node_metrics::block_timing::{get_block_timing, store_block_timing};
+        use std::time::Duration;
         let validate_exec_start = Instant::now();
         let start = Instant::now();
 
