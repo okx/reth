@@ -231,7 +231,7 @@ where
         block_prefix: &str,
         block_number: u64,
     ) -> eyre::Result<()> {
-        let filename = format!("{block_prefix}.witness.re_executed.json");
+        let filename = format!("{}.witness.re_executed.json", block_prefix);
         let re_executed_witness_path = self.save_file(filename, witness)?;
 
         if let Some(healthy_node_client) = &self.healthy_node_client {
