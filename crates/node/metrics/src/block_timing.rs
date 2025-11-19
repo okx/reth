@@ -53,8 +53,6 @@ pub struct BlockTimingMetrics {
     pub insert: InsertTiming,
     /// Transaction execution timing
     pub deliver_txs: DeliverTxsTiming,
-    /// Total time from build start to insert end
-    pub total: Duration,
 }
 
 impl BlockTimingMetrics {
@@ -81,7 +79,7 @@ impl BlockTimingMetrics {
             let deliver_txs_total_time = self.build.execute_sequencer_transactions + self.build.execute_mempool_transactions;
 
             format!(
-                "Produce[Build[applyPreExec<{}>, seqTxs<{}>, mempoolTxs<{}>, finish<{}>, total<{}>], Insert[validateExec<{}>, insertTree<{}>, total<{}>], total<{}>], DeliverTxs[total<{}>]",
+                "Produce[Build[applyPreExec<{}>, seqTxs<{}>, mempoolTxs<{}>, finish<{}>, total<{}>], Insert[validateExec<{}>, insertTree<{}>, total<{}>]], DeliverTxs[total<{}>]",
                 format_duration(self.build.apply_pre_execution_changes),
                 format_duration(self.build.execute_sequencer_transactions),
                 format_duration(self.build.execute_mempool_transactions),
@@ -90,17 +88,15 @@ impl BlockTimingMetrics {
                 format_duration(self.insert.validate_and_execute),
                 format_duration(self.insert.insert_to_tree),
                 format_duration(self.insert.total),
-                format_duration(self.total),
                 format_duration(deliver_txs_total_time),
             )
         } else {
             // Block was received from network, only show Insert timing
             format!(
-                "Produce[Insert[validateExec<{}>, insertTree<{}>, total<{}>], total<{}>]",
+                "Produce[Insert[validateExec<{}>, insertTree<{}>, total<{}>]]",
                 format_duration(self.insert.validate_and_execute),
                 format_duration(self.insert.insert_to_tree),
                 format_duration(self.insert.total),
-                format_duration(self.total),
             )
         }
     }

@@ -1387,10 +1387,35 @@ where
                             self.canonical_in_memory_state.set_pending_block(block.clone());
                         }
 
+                        let insert_tree_start = Instant::now();
                         self.state.tree_state.insert_executed(block.clone());
+                        let insert_tree_elapsed = insert_tree_start.elapsed();
                         self.metrics.engine.inserted_already_executed_blocks.increment(1);
+                        let elapsed = now.elapsed();
+                        
+                        // X Layer: Update timing metrics for InsertExecutedBlock path
+                        use reth_node_metrics::block_timing::{get_block_timing, store_block_timing};
+                        use std::time::Duration;
+                        let block_hash = block.recovered_block().hash();
+                        if let Some(mut timing_metrics) = get_block_timing(&block_hash) {
+                            // Block was built locally, update insert timing
+                            // Note: validate_exec time is 0 because block was already executed during build
+                            timing_metrics.insert.validate_and_execute = Duration::from_nanos(0);
+                            timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
+                            timing_metrics.insert.total = elapsed;
+                            store_block_timing(block_hash, timing_metrics);
+                        } else {
+                            // Block was received from network, create timing metrics with insert timing only
+                            use reth_node_metrics::block_timing::BlockTimingMetrics;
+                            let mut timing_metrics = BlockTimingMetrics::default();
+                            timing_metrics.insert.validate_and_execute = Duration::from_nanos(0);
+                            timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
+                            timing_metrics.insert.total = elapsed;
+                            store_block_timing(block_hash, timing_metrics);
+                        }
+                        
                         self.emit_event(EngineApiEvent::BeaconConsensus(
-                            ConsensusEngineEvent::CanonicalBlockAdded(block, now.elapsed()),
+                            ConsensusEngineEvent::CanonicalBlockAdded(block, elapsed),
                         ));
                     }
                     EngineApiRequest::Beacon(request) => {
@@ -2462,7 +2487,6 @@ where
                     timing_metrics.insert.validate_and_execute = Duration::from_nanos(0);
                     timing_metrics.insert.insert_to_tree = Duration::from_nanos(0);
                     timing_metrics.insert.total = Duration::from_nanos(0);
-                    timing_metrics.total = timing_metrics.build.total;
                     store_block_timing(block_hash, timing_metrics);
                 }
                 
@@ -2541,7 +2565,6 @@ where
             timing_metrics.insert.validate_and_execute = validate_exec_elapsed;
             timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
             timing_metrics.insert.total = elapsed;
-            timing_metrics.total = timing_metrics.build.total + elapsed;
             store_block_timing(block_hash, timing_metrics);
         } else {
             // Block was received from network, create timing metrics with insert timing only
@@ -2550,7 +2573,6 @@ where
             timing_metrics.insert.validate_and_execute = validate_exec_elapsed;
             timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
             timing_metrics.insert.total = elapsed;
-            timing_metrics.total = elapsed;
             store_block_timing(block_hash, timing_metrics);
         }
         let engine_event = if is_fork {
