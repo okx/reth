@@ -34,6 +34,7 @@ tracing.workspace = true
 
 op-alloy-rpc-types-engine = { workspace = true, optional = true }
 reth-optimism-chainspec = { workspace = true, optional = true }
+reth-optimism-forks = { workspace = true, optional = true }
 
 [lints]
 workspace = true
@@ -42,5 +43,6 @@ workspace = true
 op = [
     "dep:op-alloy-rpc-types-engine",
     "dep:reth-optimism-chainspec",
+    "dep:reth-optimism-forks",
     "reth-payload-primitives/op",
 ]

@@ -8352,6 +8352,7 @@ dependencies = [
  "reth-engine-primitives",
  "reth-ethereum-engine-primitives",
  "reth-optimism-chainspec",
+ "reth-optimism-forks",
  "reth-payload-builder",
  "reth-payload-primitives",
  "reth-storage-api",

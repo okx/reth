@@ -7,6 +7,9 @@ use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_primitives::PayloadAttributesBuilder;
 use std::sync::Arc;
 
+#[cfg(feature = "op")]
+use reth_optimism_forks::OpHardforks;
+
 /// The attributes builder for local Ethereum payload.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -48,9 +51,26 @@ where
 impl<ChainSpec> PayloadAttributesBuilder<op_alloy_rpc_types_engine::OpPayloadAttributes>
     for LocalPayloadAttributesBuilder<ChainSpec>
 where
-    ChainSpec: Send + Sync + EthereumHardforks + 'static,
+    ChainSpec: Send + Sync + EthereumHardforks + OpHardforks + 'static,
 {
     fn build(&self, timestamp: u64) -> op_alloy_rpc_types_engine::OpPayloadAttributes {
+        use alloy_primitives::B64;
+        
+        let eip_1559_params = if self.chain_spec.is_holocene_active_at_timestamp(timestamp) ||
+            self.chain_spec.is_jovian_active_at_timestamp(timestamp)
+        {
+            Some(B64::ZERO)
+        } else {
+            None
+        };
+        
+        let min_base_fee = if self.chain_spec.is_jovian_active_at_timestamp(timestamp) {
+
+            Some(1_000_000_000u64)
+        } else {
+            None
+        };
+        
         op_alloy_rpc_types_engine::OpPayloadAttributes {
             payload_attributes: self.build(timestamp),
             // Add dummy system transaction
@@ -59,9 +79,9 @@ where
                     .into(),
             ]),
             no_tx_pool: None,
-            gas_limit: None,
-            eip_1559_params: None,
-            min_base_fee: None,
+            gas_limit: Some(30_000_000),
+            eip_1559_params,
+            min_base_fee,
         }
     }
 }
