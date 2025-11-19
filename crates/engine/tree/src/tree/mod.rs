@@ -2495,6 +2495,7 @@ where
                 // X Layer: Even if block is already seen, update timing metrics if it was built locally
                 // Block was built locally but already exists in tree
                 // Set insert timing to 0 for now, will be updated in event handler if elapsed > 0
+                use reth_node_metrics::block_timing::get_block_timing;
                 use std::time::Duration;
                 let block_hash = block_num_hash.hash;
                 if get_block_timing(&block_hash).is_some() {
