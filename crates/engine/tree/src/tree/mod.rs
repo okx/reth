@@ -228,6 +228,37 @@ impl OnStateHook for MeteredStateHook {
     }
 }
 
+/// Helper function to update block timing metrics for insert phase.
+///
+/// This function handles the common pattern of:
+/// 1. Getting existing timing metrics (if block was built locally)
+/// 2. Creating new metrics (if block was received from network)
+/// 3. Setting insert timing values
+/// 4. Calculating total as the sum of validate_and_execute + insert_to_tree
+/// 5. Storing the updated metrics
+fn update_insert_timing_metrics(
+    block_hash: B256,
+    validate_and_execute: std::time::Duration,
+    insert_to_tree: std::time::Duration,
+) {
+    use reth_node_metrics::block_timing::{get_block_timing, store_block_timing, BlockTimingMetrics};
+    
+    let mut timing_metrics = if let Some(existing) = get_block_timing(&block_hash) {
+        // Block was built locally, update insert timing
+        existing
+    } else {
+        // Block was received from network, create timing metrics with insert timing only
+        BlockTimingMetrics::default()
+    };
+    
+    timing_metrics.insert.validate_and_execute = validate_and_execute;
+    timing_metrics.insert.insert_to_tree = insert_to_tree;
+    // Total should be the sum of validate_and_execute + insert_to_tree
+    timing_metrics.insert.total = timing_metrics.insert.validate_and_execute + timing_metrics.insert.insert_to_tree;
+    
+    store_block_timing(block_hash, timing_metrics);
+}
+
 /// The engine API tree handler implementation.
 ///
 /// This type is responsible for processing engine API requests, maintaining the canonical state and
@@ -1394,25 +1425,10 @@ where
                         let elapsed = now.elapsed();
                         
                         // X Layer: Update timing metrics for InsertExecutedBlock path
-                        use reth_node_metrics::block_timing::{get_block_timing, store_block_timing};
+                        // Note: validate_exec time is 0 because block was already executed during build
                         use std::time::Duration;
                         let block_hash = block.recovered_block().hash();
-                        if let Some(mut timing_metrics) = get_block_timing(&block_hash) {
-                            // Block was built locally, update insert timing
-                            // Note: validate_exec time is 0 because block was already executed during build
-                            timing_metrics.insert.validate_and_execute = Duration::from_nanos(0);
-                            timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
-                            timing_metrics.insert.total = timing_metrics.insert.validate_and_execute + timing_metrics.insert.insert_to_tree;
-                            store_block_timing(block_hash, timing_metrics);
-                        } else {
-                            // Block was received from network, create timing metrics with insert timing only
-                            use reth_node_metrics::block_timing::BlockTimingMetrics;
-                            let mut timing_metrics = BlockTimingMetrics::default();
-                            timing_metrics.insert.validate_and_execute = Duration::from_nanos(0);
-                            timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
-                            timing_metrics.insert.total = timing_metrics.insert.validate_and_execute + timing_metrics.insert.insert_to_tree;
-                            store_block_timing(block_hash, timing_metrics);
-                        }
+                        update_insert_timing_metrics(block_hash, Duration::from_nanos(0), insert_tree_elapsed);
                         
                         self.emit_event(EngineApiEvent::BeaconConsensus(
                             ConsensusEngineEvent::CanonicalBlockAdded(block, elapsed),
@@ -2477,17 +2493,12 @@ where
                 convert_to_block(self, input)?;
                 
                 // X Layer: Even if block is already seen, update timing metrics if it was built locally
-                // Note: Insert timing will be updated later in event handler if elapsed > 0
-                use reth_node_metrics::block_timing::{get_block_timing, store_block_timing};
+                // Block was built locally but already exists in tree
+                // Set insert timing to 0 for now, will be updated in event handler if elapsed > 0
                 use std::time::Duration;
                 let block_hash = block_num_hash.hash;
-                if let Some(mut timing_metrics) = get_block_timing(&block_hash) {
-                    // Block was built locally but already exists in tree
-                    // Set insert timing to 0 for now, will be updated in event handler if elapsed > 0
-                    timing_metrics.insert.validate_and_execute = Duration::from_nanos(0);
-                    timing_metrics.insert.insert_to_tree = Duration::from_nanos(0);
-                    timing_metrics.insert.total = Duration::from_nanos(0);
-                    store_block_timing(block_hash, timing_metrics);
+                if get_block_timing(&block_hash).is_some() {
+                    update_insert_timing_metrics(block_hash, Duration::from_nanos(0), Duration::from_nanos(0));
                 }
                 
                 return Ok(InsertPayloadOk::AlreadySeen(BlockStatus::Valid))
@@ -2535,8 +2546,6 @@ where
         let ctx = TreeCtx::new(&mut self.state, &self.canonical_in_memory_state);
 
         // X Layer: Track insert timing
-        use reth_node_metrics::block_timing::{get_block_timing, store_block_timing};
-        use std::time::Duration;
         let validate_exec_start = Instant::now();
         let start = Instant::now();
 
@@ -2560,23 +2569,7 @@ where
         
         // X Layer: Update timing metrics with insert timing
         let block_hash = executed.recovered_block().hash();
-        if let Some(mut timing_metrics) = get_block_timing(&block_hash) {
-            // Block was built locally, update insert timing
-            timing_metrics.insert.validate_and_execute = validate_exec_elapsed;
-            timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
-            // Total should be the sum of validate_and_execute + insert_to_tree
-            timing_metrics.insert.total = timing_metrics.insert.validate_and_execute + timing_metrics.insert.insert_to_tree;
-            store_block_timing(block_hash, timing_metrics);
-        } else {
-            // Block was received from network, create timing metrics with insert timing only
-            use reth_node_metrics::block_timing::BlockTimingMetrics;
-            let mut timing_metrics = BlockTimingMetrics::default();
-            timing_metrics.insert.validate_and_execute = validate_exec_elapsed;
-            timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
-            // Total should be the sum of validate_and_execute + insert_to_tree
-            timing_metrics.insert.total = timing_metrics.insert.validate_and_execute + timing_metrics.insert.insert_to_tree;
-            store_block_timing(block_hash, timing_metrics);
-        }
+        update_insert_timing_metrics(block_hash, validate_exec_elapsed, insert_tree_elapsed);
         let engine_event = if is_fork {
             ConsensusEngineEvent::ForkBlockAdded(executed.clone(), elapsed)
         } else {
