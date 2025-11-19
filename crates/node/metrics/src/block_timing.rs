@@ -1,8 +1,8 @@
 //! Block timing metrics for tracking block production and execution times
 
 use alloy_primitives::B256;
+use indexmap::IndexMap;
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -103,28 +103,42 @@ impl BlockTimingMetrics {
 }
 
 /// Global storage for block timing metrics
-static BLOCK_TIMING_STORE: std::sync::OnceLock<Arc<Mutex<HashMap<B256, BlockTimingMetrics>>>> =
+/// 
+/// Uses IndexMap to maintain insertion order, allowing us to remove the oldest entries
+/// when the cache exceeds the limit.
+static BLOCK_TIMING_STORE: std::sync::OnceLock<Arc<Mutex<IndexMap<B256, BlockTimingMetrics>>>> =
     std::sync::OnceLock::new();
 
 /// Initialize the global block timing store
-fn get_timing_store() -> Arc<Mutex<HashMap<B256, BlockTimingMetrics>>> {
+fn get_timing_store() -> Arc<Mutex<IndexMap<B256, BlockTimingMetrics>>> {
     BLOCK_TIMING_STORE
-        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .get_or_init(|| Arc::new(Mutex::new(IndexMap::new())))
         .clone()
 }
 
 /// Store timing metrics for a block
+/// 
+/// If the block already exists, it will be updated and moved to the end (most recent).
+/// When the cache exceeds 1000 entries, the oldest entries are removed.
 pub fn store_block_timing(block_hash: B256, metrics: BlockTimingMetrics) {
     let store = get_timing_store();
     let mut map = store.lock().unwrap();
+    
+    // If the block already exists, remove it first so it can be re-inserted at the end
+    // This ensures that updated blocks are treated as the most recent
+    if map.contains_key(&block_hash) {
+        map.shift_remove(&block_hash);
+    }
+    
+    // Insert at the end (most recent position)
     map.insert(block_hash, metrics);
     
     // Clean up old entries to prevent memory leak (keep last 1000 blocks)
-    if map.len() > 1000 {
-        let keys: Vec<B256> = map.keys().copied().collect();
-        for key in keys.iter().take(map.len() - 1000) {
-            map.remove(key);
-        }
+    // IndexMap maintains insertion order, so we can safely remove from the front
+    const MAX_ENTRIES: usize = 1000;
+    while map.len() > MAX_ENTRIES {
+        // Remove the oldest entry (first in insertion order)
+        map.shift_remove_index(0);
     }
 }
 
