@@ -1402,7 +1402,7 @@ where
                             // Note: validate_exec time is 0 because block was already executed during build
                             timing_metrics.insert.validate_and_execute = Duration::from_nanos(0);
                             timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
-                            timing_metrics.insert.total = elapsed;
+                            timing_metrics.insert.total = timing_metrics.insert.validate_and_execute + timing_metrics.insert.insert_to_tree;
                             store_block_timing(block_hash, timing_metrics);
                         } else {
                             // Block was received from network, create timing metrics with insert timing only
@@ -1410,7 +1410,7 @@ where
                             let mut timing_metrics = BlockTimingMetrics::default();
                             timing_metrics.insert.validate_and_execute = Duration::from_nanos(0);
                             timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
-                            timing_metrics.insert.total = elapsed;
+                            timing_metrics.insert.total = timing_metrics.insert.validate_and_execute + timing_metrics.insert.insert_to_tree;
                             store_block_timing(block_hash, timing_metrics);
                         }
                         
@@ -2564,7 +2564,8 @@ where
             // Block was built locally, update insert timing
             timing_metrics.insert.validate_and_execute = validate_exec_elapsed;
             timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
-            timing_metrics.insert.total = elapsed;
+            // Total should be the sum of validate_and_execute + insert_to_tree
+            timing_metrics.insert.total = timing_metrics.insert.validate_and_execute + timing_metrics.insert.insert_to_tree;
             store_block_timing(block_hash, timing_metrics);
         } else {
             // Block was received from network, create timing metrics with insert timing only
@@ -2572,7 +2573,8 @@ where
             let mut timing_metrics = BlockTimingMetrics::default();
             timing_metrics.insert.validate_and_execute = validate_exec_elapsed;
             timing_metrics.insert.insert_to_tree = insert_tree_elapsed;
-            timing_metrics.insert.total = elapsed;
+            // Total should be the sum of validate_and_execute + insert_to_tree
+            timing_metrics.insert.total = timing_metrics.insert.validate_and_execute + timing_metrics.insert.insert_to_tree;
             store_block_timing(block_hash, timing_metrics);
         }
         let engine_event = if is_fork {
