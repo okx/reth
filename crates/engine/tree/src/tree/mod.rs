@@ -537,7 +537,6 @@ where
         payload: T::ExecutionData,
     ) -> Result<TreeOutcome<PayloadStatus>, InsertBlockFatalError> {
         trace!(target: "engine::tree", "invoked new payload");
-        self.metrics.engine.new_payload_messages.increment(1);
 
         use reth_node_metrics::transaction_trace_xlayer::{
             get_global_tracer, TransactionProcessId,
@@ -1024,7 +1023,7 @@ where
         trace!(target: "engine::tree", ?attrs, "invoked forkchoice update");
 
         // Record metrics
-        self.record_forkchoice_metrics(&attrs);
+        self.record_forkchoice_metrics();
 
         // Pre-validation of forkchoice state
         if let Some(early_result) = self.validate_forkchoice_state(state)? {
@@ -1047,11 +1046,7 @@ where
     }
 
     /// Records metrics for forkchoice updated calls
-    fn record_forkchoice_metrics(&self, attrs: &Option<T::PayloadAttributes>) {
-        self.metrics.engine.forkchoice_updated_messages.increment(1);
-        if attrs.is_some() {
-            self.metrics.engine.forkchoice_with_attributes_updated_messages.increment(1);
-        }
+    fn record_forkchoice_metrics(&self) {
         self.canonical_in_memory_state.on_forkchoice_update_received();
     }
 
@@ -1169,6 +1164,15 @@ where
             if self.engine_kind.is_opstack() ||
                 self.config.always_process_payload_attributes_on_canonical_head()
             {
+                // We need to effectively unwind the _canonical_ chain to the FCU's head, which is
+                // part of the canonical chain. We need to update the latest block state to reflect
+                // the canonical ancestor. This ensures that state providers and the transaction
+                // pool operate with the correct chain state after forkchoice update processing, and
+                // new payloads built on the reorg'd head will be added to the tree immediately.
+                if self.config.unwind_canonical_header() {
+                    self.update_latest_block_to_canonical_ancestor(&canonical_header)?;
+                }
+
                 if let Some(attr) = attrs {
                     debug!(target: "engine::tree", head = canonical_header.number(), "handling payload attributes for canonical head");
                     // Clone only when we actually need to process the attributes
@@ -1179,17 +1183,6 @@ where
                         version,
                     );
                     return Ok(Some(TreeOutcome::new(updated)));
-                }
-
-                // At this point, no alternative block has been triggered, so we need effectively
-                // unwind the _canonical_ chain to the FCU's head, which is part of the canonical
-                // chain. We need to update the latest block state to reflect the
-                // canonical ancestor. This ensures that state providers and the
-                // transaction pool operate with the correct chain state after
-                // forkchoice update processing.
-
-                if self.config.unwind_canonical_header() {
-                    self.update_latest_block_to_canonical_ancestor(&canonical_header)?;
                 }
             }
 
@@ -1442,6 +1435,9 @@ where
                                 tx,
                                 version,
                             } => {
+                                let has_attrs = payload_attrs.is_some();
+
+                                let start = Instant::now();
                                 let mut output =
                                     self.on_forkchoice_updated(state, payload_attrs, version);
 
@@ -1461,6 +1457,13 @@ where
                                     self.on_maybe_tree_event(res.event.take())?;
                                 }
 
+                                self.metrics.engine.forkchoice_updated.update_response_metrics(
+                                    start,
+                                    &mut self.metrics.engine.new_payload.latest_at,
+                                    has_attrs,
+                                    &output,
+                                );
+
                                 if let Err(err) =
                                     tx.send(output.map(|o| o.outcome).map_err(Into::into))
                                 {
@@ -1472,7 +1475,13 @@ where
                                 }
                             }
                             BeaconEngineMessage::NewPayload { payload, tx } => {
+                                let start = Instant::now();
+                                let gas_used = payload.gas_used();
                                 let mut output = self.on_new_payload(payload);
+                                self.metrics
+                                    .engine
+                                    .new_payload
+                                    .update_response_metrics(start, &output, gas_used);
 
                                 let maybe_event =
                                     output.as_mut().ok().and_then(|out| out.event.take());

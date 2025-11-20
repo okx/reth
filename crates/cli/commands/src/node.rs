@@ -10,8 +10,8 @@ use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, MetricArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TransactionTraceArgs,
-        TxPoolArgs,
+        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs,
+        TransactionTraceArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -111,6 +111,10 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "ERA")]
     pub era: EraArgs,
 
+    /// All static files related arguments
+    #[command(flatten, next_help_heading = "Static Files")]
+    pub static_files: StaticFilesArgs,
+
     /// All transaction trace related arguments with --tx-trace prefix
     #[command(flatten)]
     pub tx_trace: TransactionTraceArgs,
@@ -167,9 +171,10 @@ where
             db,
             dev,
             pruning,
-            ext,
             engine,
             era,
+            static_files,
+            ext,
             tx_trace,
         } = self;
 
@@ -209,6 +214,7 @@ where
             pruning,
             engine,
             era,
+            static_files,
             tx_trace,
         };
 

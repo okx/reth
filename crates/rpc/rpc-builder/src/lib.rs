@@ -100,7 +100,7 @@ pub use eth::EthHandlers;
 mod legacy_xlayer;
 mod metrics;
 use crate::middleware::RethRpcMiddleware;
-pub use metrics::{MeteredRequestFuture, RpcRequestMetricsService};
+pub use metrics::{MeteredBatchRequestsFuture, MeteredRequestFuture, RpcRequestMetricsService};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_rpc::eth::sim_bundle::EthSimBundle;
 
