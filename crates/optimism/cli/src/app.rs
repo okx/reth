@@ -9,9 +9,12 @@ use reth_optimism_consensus::OpBeaconConsensus;
 use reth_optimism_node::{OpExecutorProvider, OpNode};
 use reth_rpc_server_types::RpcModuleValidator;
 use reth_tracing::{FileWorkerGuard, Layers};
-use reth_tracing_otlp::OtlpProtocol;
 use std::{fmt, sync::Arc};
 use tracing::info;
+
+#[cfg(feature = "otlp")]
+use reth_tracing_otlp::OtlpProtocol;
+#[cfg(feature = "otlp")]
 use url::Url;
 
 /// A wrapper around a parsed CLI that handles command execution.
@@ -113,6 +116,9 @@ where
             Commands::TestVectors(command) => runner.run_until_ctrl_c(command.execute()),
             Commands::ReExecute(command) => {
                 runner.run_until_ctrl_c(command.execute::<OpNode>(components))
+            }
+            Commands::SetHead(command) => {
+                runner.run_until_ctrl_c(command.execute::<OpNode>())
             }
         }
     }

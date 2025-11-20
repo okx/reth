@@ -16,6 +16,7 @@ pub mod import;
 pub mod import_receipts;
 pub mod import_simple;
 pub mod init_state;
+pub mod sethead;
 
 #[cfg(feature = "dev")]
 pub mod test_vectors;
@@ -66,6 +67,9 @@ pub enum Commands<Spec: ChainSpecParser = OpChainSpecParser, Ext: clap::Args + f
     /// Re-execute blocks in parallel to verify historical sync correctness.
     #[command(name = "re-execute")]
     ReExecute(re_execute::Command<Spec>),
+    /// Reset the chain head to a specific block number
+    #[command(name = "sethead")]
+    SetHead(sethead::SetHeadCommand<Spec>),
 }
 
 impl<
@@ -91,6 +95,7 @@ impl<
             #[cfg(feature = "dev")]
             Self::TestVectors(_) => None,
             Self::ReExecute(cmd) => cmd.chain_spec(),
+            Self::SetHead(cmd) => Some(cmd.chain_spec()),
         }
     }
 }

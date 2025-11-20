@@ -9667,6 +9667,7 @@ dependencies = [
  "reth-prune",
  "reth-rpc-server-types",
  "reth-stages",
+ "reth-stages-types",
  "reth-static-file",
  "reth-static-file-types",
  "reth-tracing",
