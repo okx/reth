@@ -266,6 +266,8 @@ pub struct StaticFileProviderInner<N> {
     _lock_file: Option<StorageLock>,
     /// Node primitives
     _pd: PhantomData<N>,
+    /// Genesis block number, default is 0;
+    genesis_block_number: u64,
 }
 
 impl<N: NodePrimitives> StaticFileProviderInner<N> {
@@ -290,6 +292,7 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             blocks_per_file: DEFAULT_BLOCKS_PER_STATIC_FILE,
             _lock_file,
             _pd: Default::default(),
+            genesis_block_number: 0,
         };
 
         Ok(provider)
@@ -303,6 +306,11 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
     /// block is positioned.
     pub const fn find_fixed_range(&self, block: BlockNumber) -> SegmentRangeInclusive {
         find_fixed_range(block, self.blocks_per_file)
+    }
+
+    /// Get genesis block number
+    pub const fn get_genesis_block_number(&self) -> u64 {
+        self.genesis_block_number
     }
 }
 
@@ -1370,6 +1378,15 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     pub fn tx_index(&self) -> &RwLock<SegmentRanges> {
         &self.static_files_tx_index
     }
+
+    /// Set genesis block number.
+    pub fn set_genesis_block_number(&mut self, genesis_block_number: u64) {
+        if let Some(inner) = Arc::get_mut(&mut self.0) {
+            inner.genesis_block_number = genesis_block_number;
+        } else {
+            panic!("set_genesis_block_number must be called when there's only one reference to StaticFileProvider");
+        }
+    }
 }
 
 /// Helper trait to manage different [`StaticFileProviderRW`] of an `Arc<StaticFileProvider`
@@ -1420,7 +1437,11 @@ impl<N: NodePrimitives> StaticFileWriter for StaticFileProvider<N> {
         &self,
         segment: StaticFileSegment,
     ) -> ProviderResult<StaticFileProviderRWRefMut<'_, Self::Primitives>> {
-        self.get_writer(self.get_highest_static_file_block(segment).unwrap_or_default(), segment)
+        let genesis_number = self.0.as_ref().get_genesis_block_number();
+        self.get_writer(
+            self.get_highest_static_file_block(segment).unwrap_or(genesis_number),
+            segment,
+        )
     }
 
     fn commit(&self) -> ProviderResult<()> {
