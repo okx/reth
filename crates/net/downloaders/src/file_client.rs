@@ -261,7 +261,8 @@ impl<B: FullBlock<Header: reth_primitives_traits::BlockHeader>> FromReader
                 // Validate standalone header
                 self.consensus.validate_header(block.sealed_header())?;
                 if let Some(parent) = &parent_header {
-                    if parent.number() == block.number() {
+                    // Skip blocks that are already sealed
+                    if parent.number() >= block.number() {
                         continue;
                     }
                     self.consensus.validate_header_against_parent(block.sealed_header(), parent)?;
