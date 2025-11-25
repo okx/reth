@@ -43,6 +43,14 @@ use reth_trie_parallel::root::{ParallelStateRoot, ParallelStateRootError};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tracing::{debug, debug_span, error, info, instrument, trace, warn};
 
+use alloy_consensus::TxReceipt;
+use reth_primitives_traits::transaction::TxHashRef;
+use xlayer_db::{
+    internal_transaction_inspector::{TraceCollector, TxHashWithInternalTransaction},
+    structs::CacheTable,
+    utils::write_single,
+};
+
 /// Context providing access to tree state during validation.
 ///
 /// This context is provided to the [`EngineValidator`] and includes the state of the tree's
@@ -591,7 +599,14 @@ where
             .without_state_clear()
             .build();
 
-        let evm = self.evm_config.evm_with_env(&mut db, env.evm_env.clone());
+        let mut tx_hashes = Vec::new();
+        let mut inspector = TraceCollector::default();
+        let evm = self.evm_config.evm_with_env_and_inspector(
+            &mut db,
+            env.evm_env.clone(),
+            &mut inspector,
+        );
+
         let ctx =
             self.execution_ctx_for(input).map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
         let mut executor = self.evm_config.create_executor(evm, ctx);
@@ -617,12 +632,38 @@ where
         let state_hook = Box::new(handle.state_hook());
         let output = self.metrics.execute_metered(
             executor,
-            handle.iter_transactions().map(|res| res.map_err(BlockExecutionError::other)),
+            handle.iter_transactions().map(|res| {
+                res.map(|tx| {
+                    tx_hashes.push(*tx.tx().tx_hash());
+                    tx
+                })
+                .map_err(BlockExecutionError::other)
+            }),
             state_hook,
         )?;
         let execution_finish = Instant::now();
         let execution_time = execution_finish.duration_since(execution_start);
         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_time, "Executed block");
+
+        // xlayer extract internal transactions
+        let mut tx_with_internal_transactions = Vec::<TxHashWithInternalTransaction>::default();
+        let internal_transactions = inspector.get();
+
+        for (index, tx_hash) in tx_hashes.iter().enumerate() {
+            if !output.receipts[index].status() || internal_transactions[index].len() > 1 {
+                tx_with_internal_transactions.push(TxHashWithInternalTransaction {
+                    tx_hash: *tx_hash,
+                    internal_transactions: internal_transactions[index].clone(),
+                });
+            }
+        }
+
+        if let Err(err) =
+            write_single::<CacheTable, _, _>(input.hash(), tx_with_internal_transactions)
+        {
+            error!(target:"reth::cli", "xlayer execute_block write_single failed for block {:#?} error {:#?}", input.hash(), err);
+        }
+
         Ok(output)
     }
 

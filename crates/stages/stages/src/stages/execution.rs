@@ -8,7 +8,7 @@ use reth_db::{static_file::HeaderMask, tables};
 use reth_evm::{execute::Executor, metrics::ExecutorMetrics, ConfigureEvm};
 use reth_execution_types::Chain;
 use reth_exex::{ExExManagerHandle, ExExNotification, ExExNotificationSource};
-use reth_primitives_traits::{format_gas_throughput, BlockBody, NodePrimitives};
+use reth_primitives_traits::{format_gas_throughput, BlockBody, NodePrimitives, RecoveredBlock};
 use reth_provider::{
     providers::{StaticFileProvider, StaticFileWriter},
     BlockHashReader, BlockReader, DBProvider, ExecutionOutcome, HeaderProvider,
@@ -311,6 +311,12 @@ where
 
         debug!(target: "sync::stages::execution", start = start_block, end = max_block, "Executing range");
 
+        let mut replay_db = State::builder()
+            .with_database(StateProviderDatabase::new(LatestStateProviderRef::new(provider)))
+            .with_bundle_update()
+            .without_state_clear()
+            .build();
+
         // Execute block range
         let mut cumulative_gas = 0;
         let batch_start = Instant::now();
@@ -352,6 +358,10 @@ where
             results.push(result);
 
             execution_duration += execute_start.elapsed();
+
+            if let Err(err) = extract(&self.evm_config, &mut replay_db, &block) {
+                error!(target:"reth::cli", "ok execute extract failed for block {:#?} error {:#?}", block.hash(), err);
+            }
 
             // Log execution throughput
             if last_log_instant.elapsed() >= log_duration {
@@ -1240,4 +1250,52 @@ mod tests {
             ]
         );
     }
+}
+
+use alloy_consensus::{transaction::TxHashRef, TxReceipt};
+use reth_evm::{block::BlockExecutionError, execute::BlockExecutor};
+use reth_revm::{Database, DatabaseRef, State};
+use xlayer_db::{
+    internal_transaction_inspector::{TraceCollector, TxHashWithInternalTransaction},
+    structs::CacheTable,
+    utils::write_single,
+};
+
+fn extract<E, DB>(
+    evm_config: &E,
+    db: &mut State<DB>,
+    block: &RecoveredBlock<<<E as ConfigureEvm>::Primitives as NodePrimitives>::Block>,
+) -> Result<(), BlockExecutionError>
+where
+    E: ConfigureEvm,
+    DB: Database + DatabaseRef + Send + std::fmt::Debug,
+    <DB as Database>::Error: Send + Sync + 'static,
+{
+    let mut inspector = TraceCollector::default();
+    let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
+    let evm = evm_config.evm_with_env_and_inspector(db, evm_env.clone(), &mut inspector);
+    let ctx = evm_config.context_for_block(block).map_err(BlockExecutionError::other)?;
+    let executor = evm_config.create_executor(evm, ctx);
+
+    let output = executor.execute_block(block.transactions_recovered())?;
+
+    let mut tx_with_internal_transactions = Vec::<TxHashWithInternalTransaction>::default();
+    let internal_transactions = inspector.get();
+
+    for (index, tx) in block.transactions_recovered().enumerate() {
+        if !output.receipts[index].status() || internal_transactions[index].len() > 1 {
+            tx_with_internal_transactions.push(TxHashWithInternalTransaction {
+                tx_hash: *tx.tx_hash(),
+                internal_transactions: internal_transactions[index].clone(),
+            });
+        }
+    }
+
+    if let Err(err) =
+        write_single::<CacheTable, _, _>(block.hash(), tx_with_internal_transactions.clone())
+    {
+        error!(target:"reth::cli", "ok extract write_single failed for block {:#?} error {:#?}", block.hash(), err);
+    }
+
+    Ok(())
 }

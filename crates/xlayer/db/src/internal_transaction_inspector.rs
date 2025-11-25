@@ -2,7 +2,7 @@ use alloy_rlp::{RlpDecodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, TxHash, U256};
 
 use reth_revm::{
     interpreter::{
@@ -32,6 +32,12 @@ pub struct InternalTransaction {
     value_wei: String,
     call_value_wei: String,
     error: String,
+}
+
+#[derive(Debug, Clone, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
+pub struct TxHashWithInternalTransaction {
+    pub tx_hash: TxHash,
+    pub internal_transactions: Vec<InternalTransaction>,
 }
 
 impl InternalTransaction {

@@ -63,6 +63,8 @@ bincode.workspace = true
 reqwest = { workspace = true, default-features = false, features = ["rustls-tls-native-roots", "blocking"] }
 eyre.workspace = true
 
+xlayer-db.workspace = true
+
 [dev-dependencies]
 # reth
 reth-chainspec.workspace = true

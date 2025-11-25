@@ -7640,7 +7640,7 @@ dependencies = [
 
 [[package]]
 name = "reth-apollo"
-version = "1.9.2"
+version = "1.9.3"
 dependencies = [
  "apollo-sdk",
  "async-once-cell",
@@ -8484,6 +8484,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tracing",
+ "xlayer-db",
 ]
 
 [[package]]
@@ -10783,6 +10784,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tracing",
+ "xlayer-db",
 ]
 
 [[package]]
@@ -14588,7 +14590,7 @@ dependencies = [
 
 [[package]]
 name = "xlayer-db"
-version = "1.9.2"
+version = "1.9.3"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -14603,7 +14605,7 @@ dependencies = [
 
 [[package]]
 name = "xlayer-exex"
-version = "1.9.2"
+version = "1.9.3"
 dependencies = [
  "alloy-consensus",
  "alloy-evm",
@@ -14621,7 +14623,7 @@ dependencies = [
 
 [[package]]
 name = "xlayer-rpc"
-version = "1.9.2"
+version = "1.9.3"
 dependencies = [
  "alloy-eips",
  "alloy-network-primitives",
