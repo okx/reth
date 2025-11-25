@@ -40,6 +40,9 @@ pub const DEFAULT_RESERVED_CPU_CORES: usize = 1;
 /// Default maximum concurrency for prewarm task.
 pub const DEFAULT_PREWARM_MAX_CONCURRENCY: usize = 16;
 
+/// Default maximum concurrency for parallel group execution.
+pub const DEFAULT_PARALLEL_GROUP_MAX_CONCURRENCY: usize = 16;
+
 const DEFAULT_BLOCK_BUFFER_LIMIT: u32 = 256;
 const DEFAULT_MAX_INVALID_HEADER_CACHE_LENGTH: u32 = 256;
 const DEFAULT_MAX_EXECUTE_BLOCK_BATCH_SIZE: usize = 4;
@@ -125,6 +128,11 @@ pub struct TreeConfig {
     always_process_payload_attributes_on_canonical_head: bool,
     /// Maximum concurrency for the prewarm task.
     prewarm_max_concurrency: usize,
+    /// Whether to enable parallel group execution.
+    /// If enabled, transactions will be executed in parallel groups instead of prewarming.
+    parallel_group_execution_enabled: bool,
+    /// Maximum concurrency for parallel group execution.
+    parallel_group_max_concurrency: usize,
     /// Whether to unwind canonical header to ancestor during forkchoice updates.
     allow_unwind_canonical_header: bool,
     /// Number of storage proof worker threads.
@@ -155,6 +163,8 @@ impl Default for TreeConfig {
             state_root_fallback: false,
             always_process_payload_attributes_on_canonical_head: false,
             prewarm_max_concurrency: DEFAULT_PREWARM_MAX_CONCURRENCY,
+            parallel_group_execution_enabled: false,
+            parallel_group_max_concurrency: DEFAULT_PARALLEL_GROUP_MAX_CONCURRENCY,
             allow_unwind_canonical_header: false,
             storage_worker_count: default_storage_worker_count(),
             account_worker_count: default_account_worker_count(),
@@ -185,6 +195,8 @@ impl TreeConfig {
         state_root_fallback: bool,
         always_process_payload_attributes_on_canonical_head: bool,
         prewarm_max_concurrency: usize,
+        parallel_group_execution_enabled: bool,
+        parallel_group_max_concurrency: usize,
         allow_unwind_canonical_header: bool,
         storage_worker_count: usize,
         account_worker_count: usize,
@@ -209,6 +221,8 @@ impl TreeConfig {
             state_root_fallback,
             always_process_payload_attributes_on_canonical_head,
             prewarm_max_concurrency,
+            parallel_group_execution_enabled,
+            parallel_group_max_concurrency,
             allow_unwind_canonical_header,
             storage_worker_count,
             account_worker_count,
@@ -459,6 +473,28 @@ impl TreeConfig {
     /// Return the prewarm max concurrency.
     pub const fn prewarm_max_concurrency(&self) -> usize {
         self.prewarm_max_concurrency
+    }
+
+    /// Returns whether parallel group execution is enabled.
+    pub const fn parallel_group_execution_enabled(&self) -> bool {
+        self.parallel_group_execution_enabled
+    }
+
+    /// Returns the maximum concurrency for parallel group execution.
+    pub const fn parallel_group_max_concurrency(&self) -> usize {
+        self.parallel_group_max_concurrency
+    }
+
+    /// Sets whether parallel group execution is enabled.
+    pub const fn with_parallel_group_execution_enabled(mut self, enabled: bool) -> Self {
+        self.parallel_group_execution_enabled = enabled;
+        self
+    }
+
+    /// Sets the maximum concurrency for parallel group execution.
+    pub const fn with_parallel_group_max_concurrency(mut self, concurrency: usize) -> Self {
+        self.parallel_group_max_concurrency = concurrency;
+        self
     }
 
     /// Return the number of storage proof worker threads.

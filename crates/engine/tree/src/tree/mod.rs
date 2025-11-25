@@ -70,6 +70,7 @@ use crate::tree::error::AdvancePersistenceError;
 pub use block_buffer::BlockBuffer;
 pub use invalid_headers::InvalidHeaderCache;
 pub use payload_processor::*;
+pub use payload_processor::parallel_group::ParallelGroupContext;
 pub use payload_validator::{BasicEngineValidator, EngineValidator};
 pub use persistence_state::PersistenceState;
 pub use reth_engine_primitives::TreeConfig;

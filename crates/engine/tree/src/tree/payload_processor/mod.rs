@@ -51,6 +51,7 @@ use tracing::{debug, debug_span, instrument, warn};
 mod configured_sparse_trie;
 pub mod executor;
 pub mod multiproof;
+pub mod parallel_group;
 pub mod prewarm;
 pub mod sparse_trie;
 

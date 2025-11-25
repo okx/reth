@@ -36,6 +36,11 @@ impl WorkloadExecutor {
     {
         self.inner.handle.spawn_blocking(func)
     }
+
+    /// Block on a join handle until it completes.
+    pub(super) fn block_on_join<R>(&self, handle: JoinHandle<R>) -> Result<R, tokio::task::JoinError> {
+        self.inner.handle.block_on(handle)
+    }
 }
 
 #[derive(Debug, Clone)]

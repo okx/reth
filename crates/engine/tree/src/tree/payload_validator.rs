@@ -5,7 +5,11 @@ use crate::tree::{
     error::{InsertBlockError, InsertBlockErrorKind, InsertPayloadError},
     executor::WorkloadExecutor,
     instrumented_state::InstrumentedStateProvider,
-    payload_processor::{multiproof::MultiProofConfig, PayloadProcessor},
+    payload_processor::{
+        multiproof::MultiProofConfig,
+        parallel_group::ParallelGroupContext,
+        PayloadProcessor,
+    },
     precompile_cache::{CachedPrecompile, CachedPrecompileMetrics, PrecompileCacheMap},
     sparse_trie::StateRootComputeOutcome,
     EngineApiMetrics, EngineApiTreeState, ExecutionEnv, PayloadHandle, StateProviderBuilder,
@@ -25,6 +29,7 @@ use reth_evm::{
     block::BlockExecutor, execute::ExecutableTxFor, ConfigureEvm, EvmEnvFor, ExecutionCtxFor,
     SpecFor,
 };
+use alloy_evm::ToTxEnv;
 use reth_payload_primitives::{
     BuiltPayload, InvalidPayloadAttributesError, NewPayloadError, PayloadTypes,
 };
@@ -38,9 +43,12 @@ use reth_provider::{
     StateRootProvider, TrieReader,
 };
 use reth_revm::db::State;
+use revm::database::states::bundle_state::BundleRetention;
 use reth_trie::{updates::TrieUpdates, HashedPostState, TrieInput};
 use reth_trie_parallel::root::{ParallelStateRoot, ParallelStateRootError};
 use std::{collections::HashMap, sync::Arc, time::Instant};
+use alloy_rlp::Decodable;
+use reth_evm::execute::WithTxEnv;
 use tracing::{debug, debug_span, error, info, instrument, trace, warn};
 
 /// Context providing access to tree state during validation.
@@ -382,10 +390,11 @@ where
         let txs = self.tx_iterator_for(&input)?;
 
         // Spawn the appropriate processor based on strategy
+        let provider_builder_for_spawn = provider_builder.clone();
         let mut handle = ensure_ok!(self.spawn_payload_processor(
             env.clone(),
             txs,
-            provider_builder,
+            provider_builder_for_spawn,
             parent_hash,
             ctx.state(),
             strategy,
@@ -400,13 +409,14 @@ where
         );
 
         // Execute the block and handle any execution errors
+        let provider_builder_for_execute = provider_builder.clone();
         let output = match if self.config.state_provider_metrics() {
             let state_provider = InstrumentedStateProvider::from_state_provider(&state_provider);
-            let result = self.execute_block(&state_provider, env, &input, &mut handle);
+            let result = self.execute_block(&state_provider, env, &input, &mut handle, Some(provider_builder_for_execute.clone()), ctx.state());
             state_provider.record_total_latency();
             result
         } else {
-            self.execute_block(&state_provider, env, &input, &mut handle)
+            self.execute_block(&state_provider, env, &input, &mut handle, Some(provider_builder_for_execute), ctx.state())
         } {
             Ok(output) => output,
             Err(err) => return self.handle_execution_error(input, err, &parent_block),
@@ -575,6 +585,8 @@ where
         env: ExecutionEnv<Evm>,
         input: &BlockOrPayload<T>,
         handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err>,
+        provider_builder_opt: Option<StateProviderBuilder<N, P>>,
+        tree_state: &EngineApiTreeState<N>,
     ) -> Result<BlockExecutionOutput<N::Receipt>, InsertBlockErrorKind>
     where
         S: StateProvider,
@@ -584,6 +596,162 @@ where
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
     {
         debug!(target: "engine::tree::payload_validator", "Executing block");
+
+        // Check if parallel group execution is enabled
+        if self.config.parallel_group_execution_enabled() {
+            debug!(
+                target: "engine::tree::payload_validator",
+                "Parallel group execution enabled, attempting parallel execution"
+            );
+
+            // Get transactions from input (not from handle, to avoid consuming handle)
+            // This allows us to re-use transactions if parallel execution fails
+            if let Ok(tx_iterator) = self.tx_iterator_for(input) {
+                // Collect all transactions from the iterator and convert to WithTxEnv
+                // WithTxEnv implements Clone + Send, which is required for parallel execution
+                let mut transactions = Vec::new();
+                let mut transaction_index = 0usize;
+                
+                for tx_result in tx_iterator {
+                    match tx_result {
+                        Ok(tx) => {
+                            // Convert to WithTxEnv for parallel execution
+                            // WithTxEnv wraps the transaction in Arc, making it Clone + Send
+                            // Note: ExecutableTxFor implements ToTxEnv, so we can use to_tx_env()
+                            let tx_env = tx.to_tx_env();
+                            let with_tx_env = WithTxEnv {
+                                tx_env,
+                                tx: Arc::new(tx),
+                            };
+                            transactions.push((transaction_index, with_tx_env));
+                            transaction_index += 1;
+                        }
+                        Err(err) => {
+                            warn!(
+                                target: "engine::tree::payload_validator",
+                                %err,
+                                "Failed to get transaction from iterator, falling back to sequential execution"
+                            );
+                            // Fall through to sequential execution
+                            break;
+                        }
+                    }
+                }
+
+                // Only attempt parallel execution if we have transactions
+                if !transactions.is_empty() {
+                    // Get StateProviderBuilder for parallel execution
+                    let provider_builder = match provider_builder_opt {
+                Some(builder) => builder,
+                None => {
+                    // Try to get StateProviderBuilder from parent hash
+                    match self.state_provider_builder(env.parent_hash, tree_state) {
+                        Ok(Some(builder)) => builder,
+                        Ok(None) | Err(_) => {
+                            warn!(
+                                target: "engine::tree::payload_validator",
+                                "Failed to get StateProviderBuilder, falling back to sequential execution"
+                            );
+                            // Fall back to sequential execution by returning error
+                            // The caller will handle sequential execution
+                            return Err(InsertBlockErrorKind::Other(Box::new(
+                                std::io::Error::new(std::io::ErrorKind::Other, "Failed to get StateProviderBuilder")
+                            )));
+                        }
+                    }
+                    }
+                };
+
+                    // Create ParallelGroupContext
+                    let parallel_ctx = ParallelGroupContext {
+                        env: env.clone(),
+                        evm_config: self.evm_config.clone(),
+                        provider: provider_builder,
+                        max_concurrency: self.config.parallel_group_max_concurrency(),
+                    };
+
+                    // Execute in parallel using a helper function to handle type constraints
+                    let execution_start = Instant::now();
+                    let workload_executor = WorkloadExecutor::default();
+                    match self.execute_parallel_with_type_inference(
+                        &parallel_ctx,
+                        transactions,
+                        &workload_executor,
+                    ) {
+                        Ok(parallel_results) => {
+                            // No conflicts detected, merge results
+                            debug!(
+                                target: "engine::tree::payload_validator",
+                                result_count = parallel_results.len(),
+                                "Parallel execution completed without conflicts, merging results"
+                            );
+                            let output_eth = ParallelGroupContext::<N, P, Evm>::merge_parallel_results(parallel_results);
+                            
+                            // Convert EthereumReceipt to N::Receipt
+                            // For Ethereum networks, Receipt types are the same underlying type
+                            // We use RLP encoding/decoding for type-safe conversion without unsafe code
+                            // This ensures correctness across different Receipt type implementations
+                            let receipts: Vec<N::Receipt> = output_eth
+                                .result
+                                .receipts
+                                .into_iter()
+                                .map(|eth_receipt| {
+                                    // Use RLP encoding/decoding for safe type conversion
+                                    // This is necessary because we're working with generic types
+                                    // and need to ensure type safety without unsafe code
+                                    let rlp_data = alloy_rlp::encode(&eth_receipt);
+                                    N::Receipt::decode(&mut rlp_data.as_slice())
+                                        .map_err(|e| {
+                                            InsertBlockErrorKind::Other(Box::new(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                format!("Failed to convert receipt: {e}"),
+                                            )))
+                                        })
+                                        .expect("Receipt conversion should succeed for Ethereum networks")
+                                })
+                                .collect();
+                            
+                            let output = BlockExecutionOutput {
+                                result: reth_execution_types::BlockExecutionResult {
+                                    receipts,
+                                    requests: output_eth.result.requests,
+                                    gas_used: output_eth.result.gas_used,
+                                    blob_gas_used: output_eth.result.blob_gas_used,
+                                },
+                                state: output_eth.state,
+                            };
+                            
+                            let execution_finish = Instant::now();
+                            let execution_time = execution_finish.duration_since(execution_start);
+                            debug!(
+                                target: "engine::tree::payload_validator",
+                                elapsed = ?execution_time,
+                                "Executed block in parallel"
+                            );
+                            return Ok(output);
+                        }
+                        Err(conflict) => {
+                            // Conflicts detected, fall back to sequential execution
+                            warn!(
+                                target: "engine::tree::payload_validator",
+                                ?conflict,
+                                "Conflicts detected in parallel execution, falling back to sequential execution"
+                            );
+                            // Conflicts detected, but we've already consumed handle.iter_transactions()
+                            // We cannot re-use the handle, so we need to return an error that will
+                            // trigger the caller to re-execute sequentially
+                            // In practice, this should be rare as conflicts are usually detected early
+                            return Err(InsertBlockErrorKind::Other(Box::new(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("Parallel execution conflict detected: {:?}. Sequential execution required.", conflict)
+                                )
+                            )));
+                        }
+                    }
+                }
+            }
+        }
 
         let mut db = State::builder()
             .with_database(StateProviderDatabase::new(&state_provider))
@@ -624,6 +792,97 @@ where
         let execution_time = execution_finish.duration_since(execution_start);
         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_time, "Executed block");
         Ok(output)
+    }
+
+    /// Helper function to execute transactions in parallel with type inference
+    /// This function uses a generic type parameter that is inferred from the transactions vector
+    /// to satisfy Clone + Send constraints at compile time
+    fn execute_parallel_with_type_inference<Tx>(
+        &self,
+        parallel_ctx: &ParallelGroupContext<N, P, Evm>,
+        transactions: Vec<(usize, Tx)>,
+        workload_executor: &WorkloadExecutor,
+    ) -> Result<Vec<crate::tree::payload_processor::parallel_group::ParallelExecutionResult>, crate::tree::payload_processor::parallel_group::ConflictResult>
+    where
+        Tx: ExecutableTxFor<Evm> + Clone + Send + 'static,
+    {
+        parallel_ctx.execute_parallel(transactions, workload_executor)
+    }
+
+    /// Sequential execution with pre-collected transactions (for fallback from parallel execution)
+    #[allow(dead_code)] // Reserved for future fallback implementation
+    #[instrument(level = "debug", target = "engine::tree::payload_validator", skip_all)]
+    fn execute_block_sequential_with_transactions<S, T, Tx>(
+        &mut self,
+        state_provider: S,
+        env: ExecutionEnv<Evm>,
+        input: &BlockOrPayload<T>,
+        transactions: Vec<(usize, Tx)>,
+    ) -> Result<BlockExecutionOutput<N::Receipt>, InsertBlockErrorKind>
+    where
+        S: StateProvider,
+        V: PayloadValidator<T, Block = N::Block>,
+        T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
+        Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
+        Tx: ExecutableTxFor<Evm>,
+    {
+        debug!(
+            target: "engine::tree::payload_validator",
+            transaction_count = transactions.len(),
+            "Executing block sequentially with pre-collected transactions"
+        );
+
+        let mut db = State::builder()
+            .with_database(StateProviderDatabase::new(&state_provider))
+            .with_bundle_update()
+            .without_state_clear()
+            .build();
+
+        let evm = self.evm_config.evm_with_env(&mut db, env.evm_env.clone());
+        let ctx =
+            self.execution_ctx_for(input).map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
+        let mut executor = self.evm_config.create_executor(evm, ctx);
+
+        if !self.config.precompile_cache_disabled() {
+            // Only cache pure precompiles to avoid issues with stateful precompiles
+            executor.evm_mut().precompiles_mut().map_pure_precompiles(|address, precompile| {
+                let metrics = self
+                    .precompile_cache_metrics
+                    .entry(*address)
+                    .or_insert_with(|| CachedPrecompileMetrics::new_with_address(*address))
+                    .clone();
+                CachedPrecompile::wrap(
+                    precompile,
+                    self.precompile_cache_map.cache_for_address(*address),
+                    *env.evm_env.spec_id(),
+                    Some(metrics),
+                )
+            });
+        }
+
+        let execution_start = Instant::now();
+        // Execute transactions in order
+        for (_, tx) in transactions {
+            executor.execute_transaction(tx).map_err(|e| {
+                InsertBlockErrorKind::Other(Box::new(e))
+            })?;
+        }
+
+        let (evm, block_result) = executor.finish().map_err(|e| {
+            InsertBlockErrorKind::Other(Box::new(e))
+        })?;
+        let db = evm.into_db();
+        db.merge_transitions(BundleRetention::Reverts);
+        let bundle_state = db.take_bundle();
+
+        let execution_finish = Instant::now();
+        let execution_time = execution_finish.duration_since(execution_start);
+        debug!(target: "engine::tree::payload_validator", elapsed = ?execution_time, "Executed block sequentially");
+
+        Ok(BlockExecutionOutput {
+            result: block_result,
+            state: bundle_state,
+        })
     }
 
     /// Compute state root for the given hashed post state in parallel.
