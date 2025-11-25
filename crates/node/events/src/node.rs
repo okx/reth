@@ -2,6 +2,7 @@
 
 use crate::cl::ConsensusLayerHealthEvent;
 use alloy_consensus::{constants::GWEI_TO_WEI, BlockHeader};
+use alloy_eips::eip4844::DATA_GAS_PER_BLOB;
 use alloy_primitives::{BlockNumber, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use futures::Stream;
@@ -9,7 +10,7 @@ use reth_engine_primitives::{
     ConsensusEngineEvent, ConsensusEngineLiveSyncProgress, ForkchoiceStatus,
 };
 use reth_network_api::PeersInfo;
-use reth_primitives_traits::{format_gas, format_gas_throughput, BlockBody, NodePrimitives};
+use reth_primitives_traits::{format_gas, format_gas_throughput, NodePrimitives};
 use reth_prune_types::PrunerEvent;
 use reth_stages::{EntitiesCheckpoint, ExecOutput, PipelineEvent, StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileProducerEvent;
@@ -248,39 +249,37 @@ impl NodeState {
                 }
             }
             ConsensusEngineEvent::CanonicalBlockAdded(executed, elapsed) => {
-                let block = executed.sealed_block();
-                let mut full = block.gas_used() as f64 * 100.0 / block.gas_limit() as f64;
-                if full.is_nan() {
-                    full = 0.0;
-                }
-                
                 // X Layer: Get timing metrics for this block
                 use reth_node_metrics::block_timing::{get_block_timing, remove_block_timing};
+                let block = executed.sealed_block();
                 let block_hash = block.hash();
                 
                 let timing_str = get_block_timing(&block_hash)
                     .map(|metrics| metrics.format_for_log())
                     .unwrap_or_default();
                 
+                // Calculate full percentage (gas usage)
+                let full = block.gas_used() as f64 * 100.0 / block.gas_limit() as f64;
+                
                 info!(
                     number=block.number(),
                     hash=?block.hash(),
                     peers=self.num_connected_peers(),
-                    txs=block.body().transactions().len(),
+                    txs=block.transaction_count(),
                     gas_used=%format_gas(block.gas_used()),
                     gas_throughput=%format_gas_throughput(block.gas_used(), elapsed),
                     gas_limit=%format_gas(block.gas_limit()),
                     full=%format!("{:.1}%", full),
                     base_fee=%format!("{:.2}Gwei", block.base_fee_per_gas().unwrap_or(0) as f64 / GWEI_TO_WEI as f64),
-                    blobs=block.blob_gas_used().unwrap_or(0) / alloy_eips::eip4844::DATA_GAS_PER_BLOB,
-                    excess_blobs=block.excess_blob_gas().unwrap_or(0) / alloy_eips::eip4844::DATA_GAS_PER_BLOB,
+                    blobs=block.blob_gas_used().unwrap_or(0) / DATA_GAS_PER_BLOB,
+                    excess_blobs=block.excess_blob_gas().unwrap_or(0) / DATA_GAS_PER_BLOB,
                     ?elapsed,
                     timing=%timing_str,
                     "Block added to canonical chain"
                 );
                 
                 // Clean up timing metrics after logging
-                remove_block_timing(&block.hash());
+                remove_block_timing(&block_hash);
             }
             ConsensusEngineEvent::CanonicalChainCommitted(head, elapsed) => {
                 self.latest_block = Some(head.number());

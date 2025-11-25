@@ -43,8 +43,8 @@ use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, Transac
 use revm::context::{Block, BlockEnv};
 use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, trace, warn};
-use reth_node_metrics::block_timing::{BlockTimingMetrics, BuildTiming, DeliverTxsTiming, store_block_timing};
-use std::time::Instant;
+use reth_node_metrics::block_timing::{BlockTimingMetrics, store_block_timing};
+use std::time::{Duration, Instant};
 
 /// Optimism's payload builder
 #[derive(Debug)]
@@ -213,15 +213,20 @@ where
         let builder = OpBuilder::new(best);
 
         let state_provider = self.client.state_by_block_hash(ctx.parent().hash())?;
-        let state = StateProviderDatabase::new(&state_provider);
+        // Wrap state_provider with StateReadTracker to track state read time in Build phase
+        use reth_engine_tree::tree::state_read_tracker_xlayer::{IoReadTracker, StateReadTracker};
+        use std::sync::Arc;
+        let io_tracker = Arc::new(StateReadTracker::from_state_provider(state_provider));
+        let state = StateProviderDatabase::new(io_tracker.as_ref());
 
-        if ctx.attributes().no_tx_pool() {
-            builder.build(state, &state_provider, ctx)
+        let result = if ctx.attributes().no_tx_pool() {
+            builder.build(state, io_tracker.as_ref(), ctx, Some(io_tracker.clone() as Arc<dyn IoReadTracker + Send + Sync>))
         } else {
             // sequencer mode we can reuse cachedreads from previous runs
-            builder.build(cached_reads.as_db_mut(state), &state_provider, ctx)
-        }
-        .map(|out| out.with_cached_reads(cached_reads))
+            builder.build(cached_reads.as_db_mut(state), io_tracker.as_ref(), ctx, Some(io_tracker.clone() as Arc<dyn IoReadTracker + Send + Sync>))
+        };
+
+        result.map(|out| out.with_cached_reads(cached_reads))
     }
 
     /// Computes the witness for the payload.
@@ -342,6 +347,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         db: impl Database<Error = ProviderError>,
         state_provider: impl StateProvider,
         ctx: OpPayloadBuilderCtx<Evm, ChainSpec, Attrs>,
+        io_tracker: Option<Arc<dyn reth_engine_tree::tree::state_read_tracker_xlayer::IoReadTracker + Send + Sync>>,
     ) -> Result<BuildOutcomeKind<OpBuiltPayload<N>>, PayloadBuilderError>
     where
         Evm: ConfigureEvm<
@@ -377,40 +383,49 @@ impl<Txs> OpBuilder<'_, Txs> {
         let mut builder = ctx.block_builder(&mut db)?;
 
         // 1. apply pre-execution changes
-        let pre_exec_start = Instant::now();
+        let start = Instant::now();
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
             PayloadBuilderError::Internal(err.into())
         })?;
-        timing_metrics.build.apply_pre_execution_changes = pre_exec_start.elapsed();
+        timing_metrics.build.apply_pre_execution_changes = start.elapsed();
 
         // 2. execute sequencer transactions
-        let seq_txs_start = Instant::now();
+        let start = Instant::now();
         let mut info = ctx.execute_sequencer_transactions(&mut builder)?;
-        let seq_txs_elapsed = seq_txs_start.elapsed();
-        timing_metrics.build.execute_sequencer_transactions = seq_txs_elapsed;
+        timing_metrics.build.execute_sequencer_transactions = start.elapsed();
 
         // 3. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool() {
-            let mempool_txs_start = Instant::now();
+            let start = Instant::now();
             let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
+            timing_metrics.build.select_mempool_transactions = start.elapsed();
+            
+            let start = Instant::now();
             if ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?.is_some() {
                 return Ok(BuildOutcomeKind::Cancelled)
             }
-            let mempool_txs_elapsed = mempool_txs_start.elapsed();
-            timing_metrics.build.execute_mempool_transactions = mempool_txs_elapsed;
+            timing_metrics.build.execute_mempool_transactions = start.elapsed();
 
-            // check if the new payload is even more valuable
             if !ctx.is_better_payload(info.total_fees) {
-                // can skip building the block
                 return Ok(BuildOutcomeKind::Aborted { fees: info.total_fees })
             }
         }
 
-        let finish_start = Instant::now();
+        let state_read_time = io_tracker.as_ref()
+            .map(|tracker| tracker.total_io_read_time())
+            .unwrap_or_default();
+
+        // finish: state root calculation + block assembly
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(state_provider)?;
-        timing_metrics.build.finish = finish_start.elapsed();
+        
+        // Get detailed timing from finish method
+        let (state_root_duration, assembly_duration) = reth_node_metrics::block_timing::take_finish_timing()
+            .unwrap_or((Duration::from_nanos(0), Duration::from_nanos(0)));
+        timing_metrics.build.state_root_calculation = state_root_duration;
+        timing_metrics.build.block_assembly = assembly_duration;
+        timing_metrics.build.state_read = state_read_time;
         timing_metrics.build.total = build_start.elapsed();
         // Calculate DeliverTxs total from BuildTiming to avoid duplication
         timing_metrics.deliver_txs.total = timing_metrics.build.execute_sequencer_transactions + timing_metrics.build.execute_mempool_transactions;

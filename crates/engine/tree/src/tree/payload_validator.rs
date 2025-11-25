@@ -8,6 +8,7 @@ use crate::tree::{
     payload_processor::{multiproof::MultiProofConfig, PayloadProcessor},
     precompile_cache::{CachedPrecompile, CachedPrecompileMetrics, PrecompileCacheMap},
     sparse_trie::StateRootComputeOutcome,
+    state_read_tracker_xlayer::{IoReadTracker, StateReadTracker},
     EngineApiMetrics, EngineApiTreeState, ExecutionEnv, PayloadHandle, StateProviderBuilder,
     StateProviderDatabase, TreeConfig,
 };
@@ -381,7 +382,8 @@ where
         // use prewarming background task
         let txs = self.tx_iterator_for(&input)?;
 
-        // Spawn the appropriate processor based on strategy
+        // Track prewarm timing
+        let prewarm_start = std::time::Instant::now();
         let mut handle = ensure_ok!(self.spawn_payload_processor(
             env.clone(),
             txs,
@@ -399,21 +401,42 @@ where
             handle.cache_metrics(),
         );
 
+        // Wrap state provider with StateReadTracker to track state read time in Insert phase
+        let state_read_tracker = StateReadTracker::from_state_provider(state_provider);
+
         // Execute the block and handle any execution errors
-        let output = match if self.config.state_provider_metrics() {
-            let state_provider = InstrumentedStateProvider::from_state_provider(&state_provider);
-            let result = self.execute_block(&state_provider, env, &input, &mut handle);
-            state_provider.record_total_latency();
-            result
+        // If state_provider_metrics is enabled, also wrap with InstrumentedStateProvider for Prometheus metrics
+        let output = if self.config.state_provider_metrics() {
+            let instrumented_provider = InstrumentedStateProvider::from_state_provider(&state_read_tracker);
+            match self.execute_block(&instrumented_provider, env, &input, &mut handle) {
+                Ok(output) => {
+                    instrumented_provider.record_total_latency();
+                    output
+                }
+                Err(err) => return self.handle_execution_error(input, err, &parent_block),
+            }
         } else {
-            self.execute_block(&state_provider, env, &input, &mut handle)
-        } {
-            Ok(output) => output,
-            Err(err) => return self.handle_execution_error(input, err, &parent_block),
+            match self.execute_block(&state_read_tracker, env, &input, &mut handle) {
+                Ok(output) => output,
+                Err(err) => return self.handle_execution_error(input, err, &parent_block),
+            }
         };
+        
+        // Get state read time after execution
+        let state_read_time = state_read_tracker.total_io_read_time();
 
         // after executing the block we can stop executing transactions
         handle.stop_prewarming_execution();
+        let prewarm_elapsed = prewarm_start.elapsed();
+
+        // Store state read time and prewarm time to timing metrics
+        use reth_node_metrics::block_timing::{get_block_timing, store_block_timing};
+        let block_hash = input.num_hash().hash;
+        if let Some(mut metrics) = get_block_timing(&block_hash) {
+            metrics.insert.state_read = state_read_time;
+            metrics.insert.prewarm = prewarm_elapsed;
+            store_block_timing(block_hash, metrics);
+        }
 
         let block = self.convert_to_block(input)?;
 
@@ -494,7 +517,7 @@ where
             }
 
             let (root, updates) = ensure_ok_post_block!(
-                state_provider.state_root_with_updates(hashed_state.clone()),
+                state_read_tracker.state_root_with_updates(hashed_state.clone()),
                 block
             );
             (root, updates, root_time.elapsed())

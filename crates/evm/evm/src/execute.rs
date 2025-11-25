@@ -515,13 +515,16 @@ where
 
         // calculate the state root
         let hashed_state = state.hashed_post_state(&db.bundle_state);
+        let state_root_start = std::time::Instant::now();
         let (state_root, trie_updates) = state
             .state_root_with_updates(hashed_state.clone())
             .map_err(BlockExecutionError::other)?;
+        let state_root_duration = state_root_start.elapsed();
 
         let (transactions, senders) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 
+        let assembly_start = std::time::Instant::now();
         let block = self.assembler.assemble_block(BlockAssemblerInput {
             evm_env,
             execution_ctx: self.ctx,
@@ -532,6 +535,14 @@ where
             state_provider: &state,
             state_root,
         })?;
+        let assembly_duration = assembly_start.elapsed();
+
+        // Store timing info in thread-local storage for retrieval by caller
+        thread_local! {
+            static FINISH_TIMING: std::cell::RefCell<Option<(std::time::Duration, std::time::Duration)>> = 
+                std::cell::RefCell::new(None);
+        }
+        FINISH_TIMING.with(|cell| *cell.borrow_mut() = Some((state_root_duration, assembly_duration)));
 
         let block = RecoveredBlock::new_unhashed(block, senders);
 

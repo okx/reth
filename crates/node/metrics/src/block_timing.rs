@@ -14,10 +14,16 @@ pub struct BuildTiming {
     pub apply_pre_execution_changes: Duration,
     /// Time spent executing sequencer transactions
     pub execute_sequencer_transactions: Duration,
+    /// Time spent selecting transactions from mempool
+    pub select_mempool_transactions: Duration,
     /// Time spent executing mempool transactions
     pub execute_mempool_transactions: Duration,
-    /// Time spent finishing block build (state root calculation, etc.)
-    pub finish: Duration,
+    /// Time spent calculating state root
+    pub state_root_calculation: Duration,
+    /// Time spent assembling block (after state root calculation)
+    pub block_assembly: Duration,
+    /// Time spent on state read operations (account + storage + bytecode reads)
+    pub state_read: Duration,
     /// Total build time
     pub total: Duration,
 }
@@ -25,10 +31,14 @@ pub struct BuildTiming {
 /// Timing metrics for block insertion phase
 #[derive(Debug, Clone, Default)]
 pub struct InsertTiming {
+    /// Time spent prewarming (parallel transaction execution to warm cache)
+    pub prewarm: Duration,
     /// Time spent validating and executing the block
     pub validate_and_execute: Duration,
     /// Time spent inserting to tree state
     pub insert_to_tree: Duration,
+    /// Time spent on state read operations (account + storage + bytecode reads)
+    pub state_read: Duration,
     /// Total insert time
     pub total: Duration,
 }
@@ -70,6 +80,17 @@ impl BlockTimingMetrics {
             }
         };
 
+        // Helper to format Insert phase components
+        let format_insert_parts = |insert: &InsertTiming| -> Vec<String> {
+            vec![
+                format!("prewarm<{}>", format_duration(insert.prewarm)),
+                format!("validateExec<{}>", format_duration(insert.validate_and_execute)),
+                format!("insertTree<{}>", format_duration(insert.insert_to_tree)),
+                format!("stateRead<{}>", format_duration(insert.state_read)),
+                format!("total<{}>", format_duration(insert.total)),
+            ]
+        };
+
         // Check if block was built locally (has build timing) or received from network
         let is_locally_built = self.build.total.as_nanos() > 0;
         
@@ -78,25 +99,33 @@ impl BlockTimingMetrics {
             // Note: DeliverTxs only shows total to avoid duplication with Build's seqTxs/mempoolTxs
             let deliver_txs_total_time = self.build.execute_sequencer_transactions + self.build.execute_mempool_transactions;
 
+            // Build phase components - always show all fields, even if 0
+            let build_parts = vec![
+                format!("applyPreExec<{}>", format_duration(self.build.apply_pre_execution_changes)),
+                format!("execSeqTxs<{}>", format_duration(self.build.execute_sequencer_transactions)),
+                format!("selectMempoolTxs<{}>", format_duration(self.build.select_mempool_transactions)),
+                format!("execMempoolTxs<{}>", format_duration(self.build.execute_mempool_transactions)),
+                format!("calcStateRoot<{}>", format_duration(self.build.state_root_calculation)),
+                format!("assemblyBlock<{}>", format_duration(self.build.block_assembly)),
+                format!("stateRead<{}>", format_duration(self.build.state_read)),
+                format!("total<{}>", format_duration(self.build.total)),
+            ];
+
+            let insert_parts = format_insert_parts(&self.insert);
+
             format!(
-                "Produce[Build[applyPreExec<{}>, seqTxs<{}>, mempoolTxs<{}>, finish<{}>, total<{}>], Insert[validateExec<{}>, insertTree<{}>, total<{}>]], DeliverTxs[total<{}>]",
-                format_duration(self.build.apply_pre_execution_changes),
-                format_duration(self.build.execute_sequencer_transactions),
-                format_duration(self.build.execute_mempool_transactions),
-                format_duration(self.build.finish),
-                format_duration(self.build.total),
-                format_duration(self.insert.validate_and_execute),
-                format_duration(self.insert.insert_to_tree),
-                format_duration(self.insert.total),
+                "Produce[Build[{}], Insert[{}]], DeliverTxs[total<{}>]",
+                build_parts.join(", "),
+                insert_parts.join(", "),
                 format_duration(deliver_txs_total_time),
             )
         } else {
             // Block was received from network, only show Insert timing
+            let insert_parts = format_insert_parts(&self.insert);
+
             format!(
-                "Produce[Insert[validateExec<{}>, insertTree<{}>, total<{}>]]",
-                format_duration(self.insert.validate_and_execute),
-                format_duration(self.insert.insert_to_tree),
-                format_duration(self.insert.total),
+                "Produce[Insert[{}]]",
+                insert_parts.join(", "),
             )
         }
     }
@@ -153,6 +182,15 @@ pub fn get_block_timing(block_hash: &B256) -> Option<BlockTimingMetrics> {
 pub fn remove_block_timing(block_hash: &B256) {
     let store = get_timing_store();
     let mut map = store.lock().unwrap();
-    map.remove(block_hash);
+    map.shift_remove(block_hash);
+}
+
+/// Get finish timing from thread-local storage (set by finish method in reth-evm)
+pub fn take_finish_timing() -> Option<(Duration, Duration)> {
+    thread_local! {
+        static FINISH_TIMING: std::cell::RefCell<Option<(std::time::Duration, std::time::Duration)>> = 
+            std::cell::RefCell::new(None);
+    }
+    FINISH_TIMING.with(|cell| cell.borrow_mut().take())
 }
 
