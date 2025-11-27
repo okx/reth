@@ -45,6 +45,7 @@ reth-testing-utils = { workspace = true, optional = true }
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
+alloy-rlp.workspace = true
 
 # async
 tokio = { workspace = true, features = ["sync"] }

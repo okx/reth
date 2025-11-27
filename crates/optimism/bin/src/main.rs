@@ -9,7 +9,6 @@ use tracing::info;
 use std::{path::Path, sync::Arc};
 use tracing::error;
 use xlayer_db::utils::initialize;
-use xlayer_exex::utils::post_exec_exex;
 use xlayer_rpc::utils::{XlayerExt, XlayerExtApiServer};
 
 #[global_allocator]
@@ -49,15 +48,13 @@ fn main() {
                     }
                 }
 
-                node_builder = node_builder
-                    .extend_rpc_modules(move |ctx| {
-                        let new_op_eth_api = ctx.registry.eth_api().clone();
-                        let custom_rpc = XlayerExt { backend: Arc::new(new_op_eth_api) };
-                        ctx.modules.merge_configured(custom_rpc.into_rpc())?;
-                        info!(target:"reth::cli", "xlayer innertx rpc enabled");
-                        Ok(())
-                    })
-                    .install_exex("post_exec_exex", |ctx| async move { Ok(post_exec_exex(ctx)) });
+                node_builder = node_builder.extend_rpc_modules(move |ctx| {
+                    let new_op_eth_api = ctx.registry.eth_api().clone();
+                    let custom_rpc = XlayerExt { backend: Arc::new(new_op_eth_api) };
+                    ctx.modules.merge_configured(custom_rpc.into_rpc())?;
+                    info!(target:"reth::cli", "xlayer innertx rpc enabled");
+                    Ok(())
+                });
             }
 
             let handle = node_builder.launch_with_debug_capabilities().await?;

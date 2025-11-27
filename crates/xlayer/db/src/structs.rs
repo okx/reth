@@ -9,8 +9,6 @@ use reth_db::{
 pub struct TxTable; // TxHash -> Vec<InternalTransaction>
 #[derive(Debug)]
 pub struct BlockTable; // BlockHash -> Vec<TxHash>
-#[derive(Debug)]
-pub struct CacheTable; // BlockHash -> Vec<(TxHash, Vec<InternalTransaction>)>
 
 impl Table for TxTable {
     const NAME: &'static str = "TxTable";
@@ -37,23 +35,6 @@ impl Table for BlockTable {
 }
 
 impl TableInfo for BlockTable {
-    fn name(&self) -> &'static str {
-        Self::NAME
-    }
-
-    fn is_dupsort(&self) -> bool {
-        Self::DUPSORT
-    }
-}
-
-impl Table for CacheTable {
-    const NAME: &'static str = "CacheTable";
-    const DUPSORT: bool = false;
-    type Key = Vec<u8>;
-    type Value = Vec<u8>;
-}
-
-impl TableInfo for CacheTable {
     fn name(&self) -> &'static str {
         Self::NAME
     }

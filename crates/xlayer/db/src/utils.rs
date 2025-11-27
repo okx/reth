@@ -5,8 +5,8 @@ use once_cell::sync::OnceCell;
 use std::{fmt::Debug, path::PathBuf};
 
 use crate::{
-    internal_transaction_inspector::{InternalTransaction, TxHashWithInternalTransaction},
-    structs::{BlockTable, CacheTable, DBTables, TxTable},
+    internal_transaction_inspector::InternalTransaction,
+    structs::{BlockTable, DBTables, TxTable},
 };
 use reth_db::{
     create_db,
@@ -41,10 +41,7 @@ pub fn initialize(db_path: PathBuf) -> Result<(), Report> {
     Ok(())
 }
 
-pub fn write_single<T: Table, Key: Encodable + Debug, Value: Encodable + Debug>(
-    key: Key,
-    value: Value,
-) -> Result<(), Report> {
+pub fn write_single<T: Table, P: Encodable + Debug>(key: Vec<u8>, value: P) -> Result<(), Report> {
     let txn_begin_result = XLAYERDB.get().unwrap().begin_rw_txn();
     if let Err(err) = txn_begin_result {
         return Err(Into::<Report>::into(err).wrap_err("write single txn begin failed"));
@@ -58,11 +55,9 @@ pub fn write_single<T: Table, Key: Encodable + Debug, Value: Encodable + Debug>(
     }
 
     let table = txn_opendb_result.unwrap();
-    let key_encoded_bytes = encode(&key);
-    let value_encoded_bytes = encode(&value);
+    let encoded_bytes = encode(&value);
 
-    let txn_put_result =
-        txn.put(table.dbi(), &key_encoded_bytes, value_encoded_bytes, WriteFlags::default());
+    let txn_put_result = txn.put(table.dbi(), &key, encoded_bytes, WriteFlags::default());
     if let Err(err) = txn_put_result {
         return Err(Into::<Report>::into(err).wrap_err(format!(
             "write single txn put failed with key {:#?} and value {:#?}",
@@ -78,7 +73,7 @@ pub fn write_single<T: Table, Key: Encodable + Debug, Value: Encodable + Debug>(
     Ok(())
 }
 
-pub fn read_single<T: Table, Key: Encodable + Debug>(key: Key) -> Result<Vec<u8>, Report> {
+pub fn read_single<T: Table>(key: Vec<u8>) -> Result<Vec<u8>, Report> {
     let txn_begin_result = XLAYERDB.get().unwrap().begin_ro_txn();
     if let Err(err) = txn_begin_result {
         return Err(Into::<Report>::into(err).wrap_err("read single txn begin failed"));
@@ -92,9 +87,8 @@ pub fn read_single<T: Table, Key: Encodable + Debug>(key: Key) -> Result<Vec<u8>
     }
 
     let table = txn_opendb_result.unwrap();
-    let key_encoded_bytes = encode(&key);
 
-    let txn_get_result = txn.get(table.dbi(), &key_encoded_bytes);
+    let txn_get_result = txn.get(table.dbi(), &key);
     if let Err(err) = txn_get_result {
         return Err(Into::<Report>::into(err)
             .wrap_err(format!("read single txn get failed with key {:#?}", &key)));
@@ -103,7 +97,7 @@ pub fn read_single<T: Table, Key: Encodable + Debug>(key: Key) -> Result<Vec<u8>
     Ok(txn_get_result.unwrap().unwrap_or_default())
 }
 
-pub fn delete_single<T: Table, Key: Encodable + Debug>(key: Key) -> Result<(), Report> {
+pub fn delete_single<T: Table>(key: Vec<u8>) -> Result<(), Report> {
     let txn_begin_result = XLAYERDB.get().unwrap().begin_rw_txn();
     if let Err(err) = txn_begin_result {
         return Err(Into::<Report>::into(err).wrap_err("delete single txn begin failed"));
@@ -117,9 +111,8 @@ pub fn delete_single<T: Table, Key: Encodable + Debug>(key: Key) -> Result<(), R
     }
 
     let table = txn_opendb_result.unwrap();
-    let key_encoded_bytes = encode(&key);
 
-    let txn_delete_result = txn.del(table.dbi(), &key_encoded_bytes, None);
+    let txn_delete_result = txn.del(table.dbi(), &key, None);
     if let Err(err) = txn_delete_result {
         return Err(Into::<Report>::into(err)
             .wrap_err(format!("delete single txn put failed with key {:#?}", &key)));
@@ -133,35 +126,29 @@ pub fn delete_single<T: Table, Key: Encodable + Debug>(key: Key) -> Result<(), R
     Ok(())
 }
 
-pub fn rw_batch_start() -> Result<Transaction<RW>, Report> {
+pub fn rw_batch_start<T: Table>() -> Result<(Transaction<RW>, Database), Report> {
     let txn_begin_result = XLAYERDB.get().unwrap().begin_rw_txn();
     if let Err(err) = txn_begin_result {
         return Err(Into::<Report>::into(err).wrap_err("rw batch start begin failed"));
     }
 
-    Ok(txn_begin_result.unwrap())
-}
+    let txn = txn_begin_result.unwrap();
 
-pub fn rw_batch_open_db<T: Table>(txn: &Transaction<RW>) -> Result<Database, Report> {
     let txn_opendb_result = txn.open_db(Some(T::NAME));
     if let Err(err) = txn_opendb_result {
-        return Err(Into::<Report>::into(err).wrap_err("rw batch open db failed"));
+        return Err(Into::<Report>::into(err).wrap_err("rw batch start open db failed"));
     }
 
-    Ok(txn_opendb_result.unwrap())
+    Ok((txn, txn_opendb_result.unwrap()))
 }
 
-pub fn rw_batch_write<Key: Encodable + Debug, Value: Encodable + Debug>(
+pub fn rw_batch_write<T: Table>(
     txn: &Transaction<RW>,
     table: &Database,
-    key: Key,
-    value: Value,
+    key: Vec<u8>,
+    value: Vec<u8>,
 ) -> Result<(), Report> {
-    let key_encoded_bytes = encode(&key);
-    let value_encoded_bytes = encode(&value);
-
-    let txn_put_result =
-        txn.put(table.dbi(), &key_encoded_bytes, value_encoded_bytes, WriteFlags::default());
+    let txn_put_result = txn.put(table.dbi(), &key, &value, WriteFlags::default());
     if let Err(err) = txn_put_result {
         return Err(Into::<Report>::into(err).wrap_err(format!(
             "rw batch write failed with key {:#?} and value {:#?}",
@@ -172,14 +159,12 @@ pub fn rw_batch_write<Key: Encodable + Debug, Value: Encodable + Debug>(
     Ok(())
 }
 
-pub fn rw_batch_delete<Key: Encodable + Debug>(
+pub fn rw_batch_delete<T: Table>(
     txn: &Transaction<RW>,
     table: &Database,
-    key: Key,
+    key: Vec<u8>,
 ) -> Result<(), Report> {
-    let key_encoded_bytes = encode(&key);
-
-    let txn_del_result = txn.del(table.dbi(), &key_encoded_bytes, None);
+    let txn_del_result = txn.del(table.dbi(), &key, None);
     if let Err(err) = txn_del_result {
         return Err(Into::<Report>::into(err)
             .wrap_err(format!("rw batch delete failed with key {:#?}", &key)));
@@ -188,7 +173,7 @@ pub fn rw_batch_delete<Key: Encodable + Debug>(
     Ok(())
 }
 
-pub fn rw_batch_end(txn: Transaction<RW>) -> Result<(), Report> {
+pub fn rw_batch_end<T: Table>(txn: Transaction<RW>) -> Result<(), Report> {
     let txn_commit_result = txn.commit();
     if let Err(err) = txn_commit_result {
         return Err(Into::<Report>::into(err).wrap_err("rw batch end commit failed"));
@@ -198,7 +183,7 @@ pub fn rw_batch_end(txn: Transaction<RW>) -> Result<(), Report> {
 }
 
 pub fn read_table_tx(tx_hash: TxHash) -> Result<Vec<InternalTransaction>, Report> {
-    let read_result = read_single::<TxTable, TxHash>(tx_hash);
+    let read_result = read_single::<TxTable>(tx_hash.to_vec());
     if let Err(err) = read_result {
         return Err(err.wrap_err(format!("tx table read failed with tx_hash {:#?}", &tx_hash)));
     }
@@ -220,7 +205,7 @@ pub fn read_table_tx(tx_hash: TxHash) -> Result<Vec<InternalTransaction>, Report
 }
 
 pub fn read_table_block(block_hash: BlockHash) -> Result<Vec<TxHash>, Report> {
-    let read_result = read_single::<BlockTable, BlockHash>(block_hash);
+    let read_result = read_single::<BlockTable>(block_hash.to_vec());
     if let Err(err) = read_result {
         return Err(
             err.wrap_err(format!("block table read failed with block_hash {:#?}", &block_hash))
@@ -236,32 +221,6 @@ pub fn read_table_block(block_hash: BlockHash) -> Result<Vec<TxHash>, Report> {
     if let Err(err) = decode_result {
         return Err(Into::<Report>::into(err).wrap_err(format!(
             "block table decode failed with encoded result {:#?}",
-            &encoded_result
-        )));
-    }
-
-    Ok(decode_result.unwrap())
-}
-
-pub fn read_table_cache(
-    block_hash: BlockHash,
-) -> Result<Vec<TxHashWithInternalTransaction>, Report> {
-    let read_result = read_single::<CacheTable, BlockHash>(block_hash);
-    if let Err(e) = read_result {
-        return Err(
-            e.wrap_err(format!("cache table read failed with block_hash {:#?}", &block_hash))
-        );
-    }
-
-    let encoded_result = read_result.unwrap();
-    if encoded_result.is_empty() {
-        return Ok(Vec::<TxHashWithInternalTransaction>::default());
-    }
-
-    let decode_result = decode_exact(&encoded_result);
-    if let Err(e) = decode_result {
-        return Err(Into::<Report>::into(e).wrap_err(format!(
-            "cache table decode failed with encoded result {:#?}",
             &encoded_result
         )));
     }

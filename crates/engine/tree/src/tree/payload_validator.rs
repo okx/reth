@@ -44,11 +44,13 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use tracing::{debug, debug_span, error, info, instrument, trace, warn};
 
 use alloy_consensus::TxReceipt;
+use alloy_rlp::{decode_exact, encode, Encodable};
 use reth_primitives_traits::transaction::TxHashRef;
+use reth_revm::primitives::alloy_primitives::TxHash;
 use xlayer_db::{
-    internal_transaction_inspector::{TraceCollector, TxHashWithInternalTransaction},
-    structs::CacheTable,
-    utils::write_single,
+    internal_transaction_inspector::TraceCollector,
+    structs::{BlockTable, TxTable},
+    utils::{rw_batch_end, rw_batch_start, rw_batch_write, write_single},
 };
 
 /// Context providing access to tree state during validation.
@@ -599,7 +601,6 @@ where
             .without_state_clear()
             .build();
 
-        let mut tx_hashes = Vec::new();
         let mut inspector = TraceCollector::default();
         let evm = self.evm_config.evm_with_env_and_inspector(
             &mut db,
@@ -632,37 +633,102 @@ where
         let state_hook = Box::new(handle.state_hook());
         let output = self.metrics.execute_metered(
             executor,
-            handle.iter_transactions().map(|res| {
-                res.map(|tx| {
-                    tx_hashes.push(*tx.tx().tx_hash());
-                    tx
-                })
-                .map_err(BlockExecutionError::other)
-            }),
+            handle.iter_transactions().map(|res| res.map_err(BlockExecutionError::other)),
             state_hook,
         )?;
         let execution_finish = Instant::now();
         let execution_time = execution_finish.duration_since(execution_start);
-        debug!(target: "engine::tree::payload_validator", elapsed = ?execution_time, "Executed block");
+        info!(target: "engine::tree::payload_validator", elapsed = ?execution_time, "Executed block");
 
-        // xlayer extract internal transactions
-        let mut tx_with_internal_transactions = Vec::<TxHashWithInternalTransaction>::default();
-        let internal_transactions = inspector.get();
+        // xlayer internal transactions
+        let mut internal_transactions = inspector.get();
+        // Get transactions from input - we need to collect tx hashes separately
+        // since Either::Left and Either::Right are different types
+        let mut tx_hashes = Vec::<TxHash>::default();
+        let tx_count = match input {
+            BlockOrPayload::Block(block) => block.transaction_count(),
+            BlockOrPayload::Payload(payload) => {
+                // For payload, get transaction count from the recovered block
+                let recovered_block = self
+                    .validator
+                    .ensure_well_formed_payload(payload.clone())
+                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
+                let count = recovered_block.transaction_count();
+                // Collect tx hashes from recovered block
+                tx_hashes =
+                    recovered_block.transactions_recovered().map(|tx| *tx.tx_hash()).collect();
+                count
+            }
+        };
 
-        for (index, tx_hash) in tx_hashes.iter().enumerate() {
-            if !output.receipts[index].status() || internal_transactions[index].len() > 1 {
-                tx_with_internal_transactions.push(TxHashWithInternalTransaction {
-                    tx_hash: *tx_hash,
-                    internal_transactions: internal_transactions[index].clone(),
-                });
+        // For Block variant, collect tx hashes
+        if tx_hashes.is_empty() {
+            if let BlockOrPayload::Block(block) = input {
+                tx_hashes = block.transactions_recovered().map(|tx| *tx.tx_hash()).collect();
             }
         }
 
-        if let Err(err) =
-            write_single::<CacheTable, _, _>(input.hash(), tx_with_internal_transactions)
-        {
-            error!(target:"reth::cli", "xlayer execute_block write_single failed for block {:#?} error {:#?}", input.hash(), err);
+        let (rw_tx, rw_db) = rw_batch_start::<TxTable>().map_err(|e| {
+            InsertBlockErrorKind::Other(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("xlayer db error: {e}"),
+            )))
+        })?;
+
+        let mut prev_cumulative_gas = 0u64;
+        let mut tx_hashes_to_write = Vec::<TxHash>::default();
+        for index in 0..tx_count {
+            let success = output.receipts[index].status();
+
+            let current_cumulative_gas = output.receipts[index].cumulative_gas_used();
+            let tx_gas_used = current_cumulative_gas - prev_cumulative_gas;
+            prev_cumulative_gas = current_cumulative_gas;
+
+            if !success ||
+                (!internal_transactions.is_empty() && internal_transactions[index].len() > 0)
+            {
+                if !internal_transactions.is_empty() && !internal_transactions[index].is_empty() {
+                    if let Some(first_inner_tx) = internal_transactions[index].first_mut() {
+                        // Use cumulative gas as approximation for gas_limit since we don't have
+                        // direct access to tx gas_limit here The gas_limit
+                        // is typically higher than gas_used, so we use cumulative_gas_used as a
+                        // reasonable approximation
+                        let gas_limit = current_cumulative_gas;
+                        first_inner_tx.set_transaction_gas(gas_limit, tx_gas_used);
+                    }
+                }
+
+                if index < tx_hashes.len() {
+                    tx_hashes_to_write.push(tx_hashes[index]);
+                    rw_batch_write::<TxTable>(
+                        &rw_tx,
+                        &rw_db,
+                        tx_hashes[index].to_vec(),
+                        encode(internal_transactions[index].clone()),
+                    )
+                    .map_err(|e| {
+                        InsertBlockErrorKind::Other(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("xlayer db write error: {e}"),
+                        )))
+                    })?;
+                }
+            }
         }
+        tx_hashes = tx_hashes_to_write;
+        rw_batch_end::<TxTable>(rw_tx).map_err(|e| {
+            InsertBlockErrorKind::Other(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("xlayer db commit error: {e}"),
+            )))
+        })?;
+
+        write_single::<BlockTable, Vec<TxHash>>(input.hash().to_vec(), tx_hashes).map_err(|e| {
+            InsertBlockErrorKind::Other(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("xlayer db write error: {e}"),
+            )))
+        })?;
 
         Ok(output)
     }

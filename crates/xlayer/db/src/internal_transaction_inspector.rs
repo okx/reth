@@ -34,12 +34,6 @@ pub struct InternalTransaction {
     error: String,
 }
 
-#[derive(Debug, Clone, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
-pub struct TxHashWithInternalTransaction {
-    pub tx_hash: TxHash,
-    pub internal_transactions: Vec<InternalTransaction>,
-}
-
 impl InternalTransaction {
     pub fn set_transaction_gas(&mut self, gas_limit: u64, gas_used: u64) {
         self.gas = gas_limit;

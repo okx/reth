@@ -3,9 +3,10 @@ use crate::{
     config::OpBuilderConfig, error::OpPayloadBuilderError, intercept_xlayer::BridgeInterceptConfig,
     payload::OpBuiltPayload, OpAttributes, OpPayloadBuilderAttributes, OpPayloadPrimitives,
 };
-use alloy_consensus::{BlockHeader, Transaction, Typed2718};
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt, Typed2718};
 use alloy_evm::Evm as AlloyEvm;
 use alloy_primitives::{B256, U256};
+use alloy_rlp::encode;
 use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_rpc_types_engine::PayloadId;
 use reth_basic_payload_builder::*;
@@ -20,7 +21,10 @@ use reth_evm::{
     ConfigureEvm, Database,
 };
 use reth_execution_types::ExecutionOutcome;
-use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
+use reth_node_metrics::{
+    block_timing::{store_block_timing, BlockTimingMetrics},
+    transaction_trace_xlayer::{get_global_tracer, TransactionProcessId},
+};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::{transaction::OpTransaction, ADDRESS_L2_TO_L1_MESSAGE_PASSER};
 use reth_optimism_txpool::{
@@ -36,15 +40,18 @@ use reth_primitives_traits::{
 };
 use reth_revm::{
     cancelled::CancelOnDrop, database::StateProviderDatabase, db::State,
-    witness::ExecutionWitnessRecord,
+    primitives::alloy_primitives::TxHash, witness::ExecutionWitnessRecord,
 };
 use reth_storage_api::{errors::ProviderError, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use revm::context::{Block, BlockEnv};
-use std::{marker::PhantomData, sync::Arc};
-use tracing::{debug, trace, warn};
-use reth_node_metrics::block_timing::{BlockTimingMetrics, BuildTiming, DeliverTxsTiming, store_block_timing};
-use std::time::Instant;
+use std::{marker::PhantomData, sync::Arc, time::Instant};
+use tracing::{debug, error, info, trace, warn};
+use xlayer_db::{
+    internal_transaction_inspector::TraceCollector,
+    structs::{BlockTable, TxTable},
+    utils::{rw_batch_end, rw_batch_start, rw_batch_write, write_single},
+};
 
 /// Optimism's payload builder
 #[derive(Debug)]
@@ -374,7 +381,30 @@ impl<Txs> OpBuilder<'_, Txs> {
         // scalar.
         db.load_cache_account(L1_BLOCK_CONTRACT).map_err(BlockExecutionError::other)?;
 
-        let mut builder = ctx.block_builder(&mut db)?;
+        // X Layer: Create TraceCollector for extracting internal transactions
+        let mut inspector = TraceCollector::default();
+
+        // X Layer: Create builder with TraceCollector inspector
+        let next_block_env_ctx = Evm::NextBlockEnvCtx::build_next_env(
+            ctx.attributes(),
+            ctx.parent(),
+            ctx.chain_spec.as_ref(),
+        )
+        .map_err(PayloadBuilderError::other)?;
+
+        let evm_env = ctx
+            .evm_config
+            .next_evm_env(ctx.parent(), &next_block_env_ctx)
+            .map_err(PayloadBuilderError::other)?;
+
+        let evm = ctx.evm_config.evm_with_env_and_inspector(&mut db, evm_env, &mut inspector);
+
+        let ctx_for_builder = ctx
+            .evm_config
+            .context_for_next_block(ctx.parent(), next_block_env_ctx)
+            .map_err(PayloadBuilderError::other)?;
+
+        let mut builder = ctx.evm_config.create_block_builder(evm, ctx.parent(), ctx_for_builder);
 
         // 1. apply pre-execution changes
         let pre_exec_start = Instant::now();
@@ -413,15 +443,81 @@ impl<Txs> OpBuilder<'_, Txs> {
         timing_metrics.build.finish = finish_start.elapsed();
         timing_metrics.build.total = build_start.elapsed();
         // Calculate DeliverTxs total from BuildTiming to avoid duplication
-        timing_metrics.deliver_txs.total = timing_metrics.build.execute_sequencer_transactions + timing_metrics.build.execute_mempool_transactions;
+        timing_metrics.deliver_txs.total = timing_metrics.build.execute_sequencer_transactions +
+            timing_metrics.build.execute_mempool_transactions;
 
         let sealed_block = Arc::new(block.sealed_block().clone());
         debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
 
+        // xlayer internal transactions
+        let mut internal_transactions = inspector.get();
+        // Collect transactions and block info before using block elsewhere
+        let block_hash = block.hash();
+        let block_number = block.number();
+        // Clone transactions to avoid borrowing block
+        let transactions: Vec<_> = block.clone_transactions_recovered().collect();
+
+        // Collect transactions with internal transactions
+        let mut tx_hashes = Vec::<TxHash>::default();
+
+        let (rw_tx, rw_db) = rw_batch_start::<TxTable>().map_err(|e| {
+            PayloadBuilderError::other(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("xlayer db error: {e}"),
+            ))
+        })?;
+
+        let mut prev_cumulative_gas = 0u64;
+        for (index, tx) in transactions.iter().enumerate() {
+            let success = execution_result.receipts[index].status();
+
+            let current_cumulative_gas = execution_result.receipts[index].cumulative_gas_used();
+            let tx_gas_used = current_cumulative_gas - prev_cumulative_gas;
+            prev_cumulative_gas = current_cumulative_gas;
+
+            if !success ||
+                (!internal_transactions.is_empty() && internal_transactions[index].len() > 0)
+            {
+                if !internal_transactions.is_empty() && !internal_transactions[index].is_empty() {
+                    if let Some(first_inner_tx) = internal_transactions[index].first_mut() {
+                        let gas_limit = tx.tx().gas_limit();
+                        first_inner_tx.set_transaction_gas(gas_limit, tx_gas_used);
+                    }
+                }
+
+                tx_hashes.push(*tx.tx_hash());
+                rw_batch_write::<TxTable>(
+                    &rw_tx,
+                    &rw_db,
+                    tx.tx_hash().to_vec(),
+                    encode(internal_transactions[index].clone()),
+                )
+                .map_err(|e| {
+                    PayloadBuilderError::other(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("xlayer db write error: {e}"),
+                    ))
+                })?;
+            }
+        }
+        rw_batch_end::<TxTable>(rw_tx).map_err(|e| {
+            PayloadBuilderError::other(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("xlayer db commit error: {e}"),
+            ))
+        })?;
+
+        write_single::<BlockTable, Vec<TxHash>>(block_hash.to_vec(), tx_hashes).map_err(|e| {
+            PayloadBuilderError::other(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("xlayer db write error: {e}"),
+            ))
+        })?;
+
         let execution_outcome = ExecutionOutcome::new(
             db.take_bundle(),
             vec![execution_result.receipts],
-            block.number(),
+            block_number,
             Vec::new(),
         );
 

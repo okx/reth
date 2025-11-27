@@ -1,6 +1,6 @@
 use crate::stages::MERKLE_STAGE_DEFAULT_INCREMENTAL_THRESHOLD;
 use alloy_consensus::BlockHeader;
-use alloy_primitives::BlockNumber;
+use alloy_primitives::{BlockNumber, TxHash};
 use num_traits::Zero;
 use reth_config::config::ExecutionConfig;
 use reth_consensus::{ConsensusError, FullConsensus};
@@ -1253,12 +1253,13 @@ mod tests {
 }
 
 use alloy_consensus::{transaction::TxHashRef, TxReceipt};
+use alloy_rlp::{decode_exact, encode};
 use reth_evm::{block::BlockExecutionError, execute::BlockExecutor};
 use reth_revm::{Database, DatabaseRef, State};
 use xlayer_db::{
-    internal_transaction_inspector::{TraceCollector, TxHashWithInternalTransaction},
-    structs::CacheTable,
-    utils::write_single,
+    internal_transaction_inspector::TraceCollector,
+    structs::{BlockTable, TxTable},
+    utils::{rw_batch_end, rw_batch_start, rw_batch_write, write_single},
 };
 
 fn extract<E, DB>(
@@ -1279,23 +1280,65 @@ where
 
     let output = executor.execute_block(block.transactions_recovered())?;
 
-    let mut tx_with_internal_transactions = Vec::<TxHashWithInternalTransaction>::default();
-    let internal_transactions = inspector.get();
+    // xlayer internal transactions
+    let mut internal_transactions = inspector.get();
+    let transactions: Vec<_> = block.transactions_recovered().collect();
+    let mut tx_hashes = Vec::<TxHash>::default();
 
-    for (index, tx) in block.transactions_recovered().enumerate() {
-        if !output.receipts[index].status() || internal_transactions[index].len() > 1 {
-            tx_with_internal_transactions.push(TxHashWithInternalTransaction {
-                tx_hash: *tx.tx_hash(),
-                internal_transactions: internal_transactions[index].clone(),
-            });
+    let (rw_tx, rw_db) = rw_batch_start::<TxTable>().map_err(|e| {
+        BlockExecutionError::other(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("xlayer db error: {e}"),
+        ))
+    })?;
+
+    let mut prev_cumulative_gas = 0u64;
+    for (index, tx) in transactions.iter().enumerate() {
+        let success = output.receipts[index].status();
+
+        let current_cumulative_gas = output.receipts[index].cumulative_gas_used();
+        let tx_gas_used = current_cumulative_gas - prev_cumulative_gas;
+        prev_cumulative_gas = current_cumulative_gas;
+
+        if !success || (!internal_transactions.is_empty() && internal_transactions[index].len() > 0)
+        {
+            if !internal_transactions.is_empty() && !internal_transactions[index].is_empty() {
+                if let Some(first_inner_tx) = internal_transactions[index].first_mut() {
+                    // Use cumulative gas as approximation for gas_limit since we don't have direct
+                    // access to tx gas_limit here
+                    let gas_limit = current_cumulative_gas;
+                    first_inner_tx.set_transaction_gas(gas_limit, tx_gas_used);
+                }
+            }
+
+            tx_hashes.push(*tx.tx_hash());
+            rw_batch_write::<TxTable>(
+                &rw_tx,
+                &rw_db,
+                tx.tx_hash().to_vec(),
+                encode(internal_transactions[index].clone()),
+            )
+            .map_err(|e| {
+                BlockExecutionError::other(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("xlayer db write error: {e}"),
+                ))
+            })?;
         }
     }
+    rw_batch_end::<TxTable>(rw_tx).map_err(|e| {
+        BlockExecutionError::other(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("xlayer db commit error: {e}"),
+        ))
+    })?;
 
-    if let Err(err) =
-        write_single::<CacheTable, _, _>(block.hash(), tx_with_internal_transactions.clone())
-    {
-        error!(target:"reth::cli", "ok extract write_single failed for block {:#?} error {:#?}", block.hash(), err);
-    }
+    write_single::<BlockTable, Vec<TxHash>>(block.hash().to_vec(), tx_hashes).map_err(|e| {
+        BlockExecutionError::other(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("xlayer db write error: {e}"),
+        ))
+    })?;
 
     Ok(())
 }

@@ -6399,10 +6399,8 @@ dependencies = [
  "reth-optimism-payload-builder",
  "reth-optimism-primitives",
  "reth-optimism-rpc",
- "reth-rpc",
  "tracing",
  "xlayer-db",
- "xlayer-exex",
  "xlayer-rpc",
 ]
 
@@ -9888,6 +9886,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.17",
  "tracing",
+ "xlayer-db",
 ]
 
 [[package]]
@@ -14601,24 +14600,6 @@ dependencies = [
  "revm-context-interface",
  "revm-inspectors",
  "serde",
-]
-
-[[package]]
-name = "xlayer-exex"
-version = "1.9.3"
-dependencies = [
- "alloy-consensus",
- "alloy-evm",
- "alloy-rlp",
- "eyre",
- "futures",
- "reth-ethereum",
- "reth-evm",
- "reth-primitives-traits",
- "reth-revm",
- "reth-tracing",
- "revm-database",
- "xlayer-db",
 ]
 
 [[package]]
