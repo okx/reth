@@ -42,9 +42,9 @@ fn main() {
                 let db_path =
                     data_dir.db().parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
                 match initialize(db_path) {
-                    Ok(_) => info!(target: "reth::cli", "xlayer db initialized"),
+                    Ok(_) => info!(target: "reth::cli", "XLayer db initialized"),
                     Err(e) => {
-                        error!(target: "reth::cli", "xlayer db failed to initialize {:#?}", e)
+                        error!(target: "reth::cli", "XLayer db failed to initialize {:#?}", e)
                     }
                 }
 
@@ -52,7 +52,7 @@ fn main() {
                     let new_op_eth_api = ctx.registry.eth_api().clone();
                     let custom_rpc = XlayerExt { backend: Arc::new(new_op_eth_api) };
                     ctx.modules.merge_configured(custom_rpc.into_rpc())?;
-                    info!(target:"reth::cli", "xlayer innertx rpc enabled");
+                    info!(target:"reth::cli", "XLayer innertx rpc enabled");
                     Ok(())
                 });
             }

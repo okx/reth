@@ -48,7 +48,7 @@ use revm::context::{Block, BlockEnv};
 use std::{marker::PhantomData, sync::Arc, time::Instant};
 use tracing::{debug, trace, warn};
 use xlayer_db::{
-    internal_transaction_inspector::TraceCollector,
+    internal_transaction_inspector::{InternalTransaction, TraceCollector},
     structs::{BlockTable, TxTable},
     utils::{rw_batch_end, rw_batch_start, rw_batch_write, write_single},
 };
@@ -459,63 +459,8 @@ impl<Txs> OpBuilder<'_, Txs> {
             trie_updates: Arc::new(trie_updates),
         };
 
-        // xlayer internal transactions
-        let mut internal_transactions = inspector.get();
-        let mut tx_hashes = Vec::<TxHash>::default();
-
-        let (rw_tx, rw_db) = rw_batch_start::<TxTable>().map_err(|e| {
-            PayloadBuilderError::other(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("xlayer db error: {e}"),
-            ))
-        })?;
-
-        let mut prev_cumulative_gas = 0u64;
-        for (index, tx) in executed.recovered_block().transactions_recovered().enumerate() {
-            let success = executed.execution_output.receipts[0][index].status();
-
-            let current_cumulative_gas =
-                executed.execution_output.receipts[0][index].cumulative_gas_used();
-            let tx_gas_used = current_cumulative_gas - prev_cumulative_gas;
-            prev_cumulative_gas = current_cumulative_gas;
-
-            if !success ||
-                (!internal_transactions.is_empty() && internal_transactions[index].len() > 0)
-            {
-                if !internal_transactions.is_empty() && !internal_transactions[index].is_empty() {
-                    if let Some(first_inner_tx) = internal_transactions[index].first_mut() {
-                        first_inner_tx.set_transaction_gas(tx.gas_limit(), tx_gas_used);
-                    }
-                }
-
-                tx_hashes.push(*tx.tx_hash());
-                rw_batch_write::<TxTable>(
-                    &rw_tx,
-                    &rw_db,
-                    tx.tx_hash().to_vec(),
-                    encode(internal_transactions[index].clone()),
-                )
-                .map_err(|e| {
-                    PayloadBuilderError::other(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("xlayer db write error: {e}"),
-                    ))
-                })?;
-            }
-        }
-        rw_batch_end::<TxTable>(rw_tx).map_err(|e| {
-            PayloadBuilderError::other(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("xlayer db commit error: {e}"),
-            ))
-        })?;
-
-        write_single::<BlockTable, Vec<TxHash>>(block.hash().to_vec(), tx_hashes).map_err(|e| {
-            PayloadBuilderError::other(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("xlayer db write error: {e}"),
-            ))
-        })?;
+        // XLayer internal transactions
+        write_internal_transactions(&mut inspector, &executed, block.hash())?;
 
         let no_tx_pool = ctx.attributes().no_tx_pool();
 
@@ -952,4 +897,72 @@ where
 
         Ok(None)
     }
+}
+
+/// Writes internal transactions to XLayer database for a payload builder execution.
+fn write_internal_transactions<N>(
+    inspector: &mut TraceCollector,
+    executed: &ExecutedBlock<N>,
+    block_hash: B256,
+) -> Result<(), PayloadBuilderError>
+where
+    N: OpPayloadPrimitives,
+{
+    let mut internal_transactions = inspector.get();
+    let mut tx_hashes = Vec::<TxHash>::default();
+
+    let (rw_tx, rw_db) = rw_batch_start::<TxTable>().map_err(|e| {
+        PayloadBuilderError::other(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("XLayer db error: {e}"),
+        ))
+    })?;
+
+    let mut prev_cumulative_gas = 0u64;
+    for (index, tx) in executed.recovered_block().transactions_recovered().enumerate() {
+        let success = executed.execution_output.receipts[0][index].status();
+
+        let current_cumulative_gas =
+            executed.execution_output.receipts[0][index].cumulative_gas_used();
+        let tx_gas_used = current_cumulative_gas - prev_cumulative_gas;
+        prev_cumulative_gas = current_cumulative_gas;
+
+        if !success || (!internal_transactions.is_empty() && internal_transactions[index].len() > 0)
+        {
+            if !internal_transactions.is_empty() && !internal_transactions[index].is_empty() {
+                if let Some(first_inner_tx) = internal_transactions[index].first_mut() {
+                    first_inner_tx.set_transaction_gas(tx.gas_limit(), tx_gas_used);
+                }
+            }
+
+            tx_hashes.push(*tx.tx_hash());
+            rw_batch_write::<TxTable>(
+                &rw_tx,
+                &rw_db,
+                tx.tx_hash().to_vec(),
+                encode(internal_transactions[index].clone()),
+            )
+            .map_err(|e| {
+                PayloadBuilderError::other(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("XLayer db write error: {e}"),
+                ))
+            })?;
+        }
+    }
+    rw_batch_end::<TxTable>(rw_tx).map_err(|e| {
+        PayloadBuilderError::other(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("XLayer db commit error: {e}"),
+        ))
+    })?;
+
+    write_single::<BlockTable, Vec<TxHash>>(block_hash.to_vec(), tx_hashes).map_err(|e| {
+        PayloadBuilderError::other(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("XLayer db write error: {e}"),
+        ))
+    })?;
+
+    Ok(())
 }
