@@ -2,7 +2,7 @@ use alloy_rlp::{RlpDecodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-use alloy_primitives::{Address, Bytes, TxHash, U256};
+use alloy_primitives::{Address, Bytes, U256};
 
 use reth_revm::{
     interpreter::{

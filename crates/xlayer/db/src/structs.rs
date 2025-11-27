@@ -10,14 +10,14 @@ pub struct TxTable; // TxHash -> Vec<InternalTransaction>
 #[derive(Debug)]
 pub struct BlockTable; // BlockHash -> Vec<TxHash>
 
-impl Table for TxTable {
-    const NAME: &'static str = "TxTable";
+impl Table for BlockTable {
+    const NAME: &'static str = "BlockTable";
     const DUPSORT: bool = false;
     type Key = Vec<u8>;
     type Value = Vec<u8>;
 }
 
-impl TableInfo for TxTable {
+impl TableInfo for BlockTable {
     fn name(&self) -> &'static str {
         Self::NAME
     }
@@ -27,14 +27,14 @@ impl TableInfo for TxTable {
     }
 }
 
-impl Table for BlockTable {
-    const NAME: &'static str = "BlockTable";
+impl Table for TxTable {
+    const NAME: &'static str = "TxTable";
     const DUPSORT: bool = false;
     type Key = Vec<u8>;
     type Value = Vec<u8>;
 }
 
-impl TableInfo for BlockTable {
+impl TableInfo for TxTable {
     fn name(&self) -> &'static str {
         Self::NAME
     }
