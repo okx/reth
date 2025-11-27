@@ -182,7 +182,11 @@ mod tests {
         assert!(spec.fork(OpHardfork::Granite).active_at_timestamp(ts));
         assert!(spec.fork(OpHardfork::Holocene).active_at_timestamp(ts));
         assert!(spec.fork(OpHardfork::Isthmus).active_at_timestamp(ts));
-        assert!(spec.fork(OpHardfork::Jovian).active_at_timestamp(ts));
+        // Jovian is configured but not active at genesis timestamp, it activates at a future timestamp
+        // Verify Jovian is configured (not ForkCondition::Never)
+        assert!(!matches!(spec.fork(OpHardfork::Jovian), reth_ethereum_forks::ForkCondition::Never));
+        // Verify it's not active at genesis timestamp
+        assert!(!spec.fork(OpHardfork::Jovian).active_at_timestamp(ts));
     }
 
     #[test]
