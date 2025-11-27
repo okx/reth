@@ -19,14 +19,14 @@ use alloy_rpc_types_engine::{
 };
 use assert_matches::assert_matches;
 use reth_chain_state::{test_utils::TestBlockBuilder, BlockState};
-use reth_chainspec::{ChainSpec, HOLESKY, MAINNET};
+use reth_chainspec::{ChainSpec, DEV, HOLESKY, MAINNET};
 use reth_engine_primitives::{EngineApiValidator, ForkchoiceStatus, NoopInvalidBlockHook};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_ethereum_primitives::{Block, EthPrimitives};
+use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives};
 use reth_evm_ethereum::MockEvmConfig;
 use reth_primitives_traits::Block as _;
-use reth_provider::{test_utils::MockEthProvider, ExecutionOutcome};
+use reth_provider::{test_utils::{create_test_provider_factory_with_chain_spec, MockNodeTypesWithDB}, ProviderFactory, providers::BlockchainProvider, LatestStateProviderRef};
 use reth_trie::{updates::TrieUpdates, HashedPostState};
 use std::{
     collections::BTreeMap,
@@ -37,6 +37,16 @@ use std::{
     },
 };
 use tokio::sync::oneshot;
+use reth_chain_state::ExecutedBlock;
+use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
+use revm::database::BundleState;
+use alloy_eips::eip7685::Requests;
+use alloy_eips::eip1559::INITIAL_BASE_FEE;  // Import from alloy_eips instead
+use alloy_signer::SignerSync;
+use reth_execution_types::ExecutionOutcome;
+// Add this import
+use reth_db_common::init::init_genesis;
+use reth_provider::test_utils::MockEthProvider;
 
 /// Mock engine validator for tests
 #[derive(Debug, Clone)]
@@ -1990,4 +2000,249 @@ mod forkchoice_updated_tests {
             .unwrap();
         assert!(result.is_some(), "OpStack should handle canonical head");
     }
+}
+
+#[test]
+fn test_state_root_calculation_with_real_provider() {
+    reth_tracing::init_test_tracing();
+    use reth_chainspec::{ChainSpec, ChainSpecBuilder, EthereumHardfork};
+    use reth_chainspec::EthChainSpec;
+    let mut chain_spec = Arc::try_unwrap(DEV.clone())
+        .unwrap_or_else(|arc| (*arc).clone());
+    chain_spec.hardforks.remove(&EthereumHardfork::Cancun);
+    chain_spec.hardforks.remove(&EthereumHardfork::Shanghai);
+    chain_spec.hardforks.remove(&EthereumHardfork::Prague);
+
+    let chain_spec = Arc::new(chain_spec);
+
+    // let chain_spec = Arc::new(chain_spec);
+    let genesis_hash = chain_spec.genesis_hash();
+
+    // Create a real provider factory with database
+    let provider_factory = create_test_provider_factory_with_chain_spec(Arc::clone(&chain_spec));
+    
+    // Initialize genesis in the database
+    init_genesis(&provider_factory).expect("Failed to initialize genesis");
+    
+    // Create BlockchainProvider from the factory
+    let provider = BlockchainProvider::new(provider_factory.clone())
+        .expect("Failed to create BlockchainProvider");
+    let genesis_block = provider.block(alloy_eips::HashOrNumber::Number(0))
+        .expect("Failed to query genesis block");
+
+    assert!(genesis_block.is_some(), "Genesis block should exist");
+    let genesis = genesis_block.unwrap();
+
+    // Seal the block to get its hash
+    let sealed_genesis = genesis.seal_slow();
+    let block_hash = sealed_genesis.hash();
+
+    // Assert that the genesis block hash matches the expected genesis hash
+    assert_eq!(
+        block_hash,
+        genesis_hash,
+        "Genesis block hash should match chain spec genesis hash"
+    );
+
+    let consensus = Arc::new(EthBeaconConsensus::new(Arc::clone(&chain_spec)));
+
+    let payload_validator = MockEngineValidator;
+
+    let (from_tree_tx, from_tree_rx) = unbounded_channel();
+
+    let genesis_header = chain_spec.genesis_header().clone();
+    let sealed_genesis_header = SealedHeader::seal_slow(genesis_header);
+    let engine_api_tree_state =
+        EngineApiTreeState::new(10, 10, sealed_genesis_header.num_hash(), EngineApiKind::Ethereum);
+    let canonical_in_memory_state = CanonicalInMemoryState::with_head(
+        sealed_genesis_header.clone(),
+        None,
+        None,
+    );
+
+    // Set up persistence
+    let (action_tx, _action_rx) = channel();
+    let persistence_handle = PersistenceHandle::new(action_tx);
+
+    // Set up payload builder
+    let (to_payload_service, _payload_command_rx) = unbounded_channel();
+    let payload_builder = PayloadBuilderHandle::new(to_payload_service);
+
+    // Use real EVM config (not mock) for actual execution
+    use reth_node_ethereum::EthEvmConfig;
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+
+    // Create engine validator
+    let engine_validator = BasicEngineValidator::new(
+        provider.clone(),
+        consensus.clone(),
+        evm_config.clone(),
+        payload_validator,
+        TreeConfig::default(),
+        Box::new(NoopInvalidBlockHook::default()),
+    );
+
+    // Create tree handler
+    let mut tree = EngineApiTreeHandler::new(
+        provider.clone(),
+        consensus,
+        engine_validator,
+        from_tree_tx,
+        engine_api_tree_state,
+        canonical_in_memory_state,
+        persistence_handle,
+        PersistenceState::default(),
+        payload_builder,
+        TreeConfig::default()
+            .with_legacy_state_root(false)
+            .with_has_enough_parallelism(true),
+        EngineApiKind::Ethereum,
+        evm_config,
+    );
+
+    use reth_node_core::args::DevArgs;
+    use alloy_signer_local::{coins_bip39::English, MnemonicBuilder, PrivateKeySigner};
+    use reth_ethereum_primitives::{Transaction, TransactionSigned, Block, BlockBody};
+    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use reth_chainspec::MIN_TRANSACTION_GAS;
+    use alloy_primitives::{Address, U256};
+    use alloy_consensus::proofs::calculate_transaction_root;
+
+    let dev_mnemonic = DevArgs::default().dev_mnemonic;
+    let sender_pk: PrivateKeySigner = MnemonicBuilder::<English>::default()
+        .phrase(dev_mnemonic)
+        .index(0)
+        .expect("invalid derivation path")
+        .build()
+        .expect("failed to build signer from mnemonic");
+    let sender_address = sender_pk.address();
+
+    let tx = Transaction::Eip1559(TxEip1559 {
+        chain_id: chain_spec.chain.id(),
+        nonce: 0,
+        gas_limit: MIN_TRANSACTION_GAS,
+        to: Address::random().into(),
+        max_fee_per_gas: INITIAL_BASE_FEE as u128,
+        max_priority_fee_per_gas: 1,
+        value: U256::from(10),
+        input: Default::default(),
+        access_list: Default::default(),
+    });
+
+    // Sign the transaction
+    let signature_hash = tx.signature_hash();
+    let signature = sender_pk.sign_hash_sync(&signature_hash).unwrap();
+    let signed_tx = TransactionSigned::new_unhashed(tx, signature);
+
+    // Create block 1 header
+    let mut block1_header = chain_spec.genesis_header().clone();
+    block1_header.number = 1;
+    block1_header.parent_hash = genesis_hash;
+    block1_header.timestamp = block1_header.timestamp + 12; // 12 seconds later
+    block1_header.gas_limit = chain_spec.genesis_header().gas_limit;
+
+    let genesis_header = chain_spec.genesis_header();
+    let base_fee = chain_spec
+        .next_block_base_fee(genesis_header, block1_header.timestamp)
+        .expect("Failed to calculate base fee");
+    block1_header.base_fee_per_gas = Some(base_fee);
+
+    // Calculate transactions root
+    let transactions = vec![signed_tx];
+    block1_header.transactions_root = calculate_transaction_root(&transactions);
+
+    use reth_primitives_traits::proofs::calculate_receipt_root;
+
+    // Create a temporary block to execute and get receipts
+    let temp_block = SealedBlock::<Block>::from_sealed_parts(
+        SealedHeader::seal_slow(block1_header.clone()),
+        BlockBody {
+            transactions: transactions.clone(),
+            ommers: Vec::new(),
+            withdrawals: None,
+        },
+    );
+
+    // Recover senders for the block
+    let recovered_temp_block = temp_block.try_recover()
+        .expect("Failed to recover block");
+
+
+    let db_provider = provider_factory.provider()
+        .expect("Failed to get database provider");
+    let state_db = StateProviderDatabase::new(LatestStateProviderRef::new(&db_provider));
+    let evm_config = EthEvmConfig::ethereum(chain_spec.clone());
+
+    use reth_evm::execute::Executor;
+    let execution_output = evm_config
+        .batch_executor(state_db)
+        .execute(&recovered_temp_block)
+        .expect("Failed to execute block");
+
+    // Calculate receipts root
+    use alloy_consensus::TxReceipt;
+    let receipts_with_bloom: Vec<_> = execution_output.result.receipts
+        .iter()
+        .map(|r| r.with_bloom_ref())
+        .collect();
+    let receipts_root = calculate_receipt_root(&receipts_with_bloom);
+
+    block1_header.receipts_root =receipts_root;
+    block1_header.gas_used = execution_output.gas_used;
+
+
+    use reth_storage_api::StateRootProvider;
+    // Get hashed post state from bundle state
+    let hashed_state = HashedPostState::from_bundle_state::<reth_trie_common::KeccakKeyHasher>(
+        execution_output.state.state()
+    );
+
+    // Calculate state root using the same state provider
+    let state_provider_for_root = LatestStateProviderRef::new(&db_provider);
+    let (state_root, _trie_updates) = state_provider_for_root
+        .state_root_with_updates(hashed_state)
+        .expect("Failed to calculate state root");
+    block1_header.state_root = state_root;
+
+    // Seal the header
+    let sealed_block1_header = SealedHeader::seal_slow(block1_header);
+    let block1_hash = sealed_block1_header.hash();
+
+    // Create block 1 as a SealedBlock
+    use reth_primitives_traits::SealedBlock;
+    let sealed_block1 = SealedBlock::<Block>::from_sealed_parts(
+        sealed_block1_header,
+        BlockBody {
+            transactions,
+            ommers: Vec::new(),
+            withdrawals: None,
+        },
+    );
+
+    // Create execution payload
+    let block1 = sealed_block1.into_block();
+    let payload1 = ExecutionPayloadV1::from_block_unchecked(block1_hash, &block1);
+
+    // Send newPayload for block 1
+    let outcome = tree
+        .on_new_payload(ExecutionData {
+            payload: payload1.into(),
+            sidecar: ExecutionPayloadSidecar::none(),
+        })
+        .expect("Failed to process new payload");
+
+    // Verify the outcome
+    assert!(
+        outcome.outcome.is_valid() || outcome.outcome.is_syncing(),
+        "Block 1 should be valid or syncing, got: {:?}",
+        outcome.outcome.status
+    );
+    //
+    // // Verify state root was calculated by checking if the block was inserted
+    // // The state root calculation happens during block execution/validation
+    // // If the block is valid, it means state root was calculated correctly
+    // if outcome.outcome.is_valid() {
+    //     // Block was successfully validated, which means state root calculation succeeded
+    //     println!("Block 1 validated successfully - state root calculation completed");
+    // }
 }

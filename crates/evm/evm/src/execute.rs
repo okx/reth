@@ -515,9 +515,33 @@ where
 
         // calculate the state root
         let hashed_state = state.hashed_post_state(&db.bundle_state);
-        let (state_root, trie_updates) = state
-            .state_root_with_updates(hashed_state.clone())
-            .map_err(BlockExecutionError::other)?;
+        use std::any::type_name_of_val;
+        use std::any::{Any, TypeId};
+//         use reth_provider::{
+//     HistoricalStateProviderRef,
+//     LatestStateProviderRef,
+//     providers::state::overlay::OverlayStateProvider,
+// };
+
+        let type_name = type_name_of_val(&state);
+        println!("State type: {}", type_name);
+        // let type_id = state.type_id();
+        // if TypeId::of::<LatestStateProviderRef<'_>>() == type_id {
+        //     println!("It's LatestStateProviderRef");
+        // } else if TypeId::of::<HistoricalStateProviderRef<'_>>() == type_id {
+        //     println!("It's HistoricalStateProviderRef");
+        // } else if TypeId::of::<OverlayStateProvider<'_>>() == type_id {
+        //     println!("It's OverlayStateProvider");
+        // } else if TypeId::of::<MemoryOverlayStateProvider<'_>>() == type_id {
+        //     println!("It's MemoryOverlayStateProvider");
+        // }else if TypeId::of::<CachedStateProvider<'_>>() == type_id {
+        //     println!("It's CachedStateProvider");
+        // } else {
+        //     println!("Unknown type: {:?}", type_id);
+        // }
+        let pr = state.state_root_with_updates(hashed_state.clone());
+        let (state_root, trie_updates) =
+            pr.map_err(BlockExecutionError::other)?;
 
         let (transactions, senders) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();

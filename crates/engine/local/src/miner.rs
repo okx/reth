@@ -141,7 +141,7 @@ where
 
     /// Runs the [`LocalMiner`] in a loop, polling the miner and building payloads.
     pub async fn run(mut self) {
-        let mut fcu_interval = tokio::time::interval(Duration::from_secs(1));
+        let mut fcu_interval = tokio::time::interval(Duration::from_secs(10000));
         loop {
             tokio::select! {
                 // Wait for the interval or the pool to receive a transaction
