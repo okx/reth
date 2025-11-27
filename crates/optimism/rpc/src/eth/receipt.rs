@@ -7,7 +7,7 @@ use alloy_rpc_types_eth::{Log, TransactionReceipt};
 use op_alloy_consensus::{OpReceiptEnvelope, OpTransaction};
 use op_alloy_rpc_types::{L1BlockInfo, OpTransactionReceipt, OpTransactionReceiptFields};
 use op_revm::estimate_tx_compressed_size;
-use reth_chainspec::ChainSpecProvider;
+use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_node_api::NodePrimitives;
 use reth_optimism_evm::RethL1BlockInfo;
 use reth_optimism_forks::OpHardforks;
@@ -72,17 +72,13 @@ where
         inputs: Vec<ConvertReceiptInput<'_, N>>,
         block: &SealedBlock<N::Block>,
     ) -> Result<Vec<Self::RpcReceipt>, Self::Error> {
-        // XLayer: Handle empty blocks (e.g., cutoff block in migration scenario)
-        if inputs.is_empty() {
-            tracing::warn!(target: "rpc::eth::receipts", block = block.header().number(), hash = ?block.hash(), "Empty block, returning empty receipts");
-            return Ok(vec![]);
-        }
         let mut l1_block_info = match reth_optimism_evm::extract_l1_info(block.body()) {
             Ok(l1_block_info) => l1_block_info,
             Err(err) => {
                 // If it is the genesis block (i.e. block number is 0), there is no L1 info, so
                 // we return an empty l1_block_info.
-                if block.header().number() == 0 {
+                let genesis_number = self.provider.chain_spec().genesis().number.unwrap_or_default();
+                if block.header().number() == genesis_number {
                     return Ok(vec![]);
                 }
                 return Err(err.into());
