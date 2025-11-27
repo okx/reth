@@ -11,7 +11,7 @@ use crate::tree::{
     EngineApiMetrics, EngineApiTreeState, ExecutionEnv, PayloadHandle, StateProviderBuilder,
     StateProviderDatabase, TreeConfig,
 };
-use alloy_consensus::transaction::Either;
+use alloy_consensus::{transaction::Either, Transaction};
 use alloy_eips::{eip1898::BlockWithParent, NumHash};
 use alloy_evm::Evm;
 use alloy_primitives::B256;
@@ -631,43 +631,26 @@ where
 
         let execution_start = Instant::now();
         let state_hook = Box::new(handle.state_hook());
+        let mut tx_hashes = Vec::<TxHash>::default();
+        let mut tx_gas_limits = Vec::<u64>::default();
         let output = self.metrics.execute_metered(
             executor,
-            handle.iter_transactions().map(|res| res.map_err(BlockExecutionError::other)),
+            handle.iter_transactions().map(|res| {
+                res.map(|tx| {
+                    tx_hashes.push(*tx.tx().tx_hash());
+                    tx_gas_limits.push(tx.tx().gas_limit());
+                    tx
+                })
+                .map_err(BlockExecutionError::other)
+            }),
             state_hook,
         )?;
         let execution_finish = Instant::now();
         let execution_time = execution_finish.duration_since(execution_start);
-        info!(target: "engine::tree::payload_validator", elapsed = ?execution_time, "Executed block");
+        debug!(target: "engine::tree::payload_validator", elapsed = ?execution_time, "Executed block");
 
-        // xlayer internal transactions
+        // XLayer internal transactions
         let mut internal_transactions = inspector.get();
-        // Get transactions from input - we need to collect tx hashes separately
-        // since Either::Left and Either::Right are different types
-        let mut tx_hashes = Vec::<TxHash>::default();
-        let tx_count = match input {
-            BlockOrPayload::Block(block) => block.transaction_count(),
-            BlockOrPayload::Payload(payload) => {
-                // For payload, get transaction count from the recovered block
-                let recovered_block = self
-                    .validator
-                    .ensure_well_formed_payload(payload.clone())
-                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
-                let count = recovered_block.transaction_count();
-                // Collect tx hashes from recovered block
-                tx_hashes =
-                    recovered_block.transactions_recovered().map(|tx| *tx.tx_hash()).collect();
-                count
-            }
-        };
-
-        // For Block variant, collect tx hashes
-        if tx_hashes.is_empty() {
-            if let BlockOrPayload::Block(block) = input {
-                tx_hashes = block.transactions_recovered().map(|tx| *tx.tx_hash()).collect();
-            }
-        }
-
         let (rw_tx, rw_db) = rw_batch_start::<TxTable>().map_err(|e| {
             InsertBlockErrorKind::Other(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -676,8 +659,7 @@ where
         })?;
 
         let mut prev_cumulative_gas = 0u64;
-        let mut tx_hashes_to_write = Vec::<TxHash>::default();
-        for index in 0..tx_count {
+        for (index, _) in tx_hashes.iter().enumerate() {
             let success = output.receipts[index].status();
 
             let current_cumulative_gas = output.receipts[index].cumulative_gas_used();
@@ -689,33 +671,24 @@ where
             {
                 if !internal_transactions.is_empty() && !internal_transactions[index].is_empty() {
                     if let Some(first_inner_tx) = internal_transactions[index].first_mut() {
-                        // Use cumulative gas as approximation for gas_limit since we don't have
-                        // direct access to tx gas_limit here The gas_limit
-                        // is typically higher than gas_used, so we use cumulative_gas_used as a
-                        // reasonable approximation
-                        let gas_limit = current_cumulative_gas;
-                        first_inner_tx.set_transaction_gas(gas_limit, tx_gas_used);
+                        first_inner_tx.set_transaction_gas(tx_gas_limits[index], tx_gas_used);
                     }
                 }
 
-                if index < tx_hashes.len() {
-                    tx_hashes_to_write.push(tx_hashes[index]);
-                    rw_batch_write::<TxTable>(
-                        &rw_tx,
-                        &rw_db,
-                        tx_hashes[index].to_vec(),
-                        encode(internal_transactions[index].clone()),
-                    )
-                    .map_err(|e| {
-                        InsertBlockErrorKind::Other(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("xlayer db write error: {e}"),
-                        )))
-                    })?;
-                }
+                rw_batch_write::<TxTable>(
+                    &rw_tx,
+                    &rw_db,
+                    tx_hashes[index].to_vec(),
+                    encode(internal_transactions[index].clone()),
+                )
+                .map_err(|e| {
+                    InsertBlockErrorKind::Other(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("xlayer db write error: {e}"),
+                    )))
+                })?;
             }
         }
-        tx_hashes = tx_hashes_to_write;
         rw_batch_end::<TxTable>(rw_tx).map_err(|e| {
             InsertBlockErrorKind::Other(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
