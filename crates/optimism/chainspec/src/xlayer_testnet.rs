@@ -168,6 +168,36 @@ mod tests {
         assert!(spec.fork(OpHardfork::Granite).active_at_timestamp(ts));
         assert!(spec.fork(OpHardfork::Holocene).active_at_timestamp(ts));
         assert!(spec.fork(OpHardfork::Isthmus).active_at_timestamp(ts));
+        assert!(spec.fork(OpHardfork::Jovian).active_at_timestamp(ts));
+    }
+
+    #[test]
+    fn test_xlayer_testnet_jovian_activation() {
+        use reth_optimism_forks::{XLAYER_TESTNET_HARDFORKS, XLAYER_TESTNET_JOVIAN_TIMESTAMP};
+
+        let spec = &*XLAYER_TESTNET;
+        let hardforks = &*XLAYER_TESTNET_HARDFORKS;
+
+        // Verify Jovian is configured with XLAYER_TESTNET_JOVIAN_TIMESTAMP
+        let jovian_fork = hardforks
+            .get(OpHardfork::Jovian)
+            .expect("Jovian fork should be configured");
+        assert!(matches!(
+            jovian_fork,
+            reth_ethereum_forks::ForkCondition::Timestamp(ts) if ts == XLAYER_TESTNET_JOVIAN_TIMESTAMP
+        ));
+
+        // Test activation before Jovian timestamp
+        assert!(!spec.fork(OpHardfork::Jovian).active_at_timestamp(XLAYER_TESTNET_JOVIAN_TIMESTAMP - 1));
+
+        // Test activation at Jovian timestamp
+        assert!(spec.fork(OpHardfork::Jovian).active_at_timestamp(XLAYER_TESTNET_JOVIAN_TIMESTAMP));
+
+        // Test activation after Jovian timestamp
+        assert!(spec.fork(OpHardfork::Jovian).active_at_timestamp(XLAYER_TESTNET_JOVIAN_TIMESTAMP + 1));
+
+        // Verify timestamp matches expected value (2025-11-27 11:00 UTC)
+        assert_eq!(XLAYER_TESTNET_JOVIAN_TIMESTAMP, 1764241200);
     }
 
     #[test]
