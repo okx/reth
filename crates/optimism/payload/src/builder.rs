@@ -48,7 +48,7 @@ use revm::context::{Block, BlockEnv};
 use std::{marker::PhantomData, sync::Arc, time::Instant};
 use tracing::{debug, trace, warn};
 use xlayer_db::{
-    internal_transaction_inspector::{InternalTransaction, TraceCollector},
+    internal_transaction_inspector::TraceCollector,
     structs::{BlockTable, TxTable},
     utils::{is_inner_tx_enabled, rw_batch_end, rw_batch_start, rw_batch_write, write_single},
 };
@@ -453,22 +453,22 @@ impl<Txs> OpBuilder<'_, Txs> {
 
         // create the executed block data
         let executed: ExecutedBlock<N> = ExecutedBlock {
-            recovered_block: Arc::new(block.clone()),
+            recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(trie_updates),
         };
-
-        // XLayer internal transactions
-        if is_inner_tx_enabled() {
-            write_internal_transactions(&mut inspector, &executed, block.hash())?;
-        }
 
         let no_tx_pool = ctx.attributes().no_tx_pool();
 
         // X Layer: Log block build start and end (success)
         let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
+
+        // XLayer internal transactions
+        if is_inner_tx_enabled() {
+            write_internal_transactions(&mut inspector, &executed, block_hash)?;
+        }
 
         // X Layer: Store timing metrics for this block (will be updated with insert timing later)
         store_block_timing(block_hash, timing_metrics.clone());

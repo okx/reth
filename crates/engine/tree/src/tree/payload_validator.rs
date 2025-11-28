@@ -44,7 +44,7 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use tracing::{debug, debug_span, error, info, instrument, trace, warn};
 
 use alloy_consensus::TxReceipt;
-use alloy_rlp::{decode_exact, encode, Encodable};
+use alloy_rlp::encode;
 use reth_primitives_traits::transaction::TxHashRef;
 use reth_revm::primitives::alloy_primitives::TxHash;
 use xlayer_db::{
