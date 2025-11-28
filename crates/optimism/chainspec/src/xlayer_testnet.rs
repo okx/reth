@@ -200,8 +200,8 @@ mod tests {
         // Test activation after Jovian timestamp
         assert!(spec.fork(OpHardfork::Jovian).active_at_timestamp(XLAYER_TESTNET_JOVIAN_TIMESTAMP + 1));
 
-        // Verify timestamp matches expected value (2025-11-27 11:00 UTC)
-        assert_eq!(XLAYER_TESTNET_JOVIAN_TIMESTAMP, 1764241200);
+        // Verify timestamp matches expected value (2025-11-28 09:00:00 UTC)
+        assert_eq!(XLAYER_TESTNET_JOVIAN_TIMESTAMP, 1764320400);
     }
 
     #[test]
