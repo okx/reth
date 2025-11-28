@@ -1261,7 +1261,7 @@ use reth_revm::{Database, DatabaseRef, State};
 use xlayer_db::{
     internal_transaction_inspector::TraceCollector,
     structs::{BlockTable, TxTable},
-    utils::{rw_batch_end, is_inner_tx_enabled, rw_batch_start, rw_batch_write, write_single},
+    utils::{is_inner_tx_enabled, rw_batch_end, rw_batch_start, rw_batch_write, write_single},
 };
 
 fn extract<E, DB>(

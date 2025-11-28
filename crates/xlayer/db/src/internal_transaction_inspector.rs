@@ -2,8 +2,8 @@ use alloy_rlp::{RlpDecodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-use alloy_primitives::{Address, Bytes, U256};
 use crate::utils;
+use alloy_primitives::{Address, Bytes, U256};
 
 use reth_revm::{
     interpreter::{
