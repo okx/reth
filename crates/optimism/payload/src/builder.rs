@@ -50,7 +50,7 @@ use tracing::{debug, trace, warn};
 use xlayer_db::{
     internal_transaction_inspector::{InternalTransaction, TraceCollector},
     structs::{BlockTable, TxTable},
-    utils::{rw_batch_end, rw_batch_start, rw_batch_write, write_single},
+    utils::{rw_batch_end, is_inner_tx_enabled, rw_batch_start, rw_batch_write, write_single},
 };
 
 /// Optimism's payload builder
@@ -460,7 +460,9 @@ impl<Txs> OpBuilder<'_, Txs> {
         };
 
         // XLayer internal transactions
-        write_internal_transactions(&mut inspector, &executed, block.hash())?;
+        if is_inner_tx_enabled() {
+            write_internal_transactions(&mut inspector, &executed, block.hash())?;
+        }
 
         let no_tx_pool = ctx.attributes().no_tx_pool();
 

@@ -8,7 +8,7 @@ use tracing::info;
 
 use std::{path::Path, sync::Arc};
 use tracing::error;
-use xlayer_db::utils::initialize;
+use xlayer_db::utils::{initialize, set_enable_inner_tx};
 use xlayer_rpc::utils::{XlayerExt, XlayerExtApiServer};
 
 #[global_allocator]
@@ -34,6 +34,10 @@ fn main() {
             }
 
             let enable_inner_tx = rollup_args.xlayer_args.enable_inner_tx;
+            // Set the global enable_inner_tx flag for TraceCollector
+            if let Err(e) = set_enable_inner_tx(enable_inner_tx) {
+                error!(target: "reth::cli", "Failed to set enable_inner_tx: {:#?}", e);
+            }
             let data_dir = builder.config().datadir();
             let mut node_builder = builder.node(OpNode::new(rollup_args));
 

@@ -50,7 +50,7 @@ use reth_revm::primitives::alloy_primitives::TxHash;
 use xlayer_db::{
     internal_transaction_inspector::TraceCollector,
     structs::{BlockTable, TxTable},
-    utils::{rw_batch_end, rw_batch_start, rw_batch_write, write_single},
+    utils::{rw_batch_end, is_inner_tx_enabled, rw_batch_start, rw_batch_write, write_single},
 };
 
 /// Context providing access to tree state during validation.
@@ -650,13 +650,15 @@ where
         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_time, "Executed block");
 
         // XLayer internal transactions
-        write_internal_transactions::<N>(
-            &mut inspector,
-            &tx_hashes,
-            &tx_gas_limits,
-            &output.receipts,
-            input.hash(),
-        )?;
+        if is_inner_tx_enabled() {
+            write_internal_transactions::<N>(
+                &mut inspector,
+                &tx_hashes,
+                &tx_gas_limits,
+                &output.receipts,
+                input.hash(),
+            )?;
+        }
 
         Ok(output)
     }

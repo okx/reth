@@ -359,8 +359,10 @@ where
 
             execution_duration += execute_start.elapsed();
 
-            if let Err(err) = extract(&self.evm_config, &mut replay_db, &block) {
-                error!(target:"reth::cli", "XLayer execute extract failed for block {:#?} error {:#?}", block.hash(), err);
+            if is_inner_tx_enabled() {
+                if let Err(err) = extract(&self.evm_config, &mut replay_db, &block) {
+                    error!(target:"reth::cli", "XLayer execute extract failed for block {:#?} error {:#?}", block.hash(), err);
+                }
             }
 
             // Log execution throughput
@@ -1259,7 +1261,7 @@ use reth_revm::{Database, DatabaseRef, State};
 use xlayer_db::{
     internal_transaction_inspector::TraceCollector,
     structs::{BlockTable, TxTable},
-    utils::{rw_batch_end, rw_batch_start, rw_batch_write, write_single},
+    utils::{rw_batch_end, is_inner_tx_enabled, rw_batch_start, rw_batch_write, write_single},
 };
 
 fn extract<E, DB>(
