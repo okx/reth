@@ -224,8 +224,8 @@ pub static BASE_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
 
 /// X Layer mainnet Jovian hardfork activation timestamp, 2025-12-02 16:00:01 UTC
 pub const XLAYER_MAINNET_JOVIAN_TIMESTAMP: u64 = 1764691201;
-/// X Layer testnet Jovian hardfork activation timestamp, 2025-11-28 09:00:00 UTC
-pub const XLAYER_TESTNET_JOVIAN_TIMESTAMP: u64 = 1764320400;
+/// X Layer testnet Jovian hardfork activation timestamp, 2025-11-28 11:00:00 UTC
+pub const XLAYER_TESTNET_JOVIAN_TIMESTAMP: u64 = 1764327600;
 
 /// X Layer mainnet list of hardforks.
 ///
@@ -326,8 +326,8 @@ mod tests {
     #[test]
     fn test_xlayer_testnet_jovian_timestamp() {
         // Verify the timestamp constant is correctly defined
-        // 2025-11-28 09:00:00 UTC = 1764320400
-        assert_eq!(XLAYER_TESTNET_JOVIAN_TIMESTAMP, 1764320400);
+        // 2025-11-28 11:00:00 UTC = 1764327600
+        assert_eq!(XLAYER_TESTNET_JOVIAN_TIMESTAMP, 1764327600);
     }
 
     #[test]
