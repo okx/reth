@@ -311,12 +311,6 @@ where
 
         debug!(target: "sync::stages::execution", start = start_block, end = max_block, "Executing range");
 
-        let mut replay_db = State::builder()
-            .with_database(StateProviderDatabase::new(LatestStateProviderRef::new(provider)))
-            .with_bundle_update()
-            .without_state_clear()
-            .build();
-
         // Execute block range
         let mut cumulative_gas = 0;
         let batch_start = Instant::now();
@@ -360,7 +354,7 @@ where
             execution_duration += execute_start.elapsed();
 
             if is_inner_tx_enabled() {
-                if let Err(err) = extract(&self.evm_config, &mut replay_db, &block) {
+                if let Err(err) = extract(&self.evm_config, provider, &block) {
                     error!(target:"reth::cli", "XLayer execute extract failed for block {:#?} error {:#?}", block.hash(), err);
                 }
             }
@@ -1257,26 +1251,36 @@ mod tests {
 use alloy_consensus::{transaction::TxHashRef, TxReceipt};
 use alloy_rlp::encode;
 use reth_evm::{block::BlockExecutionError, execute::BlockExecutor};
-use reth_revm::{Database, DatabaseRef, State};
+use reth_revm::State;
 use xlayer_db::{
     internal_transaction_inspector::TraceCollector,
     structs::{BlockTable, TxTable},
     utils::{is_inner_tx_enabled, rw_batch_end, rw_batch_start, rw_batch_write, write_single},
 };
 
-fn extract<E, DB>(
+fn extract<E, Provider>(
     evm_config: &E,
-    db: &mut State<DB>,
+    provider: &Provider,
     block: &RecoveredBlock<<<E as ConfigureEvm>::Primitives as NodePrimitives>::Block>,
 ) -> Result<(), BlockExecutionError>
 where
     E: ConfigureEvm,
-    DB: Database + DatabaseRef + Send + std::fmt::Debug,
-    <DB as Database>::Error: Send + Sync + 'static,
+    Provider: DBProvider
+        + BlockReader<
+            Block = <<E as ConfigureEvm>::Primitives as NodePrimitives>::Block,
+            Header = <<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader,
+        >,
 {
+    let mut replay_db = State::builder()
+        .with_database(StateProviderDatabase::new(LatestStateProviderRef::new(provider)))
+        .with_bundle_update()
+        .without_state_clear()
+        .build();
+
     let mut inspector = TraceCollector::default();
     let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
-    let evm = evm_config.evm_with_env_and_inspector(db, evm_env.clone(), &mut inspector);
+    let evm =
+        evm_config.evm_with_env_and_inspector(&mut replay_db, evm_env.clone(), &mut inspector);
     let ctx = evm_config.context_for_block(block).map_err(BlockExecutionError::other)?;
     let executor = evm_config.create_executor(evm, ctx);
 
