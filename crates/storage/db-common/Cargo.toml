@@ -48,6 +48,8 @@ trie-db-ext = []
 [dev-dependencies]
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
+reth-storage-api.workspace = true
+tempdir = "0.3.7"
 
 [lints]
 workspace = true

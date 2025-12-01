@@ -8162,10 +8162,12 @@ dependencies = [
  "reth-provider",
  "reth-stages-types",
  "reth-static-file-types",
+ "reth-storage-api",
  "reth-trie",
  "reth-trie-db",
  "serde",
  "serde_json",
+ "tempdir",
  "thiserror 2.0.17",
  "tracing",
 ]

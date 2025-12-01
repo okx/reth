@@ -158,14 +158,14 @@ where
     // compute state root to populate trie tables
     #[cfg(feature = "trie-db-ext")]
     {
+        use std::path::PathBuf;
+        use reth_trie::{hashed_cursor::{HashedCursorFactory, HashedCursor}, StateRootTrieDb, TrieExtDatabase};
         let trie_db_path = std::env::var("RETH_TRIEDB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                // Default: assume we're in the database directory context
-                // This creates triedb as a sibling to the main db directory
-                // Adjust this based on your actual directory structure
                 PathBuf::from("../triedb")
             });
+        let file_path = trie_db_path.join("test.db");
         let trie_ext_db = TrieExtDatabase::new(file_path);
         let trie_db_path = std::env::temp_dir().join("reth_triedb_init");
         calculate_state_root_with_triedb(&provider_rw, trie_db_path, None)?;
@@ -644,7 +644,7 @@ where
 
 /// Computes the state root (from scratch) based on the accounts and storages present in the
 /// database.
-fn compute_state_root<Provider>(
+pub(crate) fn compute_state_root<Provider>(
     provider: &Provider,
     prefix_sets: Option<TriePrefixSets>,
 ) -> Result<B256, InitStorageError>
