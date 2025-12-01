@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 use alloy_primitives::B256;
 use alloy_trie::{HashBuilder, EMPTY_ROOT_HASH};
 use tracing::{debug, trace};
@@ -101,10 +102,10 @@ where
 
             account_entry = acct_cursor.next()?;
         }
-
+let start_commit = Instant::now();
         tx.commit().unwrap();
+        println!("commit elapsed: {:?}", start_commit.elapsed());
         Ok(self.db.inner.state_root())
-        // Ok(EMPTY_ROOT_HASH)
     }
 }
 

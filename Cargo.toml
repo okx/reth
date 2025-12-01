@@ -311,8 +311,8 @@ lto = "thin"
 [profile.release]
 opt-level = 3
 lto = "thin"
-debug = "none"
-strip = "symbols"
+debug = 1
+strip = "none"
 panic = "unwind"
 codegen-units = 16
 

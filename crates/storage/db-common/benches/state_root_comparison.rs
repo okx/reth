@@ -91,12 +91,13 @@ pub fn bench_state_root_comparison(c: &mut Criterion) {
 
     for size in [100000] {
         let provider_factory = setup_test_data(size, 5);
-
+        
         // Benchmark traditional method
         group.bench_function(BenchmarkId::new("traditional", size), |b| {
             b.iter(|| {
                 let provider_rw = provider_factory.provider_rw().unwrap();
-                compute_state_root(&*provider_rw, None).unwrap()
+                compute_state_root(&*provider_rw, None).unwrap();
+                provider_rw.commit().unwrap();
             })
         });
 
@@ -109,8 +110,8 @@ pub fn bench_state_root_comparison(c: &mut Criterion) {
                     (tmp_dir, db_path)
                 },
                 |(tmp_dir, trie_db_path)| {
-                    let provider_rw = provider_factory.provider_rw().unwrap();
-                    calculate_state_root_with_triedb(&*provider_rw, trie_db_path, None).unwrap()
+                    let provider = provider_factory.provider_rw().unwrap();
+                    calculate_state_root_with_triedb(&*provider, trie_db_path, None).unwrap()
                 },
             )
         });

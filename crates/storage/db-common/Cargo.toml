@@ -11,7 +11,7 @@ repository.workspace = true
 # reth
 reth-chainspec.workspace = true
 reth-db-api.workspace = true
-reth-provider.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
 reth-primitives-traits.workspace = true
 reth-config.workspace = true
 reth-trie.workspace = true
@@ -19,6 +19,7 @@ reth-trie-db.workspace = true
 reth-etl.workspace = true
 reth-codecs.workspace = true
 reth-stages-types.workspace = true
+reth-storage-api.workspace = true
 reth-fs-util.workspace = true
 reth-node-types.workspace = true
 reth-static-file-types.workspace = true
@@ -33,6 +34,7 @@ alloy-primitives.workspace = true
 eyre.workspace = true
 thiserror.workspace = true
 boyer-moore-magiclen.workspace = true
+rand = "0.8"
 
 # io
 serde.workspace = true
@@ -41,9 +43,13 @@ serde_json.workspace = true
 # tracing
 tracing.workspace = true
 
+# Add tempdir for the binary
+tempdir = "0.3.7"
+
 [features]
 default = []
 trie-db-ext = []
+bin-utils = ["reth-provider/test-utils"]
 
 [dev-dependencies]
 reth-db = { workspace = true, features = ["mdbx"] }
@@ -57,6 +63,11 @@ criterion = { workspace = true }
 name = "state_root_comparison"
 harness = false
 required-features = ["trie-db-ext"]
+
+[[bin]]
+name = "state_root_runner"
+path = "src/bin/state_root_runner.rs"
+required-features = ["trie-db-ext"]   # so you can also run the TrieDB method
 
 [lints]
 workspace = true
