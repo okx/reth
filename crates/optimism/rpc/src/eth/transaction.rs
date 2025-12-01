@@ -1,20 +1,24 @@
 //! Loads and formats OP transaction RPC response.
 
 use crate::{OpEthApi, OpEthApiError, SequencerClient};
+use alloy_consensus::transaction::TxHashRef;
+use alloy_consensus::BlockHeader;
 use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_eth::TransactionInfo;
 use futures::StreamExt;
 use op_alloy_consensus::{transaction::OpTransactionInfo, OpTransaction};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_optimism_primitives::DepositReceipt;
-use reth_primitives_traits::{BlockBody, SignedTransaction};
+use reth_primitives_traits::{BlockBody, SignedTransaction, SignerRecoverable};
+use reth_rpc_eth_api::helpers::SpawnBlocking;
 use reth_rpc_eth_api::{
     helpers::{spec::SignersForRpc, EthTransactions, LoadReceipt, LoadTransaction},
     try_into_op_tx_info, EthApiTypes as _, FromEthApiError, FromEvmError, RpcConvert, RpcNodeCore,
     RpcReceipt, TxInfoMapper,
 };
-use reth_rpc_eth_types::{utils::recover_raw_transaction, EthApiError};
-use reth_storage_api::{errors::ProviderError, ReceiptProvider};
+use reth_rpc_eth_types::{utils::recover_raw_transaction, EthApiError, TransactionSource};
+use reth_storage_api::TransactionsProvider;
+use reth_storage_api::{errors::ProviderError, ProviderTx, ReceiptProvider};
 use reth_transaction_pool::{
     AddedTransactionOutcome, PoolTransaction, TransactionOrigin, TransactionPool,
 };
@@ -74,7 +78,7 @@ where
                 tracing::warn!(target: "rpc::eth", %err, %hash, "successfully sent tx to sequencer, but failed to persist in local tx pool");
             });
 
-            return Ok(hash)
+            return Ok(hash);
         }
 
         // Sequencer node receiving transaction (no forwarder configured).
@@ -177,8 +181,8 @@ where
 
             if tx_receipt.is_none() {
                 // if flashblocks are supported, attempt to find id from the pending block
-                if let Ok(Some(pending_block)) = this.pending_flashblock().await &&
-                    let Some(Ok(receipt)) = pending_block
+                if let Ok(Some(pending_block)) = this.pending_flashblock().await
+                    && let Some(Ok(receipt)) = pending_block
                         .find_and_convert_transaction_receipt(hash, this.tx_resp_builder())
                 {
                     return Ok(Some(receipt));
@@ -187,6 +191,67 @@ where
             let Some((tx, meta, receipt)) = tx_receipt else { return Ok(None) };
             self.build_transaction_receipt(tx, meta, receipt).await.map(Some)
         }
+    }
+
+    async fn transaction_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<TransactionSource<ProviderTx<Self::Provider>>>, Self::Error> {
+        if let Ok(Some(pending)) = self.pending_flashblock().await {
+            // Search for transaction in flashblock
+            for (idx, tx) in pending.block().body().transactions().iter().enumerate() {
+                if *tx.tx_hash() == hash {
+                    return Ok(Some(TransactionSource::Block {
+                        transaction: tx
+                            .clone()
+                            .try_clone_into_recovered()
+                            .map_err(|_| EthApiError::InvalidTransactionSignature)?,
+                        index: idx as u64,
+                        block_hash: pending.block().hash(),
+                        block_number: pending.block().number(),
+                        base_fee: pending.block().base_fee_per_gas(),
+                    }));
+                }
+            }
+        }
+
+        // Try to find the transaction on disk (historical)
+        let mut resp = self
+            .spawn_blocking_io(move |this| {
+                match this
+                    .provider()
+                    .transaction_by_hash_with_meta(hash)
+                    .map_err(Self::Error::from_eth_err)?
+                {
+                    None => Ok(None),
+                    Some((tx, meta)) => {
+                        let transaction = tx
+                            .try_into_recovered_unchecked()
+                            .map_err(|_| EthApiError::InvalidTransactionSignature)?;
+
+                        let tx = TransactionSource::Block {
+                            transaction,
+                            index: meta.index,
+                            block_hash: meta.block_hash,
+                            block_number: meta.block_number,
+                            base_fee: meta.base_fee,
+                        };
+                        Ok(Some(tx))
+                    }
+                }
+            })
+            .await?;
+
+        if resp.is_none() {
+            // tx not found on disk or flashblocks, check pool
+            if let Some(tx) =
+                self.pool().get(&hash).map(|tx| tx.transaction.clone().into_consensus())
+            {
+                resp = Some(TransactionSource::Pool(tx.into()));
+            }
+        }
+
+        Ok(resp)
     }
 }
 
