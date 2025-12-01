@@ -22,6 +22,7 @@ pub struct TrieExtDatabase {
 
 impl TrieExtDatabase {
     pub fn new(db_path: impl AsRef<Path>) -> Self {
+        let db_path = db_path.as_ref();
         let db = TrieDbDatabase::create_new(db_path).unwrap();
         Self {
             inner: db,
