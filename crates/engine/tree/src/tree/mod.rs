@@ -228,15 +228,6 @@ impl OnStateHook for MeteredStateHook {
     }
 }
 
-/// Helper function to update block timing metrics for insert phase.
-///
-/// This function handles the common pattern of:
-/// 1. Getting existing timing metrics (if block was built locally)
-/// 2. Creating new metrics (if block was received from network)
-/// 3. Setting insert timing values
-/// 4. Calculating total as the sum of validate_and_execute + insert_to_tree
-/// 5. Storing the updated metrics
-/// Update insert timing metrics (legacy function, kept for compatibility)
 /// The engine API tree handler implementation.
 ///
 /// This type is responsible for processing engine API requests, maintaining the canonical state and
@@ -1401,7 +1392,7 @@ where
                         let insert_tree_elapsed = insert_tree_start.elapsed();
                         self.metrics.engine.inserted_already_executed_blocks.increment(1);
                         let elapsed = now.elapsed();
-                        
+
                         self.emit_event(EngineApiEvent::BeaconConsensus(
                             ConsensusEngineEvent::CanonicalBlockAdded(block, elapsed),
                         ));
@@ -2463,7 +2454,7 @@ where
                 // We now assume that we already have this block in the tree. However, we need to
                 // run the conversion to ensure that the block hash is valid.
                 convert_to_block(self, input)?;
-                
+
                 return Ok(InsertPayloadOk::AlreadySeen(BlockStatus::Valid))
             }
             _ => {}
@@ -2511,7 +2502,7 @@ where
         // X Layer: Track insert timing with RAII
         let start = Instant::now();
         let block_hash = block_num_hash.hash;
-        
+
         // Create timing context with Prometheus support
         // We'll create Prometheus metrics from the handler's metrics if needed
         use reth_node_metrics::block_timing::{BlockTimingContext, BlockTimingPrometheusMetrics};
@@ -2540,7 +2531,7 @@ where
 
         // emit insert event
         let elapsed = start.elapsed();
-        
+
         // X Layer: Update timing metrics (auto-updates and stores on drop)
         timing_ctx.update_totals();
         let engine_event = if is_fork {
