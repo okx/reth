@@ -77,6 +77,9 @@ pub trait EthBlocks:
     ) -> impl Future<Output = Result<Option<usize>, Self::Error>> + Send {
         async move {
             if block_id.is_pending() {
+                if let Ok(Some(pending)) = self.local_pending_block().await {
+                    return Ok(Some(pending.block.body().transaction_count()));
+                }
                 // Pending block can be fetched directly without need for caching
                 return Ok(self
                     .provider()

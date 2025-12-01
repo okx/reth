@@ -1,7 +1,10 @@
 //! Database access for `eth_` transaction RPC methods. Loads transaction and receipt data w.r.t.
 //! network.
 
-use super::{EthApiSpec, EthSigner, LoadBlock, LoadFee, LoadReceipt, LoadState, SpawnBlocking};
+use super::{
+    EthApiSpec, EthSigner, LoadBlock, LoadFee, LoadPendingBlock, LoadReceipt, LoadState,
+    SpawnBlocking,
+};
 use crate::{
     helpers::{estimate::EstimateCall, spec::SignersForRpc},
     FromEthApiError, FullEthApiTypes, IntoEthApiError, RpcNodeCore, RpcNodeCoreExt, RpcReceipt,
@@ -130,7 +133,10 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
         hash: B256,
     ) -> impl Future<
         Output = Result<Option<TransactionSource<ProviderTx<Self::Provider>>>, Self::Error>,
-    > + Send {
+    > + Send
+    where
+        Self: LoadPendingBlock,
+    {
         LoadTransaction::transaction_by_hash(self, hash)
     }
 
@@ -162,8 +168,24 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
     fn raw_transaction_by_hash(
         &self,
         hash: B256,
-    ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send
+    where
+        Self: LoadPendingBlock,
+    {
         async move {
+            if let Ok(Some(pending)) = self.local_pending_block().await {
+                return Ok(Some(
+                    pending
+                        .block
+                        .body()
+                        .transactions()
+                        .iter()
+                        .find(|tx| *tx.tx_hash() == hash)
+                        .map(|tx| tx.encoded_2718().into())
+                        .unwrap_or_default(),
+                ));
+            }
+
             // Note: this is mostly used to fetch pooled transactions so we check the pool first
             if let Some(tx) =
                 self.pool().get_pooled_transaction_element(hash).map(|tx| tx.encoded_2718().into())
@@ -189,7 +211,10 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
         hash: B256,
     ) -> impl Future<
         Output = Result<Option<(TransactionSource<ProviderTx<Self::Provider>>, B256)>, Self::Error>,
-    > + Send {
+    > + Send
+    where
+        Self: LoadPendingBlock,
+    {
         async move {
             match self.transaction_by_hash_at(hash).await? {
                 None => Ok(None),
@@ -369,11 +394,23 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
         index: usize,
     ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send
     where
-        Self: LoadBlock,
+        Self: LoadBlock + LoadPendingBlock,
     {
         async move {
-            if let Some(block) = self.recovered_block(block_id).await? &&
-                let Some(tx) = block.body().transactions().get(index)
+            if let Ok(Some(pending)) = self.local_pending_block().await {
+                return Ok(Some(
+                    pending
+                        .block
+                        .body()
+                        .transactions()
+                        .get(index)
+                        .map(|tx| tx.encoded_2718().into())
+                        .unwrap_or_default(),
+                ));
+            }
+
+            if let Some(block) = self.recovered_block(block_id).await?
+                && let Some(tx) = block.body().transactions().get(index)
             {
                 return Ok(Some(tx.encoded_2718().into()))
             }
@@ -594,8 +631,29 @@ pub trait LoadTransaction: SpawnBlocking + FullEthApiTypes + RpcNodeCoreExt {
         hash: B256,
     ) -> impl Future<
         Output = Result<Option<TransactionSource<ProviderTx<Self::Provider>>>, Self::Error>,
-    > + Send {
+    > + Send
+    where
+        Self: LoadPendingBlock,
+    {
         async move {
+            if let Ok(Some(pending)) = self.local_pending_block().await {
+                // Search for transaction in flashblock
+                for (idx, tx) in pending.block.body().transactions().iter().enumerate() {
+                    if *tx.tx_hash() == hash {
+                        return Ok(Some(TransactionSource::Block {
+                            transaction: tx
+                                .clone()
+                                .try_clone_into_recovered()
+                                .map_err(|_| EthApiError::InvalidTransactionSignature)?,
+                            index: idx as u64,
+                            block_hash: pending.block.hash(),
+                            block_number: pending.block.number(),
+                            base_fee: pending.block.base_fee_per_gas(),
+                        }));
+                    }
+                }
+            }
+
             // Try to find the transaction on disk
             let mut resp = self
                 .spawn_blocking_io(move |this| {
@@ -651,7 +709,10 @@ pub trait LoadTransaction: SpawnBlocking + FullEthApiTypes + RpcNodeCoreExt {
             Option<(TransactionSource<ProviderTx<Self::Provider>>, BlockId)>,
             Self::Error,
         >,
-    > + Send {
+    > + Send
+    where
+        Self: LoadPendingBlock,
+    {
         async move {
             Ok(self.transaction_by_hash(transaction_hash).await?.map(|tx| match tx {
                 tx @ TransactionSource::Pool(_) => (tx, BlockId::pending()),
@@ -675,7 +736,10 @@ pub trait LoadTransaction: SpawnBlocking + FullEthApiTypes + RpcNodeCoreExt {
             )>,
             Self::Error,
         >,
-    > + Send {
+    > + Send
+    where
+        Self: LoadPendingBlock,
+    {
         async move {
             let (transaction, at) = match self.transaction_by_hash_at(hash).await? {
                 None => return Ok(None),
