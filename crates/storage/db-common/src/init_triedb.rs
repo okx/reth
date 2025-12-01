@@ -122,8 +122,8 @@ mod tests {
         let mut provider_rw = provider_factory.database_provider_rw().unwrap();
 
         let (dummy_accounts, storage_entries) = generate_random_accounts_and_storage(
-            100, // num_accounts
-            5,   // storage_per_account
+            10000, // num_accounts
+            10,   // storage_per_account
             &mut rng,
         );
 
