@@ -10,6 +10,9 @@ mod storage;
 mod trie_cursor;
 mod witness;
 
+#[cfg(test)]
+mod tests;
+
 pub use hashed_cursor::{
     DatabaseHashedAccountCursor, DatabaseHashedCursorFactory, DatabaseHashedStorageCursor,
 };

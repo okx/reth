@@ -32,7 +32,8 @@ reth-db = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-trie-common = { workspace = true, features = ["test-utils", "arbitrary"] }
 reth-trie = { workspace = true, features = ["test-utils"] }
-
+reth-trie-db.workspace = true
+reth-storage-api.workspace = true
 alloy-consensus.workspace = true
 alloy-rlp.workspace = true
 revm.workspace = true
@@ -40,7 +41,8 @@ revm-database.workspace = true
 
 # trie
 triehash.workspace = true
-
+triedb.workspace = true
+tempdir = "0.3.7"
 # misc
 proptest.workspace = true
 proptest-arbitrary-interop.workspace = true

@@ -30,6 +30,9 @@ use serde::{Deserialize, Serialize};
 use std::io::BufRead;
 use tracing::{debug, error, info, trace};
 
+#[cfg(feature = "trie-db-ext")]
+use crate::init_triedb::calculate_state_root_with_triedb;
+
 /// Default soft limit for number of bytes to read from state dump file, before inserting into
 /// database.
 ///
@@ -153,7 +156,24 @@ where
     insert_genesis_state(&provider_rw, alloc.iter())?;
 
     // compute state root to populate trie tables
-    compute_state_root(&provider_rw, None)?;
+    #[cfg(feature = "trie-db-ext")]
+    {
+        let trie_db_path = std::env::var("RETH_TRIEDB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                // Default: assume we're in the database directory context
+                // This creates triedb as a sibling to the main db directory
+                // Adjust this based on your actual directory structure
+                PathBuf::from("../triedb")
+            });
+        let trie_ext_db = TrieExtDatabase::new(file_path);
+        let trie_db_path = std::env::temp_dir().join("reth_triedb_init");
+        calculate_state_root_with_triedb(&provider_rw, trie_db_path, None)?;
+    }
+    #[cfg(not(feature = "trie-db-ext"))]
+    {
+        compute_state_root(&provider_rw, None)?;
+    }
 
     // set stage checkpoint to genesis block number for all stages
     let checkpoint = StageCheckpoint { block_number: genesis_block_number, ..Default::default() };
@@ -834,5 +854,14 @@ mod tests {
                 IntegerList::new([0]).unwrap()
             )],
         );
+    }
+
+    #[test]
+    fn init_genesis_with_triedb() {
+        let genesis_hash =
+            init_genesis(&create_test_provider_factory_with_chain_spec(MAINNET.clone())).unwrap();
+
+        // actual, expected
+        assert_eq!(genesis_hash, MAINNET_GENESIS_HASH);
     }
 }

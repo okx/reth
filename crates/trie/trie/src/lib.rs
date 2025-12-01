@@ -66,3 +66,5 @@ pub mod mock;
 
 /// Verification of existing stored trie nodes against state data.
 pub mod verify;
+mod trie_ext;
+pub use trie_ext::{StateRootTrieDb, TrieExtDatabase};

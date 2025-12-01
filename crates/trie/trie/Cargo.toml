@@ -42,6 +42,8 @@ metrics = { workspace = true, optional = true }
 
 # `test-utils` feature
 triehash = { workspace = true, optional = true }
+triedb.workspace = true
+nybbles = "0.3.4"
 
 [dev-dependencies]
 # reth
@@ -49,6 +51,10 @@ reth-ethereum-primitives = { workspace = true, features = ["arbitrary", "std"] }
 reth-primitives-traits = { workspace = true, features = ["test-utils"] }
 reth-tracing.workspace = true
 reth-trie-common = { workspace = true, features = ["test-utils", "arbitrary"] }
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-trie-db.workspace = true
+reth-chainspec.workspace = true
+nybbles.workspace = true
 
 # revm
 revm-state.workspace = true
