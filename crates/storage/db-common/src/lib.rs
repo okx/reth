@@ -11,7 +11,7 @@
 pub mod init;
 
 mod db_tool;
-#[cfg(feature = "trie-db-ext")]
+// #[cfg(feature = "trie-db-ext")]
 pub mod init_triedb;
 
 pub use db_tool::*;

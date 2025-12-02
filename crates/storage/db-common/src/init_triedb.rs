@@ -58,7 +58,7 @@ mod tests {
     };
     use reth_chainspec::MAINNET;
     use reth_provider::DatabaseProviderFactory;
-    use reth_trie_db::DatabaseHashedCursorFactory;
+    use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseTrieCursorFactory};
     use reth_trie::{StateRootTrieDb, TrieExtDatabase};
     use alloy_primitives::{Address, U256, keccak256, B256};
     use reth_primitives_traits::{Account, StorageEntry};
@@ -68,6 +68,7 @@ mod tests {
     use reth_storage_api::TrieWriter;
     use crate::init::compute_state_root;
     use rand::Rng;
+    use reth_trie::trie_cursor::{TrieCursor, TrieCursorFactory};
 
     fn generate_random_accounts_and_storage(
         num_accounts: usize,
@@ -115,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    pub fn test_triedb_state_root() {
+    pub fn test_triedb_state_root_with_random_accts() {
         let mut rng = rand::thread_rng();
         let provider_factory = create_test_provider_factory_with_chain_spec(MAINNET.clone());
 
@@ -152,5 +153,89 @@ mod tests {
         };
 
         assert_eq!(triedb_root, traditional_root, "State roots should match");
+    }
+
+    #[test]
+    pub fn test_triedb_state_root_with_determistic_accts() {
+        let provider_factory = create_test_provider_factory_with_chain_spec(MAINNET.clone());
+        let mut provider_rw = provider_factory.database_provider_rw().unwrap();
+
+        let accounts: Vec<(Address, Account)> = vec![
+            (
+                Address::from_slice(&[
+                    0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x01,
+                ]), // keccak256(address) = [20, 104, 40, 128, 86, 49, 12, 130, 170, 76, 1, 167, 225, 42, 16, 248, 17, 26, 5, 96, 231, 43, 112, 5, 85, 71, 144, 49, 184, 108, 53, 125]
+                Account { nonce: 1, balance: U256::from(100u64), bytecode_hash: None },
+            ),
+            (
+                Address::from_slice(&[
+                    0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x02,
+                ]), // keccak256(address) = [213, 38, 136, 168, 249, 38, 200, 22, 202, 30, 7, 144, 103, 202, 186, 148, 79, 21, 142, 118, 72, 23, 184, 63, 196, 53, 148, 55, 12, 169, 207, 98]
+                Account { nonce: 2, balance: U256::from(200u64), bytecode_hash: None },
+            ),
+            (
+                Address::from_slice(&[
+                    0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x10,
+                ]), // keccak256(address) = [144,176, 210, 137, 234, 33, 29, 202, 142, 2, 12, 156, 200, 197, 214, 186, 47, 65, 111, 225, 95, 166, 146, 180, 113, 132, 164, 185, 70, 178, 33, 77]
+                Account { nonce: 3, balance: U256::from(300u64), bytecode_hash: None },
+            ),
+        ];
+
+        // let storage_entries: Vec<(Address, Vec<StorageEntry>)> = accounts
+        //     .iter()
+        //     .map(|(address, _)| {
+        //         let addr_bytes = address.as_slice();
+        //
+        //         let key1 = B256::from_slice(&keccak256([addr_bytes, &[0x01]].concat()).as_slice());
+        //         let key2 = B256::from_slice(&keccak256([addr_bytes, &[0x02]].concat()).as_slice());
+        //
+        //         let value1 = U256::from(keccak256([addr_bytes, &[0xA1]].concat()).as_slice());
+        //         let value2 = U256::from(keccak256([addr_bytes, &[0xA2]].concat()).as_slice());
+        //
+        //         let slots = vec![
+        //             StorageEntry { key: key1, value: value1 },
+        //             StorageEntry { key: key2, value: value2 },
+        //         ];
+        //
+        //         (*address, slots)
+        //     })
+        //     .collect();
+
+        let accounts_for_hashing = accounts
+            .iter()
+            .map(|(address, account)| (*address, Some(*account)));
+
+        provider_rw.insert_account_for_hashing(accounts_for_hashing).unwrap();
+        // provider_rw.insert_storage_for_hashing(storage_entries).unwrap();
+        provider_rw.commit().unwrap();
+
+        // Traditional root
+        let traditional_root = {
+            let provider_rw = provider_factory.database_provider_rw().unwrap();
+            compute_state_root(&provider_rw, None).unwrap()
+        };
+
+        // TrieDB root
+        let triedb_root = {
+            let provider_ro = provider_factory.database_provider_ro().unwrap();
+            let tx = provider_ro.tx_ref();
+            let hashed_cursor_factory = DatabaseHashedCursorFactory::new(tx);
+            let tmp_dir = TempDir::new("test_triedb_deterministic").unwrap();
+            let file_path = tmp_dir.path().join("test.db");
+            let trie_ext_db = TrieExtDatabase::new(file_path);
+            let state_root_ext = StateRootTrieDb::new(hashed_cursor_factory, trie_ext_db);
+            state_root_ext.calculate_commit().unwrap()
+        };
+
+        assert_eq!(triedb_root, traditional_root, "Deterministic state roots should match");
     }
 }

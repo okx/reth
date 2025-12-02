@@ -25,11 +25,11 @@ use reth_trie::{
     prefix_set::{TriePrefixSets, TriePrefixSetsMut},
     IntermediateStateRootState, Nibbles, StateRoot as StateRootComputer, StateRootProgress,
 };
-use reth_trie_db::DatabaseStateRoot;
+use reth_trie_db::{DatabaseStateRoot, DatabaseTrieCursorFactory};
 use serde::{Deserialize, Serialize};
 use std::io::BufRead;
 use tracing::{debug, error, info, trace};
-
+use reth_trie::{trie_cursor::{TrieCursor, TrieCursorFactory}};
 #[cfg(feature = "trie-db-ext")]
 use crate::init_triedb::calculate_state_root_with_triedb;
 
