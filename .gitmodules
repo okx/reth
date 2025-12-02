@@ -1,0 +1,3 @@
+[submodule "crates/op-rbuilder"]
+	path = crates/op-rbuilder
+	url = https://github.com/okx/op-rbuilder
