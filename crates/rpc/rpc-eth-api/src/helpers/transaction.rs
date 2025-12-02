@@ -135,7 +135,7 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
         Output = Result<Option<TransactionSource<ProviderTx<Self::Provider>>>, Self::Error>,
     > + Send
     where
-        Self: LoadPendingBlock,
+        Self: LoadBlock,
     {
         LoadTransaction::transaction_by_hash(self, hash)
     }
@@ -170,7 +170,7 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
         hash: B256,
     ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send
     where
-        Self: LoadPendingBlock,
+        Self: LoadBlock,
     {
         async move {
             if let Ok(Some(pending)) = self.local_pending_block().await {
@@ -213,7 +213,7 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
         Output = Result<Option<(TransactionSource<ProviderTx<Self::Provider>>, B256)>, Self::Error>,
     > + Send
     where
-        Self: LoadPendingBlock,
+        Self: LoadBlock,
     {
         async move {
             match self.transaction_by_hash_at(hash).await? {
@@ -394,7 +394,7 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
         index: usize,
     ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send
     where
-        Self: LoadBlock + LoadPendingBlock,
+        Self: LoadBlock,
     {
         async move {
             if let Ok(Some(pending)) = self.local_pending_block().await {
