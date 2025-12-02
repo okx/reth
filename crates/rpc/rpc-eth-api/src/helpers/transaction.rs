@@ -174,16 +174,11 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
     {
         async move {
             if let Ok(Some(pending)) = self.local_pending_block().await {
-                return Ok(Some(
-                    pending
-                        .block
-                        .body()
-                        .transactions()
-                        .iter()
-                        .find(|tx| *tx.tx_hash() == hash)
-                        .map(|tx| tx.encoded_2718().into())
-                        .unwrap_or_default(),
-                ));
+                if let Some(tx) =
+                    pending.block.body().transactions().iter().find(|tx| *tx.tx_hash() == hash)
+                {
+                    return Ok(Some(tx.encoded_2718().into()));
+                }
             }
 
             // Note: this is mostly used to fetch pooled transactions so we check the pool first
@@ -398,15 +393,9 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
     {
         async move {
             if let Ok(Some(pending)) = self.local_pending_block().await {
-                return Ok(Some(
-                    pending
-                        .block
-                        .body()
-                        .transactions()
-                        .get(index)
-                        .map(|tx| tx.encoded_2718().into())
-                        .unwrap_or_default(),
-                ));
+                if let Some(tx) = pending.block.body().transactions().get(index) {
+                    return Ok(Some(tx.encoded_2718().into()));
+                }
             }
 
             if let Some(block) = self.recovered_block(block_id).await?
