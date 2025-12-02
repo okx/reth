@@ -20,7 +20,10 @@ use reth_evm::{
     ConfigureEvm, Database,
 };
 use reth_execution_types::ExecutionOutcome;
-use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
+use reth_node_metrics::{
+    block_timing::{store_block_timing, BlockTimingContext},
+    transaction_trace_xlayer::{get_global_tracer, TransactionProcessId},
+};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::{transaction::OpTransaction, ADDRESS_L2_TO_L1_MESSAGE_PASSER};
 use reth_optimism_txpool::{
@@ -41,10 +44,8 @@ use reth_revm::{
 use reth_storage_api::{errors::ProviderError, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use revm::context::{Block, BlockEnv};
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::Instant};
 use tracing::{debug, trace, warn};
-use reth_node_metrics::block_timing::{BlockTimingContext, store_block_timing};
-use std::time::Instant;
 
 /// Optimism's payload builder
 #[derive(Debug)]
@@ -400,11 +401,14 @@ impl<Txs> OpBuilder<'_, Txs> {
                 let _guard = timing_ctx.time_select_mempool_transactions();
                 best(ctx.best_transaction_attributes(builder.evm_mut().block()))
             };
-            
+
             // 3.2. execute mempool transactions
             {
                 let _guard = timing_ctx.time_exec_mempool_transactions();
-                if ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?.is_some() {
+                if ctx
+                    .execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?
+                    .is_some()
+                {
                     return Ok(BuildOutcomeKind::Cancelled)
                 }
             }
@@ -450,7 +454,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         timing_ctx.set_block_hash(block_hash);
         timing_ctx.metrics_mut().build.total = build_start.elapsed();
         timing_ctx.update_totals();
-        
+
         // Store timing metrics for this block (will be updated with insert timing later)
         // Context will auto-store on drop, but we can also manually store here
         timing_ctx.store();

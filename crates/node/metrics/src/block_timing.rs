@@ -75,10 +75,11 @@ impl BlockTimingMetrics {
 
         // Check if block was built locally (has build timing) or received from network
         let is_locally_built = self.build.total.as_nanos() > 0;
-        
+
         if is_locally_built {
             // Block was built locally, show full timing including Build
-            // Note: Transaction execution times (execSeqTxs, selectMempoolTxs, execMempoolTxs) are already shown in Build phase
+            // Note: Transaction execution times (execSeqTxs, selectMempoolTxs, execMempoolTxs) are
+            // already shown in Build phase
             format!(
                 "Produce[Build[applyPreExec<{}>, execSeqTxs<{}>, selectMempoolTxs<{}>, execMempoolTxs<{}>, calcStateRoot<{}>, total<{}>], Insert[validateExec<{}>, insertTree<{}>, total<{}>]]",
                 format_duration(self.build.apply_pre_execution_changes),
@@ -104,7 +105,7 @@ impl BlockTimingMetrics {
 }
 
 /// Global storage for block timing metrics
-/// 
+///
 /// Uses IndexMap to maintain insertion order, allowing us to remove the oldest entries
 /// when the cache exceeds the limit.
 static BLOCK_TIMING_STORE: std::sync::OnceLock<Arc<Mutex<IndexMap<B256, BlockTimingMetrics>>>> =
@@ -112,28 +113,26 @@ static BLOCK_TIMING_STORE: std::sync::OnceLock<Arc<Mutex<IndexMap<B256, BlockTim
 
 /// Initialize the global block timing store
 fn get_timing_store() -> Arc<Mutex<IndexMap<B256, BlockTimingMetrics>>> {
-    BLOCK_TIMING_STORE
-        .get_or_init(|| Arc::new(Mutex::new(IndexMap::new())))
-        .clone()
+    BLOCK_TIMING_STORE.get_or_init(|| Arc::new(Mutex::new(IndexMap::new()))).clone()
 }
 
 /// Store timing metrics for a block
-/// 
+///
 /// If the block already exists, it will be updated and moved to the end (most recent).
 /// When the cache exceeds 1000 entries, the oldest entries are removed.
 pub fn store_block_timing(block_hash: B256, metrics: BlockTimingMetrics) {
     let store = get_timing_store();
     let mut map = store.lock().unwrap();
-    
+
     // If the block already exists, remove it first so it can be re-inserted at the end
     // This ensures that updated blocks are treated as the most recent
     if map.contains_key(&block_hash) {
         map.shift_remove(&block_hash);
     }
-    
+
     // Insert at the end (most recent position)
     map.insert(block_hash, metrics);
-    
+
     // Clean up old entries to prevent memory leak (keep last 1000 blocks)
     // IndexMap maintains insertion order, so we can safely remove from the front
     const MAX_ENTRIES: usize = 1000;
@@ -161,8 +160,9 @@ pub fn remove_block_timing(block_hash: &B256) {
 // RAII-based timing helpers
 // ============================================================================
 
-/// RAII guard that automatically records timing to a mutable reference and optionally to Prometheus when dropped.
-/// 
+/// RAII guard that automatically records timing to a mutable reference and optionally to Prometheus
+/// when dropped.
+///
 /// Usage:
 /// ```rust
 /// let mut timing = Duration::default();
@@ -180,11 +180,7 @@ pub struct TimingGuard<'a> {
 impl<'a> TimingGuard<'a> {
     /// Create a new timing guard that will record the elapsed time to `target` when dropped.
     pub fn new(target: &'a mut Duration) -> Self {
-        Self {
-            start: Instant::now(),
-            target,
-            prometheus_histogram: None,
-        }
+        Self { start: Instant::now(), target, prometheus_histogram: None }
     }
 
     /// Create a new timing guard that records to both `target` and Prometheus histogram.
@@ -192,11 +188,7 @@ impl<'a> TimingGuard<'a> {
         target: &'a mut Duration,
         prometheus_histogram: &'a metrics::Histogram,
     ) -> Self {
-        Self {
-            start: Instant::now(),
-            target,
-            prometheus_histogram: Some(prometheus_histogram),
-        }
+        Self { start: Instant::now(), target, prometheus_histogram: Some(prometheus_histogram) }
     }
 
     /// Record the elapsed duration to target and Prometheus (if enabled).
@@ -224,10 +216,10 @@ impl<'a> Drop for TimingGuard<'a> {
 }
 
 /// Context for managing block timing metrics using RAII.
-/// 
+///
 /// This provides a cleaner API for recording timing metrics throughout the block
 /// building and insertion process. The context automatically stores metrics when dropped.
-/// 
+///
 /// Supports both logging (via IndexMap) and Prometheus metrics recording.
 pub struct BlockTimingContext {
     block_hash: B256,
@@ -238,34 +230,30 @@ pub struct BlockTimingContext {
 
 impl BlockTimingContext {
     /// Create a new timing context for a block.
-    /// 
+    ///
     /// If timing metrics already exist for this block (e.g., from build phase),
     /// they will be loaded. Otherwise, a new empty metrics structure is created.
-    /// 
+    ///
     /// Metrics will be automatically stored when the context is dropped.
     pub fn new(block_hash: B256) -> Self {
         Self::with_metrics(block_hash, get_block_timing(&block_hash), None)
     }
 
     /// Create a new timing context for a block, initializing with empty metrics.
-    /// 
+    ///
     /// Metrics will be automatically stored when the context is dropped.
     pub fn new_empty(block_hash: B256) -> Self {
         Self::with_metrics(block_hash, None, None)
     }
 
     /// Create a new timing context with Prometheus metrics support.
-    /// 
+    ///
     /// This enables automatic recording to Prometheus in addition to logging.
     pub fn new_with_prometheus(
         block_hash: B256,
         prometheus_metrics: BlockTimingPrometheusMetrics,
     ) -> Self {
-        Self::with_metrics(
-            block_hash,
-            get_block_timing(&block_hash),
-            Some(prometheus_metrics),
-        )
+        Self::with_metrics(block_hash, get_block_timing(&block_hash), Some(prometheus_metrics))
     }
 
     /// Create a new empty timing context with Prometheus metrics support.
@@ -402,14 +390,14 @@ impl BlockTimingContext {
 
     /// Calculate and update total times.
     pub fn update_totals(&mut self) {
-        self.metrics.build.total = self.metrics.build.apply_pre_execution_changes
-            + self.metrics.build.exec_sequencer_transactions
-            + self.metrics.build.select_mempool_transactions
-            + self.metrics.build.exec_mempool_transactions
-            + self.metrics.build.calc_state_root;
-        
-        self.metrics.insert.total = self.metrics.insert.validate_and_execute
-            + self.metrics.insert.insert_to_tree;
+        self.metrics.build.total = self.metrics.build.apply_pre_execution_changes +
+            self.metrics.build.exec_sequencer_transactions +
+            self.metrics.build.select_mempool_transactions +
+            self.metrics.build.exec_mempool_transactions +
+            self.metrics.build.calc_state_root;
+
+        self.metrics.insert.total =
+            self.metrics.insert.validate_and_execute + self.metrics.insert.insert_to_tree;
 
         // Also record totals to Prometheus if enabled
         if let Some(ref prom_metrics) = self.prometheus_metrics {
@@ -427,4 +415,3 @@ impl Drop for BlockTimingContext {
         }
     }
 }
-

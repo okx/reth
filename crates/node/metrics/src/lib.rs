@@ -7,6 +7,10 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// Block timing metrics for tracking block production and execution times (X Layer)
+pub mod block_timing;
+#[path = "block_timing_prometheus.rs"]
+mod block_timing_prometheus;
 pub mod chain;
 /// The metrics hooks for prometheus.
 pub mod hooks;
@@ -16,10 +20,6 @@ pub mod server;
 /// Transaction tracing for monitoring transaction lifecycle (X Layer)
 pub mod transaction_trace_xlayer;
 pub mod version;
-/// Block timing metrics for tracking block production and execution times (X Layer)
-pub mod block_timing;
-#[path = "block_timing_prometheus.rs"]
-mod block_timing_prometheus;
 
 pub use metrics_exporter_prometheus::*;
 pub use metrics_process::*;
@@ -30,7 +30,6 @@ pub use transaction_trace_xlayer::{
 };
 // Re-export block timing module items for convenience
 pub use block_timing::{
-    BlockTimingContext, BlockTimingMetrics, BlockTimingPrometheusMetrics, BuildTiming,
-    InsertTiming, TimingGuard, get_block_timing, remove_block_timing,
-    store_block_timing,
+    get_block_timing, remove_block_timing, store_block_timing, BlockTimingContext,
+    BlockTimingMetrics, BlockTimingPrometheusMetrics, BuildTiming, InsertTiming, TimingGuard,
 };
