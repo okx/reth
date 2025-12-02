@@ -398,8 +398,8 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
                 }
             }
 
-            if let Some(block) = self.recovered_block(block_id).await?
-                && let Some(tx) = block.body().transactions().get(index)
+            if let Some(block) = self.recovered_block(block_id).await? &&
+                let Some(tx) = block.body().transactions().get(index)
             {
                 return Ok(Some(tx.encoded_2718().into()))
             }
