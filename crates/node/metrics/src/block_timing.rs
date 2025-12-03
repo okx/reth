@@ -172,7 +172,7 @@ pub fn remove_block_timing(block_hash: &B256) {
 /// } // Guard is dropped here and timing is automatically recorded
 /// ```
 pub struct TimingGuard<'a> {
-    start: Instant,
+    start: Option<Instant>,
     target: &'a mut Duration,
     prometheus_histogram: Option<&'a metrics::Histogram>,
 }
@@ -180,7 +180,7 @@ pub struct TimingGuard<'a> {
 impl<'a> TimingGuard<'a> {
     /// Create a new timing guard that will record the elapsed time to `target` when dropped.
     pub fn new(target: &'a mut Duration) -> Self {
-        Self { start: Instant::now(), target, prometheus_histogram: None }
+        Self { start: Some(Instant::now()), target, prometheus_histogram: None }
     }
 
     /// Create a new timing guard that records to both `target` and Prometheus histogram.
@@ -188,30 +188,46 @@ impl<'a> TimingGuard<'a> {
         target: &'a mut Duration,
         prometheus_histogram: &'a metrics::Histogram,
     ) -> Self {
-        Self { start: Instant::now(), target, prometheus_histogram: Some(prometheus_histogram) }
+        Self {
+            start: Some(Instant::now()),
+            target,
+            prometheus_histogram: Some(prometheus_histogram),
+        }
     }
 
     /// Record the elapsed duration to target and Prometheus (if enabled).
-    fn record(&mut self) {
-        let duration = self.start.elapsed();
+    /// Returns `None` if already recorded.
+    fn record(&mut self) -> Option<Duration> {
+        let start = self.start.take()?; // If None, already recorded
+        let duration = start.elapsed();
         *self.target = duration;
         if let Some(histogram) = self.prometheus_histogram {
             histogram.record(duration.as_secs_f64());
         }
+        Some(duration)
     }
 
     /// Manually finish timing and return the duration.
     /// This updates the target immediately and prevents the drop handler from running.
     pub fn finish(mut self) -> Duration {
-        let duration = self.start.elapsed();
-        self.record();
-        duration
+        // Calculate duration once and use it for both recording and return
+        if let Some(start) = self.start.take() {
+            let duration = start.elapsed();
+            *self.target = duration;
+            if let Some(histogram) = self.prometheus_histogram {
+                histogram.record(duration.as_secs_f64());
+            }
+            duration
+        } else {
+            // Already recorded, return the current target value
+            *self.target
+        }
     }
 }
 
 impl<'a> Drop for TimingGuard<'a> {
     fn drop(&mut self) {
-        self.record();
+        let _ = self.record(); // Ignore return value, just ensure recording happens
     }
 }
 
@@ -295,85 +311,78 @@ impl BlockTimingContext {
 
     /// Create a timing guard for recording build phase: apply pre-execution changes.
     pub fn time_apply_pre_execution_changes(&mut self) -> TimingGuard<'_> {
-        if let Some(ref prom_metrics) = self.prometheus_metrics {
-            TimingGuard::new_with_prometheus(
+        match &self.prometheus_metrics {
+            Some(prom_metrics) => TimingGuard::new_with_prometheus(
                 &mut self.metrics.build.apply_pre_execution_changes,
                 &prom_metrics.build_apply_pre_execution_changes,
-            )
-        } else {
-            TimingGuard::new(&mut self.metrics.build.apply_pre_execution_changes)
+            ),
+            None => TimingGuard::new(&mut self.metrics.build.apply_pre_execution_changes),
         }
     }
 
     /// Create a timing guard for recording build phase: execute sequencer transactions.
     pub fn time_exec_sequencer_transactions(&mut self) -> TimingGuard<'_> {
-        if let Some(ref prom_metrics) = self.prometheus_metrics {
-            TimingGuard::new_with_prometheus(
+        match &self.prometheus_metrics {
+            Some(prom_metrics) => TimingGuard::new_with_prometheus(
                 &mut self.metrics.build.exec_sequencer_transactions,
                 &prom_metrics.build_exec_sequencer_transactions,
-            )
-        } else {
-            TimingGuard::new(&mut self.metrics.build.exec_sequencer_transactions)
+            ),
+            None => TimingGuard::new(&mut self.metrics.build.exec_sequencer_transactions),
         }
     }
 
     /// Create a timing guard for recording build phase: select/pack mempool transactions.
     pub fn time_select_mempool_transactions(&mut self) -> TimingGuard<'_> {
-        if let Some(ref prom_metrics) = self.prometheus_metrics {
-            TimingGuard::new_with_prometheus(
+        match &self.prometheus_metrics {
+            Some(prom_metrics) => TimingGuard::new_with_prometheus(
                 &mut self.metrics.build.select_mempool_transactions,
                 &prom_metrics.build_select_mempool_transactions,
-            )
-        } else {
-            TimingGuard::new(&mut self.metrics.build.select_mempool_transactions)
+            ),
+            None => TimingGuard::new(&mut self.metrics.build.select_mempool_transactions),
         }
     }
 
     /// Create a timing guard for recording build phase: execute mempool transactions.
     pub fn time_exec_mempool_transactions(&mut self) -> TimingGuard<'_> {
-        if let Some(ref prom_metrics) = self.prometheus_metrics {
-            TimingGuard::new_with_prometheus(
+        match &self.prometheus_metrics {
+            Some(prom_metrics) => TimingGuard::new_with_prometheus(
                 &mut self.metrics.build.exec_mempool_transactions,
                 &prom_metrics.build_exec_mempool_transactions,
-            )
-        } else {
-            TimingGuard::new(&mut self.metrics.build.exec_mempool_transactions)
+            ),
+            None => TimingGuard::new(&mut self.metrics.build.exec_mempool_transactions),
         }
     }
 
     /// Create a timing guard for recording build phase: calculate state root.
     pub fn time_calc_state_root(&mut self) -> TimingGuard<'_> {
-        if let Some(ref prom_metrics) = self.prometheus_metrics {
-            TimingGuard::new_with_prometheus(
+        match &self.prometheus_metrics {
+            Some(prom_metrics) => TimingGuard::new_with_prometheus(
                 &mut self.metrics.build.calc_state_root,
                 &prom_metrics.build_calc_state_root,
-            )
-        } else {
-            TimingGuard::new(&mut self.metrics.build.calc_state_root)
+            ),
+            None => TimingGuard::new(&mut self.metrics.build.calc_state_root),
         }
     }
 
     /// Create a timing guard for recording insert phase: validate and execute.
     pub fn time_validate_and_execute(&mut self) -> TimingGuard<'_> {
-        if let Some(ref prom_metrics) = self.prometheus_metrics {
-            TimingGuard::new_with_prometheus(
+        match &self.prometheus_metrics {
+            Some(prom_metrics) => TimingGuard::new_with_prometheus(
                 &mut self.metrics.insert.validate_and_execute,
                 &prom_metrics.insert_validate_and_execute,
-            )
-        } else {
-            TimingGuard::new(&mut self.metrics.insert.validate_and_execute)
+            ),
+            None => TimingGuard::new(&mut self.metrics.insert.validate_and_execute),
         }
     }
 
     /// Create a timing guard for recording insert phase: insert to tree.
     pub fn time_insert_to_tree(&mut self) -> TimingGuard<'_> {
-        if let Some(ref prom_metrics) = self.prometheus_metrics {
-            TimingGuard::new_with_prometheus(
+        match &self.prometheus_metrics {
+            Some(prom_metrics) => TimingGuard::new_with_prometheus(
                 &mut self.metrics.insert.insert_to_tree,
                 &prom_metrics.insert_insert_to_tree,
-            )
-        } else {
-            TimingGuard::new(&mut self.metrics.insert.insert_to_tree)
+            ),
+            None => TimingGuard::new(&mut self.metrics.insert.insert_to_tree),
         }
     }
 
@@ -388,21 +397,36 @@ impl BlockTimingContext {
         self.auto_store = auto_store;
     }
 
-    /// Calculate and update total times.
-    pub fn update_totals(&mut self) {
-        self.metrics.build.total = self.metrics.build.apply_pre_execution_changes +
+    /// Calculate total build time from individual components.
+    fn calculate_build_total(&self) -> Duration {
+        self.metrics.build.apply_pre_execution_changes +
             self.metrics.build.exec_sequencer_transactions +
             self.metrics.build.select_mempool_transactions +
             self.metrics.build.exec_mempool_transactions +
-            self.metrics.build.calc_state_root;
+            self.metrics.build.calc_state_root
+    }
 
-        self.metrics.insert.total =
-            self.metrics.insert.validate_and_execute + self.metrics.insert.insert_to_tree;
+    /// Calculate total insert time from individual components.
+    fn calculate_insert_total(&self) -> Duration {
+        self.metrics.insert.validate_and_execute + self.metrics.insert.insert_to_tree
+    }
 
-        // Also record totals to Prometheus if enabled
-        if let Some(ref prom_metrics) = self.prometheus_metrics {
+    /// Calculate and update total times.
+    ///
+    /// This method can be safely called multiple times - it will only record to Prometheus once.
+    /// The totals are recalculated each time, but Prometheus recording happens only on the first
+    /// call.
+    pub fn update_totals(&mut self) {
+        self.metrics.build.total = self.calculate_build_total();
+        self.metrics.insert.total = self.calculate_insert_total();
+
+        // Record totals to Prometheus if enabled, then consume the metrics to prevent double
+        // recording
+        if let Some(prom_metrics) = self.prometheus_metrics.take() {
             prom_metrics.build_total.record(self.metrics.build.total.as_secs_f64());
             prom_metrics.insert_total.record(self.metrics.insert.total.as_secs_f64());
+            // Note: We don't restore prometheus_metrics here because we only want to record once
+            // If metrics are needed later, they should be passed again
         }
     }
 }

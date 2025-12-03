@@ -454,7 +454,8 @@ impl<Txs> OpBuilder<'_, Txs> {
 
         // X Layer: Update timing context with actual block hash and total times
         timing_ctx.set_block_hash(block_hash);
-        timing_ctx.metrics_mut().build.total = build_start.elapsed();
+        // Note: update_totals() will calculate build.total from individual components,
+        // so we don't need to manually set it here
         timing_ctx.update_totals();
 
         // Store timing metrics for this block (will be updated with insert timing later)
