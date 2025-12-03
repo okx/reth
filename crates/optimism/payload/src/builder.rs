@@ -21,7 +21,7 @@ use reth_evm::{
 };
 use reth_execution_types::ExecutionOutcome;
 use reth_node_metrics::{
-    block_timing::{store_block_timing, BlockTimingContext},
+    block_timing::{store_block_timing, BlockTimingContext, BlockTimingPrometheusMetrics},
     transaction_trace_xlayer::{get_global_tracer, TransactionProcessId},
 };
 use reth_optimism_forks::OpHardforks;
@@ -373,11 +373,13 @@ impl<Txs> OpBuilder<'_, Txs> {
 
         let mut builder = ctx.block_builder(&mut db)?;
 
-        // X Layer: Initialize timing context with RAII
+        // X Layer: Initialize timing context with RAII and Prometheus support
         // Note: We'll get the block hash after building, so we create an empty context first
         // and update it later. For now, we use a placeholder hash.
         let build_start = Instant::now();
-        let mut timing_ctx = BlockTimingContext::new_empty(B256::ZERO);
+        let prom_metrics = BlockTimingPrometheusMetrics::default();
+        let mut timing_ctx =
+            BlockTimingContext::new_empty_with_prometheus(B256::ZERO, prom_metrics);
 
         // 1. apply pre-execution changes
         {
