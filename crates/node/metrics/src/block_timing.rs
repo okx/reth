@@ -195,10 +195,8 @@ impl<'a> TimingGuard<'a> {
         }
     }
 
-    /// Record the elapsed duration to target and Prometheus (if enabled).
-    /// Returns `None` if already recorded.
     fn record(&mut self) -> Option<Duration> {
-        let start = self.start.take()?; // If None, already recorded
+        let start = self.start.take()?;
         let duration = start.elapsed();
         *self.target = duration;
         if let Some(histogram) = self.prometheus_histogram {
@@ -208,9 +206,7 @@ impl<'a> TimingGuard<'a> {
     }
 
     /// Manually finish timing and return the duration.
-    /// This updates the target immediately and prevents the drop handler from running.
     pub fn finish(mut self) -> Duration {
-        // Calculate duration once and use it for both recording and return
         if let Some(start) = self.start.take() {
             let duration = start.elapsed();
             *self.target = duration;
@@ -219,7 +215,6 @@ impl<'a> TimingGuard<'a> {
             }
             duration
         } else {
-            // Already recorded, return the current target value
             *self.target
         }
     }
@@ -227,7 +222,7 @@ impl<'a> TimingGuard<'a> {
 
 impl<'a> Drop for TimingGuard<'a> {
     fn drop(&mut self) {
-        let _ = self.record(); // Ignore return value, just ensure recording happens
+        let _ = self.record();
     }
 }
 
@@ -412,21 +407,13 @@ impl BlockTimingContext {
     }
 
     /// Calculate and update total times.
-    ///
-    /// This method can be safely called multiple times - it will only record to Prometheus once.
-    /// The totals are recalculated each time, but Prometheus recording happens only on the first
-    /// call.
     pub fn update_totals(&mut self) {
         self.metrics.build.total = self.calculate_build_total();
         self.metrics.insert.total = self.calculate_insert_total();
 
-        // Record totals to Prometheus if enabled, then consume the metrics to prevent double
-        // recording
         if let Some(prom_metrics) = self.prometheus_metrics.take() {
             prom_metrics.build_total.record(self.metrics.build.total.as_secs_f64());
             prom_metrics.insert_total.record(self.metrics.insert.total.as_secs_f64());
-            // Note: We don't restore prometheus_metrics here because we only want to record once
-            // If metrics are needed later, they should be passed again
         }
     }
 }
