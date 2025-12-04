@@ -181,6 +181,9 @@ members = [
     "crates/xlayer/db",
     "crates/xlayer/rpc",
     "crates/xlayer/exex",
+    "crates/op-rbuilder/crates/op-rbuilder",
+    "crates/op-rbuilder/crates/p2p",
+    "crates/op-rbuilder/crates/tdx-quote-provider",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]
@@ -428,7 +431,7 @@ reth-payload-builder-primitives = { path = "crates/payload/builder-primitives" }
 reth-payload-primitives = { path = "crates/payload/primitives" }
 reth-payload-validator = { path = "crates/payload/validator" }
 reth-payload-util = { path = "crates/payload/util" }
-reth-primitives = { path = "crates/primitives", default-features = false }
+reth-primitives = { path = "crates/primitives", default-features = false, features = ["c-kzg"] }
 reth-primitives-traits = { path = "crates/primitives-traits", default-features = false }
 reth-provider = { path = "crates/storage/provider" }
 reth-prune = { path = "crates/prune/prune" }
@@ -481,7 +484,7 @@ revm-inspector = { version = "12.0.2", default-features = false }
 revm-context = { version = "11.0.2", default-features = false }
 revm-context-interface = { version = "12.0.1", default-features = false }
 revm-database-interface = { version = "8.0.5", default-features = false }
-op-revm = { version = "12.0.2", default-features = false }
+op-revm = { version = "12.0.2", default-features = false, features = ["optional_balance_check"] }
 revm-inspectors = "0.32.0"
 
 # eth
@@ -492,7 +495,7 @@ alloy-evm = { version = "0.23.0", default-features = false }
 alloy-primitives = { version = "1.4.1", default-features = false, features = ["map-foldhash"] }
 alloy-rlp = { version = "0.3.10", default-features = false, features = ["core-net"] }
 alloy-sol-macro = "1.4.1"
-alloy-sol-types = { version = "1.4.1", default-features = false }
+alloy-sol-types = { version = "1.4.1", default-features = false, features = ["json"] }
 alloy-trie = { version = "0.9.1", default-features = false }
 
 alloy-hardforks = "0.4.4"
@@ -548,6 +551,7 @@ bytes = { version = "1.5", default-features = false }
 brotli = "8"
 cfg-if = "1.0"
 clap = "4"
+clap_builder = { version = "4.5.19" }
 dashmap = "6.0"
 derive_more = { version = "2", default-features = false, features = ["full"] }
 dirs-next = "2.0.0"
@@ -703,6 +707,7 @@ data-encoding = "2"
 delegate = "0.13"
 digest = "0.10.5"
 hash-db = "=0.15.2"
+hex = "0.4"
 hickory-resolver = "0.25.0"
 hmac = "0.12.1"
 human_bytes = "0.4.1"
@@ -739,6 +744,12 @@ vergen-git2 = "1.0.5"
 xlayer-db = { path = "crates/xlayer/db" }
 xlayer-rpc = { path = "crates/xlayer/rpc" }
 xlayer-exex = { path = "crates/xlayer/exex" }
+
+# xlayer op-rbuilder
+rollup-boost = { git = "http://github.com/okx/rollup-boost", tag = "v0.1.4" }
+op-rbuilder = { path = "crates/op-rbuilder/crates/op-rbuilder" }
+op-rbuilder-p2p = { path = "crates/op-rbuilder/crates/p2p" }
+op-rbuilder-tdx-quote-provider = { path = "crates/op-rbuilder/crates/tdx-quote-provider" }
 
 # [patch.crates-io]
 # alloy-consensus = { git = "https://github.com/alloy-rs/alloy", rev = "3049f232fbb44d1909883e154eb38ec5962f53a3" }

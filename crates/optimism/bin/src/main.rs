@@ -2,10 +2,15 @@
 
 use clap::Parser;
 use reth_apollo::{ApolloConfig, ApolloService};
+use reth_node_builder::Node;
 use reth_optimism_cli::{chainspec::OpChainSpecParser, Cli};
 use reth_optimism_node::{args::RollupArgs, OpNode};
 use tracing::info;
 
+use op_rbuilder::{
+    args::OpRbuilderArgs,
+    builders::{BuilderConfig, FlashblocksServiceBuilder},
+};
 use std::{path::Path, sync::Arc};
 use tracing::error;
 use xlayer_db::utils::initialize;
@@ -26,8 +31,9 @@ fn main() {
     }
 
     if let Err(err) =
-        Cli::<OpChainSpecParser, RollupArgs>::parse().run(async move |builder, rollup_args| {
+        Cli::<OpChainSpecParser, OpRbuilderArgs>::parse().run(async move |builder, parsed_args| {
             info!(target: "reth::cli", "Launching node");
+            let rollup_args = parsed_args.rollup_args.clone();
 
             // For X Layer
             if rollup_args.xlayer_args.apollo.enabled {
@@ -36,7 +42,47 @@ fn main() {
 
             let enable_inner_tx = rollup_args.xlayer_args.enable_inner_tx;
             let data_dir = builder.config().datadir();
-            let mut node_builder = builder.node(OpNode::new(rollup_args));
+            let op_node = OpNode::new(rollup_args);
+            if parsed_args.flashblocks.enabled {
+                let builder_config = BuilderConfig::try_from(parsed_args.clone())
+                    .expect("Failed to convert builder args to builder config");
+                let components =
+                    op_node.components().payload(FlashblocksServiceBuilder(builder_config));
+                let mut node_builder = builder
+                    .with_types::<OpNode>()
+                    .with_components(components)
+                    .with_add_ons(op_node.add_ons());
+
+                if enable_inner_tx {
+                    // Conditionally initialize InnerTx database before consuming builder
+                    let db_path =
+                        data_dir.db().parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
+                    match initialize(db_path) {
+                        Ok(_) => info!(target: "reth::cli", "xlayer db initialized"),
+                        Err(e) => {
+                            error!(target: "reth::cli", "xlayer db failed to initialize {:#?}", e)
+                        }
+                    }
+
+                    node_builder = node_builder
+                        .extend_rpc_modules(move |ctx| {
+                            let new_op_eth_api = ctx.registry.eth_api().clone();
+                            let custom_rpc = XlayerExt { backend: Arc::new(new_op_eth_api) };
+                            ctx.modules.merge_configured(custom_rpc.into_rpc())?;
+                            info!(target:"reth::cli", "xlayer innertx rpc enabled");
+                            Ok(())
+                        })
+                        .install_exex(
+                            "post_exec_exex",
+                            |ctx| async move { Ok(post_exec_exex(ctx)) },
+                        );
+                }
+
+                let handle = node_builder.launch_with_debug_capabilities().await?;
+                return handle.node_exit_future.await;
+            }
+
+            let mut node_builder = builder.node(op_node);
 
             if enable_inner_tx {
                 // Conditionally initialize InnerTx database before consuming builder

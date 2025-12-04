@@ -10,6 +10,8 @@ exclude.workspace = true
 
 [dependencies]
 reth-cli-util.workspace = true
+reth-node-builder.workspace = true
+reth-node-api.workspace = true
 reth-optimism-cli.workspace = true
 reth-optimism-rpc.workspace = true
 reth-optimism-node.workspace = true
@@ -29,6 +31,9 @@ xlayer-rpc.workspace = true
 reth-rpc.workspace = true
 xlayer-exex.workspace = true
 xlayer-db.workspace = true
+
+# xlayer flashblocks
+op-rbuilder.workspace = true
 
 [lints]
 workspace = true
