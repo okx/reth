@@ -14483,7 +14483,7 @@ dependencies = [
 [[package]]
 name = "rollup-boost"
 version = "0.1.0"
-source = "git+http://github.com/okx/rollup-boost?tag=v0.1.4#5fb3883527cfd2b082ab2fab283ffa1fb9885be0"
+source = "git+https://github.com/okx/rollup-boost?tag=v0.1.4#5fb3883527cfd2b082ab2fab283ffa1fb9885be0"
 dependencies = [
  "alloy-primitives 1.4.1",
  "alloy-rpc-types-engine",

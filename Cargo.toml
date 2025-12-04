@@ -746,7 +746,7 @@ xlayer-rpc = { path = "crates/xlayer/rpc" }
 xlayer-exex = { path = "crates/xlayer/exex" }
 
 # xlayer op-rbuilder
-rollup-boost = { git = "http://github.com/okx/rollup-boost", tag = "v0.1.4" }
+rollup-boost = { git = "https://github.com/okx/rollup-boost", tag = "v0.1.4" }
 op-rbuilder = { path = "crates/op-rbuilder/crates/op-rbuilder" }
 op-rbuilder-p2p = { path = "crates/op-rbuilder/crates/p2p" }
 op-rbuilder-tdx-quote-provider = { path = "crates/op-rbuilder/crates/tdx-quote-provider" }
