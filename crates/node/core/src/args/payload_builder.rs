@@ -41,7 +41,7 @@ impl Default for PayloadBuilderArgs {
     fn default() -> Self {
         Self {
             extra_data: default_extra_data(),
-            interval: Duration::from_secs(1),
+            interval: Duration::from_secs(1000),
             gas_limit: None,
             deadline: SLOT_DURATION,
             max_payload_tasks: 3,

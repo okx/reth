@@ -131,7 +131,13 @@ impl<T: PayloadTypes> PayloadBuilderHandle<T> {
         attr: T::PayloadBuilderAttributes,
     ) -> Receiver<Result<PayloadId, PayloadBuilderError>> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.to_service.send(PayloadServiceCommand::BuildNewPayload(attr, tx));
+        let ret = self.to_service.send(PayloadServiceCommand::BuildNewPayload(attr, tx));
+        match ret {
+            Ok(_) => {},
+            Err(payload_err) => {
+                eprintln!("payload error: {payload_err:?}");
+            }
+        }
         rx
     }
 

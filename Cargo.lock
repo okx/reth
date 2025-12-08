@@ -9857,6 +9857,7 @@ name = "reth-optimism-node"
 version = "1.9.2"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-genesis",
  "alloy-network",
  "alloy-primitives",
@@ -9891,6 +9892,7 @@ dependencies = [
  "reth-optimism-storage",
  "reth-optimism-txpool",
  "reth-payload-builder",
+ "reth-payload-primitives",
  "reth-payload-util",
  "reth-primitives-traits",
  "reth-provider",

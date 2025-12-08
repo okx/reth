@@ -2003,6 +2003,118 @@ mod forkchoice_updated_tests {
 }
 
 #[test]
+fn test_fcu_with_real_provider() {
+    use reth_chainspec::{EthereumHardfork};
+    use reth_chainspec::EthChainSpec;
+    use reth_payload_primitives::EngineApiMessageVersion;
+    use reth_node_ethereum::EthEvmConfig;
+    use alloy_rpc_types_engine::PayloadAttributes;
+    use alloy_primitives::Address;
+
+    reth_tracing::init_test_tracing();
+
+    let mut chain_spec = Arc::try_unwrap(DEV.clone())
+        .unwrap_or_else(|arc| (*arc).clone());
+    chain_spec.hardforks.remove(&EthereumHardfork::Cancun);
+    chain_spec.hardforks.remove(&EthereumHardfork::Shanghai);
+    chain_spec.hardforks.remove(&EthereumHardfork::Prague);
+
+    let chain_spec = Arc::new(chain_spec);
+    let genesis_hash = chain_spec.genesis_hash();
+
+    let provider_factory = create_test_provider_factory_with_chain_spec(Arc::clone(&chain_spec));
+    
+    init_genesis(&provider_factory).expect("Failed to initialize genesis");
+    
+    let provider = BlockchainProvider::new(provider_factory.clone())
+        .expect("Failed to create BlockchainProvider");
+
+    let consensus = Arc::new(EthBeaconConsensus::new(Arc::clone(&chain_spec)));
+    let payload_validator = MockEngineValidator;
+
+    let (from_tree_tx, _from_tree_rx) = unbounded_channel();
+
+    let genesis_header = chain_spec.genesis_header().clone();
+    let sealed_genesis_header = SealedHeader::seal_slow(genesis_header);
+    let engine_api_tree_state =
+        EngineApiTreeState::new(10, 10, sealed_genesis_header.num_hash(), EngineApiKind::Ethereum);
+    let canonical_in_memory_state = CanonicalInMemoryState::with_head(
+        sealed_genesis_header.clone(),
+        None,
+        None,
+    );
+
+    let (action_tx, _action_rx) = channel();
+    let persistence_handle = PersistenceHandle::new(action_tx);
+
+    let (to_payload_service, _payload_command_rx) = unbounded_channel();
+    let payload_builder = PayloadBuilderHandle::new(to_payload_service);
+    payload_builder.spawn_payload_builder_service();
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+
+    let engine_validator = BasicEngineValidator::new(
+        provider.clone(),
+        consensus.clone(),
+        evm_config.clone(),
+        payload_validator,
+        TreeConfig::default(),
+        Box::new(NoopInvalidBlockHook::default()),
+    );
+
+    let mut tree = EngineApiTreeHandler::new(
+        provider.clone(),
+        consensus,
+        engine_validator,
+        from_tree_tx,
+        engine_api_tree_state,
+        canonical_in_memory_state,
+        persistence_handle,
+        PersistenceState::default(),
+        payload_builder,
+        TreeConfig::default()
+            .with_legacy_state_root(false)
+            .with_has_enough_parallelism(true),
+        EngineApiKind::Ethereum,
+        evm_config,
+    );
+
+    let fcu_state = ForkchoiceState {
+        head_block_hash: genesis_hash,
+        safe_block_hash: genesis_hash,
+        finalized_block_hash: genesis_hash,
+    };
+
+    let genesis_timestamp = chain_spec.genesis_header().timestamp;
+    let payload_attrs = Some(PayloadAttributes {
+        timestamp: genesis_timestamp + 12, // 12 seconds after genesis
+        prev_randao: B256::random(),
+        suggested_fee_recipient: Address::random(),
+        withdrawals: None,
+        parent_beacon_block_root: None,
+    });
+
+    let mut outcome = tree
+        .on_forkchoice_updated(fcu_state, payload_attrs, EngineApiMessageVersion::default())
+        .expect("Failed to process forkchoice update");
+
+    println!("outcome: {outcome:?}");
+
+    // let rt = tokio::runtime::Builder::new_current_thread()
+    //     .enable_all()
+    //     .build()
+    //     .unwrap();
+    // rt.block_on(tokio::time::sleep(tokio::time::Duration::from_secs(86400)));
+    std::thread::sleep(std::time::Duration::from_secs(86400));
+
+    // let fcu_result = outcome.outcome.await.expect("Failed to await forkchoice result");
+    // assert!(
+    //     fcu_result.payload_status.is_valid() || fcu_result.payload_status.is_syncing(),
+    //     "Forkchoice update should be valid or syncing, got: {:?}",
+    //     fcu_result.payload_status
+    // );
+}
+
+#[test]
 fn test_state_root_calculation_with_real_provider() {
     reth_tracing::init_test_tracing();
     use reth_chainspec::{ChainSpec, ChainSpecBuilder, EthereumHardfork};

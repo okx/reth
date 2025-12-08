@@ -7,5 +7,6 @@ mod p2p;
 mod pool;
 mod rpc;
 mod utils;
+mod engine;
 
 const fn main() {}

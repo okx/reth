@@ -58,7 +58,10 @@ where
         PayloadAttributesBuilder<<<N as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes>,
 {
     E2ETestSetupBuilder::new(num_nodes, chain_spec, attributes_generator)
-        .with_node_config_modifier(move |config| config.set_dev(is_dev))
+        .with_node_config_modifier(move |mut config| {
+            config.set_dev(is_dev)
+
+        })
         .build()
         .await
 }
