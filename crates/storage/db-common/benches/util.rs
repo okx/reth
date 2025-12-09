@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 use tempdir::TempDir;
 use rand::prelude::*;
 use rand::RngCore;
-use alloy_primitives::{Address, StorageKey, StorageValue, U256};
+use alloy_primitives::{Address, StorageKey, StorageValue, U256, B256};
+use reth_primitives_traits::{Account, StorageEntry};
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use triedb::{
-    account::Account,
+    account::Account as TrieDBAccount,
     path::{AddressPath, StoragePath},
     transaction::TransactionError,
     Database,
@@ -16,6 +17,8 @@ use std::{
     thread,
     time::Duration,
 };
+use std::collections::HashMap;
+
 pub const BATCH_SIZE: usize = 10_000;
 
 pub fn generate_random_address(rng: &mut StdRng) -> AddressPath {
@@ -45,40 +48,25 @@ pub fn get_flat_trie_database(
     fallback_eoa_size: usize,
     fallback_contract_size: usize,
     fallback_storage_per_contract: usize,
-) -> FlatTrieDatabase {
-    let base_dir = std::env::var("BASE_DIR").ok();
-    if let Some(base_dir) = base_dir {
-        let file_name =
-            std::env::var("FILE_NAME").expect("FILE_NAME must be set when using BASE_DIR");
-        let main_file_name = file_name.to_string();
-        let meta_file_name = format!("{file_name}.meta");
-        let file_name_path = Path::new(&base_dir).join(&main_file_name);
-        let meta_file_name_path = Path::new(&base_dir).join(&meta_file_name);
+    overlay_size: usize,
+) -> (FlatTrieDatabase,(HashMap<Address, Account>, HashMap<Address, HashMap<B256, U256>>) ){
 
-        return FlatTrieDatabase {
-            _base_dir: None,
-            main_file_name,
-            meta_file_name,
-            file_name_path,
-            meta_file_name_path,
-        };
-    }
     let dir = TempDir::new("triedb_bench_base").unwrap();
 
     let main_file_name_path = dir.path().join("triedb");
     let meta_file_name_path = dir.path().join("triedb.meta");
     let db = Database::create_new(&main_file_name_path).unwrap();
 
-    setup_database(&db, fallback_eoa_size, fallback_contract_size, fallback_storage_per_contract)
+    let ret = setup_database(&db, fallback_eoa_size, fallback_contract_size, fallback_storage_per_contract, overlay_size)
         .unwrap();
 
-    FlatTrieDatabase {
+    (FlatTrieDatabase {
         _base_dir: Some(dir),
         main_file_name: "triedb".to_string(),
         file_name_path: main_file_name_path,
         meta_file_name: "triedb.meta".to_string(),
         meta_file_name_path,
-    }
+    }, ret)
 }
 
 fn setup_database(
@@ -86,43 +74,208 @@ fn setup_database(
     eoa_count: usize,
     contract_count: usize,
     storage_per_contract: usize,
-) -> Result<(), TransactionError> {
-    // Populate database with initial accounts
-    let mut eoa_rng = StdRng::seed_from_u64(SEED_EOA);
-    let mut contract_rng = StdRng::seed_from_u64(SEED_CONTRACT);
+    overlay_size: usize,
+) -> Result<(HashMap<Address, Account>, HashMap<Address, HashMap<B256, U256>>), TransactionError> {
+    // Generate shared test data (overlay not used, so pass 0)
+    let (addresses, accounts_map, storage_map, overlay_acct, overlay_storage) = generate_shared_test_data(
+        eoa_count,
+        contract_count,
+        storage_per_contract,
+        overlay_size, // overlay_count not used
+    );
     {
         let mut tx = db.begin_rw()?;
-        for i in 1..=eoa_count {
-            let address = generate_random_address(&mut eoa_rng);
-            let account =
-                Account::new(i as u64, U256::from(i as u64), EMPTY_ROOT_HASH, KECCAK_EMPTY);
 
-            tx.set_account(address, Some(account))?;
+        // Set accounts from the generated data
+        for address in &addresses {
+            if let Some(account) = accounts_map.get(address) {
+                let address_path = AddressPath::for_address(*address);
+                let trie_account = TrieDBAccount::new(
+                    account.nonce,
+                    account.balance,
+                    EMPTY_ROOT_HASH,
+                    KECCAK_EMPTY,
+                );
+                tx.set_account(address_path, Some(trie_account))?;
+            }
         }
 
-        for i in 1..=contract_count {
-            let address = generate_random_address(&mut contract_rng);
-            let account =
-                Account::new(i as u64, U256::from(i as u64), EMPTY_ROOT_HASH, KECCAK_EMPTY);
-
-            tx.set_account(address.clone(), Some(account))?;
-
-            // add random storage to each account
-            for key in 1..=storage_per_contract {
-                let storage_key = StorageKey::from(U256::from(key));
-                let storage_path =
-                    StoragePath::for_address_path_and_slot(address.clone(), storage_key);
-                let storage_value =
-                    StorageValue::from_be_slice(storage_path.get_slot().pack().as_slice());
-
-                tx.set_storage_slot(storage_path, Some(storage_value))?;
+        // Set storage from the generated data (only for contracts)
+        for (address, storage) in &storage_map {
+            let address_path = AddressPath::for_address(*address);
+            for (storage_key, storage_value) in storage {
+                let storage_path = StoragePath::for_address_path_and_slot(
+                    address_path.clone(),
+                    StorageKey::from(*storage_key),
+                );
+                let storage_value_triedb = StorageValue::from_be_slice(
+                    storage_path.get_slot().pack().as_slice()
+                );
+                tx.set_storage_slot(storage_path, Some(storage_value_triedb))?;
             }
         }
 
         tx.commit()?;
     }
 
-    Ok(())
+    Ok((overlay_acct, overlay_storage))
+}
+
+// Helper function to generate shared test data using alloy primitives
+pub fn generate_shared_test_data(
+    eoa_count: usize,
+    contract_count: usize,
+    storage_per_contract: usize,
+    overlay_count: usize, // total number of overlay addresses (can include duplicates and new ones)
+) -> (
+    Vec<Address>, // all base addresses (EOA + contracts)
+    HashMap<Address, Account>, // base accounts map
+    HashMap<Address, HashMap<B256, U256>>, // base storage map: address -> storage_key -> value
+    HashMap<Address, Account>, // overlay accounts map (can have duplicates with base + new addresses)
+    HashMap<Address, HashMap<B256, U256>>, // overlay storage map
+) {
+    let mut rng = StdRng::seed_from_u64(SEED_CONTRACT);
+
+    // Generate EOA addresses
+    let eoa_addresses: Vec<Address> = (0..eoa_count).map(|_| {
+        let mut addr_bytes = [0u8; 20];
+        rng.fill(&mut addr_bytes);
+        Address::from_slice(&addr_bytes)
+    }).collect();
+
+    // Generate contract addresses
+    let contract_addresses: Vec<Address> = (0..contract_count).map(|_| {
+        let mut addr_bytes = [0u8; 20];
+        rng.fill(&mut addr_bytes);
+        Address::from_slice(&addr_bytes)
+    }).collect();
+
+    // Combine all base addresses
+    let mut addresses = eoa_addresses.clone();
+    addresses.extend(contract_addresses.clone());
+
+    // Generate base accounts map
+    let mut accounts_map = HashMap::new();
+    for (i, address) in addresses.iter().enumerate() {
+        let account = Account {
+            nonce: i as u64,
+            balance: U256::from(i as u64),
+            bytecode_hash: if contract_addresses.contains(address) {
+                // Contracts have bytecode hash
+                Some(EMPTY_ROOT_HASH)
+            } else {
+                // EOAs have no bytecode
+                None
+            },
+        };
+        accounts_map.insert(*address, account);
+    }
+
+    // Generate base storage map (only for contracts)
+    let mut storage_map: HashMap<Address, HashMap<B256, U256>> = HashMap::new();
+    for address in &contract_addresses {
+        let mut contract_storage = HashMap::new();
+        for key in 1..=storage_per_contract {
+            let storage_key = B256::from(U256::from(key));
+            let storage_value = U256::from(key);
+            contract_storage.insert(storage_key, storage_value);
+        }
+        storage_map.insert(*address, contract_storage);
+    }
+
+    // Generate overlay states
+    // Some addresses can be duplicates (updates to existing), some can be new
+    let mut overlay_accounts_map = HashMap::new();
+    let mut overlay_storage_map: HashMap<Address, HashMap<B256, U256>> = HashMap::new();
+
+    for i in 0..overlay_count {
+        // Randomly decide: duplicate existing address or new address
+        let address = if rng.gen_bool(0.5) && !addresses.is_empty() {
+            // 50% chance to update existing account
+            addresses[rng.gen_range(0..addresses.len())]
+        } else {
+            // 50% chance to create new account
+            let mut addr_bytes = [0u8; 20];
+            rng.fill(&mut addr_bytes);
+            Address::from_slice(&addr_bytes)
+        };
+
+        // Generate overlay account (with different values)
+        let overlay_account = Account {
+            nonce: (i + 1000) as u64, // different nonce
+            balance: U256::from((i + 2000) as u64), // different balance
+            bytecode_hash: if rng.gen_bool(0.3) {
+                // 30% chance to be a contract
+                Some(EMPTY_ROOT_HASH)
+            } else {
+                None
+            },
+        };
+        overlay_accounts_map.insert(address, overlay_account);
+
+        // Generate overlay storage (only for contracts)
+        if overlay_account.bytecode_hash.is_some() {
+            let mut contract_storage = HashMap::new();
+
+            // Random number of storage changes (max half of storage_per_contract)
+            let max_changes = (storage_per_contract / 2).max(1);
+            let num_changes = rng.gen_range(1..=max_changes);
+
+            // Get existing storage if this address exists in base storage_map
+            let existing_storage = storage_map.get(&address);
+
+            for _ in 0..num_changes {
+                let change_type = rng.gen_range(0..3); // 0: new, 1: delete, 2: update
+
+                match change_type {
+                    0 => {
+                        // New storage slot
+                        let storage_key = B256::from(U256::from(rng.gen_range(1000..2000)));
+                        let storage_value = U256::from(rng.gen_range(5000..10000));
+                        contract_storage.insert(storage_key, storage_value);
+                    }
+                    1 => {
+                        // Delete existing storage (value = 0)
+                        if let Some(existing) = existing_storage {
+                            if !existing.is_empty() {
+                                let keys: Vec<B256> = existing.keys().copied().collect();
+                                if !keys.is_empty() {
+                                    let key_to_delete = keys[rng.gen_range(0..keys.len())];
+                                    contract_storage.insert(key_to_delete, U256::ZERO);
+                                }
+                            }
+                        }
+                    }
+                    2 => {
+                        // Update existing storage
+                        if let Some(existing) = existing_storage {
+                            if !existing.is_empty() {
+                                let keys: Vec<B256> = existing.keys().copied().collect();
+                                if !keys.is_empty() {
+                                    let key_to_update = keys[rng.gen_range(0..keys.len())];
+                                    let new_value = U256::from(rng.gen_range(10000..20000));
+                                    contract_storage.insert(key_to_update, new_value);
+                                }
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            if !contract_storage.is_empty() {
+                overlay_storage_map.insert(address, contract_storage);
+            }
+        }
+    }
+
+    (
+        addresses,
+        accounts_map,
+        storage_map,
+        overlay_accounts_map,
+        overlay_storage_map,
+    )
 }
 
 pub fn copy_files(from: &FlatTrieDatabase, to: &Path) -> Result<(), io::Error> {

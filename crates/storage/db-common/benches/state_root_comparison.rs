@@ -2,7 +2,7 @@
 
 mod util;
 
-use alloy_primitives::{keccak256,Address, B256, U256};
+use alloy_primitives::{keccak256, Address, StorageKey, StorageValue, B256, U256};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::prelude::*;
 use rand::{Rng, SeedableRng};
@@ -15,15 +15,17 @@ use reth_provider::{
     DatabaseProviderFactory, DBProvider, HashingWriter, ProviderFactory, TrieWriter,
 };
 use reth_storage_api::{StateRootProvider, TrieWriter as _};
-use reth_trie::{HashedPostState, StateRoot as StateRootComputer};
+use reth_trie::{HashedPostState, HashedStorage, StateRoot as StateRootComputer};
 use reth_trie_db::DatabaseHashedCursorFactory;
 use reth_trie::{StateRootTrieDb, TrieExtDatabase};
 use std::path::PathBuf;
 use std::time::Duration;
+use alloy_primitives::map::{B256Map, HashMap};
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use tempdir::TempDir;
 use triedb::overlay::{OverlayStateMut, OverlayValue};
 use triedb::{path::AddressPath, account::Account as TrieDBAccount, Database};
+use triedb::path::StoragePath;
 use reth_db_common::init::compute_state_root;
 use reth_db_common::init_triedb::calculate_state_root_with_triedb;
 use crate::util::{get_flat_trie_database, copy_files, DEFAULT_SETUP_DB_CONTRACT_SIZE, DEFAULT_SETUP_DB_EOA_SIZE, DEFAULT_SETUP_DB_STORAGE_PER_CONTRACT, SEED_CONTRACT, BATCH_SIZE, generate_random_address};
@@ -130,33 +132,57 @@ pub fn bench_state_root_comparison(c: &mut Criterion) {
 
     group.finish();
 }
-
-fn bench_state_root_with_overlay(c: &mut Criterion) {
+fn bench_state_root_with_overlay_triedb(c: &mut Criterion) {
     let mut group = c.benchmark_group("state_root_with_overlay");
-    let base_dir = get_flat_trie_database(
+    let (base_dir, (overlay_acct, overlay_storage)) = get_flat_trie_database(
         DEFAULT_SETUP_DB_EOA_SIZE,
         DEFAULT_SETUP_DB_CONTRACT_SIZE,
         DEFAULT_SETUP_DB_STORAGE_PER_CONTRACT,
+        BATCH_SIZE
     );
     let dir = TempDir::new("triedb_bench_state_root_with_overlay").unwrap();
     let file_name = base_dir.main_file_name.clone();
     copy_files(&base_dir, dir.path()).unwrap();
 
-    let mut rng = StdRng::seed_from_u64(SEED_CONTRACT);
-    let addresses: Vec<AddressPath> =
-        (0..BATCH_SIZE).map(|_| generate_random_address(&mut rng)).collect();
-
+    // Generate overlay from the returned overlay data (accounts + storage)
     let mut account_overlay_mut = OverlayStateMut::new();
-    addresses.iter().enumerate().for_each(|(i, addr)| {
-        let new_account =
-            TrieDBAccount::new(i as u64, U256::from(i as u64), EMPTY_ROOT_HASH, KECCAK_EMPTY);
-        account_overlay_mut.insert(addr.clone().into(), Some(OverlayValue::Account(new_account)));
-    });
+
+    // Add account overlays
+    for (address, account) in &overlay_acct {
+        let address_path = AddressPath::for_address(*address);
+        let trie_account = TrieDBAccount::new(
+            account.nonce,
+            account.balance,
+            EMPTY_ROOT_HASH,
+            KECCAK_EMPTY,
+        );
+        account_overlay_mut.insert(address_path.clone().into(), Some(OverlayValue::Account(trie_account)));
+    }
+
+    // Add storage overlays
+    for (address, storage) in &overlay_storage {
+        let address_path = AddressPath::for_address(*address);
+        for (storage_key, storage_value) in storage {
+            let storage_path = StoragePath::for_address_path_and_slot(
+                address_path.clone(),
+                StorageKey::from(*storage_key),
+            );
+            account_overlay_mut.insert(
+                storage_path.clone().into(),
+                Some(OverlayValue::Storage(StorageValue::from_be_slice(
+                    storage_path.get_slot().pack().as_slice()
+                ))),
+            );
+        }
+    }
+
     let account_overlay = account_overlay_mut.freeze();
 
-    group.throughput(criterion::Throughput::Elements(BATCH_SIZE as u64));
+    let overlay_count = overlay_acct.len() + overlay_storage.values().map(|s| s.len()).sum::<usize>();
+
+    group.throughput(criterion::Throughput::Elements(overlay_count as u64));
     group.measurement_time(Duration::from_secs(30));
-    group.bench_function(BenchmarkId::new("state_root_with_account_overlay", BATCH_SIZE), |b| {
+    group.bench_function(BenchmarkId::new("state_root_with_overlay_triedb", overlay_count), |b| {
         b.iter_with_setup(
             || {
                 let db_path = dir.path().join(&file_name);
@@ -165,7 +191,6 @@ fn bench_state_root_with_overlay(c: &mut Criterion) {
             |db| {
                 let tx = db.begin_ro().unwrap();
 
-                // Compute the root hash with the overlay
                 let _root_result = tx.compute_root_with_overlay(account_overlay.clone()).unwrap();
 
                 tx.commit().unwrap();
@@ -174,45 +199,90 @@ fn bench_state_root_with_overlay(c: &mut Criterion) {
     });
 
     group.finish();
-
 }
 
-fn bench_state_root_mdbx_with_overlay(c: &mut Criterion) {
+fn bench_state_root_with_overlay_mdbx(c: &mut Criterion) {
+    let mut group = c.benchmark_group("state_root_mdbx_with_overlay");
+
+    // Generate random data and overlay
+    let (addresses, accounts_map, storage_map, overlay_acct, overlay_storage) =
+        util::generate_shared_test_data(
+            DEFAULT_SETUP_DB_EOA_SIZE, // eoa_count
+            DEFAULT_SETUP_DB_CONTRACT_SIZE, // contract_count
+            DEFAULT_SETUP_DB_STORAGE_PER_CONTRACT,
+            BATCH_SIZE, // overlay_count
+        );
+
+    // Write base data into database using provider_rw
     let provider_factory = create_test_provider_factory_with_chain_spec(MAINNET.clone());
+    {
+        let mut provider_rw = provider_factory.provider_rw().unwrap();
+
+        // Convert base accounts to vector format
+        let accounts: Vec<(Address, Account)> = accounts_map.into_iter().collect();
+        let storage_entries: Vec<(Address, Vec<StorageEntry>)> = storage_map.into_iter()
+            .map(|(address, storage)| {
+                let entries: Vec<StorageEntry> = storage.into_iter()
+                    .map(|(key, value)| StorageEntry { key, value })
+                    .collect();
+                (address, entries)
+            })
+            .collect();
+
+        let accounts_for_hashing = accounts.iter().map(|(address, account)| (*address, Some(*account)));
+        provider_rw.insert_account_for_hashing(accounts_for_hashing).unwrap();
+        provider_rw.insert_storage_for_hashing(storage_entries).unwrap();
+        provider_rw.commit().unwrap();
+    }
+
+    // Create HashedPostState from overlay data
+    let mut hashed_accounts: Vec<(B256, Option<Account>)> = overlay_acct.iter()
+        .map(|(address, account)| {
+            let hashed = keccak256(address);
+            (hashed, Some(*account))
+        })
+        .collect();
+
+    // Build HashedStorage for overlay storage
+    let mut hashed_storages: B256Map<HashedStorage> = HashMap::default();
+    for (address, storage) in &overlay_storage {
+        let hashed_address = keccak256(address);
+        let hashed_storage = HashedStorage::from_iter(
+            false, // wiped = false
+            storage.iter().map(|(key, value)| {
+                // key is a raw storage slot (B256), need to hash it
+                let hashed_slot = keccak256(*key);
+                (hashed_slot, *value)
+            }),
+        );
+        hashed_storages.insert(hashed_address, hashed_storage);
+    }
+
+    let hashed_state = HashedPostState {
+        accounts: hashed_accounts.into_iter().collect(),
+        storages: hashed_storages,
+    };
+
+    // Use provider_ro for state_root_with_updates
     let db_provider_ro = provider_factory.database_provider_ro().unwrap();
     let latest_ro = LatestStateProvider::new(db_provider_ro);
-    let mut rng = rand::thread_rng();
-    let hashed_accounts: Vec<(B256, Option<Account>)> = (0..1000).map(|_| {
-        let mut addr = [0u8; 20];
-        rng.fill(&mut addr);
-        let hashed = keccak256(addr);
-        let acct = Account {
-            nonce: rng.gen_range(0..=u64::MAX),
-            balance: U256::from(rng.gen_range(0u128..=u128::MAX)),
-            bytecode_hash: {
-                let mut hash_bytes = [0u8; 32];
-                rng.fill(&mut hash_bytes);
-                Some(B256::from(hash_bytes))
-            },
-        };
-        (hashed, Some(acct))
-    }).collect();
-    let hashed_state = HashedPostState::default().with_accounts(hashed_accounts);
-    c.bench_with_input(
-        BenchmarkId::new("bench_state_root_mdbx_with_overlay", 1000),
-        &hashed_state,
-        |b, hs| {
-            b.iter(|| {
-                let _ = latest_ro.state_root_with_updates(hs.clone());
-            })
-        },
-    );
-}
 
+    let overlay_count = overlay_acct.len() + overlay_storage.values().map(|s| s.len()).sum::<usize>();
+
+    group.throughput(criterion::Throughput::Elements(overlay_count as u64));
+    group.measurement_time(Duration::from_secs(30));
+    group.bench_function(BenchmarkId::new("state_root_with_overlay_mdbx", overlay_count), |b| {
+        b.iter(|| {
+            let _ = latest_ro.state_root_with_updates(hashed_state.clone());
+        })
+    });
+
+    group.finish();
+}
 
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_state_root_comparison, bench_state_root_with_overlay, bench_state_root_mdbx_with_overlay
+    targets = bench_state_root_comparison, bench_state_root_with_overlay_triedb, bench_state_root_with_overlay_mdbx
 }
 criterion_main!(benches);
