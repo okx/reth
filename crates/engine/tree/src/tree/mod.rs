@@ -1370,14 +1370,14 @@ where
             }
         }
 
-        if !self.persistence_state.in_progress() {
-            if let Some(new_tip_num) = self.find_disk_reorg()? {
-                self.remove_blocks(new_tip_num)
-            } else if self.should_persist() {
-                let blocks_to_persist = self.get_canonical_blocks_to_persist()?;
-                self.persist_blocks(blocks_to_persist);
-            }
-        }
+        // if !self.persistence_state.in_progress() {
+        //     if let Some(new_tip_num) = self.find_disk_reorg()? {
+        //         self.remove_blocks(new_tip_num)
+        //     } else if self.should_persist() {
+        //         let blocks_to_persist = self.get_canonical_blocks_to_persist()?;
+        //         self.persist_blocks(blocks_to_persist);
+        //     }
+        // }
 
         Ok(())
     }

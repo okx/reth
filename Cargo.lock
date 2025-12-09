@@ -8147,6 +8147,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-genesis",
  "alloy-primitives",
+ "alloy-trie 0.9.1",
  "boyer-moore-magiclen",
  "codspeed-criterion-compat",
  "eyre",
@@ -8172,6 +8173,7 @@ dependencies = [
  "tempdir",
  "thiserror 2.0.17",
  "tracing",
+ "triedb",
 ]
 
 [[package]]

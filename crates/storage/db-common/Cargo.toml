@@ -58,6 +58,8 @@ reth-storage-api.workspace = true
 tempdir = "0.3.7"
 rand = "0.8"
 criterion = { workspace = true }
+triedb.workspace = true
+alloy-trie.workspace = true
 
 [[bench]]
 name = "state_root_comparison"
