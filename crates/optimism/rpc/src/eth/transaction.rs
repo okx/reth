@@ -1,8 +1,7 @@
 //! Loads and formats OP transaction RPC response.
 
 use crate::{OpEthApi, OpEthApiError, SequencerClient};
-use alloy_consensus::transaction::TxHashRef;
-use alloy_consensus::BlockHeader;
+use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_eth::TransactionInfo;
 use futures::StreamExt;
@@ -179,8 +178,8 @@ where
 
             if tx_receipt.is_none() {
                 // if flashblocks are supported, attempt to find id from the pending block
-                if let Ok(Some(pending_block)) = this.pending_flashblock().await
-                    && let Some(Ok(receipt)) = pending_block
+                if let Ok(Some(pending_block)) = this.pending_flashblock().await &&
+                    let Some(Ok(receipt)) = pending_block
                         .find_and_convert_transaction_receipt(hash, this.tx_resp_builder())
                 {
                     return Ok(Some(receipt));
