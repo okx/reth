@@ -79,7 +79,6 @@ pub trait EthBlocks: LoadBlock<RpcConvert: RpcConvert<Primitives = Self::Primiti
                 if let Some(pending) = self.local_pending_block().await? {
                     return Ok(Some(pending.block.body().transaction_count()));
                 }
-                return Ok(None); // no local pending block
             }
 
             let block_hash = match self
