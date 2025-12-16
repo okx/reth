@@ -57,7 +57,10 @@ pub fn get_flat_trie_database(
     let meta_file_name_path = dir.path().join("triedb.meta");
     let db = Database::create_new(&main_file_name_path).unwrap();
 
-    let ret = setup_database(&db, fallback_eoa_size, fallback_contract_size, fallback_storage_per_contract, overlay_size)
+    let (addresses, accounts_map, storage_map, overlay_acct, overlay_storage) =
+        generate_shared_test_data(fallback_eoa_size, fallback_contract_size, fallback_storage_per_contract, overlay_size);
+
+    let ret = setup_tdb_database(&db, &addresses, &accounts_map, &storage_map)
         .unwrap();
 
     (FlatTrieDatabase {
@@ -66,50 +69,42 @@ pub fn get_flat_trie_database(
         file_name_path: main_file_name_path,
         meta_file_name: "triedb.meta".to_string(),
         meta_file_name_path,
-    }, ret)
+    }, (overlay_acct, overlay_storage  ))
 }
-
-fn setup_database(
+pub fn setup_tdb_database(
     db: &Database,
-    eoa_count: usize,
-    contract_count: usize,
-    storage_per_contract: usize,
-    overlay_size: usize,
-) -> Result<(HashMap<Address, Account>, HashMap<Address, HashMap<B256, U256>>), TransactionError> {
-    // Generate shared test data (overlay not used, so pass 0)
-    let (addresses, accounts_map, storage_map, overlay_acct, overlay_storage) = generate_shared_test_data(
-        eoa_count,
-        contract_count,
-        storage_per_contract,
-        overlay_size, // overlay_count not used
-    );
+    addresses: &[Address],
+    accounts_map: &HashMap<Address, Account>,
+    storage_map: &HashMap<Address, HashMap<B256, U256>>,
+) -> Result<(), TransactionError> {
     {
         let mut tx = db.begin_rw()?;
 
-        // Set accounts from the generated data
-        for address in &addresses {
+        // Set accounts from the provided data
+        for address in addresses {
             if let Some(account) = accounts_map.get(address) {
                 let address_path = AddressPath::for_address(*address);
                 let trie_account = TrieDBAccount::new(
                     account.nonce,
                     account.balance,
                     EMPTY_ROOT_HASH,
-                    KECCAK_EMPTY,
+                    account.bytecode_hash.unwrap_or(KECCAK_EMPTY),
                 );
                 tx.set_account(address_path, Some(trie_account))?;
             }
         }
 
-        // Set storage from the generated data (only for contracts)
-        for (address, storage) in &storage_map {
+        // Set storage from the provided data (only for contracts)
+        for (address, storage) in storage_map {
             let address_path = AddressPath::for_address(*address);
             for (storage_key, storage_value) in storage {
                 let storage_path = StoragePath::for_address_path_and_slot(
                     address_path.clone(),
                     StorageKey::from(*storage_key),
                 );
+                // Fix: Use the actual storage value, not the slot
                 let storage_value_triedb = StorageValue::from_be_slice(
-                    storage_path.get_slot().pack().as_slice()
+                    storage_value.to_be_bytes::<32>().as_slice()
                 );
                 tx.set_storage_slot(storage_path, Some(storage_value_triedb))?;
             }
@@ -118,7 +113,7 @@ fn setup_database(
         tx.commit()?;
     }
 
-    Ok((overlay_acct, overlay_storage))
+    Ok(())
 }
 
 // Helper function to generate shared test data using alloy primitives
@@ -190,31 +185,49 @@ pub fn generate_shared_test_data(
 
     for i in 0..overlay_count {
         // Randomly decide: duplicate existing address or new address
-        let address = if rng.gen_bool(0.5) && !addresses.is_empty() {
-            // 50% chance to update existing account
+        let is_existing = rng.gen_bool(0.5) && !addresses.is_empty();
+        let address = if is_existing {
+            // Update existing account (only storage, no account update)
             addresses[rng.gen_range(0..addresses.len())]
         } else {
-            // 50% chance to create new account
+            // Create new account
             let mut addr_bytes = [0u8; 20];
             rng.fill(&mut addr_bytes);
             Address::from_slice(&addr_bytes)
         };
 
-        // Generate overlay account (with different values)
-        let overlay_account = Account {
-            nonce: (i + 1000) as u64, // different nonce
-            balance: U256::from((i + 2000) as u64), // different balance
-            bytecode_hash: if rng.gen_bool(0.3) {
-                // 30% chance to be a contract
-                Some(EMPTY_ROOT_HASH)
-            } else {
-                None
-            },
-        };
-        overlay_accounts_map.insert(address, overlay_account);
+        // Only generate overlay account for newly created accounts
+        if !is_existing {
+            // Generate overlay account (with different values)
+            let overlay_account = Account {
+                nonce: (i + 1000) as u64, // different nonce
+                balance: U256::from((i + 2000) as u64), // different balance
+                bytecode_hash: if rng.gen_bool(0.3) {
+                    // 30% chance to be a contract
+                    Some(EMPTY_ROOT_HASH)
+                } else {
+                    None
+                },
+            };
+            overlay_accounts_map.insert(address, overlay_account);
+        }
 
         // Generate overlay storage (only for contracts)
-        if overlay_account.bytecode_hash.is_some() {
+        // For existing addresses, check if they're contracts in base data
+        // For new addresses, check if the overlay account is a contract
+        let is_contract = if is_existing {
+            // Check if existing address is a contract in base data
+            accounts_map.get(&address)
+                .map(|acc| acc.bytecode_hash.is_some())
+                .unwrap_or(false)
+        } else {
+            // Check if new overlay account is a contract
+            overlay_accounts_map.get(&address)
+                .map(|acc| acc.bytecode_hash.is_some())
+                .unwrap_or(false)
+        };
+
+        if is_contract {
             let mut contract_storage = HashMap::new();
 
             // Random number of storage changes (max half of storage_per_contract)
@@ -287,4 +300,49 @@ pub fn copy_files(from: &FlatTrieDatabase, to: &Path) -> Result<(), io::Error> {
         fs::copy(from_path, &to_path)?;
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_shared_test_data_single_eoa() {
+        let (addresses, accounts_map, storage_map, overlay_accounts_map, overlay_storage_map) =
+            generate_shared_test_data(1, 0, 0, 0);
+
+        // Should have exactly 1 base address (EOA)
+        assert_eq!(addresses.len(), 1, "Should have exactly 1 base address");
+
+        // Should have exactly 1 account in base accounts map
+        assert_eq!(accounts_map.len(), 1, "Should have exactly 1 account in base accounts map");
+
+        // Verify the account properties
+        let address = &addresses[0];
+        let account = accounts_map.get(address).expect("Address should exist in accounts_map");
+        assert_eq!(account.nonce, 0, "EOA should have nonce 0");
+        assert_eq!(account.balance, U256::from(0), "EOA should have balance 0");
+        assert_eq!(account.bytecode_hash, None, "EOA should have no bytecode hash");
+
+        // Storage map should be empty (no contracts)
+        assert!(storage_map.is_empty(), "Storage map should be empty when contract_count is 0");
+
+        // Overlay maps should be empty (overlay_count is 0)
+        assert!(overlay_accounts_map.is_empty(), "Overlay accounts map should be empty when overlay_count is 0");
+        assert!(overlay_storage_map.is_empty(), "Overlay storage map should be empty when overlay_count is 0");
+    }
+    #[test]
+    fn test_generate_shared_test_data_single_eoa_single_contract() {
+        let (addresses, accounts_map, storage_map, overlay_accounts_map, overlay_storage_map) =
+            generate_shared_test_data(1, 1, 0, 0);
+
+        // Should have exactly 1 base address (EOA)
+        assert_eq!(addresses.len(), 2, "Should have exactly 1 base address");
+
+        // Should have exactly 1 account in base accounts map
+        assert_eq!(accounts_map.len(), 2, "Should have exactly 1 account in base accounts map");
+
+
+    }
 }

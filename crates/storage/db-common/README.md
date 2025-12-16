@@ -13,3 +13,4 @@ cargo bench -p reth-db-common --features trie-db-ext --bench state_root_comparis
 ```
 
 cargo run --release -p reth-db-common --features trie-db-ext --bin state_root_runner -- traditional 100000 5
+cargo run --release -p reth-db-common --features trie-db-ext --bin state_root_overlay

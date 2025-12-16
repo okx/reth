@@ -31,7 +31,7 @@ reth-node-core.workspace = true
 reth-rpc-engine-api.workspace = true
 reth-engine-local = { workspace = true, features = ["op"] }
 reth-rpc-api.workspace = true
-
+alloy-sol-types.workspace = true
 # op-reth
 reth-optimism-payload-builder.workspace = true
 reth-optimism-evm = { workspace = true, features = ["rpc"] }
