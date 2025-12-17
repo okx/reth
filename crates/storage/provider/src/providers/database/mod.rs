@@ -49,6 +49,7 @@ mod metrics;
 
 mod chain;
 pub use chain::*;
+use crate::providers::triedb::TriedbProvider;
 
 /// A common provider that fetches data from a database or static file.
 ///
@@ -64,6 +65,8 @@ pub struct ProviderFactory<N: NodeTypesWithDB> {
     prune_modes: PruneModes,
     /// The node storage handler.
     storage: Arc<N::Storage>,
+
+    triedb_provider: TriedbProvider
 }
 
 impl<N: NodeTypes> ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>> {
@@ -79,6 +82,7 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
         db: N::DB,
         chain_spec: Arc<N::ChainSpec>,
         static_file_provider: StaticFileProvider<N::Primitives>,
+        triedb_provider: TriedbProvider
     ) -> Self {
         Self {
             db,
@@ -86,6 +90,7 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
             static_file_provider,
             prune_modes: PruneModes::default(),
             storage: Default::default(),
+            triedb_provider
         }
     }
 
@@ -127,6 +132,7 @@ impl<N: NodeTypesWithDB<DB = Arc<DatabaseEnv>>> ProviderFactory<N> {
         chain_spec: Arc<N::ChainSpec>,
         args: DatabaseArguments,
         static_file_provider: StaticFileProvider<N::Primitives>,
+        triedb_provider: TriedbProvider
     ) -> RethResult<Self> {
         Ok(Self {
             db: Arc::new(init_db(path, args).map_err(RethError::msg)?),
@@ -134,6 +140,7 @@ impl<N: NodeTypesWithDB<DB = Arc<DatabaseEnv>>> ProviderFactory<N> {
             static_file_provider,
             prune_modes: PruneModes::default(),
             storage: Default::default(),
+            triedb_provider
         })
     }
 }
@@ -551,11 +558,12 @@ where
     N: NodeTypesWithDB<DB: fmt::Debug, ChainSpec: fmt::Debug, Storage: fmt::Debug>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { db, chain_spec, static_file_provider, prune_modes, storage } = self;
+        let Self { db, chain_spec, static_file_provider, prune_modes, storage, triedb_provider } = self;
         f.debug_struct("ProviderFactory")
             .field("db", &db)
             .field("chain_spec", &chain_spec)
             .field("static_file_provider", &static_file_provider)
+            .field("triedb_provider", &triedb_provider)
             .field("prune_modes", &prune_modes)
             .field("storage", &storage)
             .finish()
@@ -568,6 +576,7 @@ impl<N: NodeTypesWithDB> Clone for ProviderFactory<N> {
             db: self.db.clone(),
             chain_spec: self.chain_spec.clone(),
             static_file_provider: self.static_file_provider.clone(),
+            triedb_provider: self.triedb_provider.clone(),
             prune_modes: self.prune_modes.clone(),
             storage: self.storage.clone(),
         }
@@ -596,6 +605,7 @@ mod tests {
     use reth_storage_errors::provider::ProviderError;
     use reth_testing_utils::generators::{self, random_block, random_header, BlockParams};
     use std::{ops::RangeInclusive, sync::Arc};
+    use reth_db::test_utils::create_test_triedb_dir;
 
     #[test]
     fn common_history_provider() {
@@ -627,11 +637,13 @@ mod tests {
     fn provider_factory_with_database_path() {
         let chain_spec = ChainSpecBuilder::mainnet().build();
         let (_static_dir, static_dir_path) = create_test_static_files_dir();
+        let (_trie_dir, trie_dir_path) = create_test_triedb_dir();
         let factory = ProviderFactory::<MockNodeTypesWithDB<DatabaseEnv>>::new_with_database_path(
             tempfile::TempDir::new().expect(ERROR_TEMPDIR).keep(),
             Arc::new(chain_spec),
             DatabaseArguments::new(Default::default()),
             StaticFileProvider::read_write(static_dir_path).unwrap(),
+            TriedbProvider::new(trie_dir_path)
         )
         .unwrap();
         let provider = factory.provider().unwrap();

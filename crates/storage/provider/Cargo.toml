@@ -37,9 +37,11 @@ alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-consensus.workspace = true
+alloy-trie.workspace = true
 revm-database.workspace = true
 revm-state = { workspace = true, optional = true }
 
+triedb.workspace = true
 # tracing
 tracing.workspace = true
 
@@ -75,6 +77,7 @@ revm-database-interface.workspace = true
 revm-state.workspace = true
 
 tempfile.workspace = true
+tempdir.workspace = true
 assert_matches.workspace = true
 rand.workspace = true
 

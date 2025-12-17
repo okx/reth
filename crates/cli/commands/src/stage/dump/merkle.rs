@@ -23,6 +23,7 @@ use reth_stages::{
     ExecutionStageThresholds, Stage, StageCheckpoint, UnwindInput,
 };
 use tracing::info;
+use reth_provider::providers::triedb::TriedbProvider;
 
 pub(crate) async fn dump_merkle_stage<N>(
     db_tool: &DbTool<N>,
@@ -62,6 +63,7 @@ where
                 Arc::new(output_db),
                 db_tool.chain(),
                 StaticFileProvider::read_write(output_datadir.static_files())?,
+                TriedbProvider::new(output_datadir.triedb()),
             ),
             to,
             from,

@@ -11,6 +11,7 @@ use reth_provider::{
 use reth_stages::{stages::StorageHashingStage, Stage, StageCheckpoint, UnwindInput};
 use std::sync::Arc;
 use tracing::info;
+use reth_provider::providers::triedb::TriedbProvider;
 
 pub(crate) async fn dump_hashing_storage_stage<N: ProviderNodeTypes<DB = Arc<DatabaseEnv>>>(
     db_tool: &DbTool<N>,
@@ -29,6 +30,7 @@ pub(crate) async fn dump_hashing_storage_stage<N: ProviderNodeTypes<DB = Arc<Dat
                 Arc::new(output_db),
                 db_tool.chain(),
                 StaticFileProvider::read_write(output_datadir.static_files())?,
+                TriedbProvider::new(output_datadir.triedb())
             ),
             to,
             from,

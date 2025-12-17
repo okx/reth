@@ -23,6 +23,8 @@ mod noop;
 pub use mock::{ExtendedAccount, MockEthProvider};
 pub use noop::NoopProvider;
 pub use reth_chain_state::test_utils::TestCanonStateSubscriptions;
+use reth_db::test_utils::create_test_triedb_dir;
+use crate::providers::triedb::TriedbProvider;
 
 /// Mock [`reth_node_types::NodeTypes`] for testing.
 pub type MockNodeTypes = reth_node_types::AnyNodeTypesWithEngine<
@@ -54,11 +56,13 @@ pub fn create_test_provider_factory_with_node_types<N: NodeTypes>(
     chain_spec: Arc<N::ChainSpec>,
 ) -> ProviderFactory<NodeTypesWithDBAdapter<N, Arc<TempDatabase<DatabaseEnv>>>> {
     let (static_dir, _) = create_test_static_files_dir();
+    let (triedb_dir, _) = create_test_triedb_dir();
     let db = create_test_rw_db();
     ProviderFactory::new(
         db,
         chain_spec,
         StaticFileProvider::read_write(static_dir.keep()).expect("static file provider"),
+        TriedbProvider::new(triedb_dir),
     )
 }
 

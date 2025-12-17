@@ -15,6 +15,7 @@ use reth_provider::{
 use reth_stages::{stages::ExecutionStage, Stage, StageCheckpoint, UnwindInput};
 use std::sync::Arc;
 use tracing::info;
+use reth_provider::providers::triedb::TriedbProvider;
 
 pub(crate) async fn dump_execution_stage<N, E, C>(
     db_tool: &DbTool<N>,
@@ -42,6 +43,7 @@ where
                 Arc::new(output_db),
                 db_tool.chain(),
                 StaticFileProvider::read_write(output_datadir.static_files())?,
+                TriedbProvider::new(output_datadir.triedb()),
             ),
             to,
             from,

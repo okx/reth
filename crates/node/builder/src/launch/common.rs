@@ -89,6 +89,7 @@ use tokio::sync::{
 use futures::{future::Either, stream, Stream, StreamExt};
 use reth_node_ethstats::EthStatsService;
 use reth_node_events::{cl::ConsensusLayerHealthEvents, node::NodeEvent};
+use reth_provider::providers::triedb::TriedbProvider;
 
 /// Reusable setup for launching a node.
 ///
@@ -468,6 +469,7 @@ where
             self.right().clone(),
             self.chain_spec(),
             StaticFileProvider::read_write(self.data_dir().static_files())?,
+            TriedbProvider::new(self.data_dir().triedb())
         )
         .with_prune_modes(self.prune_modes())
         .with_static_files_metrics()

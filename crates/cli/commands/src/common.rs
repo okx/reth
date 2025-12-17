@@ -21,7 +21,7 @@ use reth_node_core::{
     dirs::{ChainPath, DataDirPath},
 };
 use reth_provider::{
-    providers::{BlockchainProvider, NodeTypesForProvider, StaticFileProvider},
+    providers::{BlockchainProvider, NodeTypesForProvider, StaticFileProvider, triedb::TriedbProvider},
     ProviderFactory, StaticFileProviderFactory,
 };
 use reth_stages::{sets::DefaultStages, Pipeline, PipelineTarget};
@@ -103,7 +103,8 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
             ),
         };
 
-        let provider_factory = self.create_provider_factory(&config, db, sfp)?;
+        let triedb_provider = TriedbProvider::new(data_dir.triedb());
+        let provider_factory = self.create_provider_factory(&config, db, sfp, triedb_provider)?;
         if access.is_read_write() {
             debug!(target: "reth::cli", chain=%self.chain.chain(), genesis=?self.chain.genesis_hash(), "Initializing genesis");
             init_genesis(&provider_factory)?;
@@ -122,16 +123,19 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         config: &Config,
         db: Arc<DatabaseEnv>,
         static_file_provider: StaticFileProvider<N::Primitives>,
+        triedb_provider: TriedbProvider
     ) -> eyre::Result<ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>>
     where
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     {
         let has_receipt_pruning = config.prune.has_receipts_pruning();
         let prune_modes = config.prune.segments.clone();
+
         let factory = ProviderFactory::<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>::new(
             db,
             self.chain.clone(),
             static_file_provider,
+            triedb_provider
         )
         .with_prune_modes(prune_modes.clone())
         .with_genesis_block_number(self.chain.genesis().number.unwrap());

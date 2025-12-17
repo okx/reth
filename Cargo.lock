@@ -10238,6 +10238,7 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rpc-types-engine",
+ "alloy-trie 0.9.1",
  "assert_matches",
  "dashmap 6.1.0",
  "eyre",
@@ -10273,9 +10274,11 @@ dependencies = [
  "revm-database-interface",
  "revm-state",
  "strum 0.27.2",
+ "tempdir",
  "tempfile",
  "tokio",
  "tracing",
+ "triedb",
 ]
 
 [[package]]
