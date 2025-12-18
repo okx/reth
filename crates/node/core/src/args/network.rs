@@ -339,7 +339,7 @@ impl NetworkArgs {
         NetworkConfigBuilder::<N>::new(secret_key)
             .external_ip_resolver(self.nat.clone())
             .sessions_config(
-                SessionsConfig::default().with_upscaled_event_buffer(peers_config.max_peers()),
+                config.sessions.with_upscaled_event_buffer(peers_config.max_peers()),
             )
             .peer_config(peers_config)
             .boot_nodes(chain_bootnodes.clone())
