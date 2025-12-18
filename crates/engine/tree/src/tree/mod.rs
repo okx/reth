@@ -591,7 +591,8 @@ where
         } else {
             self.try_buffer_payload(payload)?
         };
-
+        debug!("try_insert_payload status: {:?}", status);
+        debug!("is_sync_target_head: {:?}", self.is_sync_target_head(block_hash));
         let mut outcome = TreeOutcome::new(status);
         // if the block is valid and it is the current sync target head, make it canonical
         if outcome.outcome.is_valid() && self.is_sync_target_head(block_hash) {
@@ -1933,7 +1934,14 @@ where
     /// See [`ForkchoiceStateTracker::sync_target_state`]
     fn is_sync_target_head(&self, block_hash: B256) -> bool {
         if let Some(target) = self.state.forkchoice_state_tracker.sync_target_state() {
+            debug!(
+                target: "engine::tree",
+                ?block_hash,
+                head_block_hash = ?target.head_block_hash,
+            );
             return target.head_block_hash == block_hash
+        } else {
+            debug!(target: "engine::tree", "no sync target state");
         }
         false
     }
