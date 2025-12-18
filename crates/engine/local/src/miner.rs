@@ -141,7 +141,7 @@ where
 
     /// Runs the [`LocalMiner`] in a loop, polling the miner and building payloads.
     pub async fn run(mut self) {
-        let mut fcu_interval = tokio::time::interval(Duration::from_secs(10000));
+        let mut fcu_interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 // Wait for the interval or the pool to receive a transaction
@@ -225,8 +225,9 @@ where
         let block = payload.block();
 
         let payload = T::block_to_payload(payload.block().clone());
+        tracing::debug!("start new_payload");
         let res = self.to_engine.new_payload(payload).await?;
-
+        tracing::debug!("end new_payload");
         if !res.is_valid() {
             eyre::bail!("Invalid payload")
         }
