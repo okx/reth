@@ -3,10 +3,10 @@
 use crate::{
     AccountReader, BlockBodyIndicesProvider, BlockHashReader, BlockIdReader, BlockNumReader,
     BlockReader, BlockReaderIdExt, BlockSource, BytecodeReader, ChangeSetReader,
-    HashedPostStateProvider, HeaderProvider, NodePrimitivesProvider, PruneCheckpointReader,
-    ReceiptProvider, ReceiptProviderIdExt, StageCheckpointReader, StateProofProvider,
-    StateProvider, StateProviderBox, StateProviderFactory, StateReader, StateRootProvider,
-    StorageRootProvider, TransactionVariant, TransactionsProvider, TrieReader,
+    HashedPostStateProvider, HeaderProvider, NodePrimitivesProvider, PlainPostState,
+    PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt, StageCheckpointReader,
+    StateProofProvider, StateProvider, StateProviderBox, StateProviderFactory, StateReader,
+    StateRootProvider, StorageRootProvider, TransactionVariant, TransactionsProvider, TrieReader,
 };
 
 #[cfg(feature = "db-api")]
@@ -423,6 +423,13 @@ impl<C: Send + Sync, N: NodePrimitives> StateRootProvider for NoopProvider<C, N>
         _input: TrieInput,
     ) -> ProviderResult<(B256, TrieUpdates)> {
         Ok((B256::default(), TrieUpdates::default()))
+    }
+
+    fn state_root_with_updates_triedb(
+        &self,
+        _plain_state: PlainPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        todo!()
     }
 }
 

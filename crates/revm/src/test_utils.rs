@@ -4,8 +4,8 @@ use alloy_primitives::{
 };
 use reth_primitives_traits::{Account, Bytecode};
 use reth_storage_api::{
-    AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, StateProofProvider,
-    StateProvider, StateRootProvider, StorageRootProvider,
+    AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, PlainPostState,
+    StateProofProvider, StateProvider, StateRootProvider, StorageRootProvider,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{
@@ -90,6 +90,13 @@ impl StateRootProvider for StateProviderTest {
         _input: TrieInput,
     ) -> ProviderResult<(B256, TrieUpdates)> {
         unimplemented!("state root computation is not supported")
+    }
+
+    fn state_root_with_updates_triedb(
+        &self,
+        _plain_state: PlainPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        todo!()
     }
 }
 

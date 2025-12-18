@@ -33,8 +33,8 @@ use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
     BlockBodyIndicesProvider, BytecodeReader, DBProvider, DatabaseProviderFactory,
-    HashedPostStateProvider, NodePrimitivesProvider, StageCheckpointReader, StateProofProvider,
-    StorageRootProvider, TrieReader,
+    HashedPostStateProvider, NodePrimitivesProvider, PlainPostState, StageCheckpointReader,
+    StateProofProvider, StorageRootProvider, TrieReader,
 };
 use reth_storage_errors::provider::{ConsistentViewError, ProviderError, ProviderResult};
 use reth_trie::{
@@ -798,6 +798,13 @@ where
     ) -> ProviderResult<(B256, TrieUpdates)> {
         let state_root = self.state_roots.lock().pop().unwrap_or_default();
         Ok((state_root, Default::default()))
+    }
+
+    fn state_root_with_updates_triedb(
+        &self,
+        _plain_state: PlainPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        todo!()
     }
 }
 

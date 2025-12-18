@@ -135,7 +135,7 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
             db,
             self.chain.clone(),
             static_file_provider,
-            triedb_provider
+            Arc::new(triedb_provider)
         )
         .with_prune_modes(prune_modes.clone())
         .with_genesis_block_number(self.chain.genesis().number.unwrap());

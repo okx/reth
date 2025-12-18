@@ -57,7 +57,7 @@ use reth_rpc_convert::{TryFromBlockResponse, TryFromReceiptResponse, TryFromTran
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
     BlockBodyIndicesProvider, BlockReaderIdExt, BlockSource, DBProvider, NodePrimitivesProvider,
-    ReceiptProviderIdExt, StatsReader,
+    PlainPostState, ReceiptProviderIdExt, StatsReader,
 };
 use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState, MultiProof, TrieInput};
 use std::{
@@ -1196,6 +1196,13 @@ where
     ) -> Result<(B256, TrieUpdates), ProviderError> {
         warn!("state_root_from_nodes_with_updates is not implemented and will return zero");
         Ok((B256::ZERO, TrieUpdates::default()))
+    }
+
+    fn state_root_with_updates_triedb(
+        &self,
+        _plain_state: PlainPostState,
+    ) -> Result<(B256, TrieUpdates), ProviderError> {
+        todo!()
     }
 }
 

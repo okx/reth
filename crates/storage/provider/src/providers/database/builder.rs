@@ -329,8 +329,8 @@ where
     pub fn triedb_provider(
         self,
         triedb_provider: TriedbProvider,
-    ) -> TypesAnd4<N, DB, Arc<C>, StaticFileProvider<N::Primitives>, TriedbProvider> {
-        TypesAnd4::new(self.val_1, self.val_2, self.val_3, triedb_provider)
+    ) -> TypesAnd4<N, DB, Arc<C>, StaticFileProvider<N::Primitives>, Arc<TriedbProvider>> {
+        TypesAnd4::new(self.val_1, self.val_2, self.val_3, Arc::new(triedb_provider))
     }
 }
 
@@ -363,7 +363,7 @@ impl<N, Val1, Val2, Val3, Val4> TypesAnd4<N, Val1, Val2, Val3, Val4> {
     }
 }
 
-impl<N, DB> TypesAnd4<N, DB, Arc<N::ChainSpec>, StaticFileProvider<N::Primitives>, TriedbProvider>
+impl<N, DB> TypesAnd4<N, DB, Arc<N::ChainSpec>, StaticFileProvider<N::Primitives>, Arc<TriedbProvider>>
 where
     N: NodeTypes,
     DB: Database + DatabaseMetrics + Clone + Unpin + 'static,

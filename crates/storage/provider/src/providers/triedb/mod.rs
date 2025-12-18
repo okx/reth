@@ -7,7 +7,7 @@ use triedb::{Database as TrieDbDatabase, path::{AddressPath, StoragePath},    ac
              transaction::TransactionError, Database};
 #[derive(Debug, Clone)]
 pub struct TriedbProvider {
-    inner: Arc<TrieDbDatabase>
+    pub inner: Arc<TrieDbDatabase>
 }
 
 impl TriedbProvider {

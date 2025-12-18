@@ -62,7 +62,7 @@ pub fn create_test_provider_factory_with_node_types<N: NodeTypes>(
         db,
         chain_spec,
         StaticFileProvider::read_write(static_dir.keep()).expect("static file provider"),
-        TriedbProvider::new(triedb_dir),
+        Arc::new(TriedbProvider::new(triedb_dir)),
     )
 }
 

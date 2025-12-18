@@ -10,8 +10,8 @@ use reth_node_builder::{EngineNodeLauncher, Node, NodeBuilder, NodeConfig, NodeH
 use reth_node_core::args::{DiscoveryArgs, NetworkArgs, RpcServerArgs};
 use reth_node_ethereum::EthereumNode;
 use reth_provider::{
-    providers::BlockchainProvider, DatabaseProviderFactory, ProviderFactory, StageCheckpointReader,
-    StaticFileProviderFactory,
+    providers::{BlockchainProvider, ProviderFactory, triedb::TriedbProvider},
+    DatabaseProviderFactory, StageCheckpointReader, StaticFileProviderFactory,
 };
 use reth_rpc_server_types::RpcModuleSelection;
 use reth_stages_types::StageId;
@@ -110,6 +110,7 @@ pub async fn setup_engine_with_chain_import(
         // Create database path and static files path
         let db_path = datadir.join("db");
         let static_files_path = datadir.join("static_files");
+        let triedb_dir = datadir.join("triedb");
 
         // Initialize the database using init_db (same as CLI import command)
         // Use the same database arguments as the node will use
@@ -125,6 +126,7 @@ pub async fn setup_engine_with_chain_import(
             db.clone(),
             chain_spec.clone(),
             reth_provider::providers::StaticFileProvider::read_write(static_files_path.clone())?,
+            Arc::new(TriedbProvider::new(triedb_dir)),
         );
 
         // Initialize genesis if needed
@@ -311,6 +313,7 @@ mod tests {
         std::fs::create_dir_all(&datadir).unwrap();
         let db_path = datadir.join("db");
         let static_files_path = datadir.join("static_files");
+        let triedb_dir = datadir.join("triedb");
 
         // Import the chain
         {
@@ -324,6 +327,7 @@ mod tests {
                 chain_spec.clone(),
                 reth_provider::providers::StaticFileProvider::read_write(static_files_path.clone())
                     .unwrap(),
+                Arc::new(TriedbProvider::new(triedb_dir.clone())),
             );
 
             // Initialize genesis
@@ -384,6 +388,7 @@ mod tests {
                 chain_spec.clone(),
                 reth_provider::providers::StaticFileProvider::read_only(static_files_path, false)
                     .unwrap(),
+                Arc::new(TriedbProvider::new(triedb_dir.clone())),
             );
 
             let provider = provider_factory.database_provider_ro().unwrap();
@@ -469,12 +474,14 @@ mod tests {
 
         // Create static files path
         let static_files_path = datadir.join("static_files");
+        let triedb_dir = datadir.join("triedb");
 
         // Create a provider factory
         let provider_factory: ProviderFactory<MockNodeTypesWithDB> = ProviderFactory::new(
             db.clone(),
             chain_spec.clone(),
             reth_provider::providers::StaticFileProvider::read_write(static_files_path).unwrap(),
+            Arc::new(TriedbProvider::new(triedb_dir)),
         );
 
         // Initialize genesis

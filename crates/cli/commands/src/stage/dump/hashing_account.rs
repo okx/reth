@@ -40,7 +40,7 @@ pub(crate) async fn dump_hashing_account_stage<N: ProviderNodeTypes<DB = Arc<Dat
                 Arc::new(output_db),
                 db_tool.chain(),
                 StaticFileProvider::read_write(output_datadir.static_files())?,
-                TriedbProvider::new(output_datadir.triedb()),
+                Arc::new(TriedbProvider::new(output_datadir.triedb())),
             ),
             to,
             from,

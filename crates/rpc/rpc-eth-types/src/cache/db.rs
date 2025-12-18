@@ -50,6 +50,13 @@ impl reth_storage_api::StateRootProvider for StateProviderTraitObjWrapper<'_> {
     ) -> reth_errors::ProviderResult<(B256, reth_trie::updates::TrieUpdates)> {
         self.0.state_root_from_nodes_with_updates(input)
     }
+
+    fn state_root_with_updates_triedb(
+        &self,
+        plain_state: reth_storage_api::PlainPostState,
+    ) -> reth_errors::ProviderResult<(B256, reth_trie::updates::TrieUpdates)> {
+        self.0.state_root_with_updates_triedb(plain_state)
+    }
 }
 
 impl reth_storage_api::StorageRootProvider for StateProviderTraitObjWrapper<'_> {

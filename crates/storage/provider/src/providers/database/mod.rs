@@ -66,7 +66,7 @@ pub struct ProviderFactory<N: NodeTypesWithDB> {
     /// The node storage handler.
     storage: Arc<N::Storage>,
 
-    triedb_provider: TriedbProvider
+    triedb_provider: Arc<TriedbProvider>
 }
 
 impl<N: NodeTypes> ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>> {
@@ -82,8 +82,11 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
         db: N::DB,
         chain_spec: Arc<N::ChainSpec>,
         static_file_provider: StaticFileProvider<N::Primitives>,
-        triedb_provider: TriedbProvider
+        triedb_provider: Arc<TriedbProvider>
     ) -> Self {
+        // Initialize the static triedb_provider
+        let _ = crate::providers::state::latest::set_triedb_provider(triedb_provider.clone());
+        
         Self {
             db,
             chain_spec,
@@ -132,8 +135,11 @@ impl<N: NodeTypesWithDB<DB = Arc<DatabaseEnv>>> ProviderFactory<N> {
         chain_spec: Arc<N::ChainSpec>,
         args: DatabaseArguments,
         static_file_provider: StaticFileProvider<N::Primitives>,
-        triedb_provider: TriedbProvider
+        triedb_provider: Arc<TriedbProvider>
     ) -> RethResult<Self> {
+        // Initialize the static triedb_provider
+        let _ = crate::providers::state::latest::set_triedb_provider(triedb_provider.clone());
+        
         Ok(Self {
             db: Arc::new(init_db(path, args).map_err(RethError::msg)?),
             chain_spec,
@@ -160,6 +166,7 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
             self.static_file_provider.clone(),
             self.prune_modes.clone(),
             self.storage.clone(),
+            Some(self.triedb_provider.clone()),
         ))
     }
 
@@ -175,6 +182,7 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
             self.static_file_provider.clone(),
             self.prune_modes.clone(),
             self.storage.clone(),
+            Some(self.triedb_provider.clone()),
         )))
     }
 
@@ -643,7 +651,7 @@ mod tests {
             Arc::new(chain_spec),
             DatabaseArguments::new(Default::default()),
             StaticFileProvider::read_write(static_dir_path).unwrap(),
-            TriedbProvider::new(trie_dir_path)
+            Arc::new(TriedbProvider::new(trie_dir_path))
         )
         .unwrap();
         let provider = factory.provider().unwrap();

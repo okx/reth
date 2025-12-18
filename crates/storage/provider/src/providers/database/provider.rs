@@ -153,12 +153,25 @@ pub struct DatabaseProvider<TX, N: NodeTypes> {
     prune_modes: PruneModes,
     /// Node storage handler.
     storage: Arc<N::Storage>,
+    /// TrieDB provider for triedb operations
+    triedb_provider: Option<Arc<crate::providers::triedb::TriedbProvider>>,
 }
 
 impl<TX, N: NodeTypes> DatabaseProvider<TX, N> {
     /// Returns reference to prune modes.
     pub const fn prune_modes_ref(&self) -> &PruneModes {
         &self.prune_modes
+    }
+
+    /// Returns reference to TrieDB provider if available
+    pub fn triedb_provider(&self) -> Option<&Arc<crate::providers::triedb::TriedbProvider>> {
+        self.triedb_provider.as_ref()
+    }
+}
+
+impl<TX, N: NodeTypes> crate::providers::state::latest::TriedbProviderAccess for DatabaseProvider<TX, N> {
+    fn triedb_provider(&self) -> Option<&Arc<crate::providers::triedb::TriedbProvider>> {
+        self.triedb_provider.as_ref()
     }
 }
 
@@ -242,14 +255,15 @@ impl<TX: Debug + Send + Sync, N: NodeTypes<ChainSpec: EthChainSpec + 'static>> C
 
 impl<TX: DbTxMut, N: NodeTypes> DatabaseProvider<TX, N> {
     /// Creates a provider with an inner read-write transaction.
-    pub const fn new_rw(
+    pub fn new_rw(
         tx: TX,
         chain_spec: Arc<N::ChainSpec>,
         static_file_provider: StaticFileProvider<N::Primitives>,
         prune_modes: PruneModes,
         storage: Arc<N::Storage>,
+        triedb_provider: Option<Arc<crate::providers::triedb::TriedbProvider>>,
     ) -> Self {
-        Self { tx, chain_spec, static_file_provider, prune_modes, storage }
+        Self { tx, chain_spec, static_file_provider, prune_modes, storage, triedb_provider }
     }
 }
 
@@ -488,14 +502,15 @@ where
 
 impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
     /// Creates a provider with an inner read-only transaction.
-    pub const fn new(
+    pub fn new(
         tx: TX,
         chain_spec: Arc<N::ChainSpec>,
         static_file_provider: StaticFileProvider<N::Primitives>,
         prune_modes: PruneModes,
         storage: Arc<N::Storage>,
+        triedb_provider: Option<Arc<crate::providers::triedb::TriedbProvider>>,
     ) -> Self {
-        Self { tx, chain_spec, static_file_provider, prune_modes, storage }
+        Self { tx, chain_spec, static_file_provider, prune_modes, storage, triedb_provider }
     }
 
     /// Consume `DbTx` or `DbTxMut`.
@@ -3124,7 +3139,7 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
     fn tx_ref(&self) -> &Self::Tx {
         &self.tx
     }
-
+    
     fn tx_mut(&mut self) -> &mut Self::Tx {
         &mut self.tx
     }

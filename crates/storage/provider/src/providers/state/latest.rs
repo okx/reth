@@ -2,11 +2,12 @@ use crate::{
     providers::state::macros::delegate_provider_impls, AccountReader, BlockHashReader,
     HashedPostStateProvider, StateProvider, StateRootProvider,
 };
-use alloy_primitives::{Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
+use alloy_primitives::{Address, BlockNumber, Bytes, StorageKey, StorageValue, B256, U256};
 use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx};
 use reth_primitives_traits::{Account, Bytecode};
-use reth_storage_api::{BytecodeReader, DBProvider, StateProofProvider, StorageRootProvider};
+use reth_storage_api::{BytecodeReader, DBProvider, PlainPostState, StateProofProvider, StorageRootProvider};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
+use std::sync::{Arc, OnceLock};
 use reth_trie::{
     proof::{Proof, StorageProof},
     updates::TrieUpdates,
@@ -18,6 +19,26 @@ use reth_trie_db::{
     DatabaseProof, DatabaseStateRoot, DatabaseStorageProof, DatabaseStorageRoot,
     DatabaseTrieWitness,
 };
+use alloy_consensus::constants::KECCAK_EMPTY;
+use alloy_trie::EMPTY_ROOT_HASH;
+use triedb::{
+    account::Account as TrieDBAccount,
+    overlay::{OverlayStateMut, OverlayValue},
+    path::{AddressPath, StoragePath},
+};
+
+/// Static storage for the triedb provider instance
+static TRIEDB_PROVIDER: OnceLock<Arc<crate::providers::triedb::TriedbProvider>> = OnceLock::new();
+
+/// Initialize the static triedb provider
+pub fn set_triedb_provider(provider: Arc<crate::providers::triedb::TriedbProvider>) -> Result<(), Arc<crate::providers::triedb::TriedbProvider>> {
+    TRIEDB_PROVIDER.set(provider)
+}
+
+/// Get the static triedb provider
+pub fn get_triedb_provider() -> Option<&'static Arc<crate::providers::triedb::TriedbProvider>> {
+    TRIEDB_PROVIDER.get()
+}
 
 /// State provider over latest state that takes tx reference.
 ///
@@ -84,7 +105,71 @@ impl<Provider: DBProvider + Sync> StateRootProvider for LatestStateProviderRef<'
         StateRoot::overlay_root_from_nodes_with_updates(self.tx(), input)
             .map_err(|err| ProviderError::Database(err.into()))
     }
+
+    fn state_root_with_updates_triedb(
+        &self,
+        plain_state: PlainPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        let triedb_provider = get_triedb_provider()
+            .ok_or_else(|| ProviderError::UnsupportedProvider)?;
+
+        let mut overlay_mut = OverlayStateMut::new();
+        
+        for (address, account_opt) in &plain_state.accounts {
+            let address_path = AddressPath::for_address(*address);
+            
+            if let Some(account) = account_opt {
+                let trie_account = TrieDBAccount::new(
+                    account.nonce,
+                    account.balance,
+                    EMPTY_ROOT_HASH, // Storage root will be computed from storage overlay
+                    account.bytecode_hash.unwrap_or(KECCAK_EMPTY),
+                );
+                overlay_mut.insert(address_path.clone().into(), Some(OverlayValue::Account(trie_account)));
+            } else {
+                // Account is being destroyed
+                overlay_mut.insert(address_path.clone().into(), None);
+            }
+        }
+        
+        for (address, storage) in &plain_state.storages {
+            let address_path = AddressPath::for_address(*address);
+            
+            for (storage_key, storage_value) in storage {
+                let raw_slot = U256::from_be_slice(storage_key.as_slice());
+                let storage_path = StoragePath::for_address_path_and_slot(
+                    address_path.clone(),
+                    StorageKey::from(raw_slot),
+                );
+                
+                if storage_value.is_zero() {
+                    overlay_mut.insert(storage_path.clone().into(), None);
+                } else {
+                    overlay_mut.insert(
+                        storage_path.clone().into(),
+                        Some(OverlayValue::Storage(StorageValue::from_be_slice(
+                            storage_value.to_be_bytes::<32>().as_slice()
+                        ))),
+                    );
+                }
+            }
+        }
+        
+        let overlay = overlay_mut.freeze();
+
+        let mut tx = triedb_provider.inner.begin_ro()
+            .map_err(|e| ProviderError::TrieWitnessError(format!("Failed to begin triedb transaction: {e:?}")))?;
+
+        let result = tx.compute_root_with_overlay(overlay)
+            .map_err(|e| ProviderError::TrieWitnessError(format!("Failed to compute triedb root: {e:?}")))?;
+
+        tx.commit()
+            .map_err(|e| ProviderError::TrieWitnessError(format!("Failed to commit triedb transaction: {e:?}")))?;
+
+        Ok((result.root, TrieUpdates::default()))
+    }
 }
+
 
 impl<Provider: DBProvider + Sync> StorageRootProvider for LatestStateProviderRef<'_, Provider> {
     fn storage_root(
@@ -178,6 +263,12 @@ impl<Provider: DBProvider + BlockHashReader> BytecodeReader
     }
 }
 
+/// Trait for accessing TrieDB provider
+pub trait TriedbProviderAccess {
+    /// Returns reference to TrieDB provider if available
+    fn triedb_provider(&self) -> Option<&Arc<crate::providers::triedb::TriedbProvider>>;
+}
+
 /// State provider for the latest state.
 #[derive(Debug)]
 pub struct LatestStateProvider<Provider>(Provider);
@@ -192,6 +283,14 @@ impl<Provider: DBProvider> LatestStateProvider<Provider> {
     #[inline(always)]
     const fn as_ref(&self) -> LatestStateProviderRef<'_, Provider> {
         LatestStateProviderRef::new(&self.0)
+    }
+
+    /// Returns reference to TrieDB provider if available
+    pub fn triedb_provider(&self) -> Option<&Arc<crate::providers::triedb::TriedbProvider>>
+    where
+        Provider: TriedbProviderAccess,
+    {
+        self.0.triedb_provider()
     }
 }
 

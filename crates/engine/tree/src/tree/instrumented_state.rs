@@ -8,6 +8,7 @@ use reth_provider::{
     AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, StateProofProvider,
     StateProvider, StateRootProvider, StorageRootProvider,
 };
+use reth_storage_api::PlainPostState;
 use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
@@ -223,6 +224,13 @@ impl<S: StateRootProvider> StateRootProvider for InstrumentedStateProvider<S> {
         input: TrieInput,
     ) -> ProviderResult<(B256, TrieUpdates)> {
         self.state_provider.state_root_from_nodes_with_updates(input)
+    }
+
+    fn state_root_with_updates_triedb(
+        &self,
+        plain_state: PlainPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.state_provider.state_root_with_updates_triedb(plain_state)
     }
 }
 

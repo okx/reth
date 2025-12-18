@@ -18,9 +18,11 @@ pub use reth_execution_types::{BlockExecutionOutput, ExecutionOutcome};
 use reth_primitives_traits::{
     Block, HeaderTy, NodePrimitives, ReceiptTy, Recovered, RecoveredBlock, SealedHeader, TxTy,
 };
-use reth_storage_api::StateProvider;
+use reth_storage_api::{PlainPostState, StateProvider};
 pub use reth_storage_errors::provider::ProviderError;
 use reth_trie_common::{updates::TrieUpdates, HashedPostState};
+use std::collections::HashMap;
+use alloy_primitives::U256;
 use revm::{
     context::result::ExecutionResult,
     database::{states::bundle_state::BundleRetention, BundleState, State},
@@ -515,31 +517,31 @@ where
 
         // calculate the state root
         let hashed_state = state.hashed_post_state(&db.bundle_state);
-        use std::any::type_name_of_val;
-        use std::any::{Any, TypeId};
-//         use reth_provider::{
-//     HistoricalStateProviderRef,
-//     LatestStateProviderRef,
-//     providers::state::overlay::OverlayStateProvider,
-// };
-
-        let type_name = type_name_of_val(&state);
-        println!("State type: {}", type_name);
-        // let type_id = state.type_id();
-        // if TypeId::of::<LatestStateProviderRef<'_>>() == type_id {
-        //     println!("It's LatestStateProviderRef");
-        // } else if TypeId::of::<HistoricalStateProviderRef<'_>>() == type_id {
-        //     println!("It's HistoricalStateProviderRef");
-        // } else if TypeId::of::<OverlayStateProvider<'_>>() == type_id {
-        //     println!("It's OverlayStateProvider");
-        // } else if TypeId::of::<MemoryOverlayStateProvider<'_>>() == type_id {
-        //     println!("It's MemoryOverlayStateProvider");
-        // }else if TypeId::of::<CachedStateProvider<'_>>() == type_id {
-        //     println!("It's CachedStateProvider");
-        // } else {
-        //     println!("Unknown type: {:?}", type_id);
-        // }
-        let pr = state.state_root_with_updates(hashed_state.clone());
+        
+        // Convert BundleState to PlainPostState for triedb computation
+        let mut plain_state = PlainPostState::default();
+        for (address, bundle_account) in db.bundle_state.state() {
+            // Convert account - None if destroyed, Some(Account) if exists/updated
+            let account = if bundle_account.was_destroyed() || bundle_account.info.is_none() {
+                None
+            } else {
+                bundle_account.info.as_ref().map(|info| reth_primitives_traits::Account::from(info))
+            };
+            plain_state.accounts.insert(*address, account);
+            
+            // Convert storage (BundleState uses U256 keys, PlainPostState uses B256 keys)
+            let mut storage_map = HashMap::new();
+            for (slot, storage_slot) in &bundle_account.storage {
+                // Convert U256 slot to B256 (32-byte representation)
+                let slot_b256 = B256::from_slice(&slot.to_be_bytes::<32>());
+                storage_map.insert(slot_b256, storage_slot.present_value);
+            }
+            if !storage_map.is_empty() {
+                plain_state.storages.insert(*address, storage_map);
+            }
+        }
+        
+        let pr = state.state_root_with_updates_triedb(plain_state);
         let (state_root, trie_updates) =
             pr.map_err(BlockExecutionError::other)?;
 

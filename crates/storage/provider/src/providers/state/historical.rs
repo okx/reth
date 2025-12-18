@@ -14,7 +14,8 @@ use reth_db_api::{
 };
 use reth_primitives_traits::{Account, Bytecode};
 use reth_storage_api::{
-    BlockNumReader, BytecodeReader, DBProvider, StateProofProvider, StorageRootProvider,
+    BlockNumReader, BytecodeReader, DBProvider, PlainPostState, StateProofProvider,
+    StorageRootProvider,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{
@@ -315,6 +316,13 @@ impl<Provider: DBProvider + BlockNumReader> StateRootProvider
         input.prepend(self.revert_state()?);
         StateRoot::overlay_root_from_nodes_with_updates(self.tx(), input)
             .map_err(|err| ProviderError::Database(err.into()))
+    }
+
+    fn state_root_with_updates_triedb(
+        &self,
+        _plain_state: PlainPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        todo!()
     }
 }
 

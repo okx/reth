@@ -4,8 +4,8 @@ use alloy_primitives::{keccak256, Address, BlockNumber, Bytes, StorageKey, Stora
 use reth_errors::ProviderResult;
 use reth_primitives_traits::{Account, Bytecode, NodePrimitives};
 use reth_storage_api::{
-    AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, StateProofProvider,
-    StateProvider, StateRootProvider, StorageRootProvider,
+    AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, PlainPostState,
+    StateProofProvider, StateProvider, StateRootProvider, StorageRootProvider,
 };
 use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
@@ -146,6 +146,13 @@ impl<N: NodePrimitives> StateRootProvider for MemoryOverlayStateProviderRef<'_, 
     ) -> ProviderResult<(B256, TrieUpdates)> {
         input.prepend_self(self.trie_input().clone());
         self.historical.state_root_from_nodes_with_updates(input)
+    }
+
+    fn state_root_with_updates_triedb(
+        &self,
+        plain_state: PlainPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.historical.state_root_with_updates_triedb(plain_state)
     }
 }
 

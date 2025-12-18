@@ -7827,6 +7827,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "triedb",
 ]
 
 [[package]]
@@ -8549,6 +8550,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tracing",
+ "triedb",
 ]
 
 [[package]]
@@ -10765,6 +10767,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "triedb",
 ]
 
 [[package]]
@@ -10983,6 +10986,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "revm-database",
+ "triedb",
 ]
 
 [[package]]
