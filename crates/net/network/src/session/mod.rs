@@ -397,13 +397,15 @@ impl<N: NetworkPrimitives> SessionManager<N> {
                                 target: "net::session",
                                 peer_id = %peer_id,
                                 message = %info,
-                                "session command buffer full, dropping message"
+                                session_command_buffer_size = self.session_command_buffer,
+                                "session command buffer full, dropping message. Consider increasing session_command_buffer in config (default: 32)"
                             );
                         } else {
                             debug!(
                                 target: "net::session",
                                 ?peer_id,
-                                "session command buffer full, dropping message"
+                                session_command_buffer_size = self.session_command_buffer,
+                                "session command buffer full, dropping message. Consider increasing session_command_buffer in config (default: 32)"
                             );
                         }
                         self.metrics.total_outgoing_peer_messages_dropped.increment(1);
