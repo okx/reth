@@ -57,7 +57,7 @@ impl Default for SessionsConfig {
         Self {
             // This should be sufficient to slots for handling commands sent to the session task,
             // since the manager is the sender.
-            session_command_buffer: 32,
+            session_command_buffer: 100000,
             // This should be greater since the manager is the receiver. The total size will be
             // `buffer + num sessions`. Each session can therefore fit at least 1 message in the
             // channel. The buffer size is additional capacity. The channel is always drained on
