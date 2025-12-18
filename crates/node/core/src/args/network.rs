@@ -33,7 +33,7 @@ use reth_network::{
         DEFAULT_SOFT_LIMIT_BYTE_SIZE_POOLED_TRANSACTIONS_RESP_ON_PACK_GET_POOLED_TRANSACTIONS_REQ,
         SOFT_LIMIT_BYTE_SIZE_POOLED_TRANSACTIONS_RESPONSE,
     },
-    HelloMessageWithProtocols, NetworkConfigBuilder, NetworkPrimitives, SessionsConfig,
+    HelloMessageWithProtocols, NetworkConfigBuilder, NetworkPrimitives,
 };
 use reth_network_peers::{mainnet_nodes, TrustedPeer};
 use secp256k1::SecretKey;
