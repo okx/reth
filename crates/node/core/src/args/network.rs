@@ -264,6 +264,7 @@ impl NetworkArgs {
             .with_max_inbound_opt(self.max_inbound_peers)
             .with_max_outbound_opt(self.max_outbound_peers);
 
+        println!("xxx session_command_buffer {}", config.sessions.session_command_buffer);
         // Configure basic network stack
         NetworkConfigBuilder::<N>::new(secret_key)
             .peer_config(config.peers_config_with_basic_nodes_from_file(
@@ -271,7 +272,7 @@ impl NetworkArgs {
             ))
             .external_ip_resolver(self.nat)
             .sessions_config(
-                SessionsConfig::default().with_upscaled_event_buffer(peers_config.max_peers()),
+                config.sessions.with_upscaled_event_buffer(peers_config.max_peers()),
             )
             .peer_config(peers_config)
             .boot_nodes(chain_bootnodes.clone())
