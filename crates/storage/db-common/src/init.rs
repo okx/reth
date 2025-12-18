@@ -2,7 +2,7 @@
 
 use alloy_consensus::BlockHeader;
 use alloy_genesis::GenesisAccount;
-use alloy_primitives::{keccak256, map::HashMap, Address, B256, U256};
+use alloy_primitives::{keccak256, map::HashMap, Address, StorageValue, StorageKey, B256, U256};
 use reth_chainspec::EthChainSpec;
 use reth_codecs::Compact;
 use reth_config::config::EtlConfig;
@@ -32,6 +32,14 @@ use tracing::{debug, error, info, trace};
 use reth_trie::{trie_cursor::{TrieCursor, TrieCursorFactory}};
 #[cfg(feature = "trie-db-ext")]
 use crate::init_triedb::calculate_state_root_with_triedb;
+use reth_provider::providers::state::latest::get_triedb_provider;
+use triedb::{
+    account::Account as TrieDBAccount,
+    path::{AddressPath, StoragePath},
+    transaction::TransactionError,
+};
+use alloy_trie::EMPTY_ROOT_HASH;
+use alloy_consensus::constants::KECCAK_EMPTY;
 
 /// Default soft limit for number of bytes to read from state dump file, before inserting into
 /// database.
@@ -105,6 +113,7 @@ where
         + AsRef<PF::ProviderRW>,
     PF::ChainSpec: EthChainSpec<Header = <PF::Primitives as NodePrimitives>::BlockHeader>,
 {
+    println!("init_genesis");
     let chain = factory.chain_spec();
 
     let genesis = chain.genesis();
@@ -156,23 +165,25 @@ where
     insert_genesis_state(&provider_rw, alloc.iter())?;
 
     // compute state root to populate trie tables
-    #[cfg(feature = "trie-db-ext")]
-    {
-        use std::path::PathBuf;
-        use reth_trie::{hashed_cursor::{HashedCursorFactory, HashedCursor}, StateRootTrieDb, TrieExtDatabase};
-        let trie_db_path = std::env::var("RETH_TRIEDB_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from("../triedb")
-            });
-        let file_path = trie_db_path.join("test.db");
-        let trie_ext_db = TrieExtDatabase::new(file_path);
-        let trie_db_path = std::env::temp_dir().join("reth_triedb_init");
-        calculate_state_root_with_triedb(&provider_rw, trie_db_path, None)?;
-    }
-    #[cfg(not(feature = "trie-db-ext"))]
-    {
-        compute_state_root(&provider_rw, None)?;
+    // #[cfg(feature = "trie-db-ext")]
+    // {
+
+    // }
+    // #[cfg(not(feature = "trie-db-ext"))]
+    println!("start compute_state_root");
+    let ret = compute_state_root(&provider_rw, None)?;
+    println!("compute_state_root done {:?}", ret);
+
+    // Calculate state root using triedb
+    println!("start compute_state_root_triedb");
+    match compute_state_root_triedb(alloc.iter()) {
+        Ok(triedb_state_root) => {
+            println!("compute_state_root_triedb done: {:?}", triedb_state_root);
+        }
+        Err(e) => {
+            println!("compute_state_root_triedb failed: {:?}", e);
+            // Don't fail genesis init if triedb fails, just log it
+        }
     }
 
     // set stage checkpoint to genesis block number for all stages
@@ -701,6 +712,66 @@ where
             }
         }
     }
+}
+
+/// Computes the state root using triedb by inserting all genesis accounts and storage.
+pub fn compute_state_root_triedb<'a, 'b>(
+    alloc: impl Iterator<Item = (&'a Address, &'b GenesisAccount)>,
+) -> Result<B256, InitStorageError> {
+    let triedb_provider = get_triedb_provider()
+        .ok_or_else(|| InitStorageError::Provider(ProviderError::UnsupportedProvider))?;
+
+    let mut tx = triedb_provider.inner.begin_rw()
+        .map_err(|e| InitStorageError::Provider(ProviderError::TrieWitnessError(format!("Failed to begin triedb transaction: {e:?}"))))?;
+
+    // Insert all genesis accounts and storage into triedb
+    for (address, genesis_account) in alloc {
+        let address_path = AddressPath::for_address(*address);
+        
+        // Convert GenesisAccount to Account
+        let account = Account {
+            nonce: genesis_account.nonce.unwrap_or(0),
+            balance: genesis_account.balance,
+            bytecode_hash: genesis_account.code.as_ref().map(|code| keccak256(code)),
+        };
+        
+        // Insert storage first (if exists), so storage root can be computed
+        if let Some(ref storage) = genesis_account.storage {
+            for (storage_key, storage_value) in storage {
+                let raw_slot = U256::from_be_slice(storage_key.as_slice());
+                let storage_path = StoragePath::for_address_path_and_slot(
+                    address_path.clone(),
+                    StorageKey::from(raw_slot),
+                );
+                
+                let storage_value_u256 = U256::from_be_slice(storage_value.as_slice());
+                if !storage_value_u256.is_zero() {
+                    let storage_value_triedb = StorageValue::from_be_slice(
+                        storage_value_u256.to_be_bytes::<32>().as_slice()
+                    );
+                    tx.set_storage_slot(storage_path, Some(storage_value_triedb)).unwrap();
+                }
+            }
+        }
+        
+        // Insert account (storage root will be computed by triedb when we commit)
+        let trie_account = TrieDBAccount::new(
+            account.nonce,
+            account.balance,
+            EMPTY_ROOT_HASH, // Will be computed by triedb
+            account.bytecode_hash.unwrap_or(KECCAK_EMPTY),
+        );
+        
+        tx.set_account(address_path, Some(trie_account)).unwrap();
+    }
+    
+    // Commit - this computes the state root
+    tx.commit()
+        .map_err(|e| InitStorageError::Provider(ProviderError::TrieWitnessError(format!("Failed to commit triedb transaction: {e:?}"))))?;
+    
+    // Get the computed state root
+    let triedb_state_root = triedb_provider.inner.state_root();
+    Ok(triedb_state_root)
 }
 
 /// Type to deserialize state root from state dump file.

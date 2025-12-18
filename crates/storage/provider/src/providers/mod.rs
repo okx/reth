@@ -15,7 +15,7 @@ pub use static_file::{
 
 pub mod triedb;
 
-mod state;
+pub mod state;
 pub use state::{
     historical::{HistoricalStateProvider, HistoricalStateProviderRef, LowestAvailableBlocks},
     latest::{LatestStateProvider, LatestStateProviderRef},

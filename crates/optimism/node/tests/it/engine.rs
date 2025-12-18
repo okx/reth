@@ -287,7 +287,7 @@ async fn full_engine_api_bock_building_continuously() -> eyre::Result<()> {
         .await?;
     assert_eq!(fcu_result_2.payload_status.status, PayloadStatusEnum::Valid);
     let payload_id_2 = fcu_result_2.payload_id.expect("second payload id");
-
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     Ok(())
 }
 

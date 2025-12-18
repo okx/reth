@@ -518,6 +518,11 @@ where
         // calculate the state root
         let hashed_state = state.hashed_post_state(&db.bundle_state);
         
+        // Calculate state root using the previous method (mdbx)
+        let (mdbx_state_root, mdbx_trie_updates) = state
+            .state_root_with_updates(hashed_state.clone())
+            .map_err(BlockExecutionError::other)?;
+        
         // Convert BundleState to PlainPostState for triedb computation
         let mut plain_state = PlainPostState::default();
         for (address, bundle_account) in db.bundle_state.state() {
@@ -541,9 +546,30 @@ where
             }
         }
         
+        // Calculate state root using triedb method
         let pr = state.state_root_with_updates_triedb(plain_state);
-        let (state_root, trie_updates) =
+        let (triedb_state_root, triedb_trie_updates) =
             pr.map_err(BlockExecutionError::other)?;
+
+        // Compare the two state roots
+        if mdbx_state_root != triedb_state_root {
+            tracing::debug!(
+                "reth::evm - State root mismatch! MDBX: {:?}, TrieDB: {:?}",
+                mdbx_state_root,
+                triedb_state_root
+            );
+            // For now, use the triedb root, but log the mismatch
+            // You may want to panic or handle this differently based on your needs
+        } else {
+            tracing::debug!(
+                "reth::evm - State roots match: {:?}",
+                triedb_state_root
+            );
+        }
+
+        // Use triedb state root (or you can choose to use mdbx_state_root)
+        let state_root = triedb_state_root;
+        let trie_updates = triedb_trie_updates;
 
         let (transactions, senders) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();

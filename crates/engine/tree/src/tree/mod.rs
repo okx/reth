@@ -1337,6 +1337,7 @@ where
     /// If we're currently awaiting a response this will try to receive the response (non-blocking)
     /// or send a new persistence action if necessary.
     fn advance_persistence(&mut self) -> Result<(), AdvancePersistenceError> {
+        debug!("start advance persistence");
         if self.persistence_state.in_progress() {
             let (mut rx, start_time, current_action) = self
                 .persistence_state
@@ -1370,14 +1371,17 @@ where
             }
         }
 
-        // if !self.persistence_state.in_progress() {
-        //     if let Some(new_tip_num) = self.find_disk_reorg()? {
-        //         self.remove_blocks(new_tip_num)
-        //     } else if self.should_persist() {
-        //         let blocks_to_persist = self.get_canonical_blocks_to_persist()?;
-        //         self.persist_blocks(blocks_to_persist);
-        //     }
-        // }
+        if !self.persistence_state.in_progress() {
+            if let Some(new_tip_num) = self.find_disk_reorg()? {
+                self.remove_blocks(new_tip_num)
+            } else if self.should_persist() {
+                debug!("start persist blocks");
+                let blocks_to_persist = self.get_canonical_blocks_to_persist()?;
+                self.persist_blocks(blocks_to_persist);
+            } else {
+                debug!("start not persist blocks");
+            }
+        }
 
         Ok(())
     }
@@ -1731,9 +1735,10 @@ where
             return false
         }
 
-        let min_block = self.persistence_state.last_persisted_block.number;
-        self.state.tree_state.canonical_block_number().saturating_sub(min_block) >
-            self.config.persistence_threshold()
+        // let min_block = self.persistence_state.last_persisted_block.number;
+        // self.state.tree_state.canonical_block_number().saturating_sub(min_block) >
+        //     self.config.persistence_threshold()
+        return true
     }
 
     /// Returns a batch of consecutive canonical blocks to persist in the range
