@@ -28,6 +28,7 @@ use reth_metrics::common::mpsc::MeteredPollSender;
 use reth_network_api::{PeerRequest, PeerRequestSender};
 use reth_network_peers::PeerId;
 use reth_network_types::SessionsConfig;
+use reth_primitives_traits::transaction::TxHashRef;
 use reth_tasks::TaskSpawner;
 use rustc_hash::FxHashMap;
 use secp256k1::SecretKey;
@@ -46,7 +47,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::PollSender;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 use crate::session::active::RANGE_UPDATE_INTERVAL;
 pub use conn::EthRlpxConnection;
@@ -375,14 +376,36 @@ impl<N: NetworkPrimitives> SessionManager<N> {
     /// Sends a message to the peer's session
     pub fn send_message(&self, peer_id: &PeerId, msg: PeerMessage<N>) {
         if let Some(session) = self.active_sessions.get(peer_id) {
+            // Log transaction information if this is a transaction message
+            let msg_info = match &msg {
+                PeerMessage::SendTransactions(txs) => {
+                    let tx_hashes: Vec<_> = txs.0.iter().map(|tx| *tx.tx_hash()).collect();
+                    Some(format!("SendTransactions with {} txs: {:?}", txs.0.len(), tx_hashes))
+                }
+                PeerMessage::PooledTransactions(hashes) => {
+                    let hash_list: Vec<_> = hashes.iter_hashes().copied().collect();
+                    Some(format!("PooledTransactions with {} hashes: {:?}", hash_list.len(), hash_list))
+                }
+                _ => None,
+            };
+
             let _ = session.commands_to_session.try_send(SessionCommand::Message(msg)).inspect_err(
                 |e| {
                     if let TrySendError::Full(_) = e {
-                        debug!(
-                            target: "net::session",
-                            ?peer_id,
-                            "session command buffer full, dropping message"
-                        );
+                        if let Some(ref info) = msg_info {
+                            tracing::warn!(
+                                target: "net::session",
+                                peer_id = %peer_id,
+                                message = %info,
+                                "session command buffer full, dropping message"
+                            );
+                        } else {
+                            debug!(
+                                target: "net::session",
+                                ?peer_id,
+                                "session command buffer full, dropping message"
+                            );
+                        }
                         self.metrics.total_outgoing_peer_messages_dropped.increment(1);
                     }
                 },

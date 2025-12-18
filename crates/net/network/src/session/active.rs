@@ -74,7 +74,7 @@ const TIMEOUT_SCALING: u32 = 3;
 /// This parameter serves as backpressure for reading additional requests from the remote.
 /// Once we've queued up more responses than this, the session should prioritize message flushing
 /// before reading any more messages from the remote peer, throttling the peer.
-const MAX_QUEUED_OUTGOING_RESPONSES: usize = 4;
+const MAX_QUEUED_OUTGOING_RESPONSES: usize = 40000;
 
 /// The type that advances an established session by listening for incoming messages (from local
 /// node or read from connection) and emitting events back to the
@@ -354,6 +354,18 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
                 self.on_internal_peer_request(req, deadline);
             }
             PeerMessage::SendTransactions(msg) => {
+                let tx_count = msg.0.len();
+                let queued_count = self.queued_outgoing.messages.len();
+                if queued_count > MAX_QUEUED_OUTGOING_RESPONSES {
+                    tracing::warn!(
+                        target: "net::session",
+                        peer_id = %self.remote_peer_id,
+                        tx_count,
+                        queued_outgoing_count = queued_count,
+                        max_queued = MAX_QUEUED_OUTGOING_RESPONSES,
+                        "Queued outgoing messages buffer is full, may cause command buffer to fill up"
+                    );
+                }
                 self.queued_outgoing.push_back(EthBroadcastMessage::Transactions(msg).into());
             }
             PeerMessage::BlockRangeUpdated(_) => {}
@@ -572,7 +584,7 @@ impl<N: NetworkPrimitives> Future for ActiveSession<N> {
         // If the budget is exhausted we manually yield back control to the (coop) scheduler. This
         // manual yield point should prevent situations where polling appears to be frozen. See also <https://tokio.rs/blog/2020-04-preemption>
         // And tokio's docs on cooperative scheduling <https://docs.rs/tokio/latest/tokio/task/#cooperative-scheduling>
-        let mut budget = 4;
+        let mut budget = 40000;
 
         // The main poll loop that drives the session
         'main: loop {
