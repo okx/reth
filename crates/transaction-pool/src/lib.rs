@@ -307,7 +307,7 @@ use reth_primitives_traits::{Block, Recovered};
 use reth_storage_api::StateProviderFactory;
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc::Receiver;
-use tracing::{instrument, trace};
+use tracing::{info, instrument, trace};
 
 pub mod error;
 pub mod maintain;
@@ -511,9 +511,47 @@ where
         if transactions.is_empty() {
             return Vec::new()
         }
+        // Log each transaction being added to pool
+        for tx in &transactions {
+            info!(
+                target: "txpool",
+                tx_hash = %tx.hash(),
+                origin = ?origin,
+                function = "add_transactions",
+                location = "crates/transaction-pool/src/lib.rs",
+                "Adding transaction to pool"
+            );
+        }
         let validated = self.validate_all(origin, transactions).await;
 
-        self.pool.add_transactions(origin, validated.into_iter())
+        let results = self.pool.add_transactions(origin, validated.into_iter());
+        // Log results
+        for (idx, result) in results.iter().enumerate() {
+            match result {
+                Ok(outcome) => {
+                    info!(
+                        target: "txpool",
+                        tx_hash = %outcome.hash,
+                        origin = ?origin,
+                        function = "add_transactions",
+                        location = "crates/transaction-pool/src/lib.rs",
+                        "Transaction successfully added to pool"
+                    );
+                }
+                Err(err) => {
+                    info!(
+                        target: "txpool",
+                        tx_hash = "unknown",
+                        error = %err,
+                        origin = ?origin,
+                        function = "add_transactions",
+                        location = "crates/transaction-pool/src/lib.rs",
+                        "Failed to add transaction to pool"
+                    );
+                }
+            }
+        }
+        results
     }
 
     async fn add_transactions_with_origins(

@@ -41,9 +41,16 @@ where
     /// Returns the hash of the transaction.
     async fn send_raw_transaction(&self, tx: Bytes) -> Result<B256, Self::Error> {
         let recovered = recover_raw_transaction(&tx)?;
-
         let mut pool_transaction =
             <Self::Pool as TransactionPool>::Transaction::from_pooled(recovered);
+        let tx_hash = *pool_transaction.hash();
+        tracing::info!(
+            target: "rpc::eth::tx",
+            tx_hash = %tx_hash,
+            function = "send_raw_transaction",
+            location = "crates/rpc/rpc/src/eth/helpers/transaction.rs",
+            "Received transaction via eth_sendRawTransaction"
+        );
 
         // TODO: remove this after Osaka transition
         // Convert legacy blob sidecars to EIP-7594 format
@@ -116,8 +123,23 @@ where
         self.broadcast_raw_transaction(tx);
 
         // submit the transaction to the pool with a `Local` origin
+        let tx_hash = *pool_transaction.hash();
+        tracing::info!(
+            target: "rpc::eth::tx",
+            tx_hash = %tx_hash,
+            function = "send_raw_transaction",
+            location = "crates/rpc/rpc/src/eth/helpers/transaction.rs",
+            "Submitting transaction to pool via add_pool_transaction"
+        );
         let AddedTransactionOutcome { hash, .. } =
             self.inner.add_pool_transaction(pool_transaction).await?;
+        tracing::info!(
+            target: "rpc::eth::tx",
+            tx_hash = %hash,
+            function = "send_raw_transaction",
+            location = "crates/rpc/rpc/src/eth/helpers/transaction.rs",
+            "Transaction successfully added to pool, will be broadcast via p2p"
+        );
 
         Ok(hash)
     }

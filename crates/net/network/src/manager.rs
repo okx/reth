@@ -49,6 +49,7 @@ use reth_network_api::{
 };
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_network_types::ReputationChangeKind;
+use reth_primitives_traits::transaction::TxHashRef;
 use reth_storage_api::BlockNumReader;
 use reth_tasks::shutdown::GracefulShutdown;
 use reth_tokio_util::EventSender;
@@ -66,7 +67,7 @@ use std::{
 };
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 // TODO: Inlined diagram due to a bug in aquamarine library, should become an include when it's
@@ -628,6 +629,17 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
                 self.on_eth_request(peer_id, req);
             }
             PeerMessage::ReceivedTransaction(msg) => {
+                // Log immediately when receiving transaction from p2p
+                for tx in &msg.0 {
+                    info!(
+                        target: "net::tx",
+                        tx_hash = %tx.tx_hash(),
+                        peer_id = %peer_id,
+                        function = "on_peer_message",
+                        location = "crates/net/network/src/manager.rs",
+                        "Received transaction from p2p peer"
+                    );
+                }
                 self.notify_tx_manager(NetworkTransactionEvent::IncomingTransactions {
                     peer_id,
                     msg,

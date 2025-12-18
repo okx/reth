@@ -77,7 +77,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, oneshot::error::RecvError};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 /// The future for importing transactions into the pool.
 ///
@@ -861,6 +861,15 @@ where
             return
         }
 
+        for hash in &hashes {
+            info!(
+                target: "net::tx",
+                tx_hash = %hash,
+                function = "on_new_pending_transactions",
+                location = "crates/net/network/src/transactions/mod.rs",
+                "Received new pending transaction hash, starting propagation"
+            );
+        }
         trace!(target: "net::tx", num_hashes=?hashes.len(), "Start propagating transactions");
 
         self.propagate_all(hashes);
@@ -1019,6 +1028,16 @@ where
         if self.network.tx_gossip_disabled() {
             return propagated
         }
+        for tx in &to_propagate {
+            info!(
+                target: "net::tx",
+                tx_hash = %tx.tx_hash(),
+                function = "propagate_transactions",
+                location = "crates/net/network/src/transactions/mod.rs",
+                propagation_mode = ?propagation_mode,
+                "Propagating transaction to peers"
+            );
+        }
 
         // send full transactions to a set of the connected peers based on the configured mode
         let max_num_full = self.config.propagation_mode.full_peer_count(self.peers.len());
@@ -1074,6 +1093,16 @@ where
                 trace!(target: "net::tx", ?peer_id, num_txs=?new_pooled_hashes.len(), "Propagating tx hashes to peer");
 
                 // send hashes of transactions
+                for hash in new_pooled_hashes.iter_hashes() {
+                    info!(
+                        target: "net::tx",
+                        tx_hash = %hash,
+                        peer_id = %peer_id,
+                        function = "propagate_transactions",
+                        location = "crates/net/network/src/transactions/mod.rs",
+                        "Sending transaction hash to peer via p2p"
+                    );
+                }
                 self.network.send_transactions_hashes(*peer_id, new_pooled_hashes);
             }
 
@@ -1092,6 +1121,16 @@ where
                 trace!(target: "net::tx", ?peer_id, num_txs=?new_full_transactions.len(), "Propagating full transactions to peer");
 
                 // send full transactions
+                for tx in &new_full_transactions {
+                    info!(
+                        target: "net::tx",
+                        tx_hash = %tx.tx_hash(),
+                        peer_id = %peer_id,
+                        function = "propagate_transactions",
+                        location = "crates/net/network/src/transactions/mod.rs",
+                        "Sending full transaction to peer via p2p"
+                    );
+                }
                 self.network.send_transactions(*peer_id, new_full_transactions);
             }
         }
@@ -1110,6 +1149,15 @@ where
         if self.peers.is_empty() {
             // nothing to propagate
             return
+        }
+        for hash in &hashes {
+            info!(
+                target: "net::tx",
+                tx_hash = %hash,
+                function = "propagate_all",
+                location = "crates/net/network/src/transactions/mod.rs",
+                "Propagating transaction to all peers"
+            );
         }
         let propagated = self.propagate_transactions(
             self.pool.get_all(hashes).into_iter().map(PropagateTransaction::pool_tx).collect(),
@@ -1286,6 +1334,17 @@ where
     fn on_network_tx_event(&mut self, event: NetworkTransactionEvent<N>) {
         match event {
             NetworkTransactionEvent::IncomingTransactions { peer_id, msg } => {
+                // Log immediately when processing incoming transactions
+                for tx in &msg.0 {
+                    info!(
+                        target: "net::tx",
+                        tx_hash = %tx.tx_hash(),
+                        peer_id = %peer_id,
+                        function = "on_network_tx_event",
+                        location = "crates/net/network/src/transactions/mod.rs",
+                        "Processing incoming transaction from p2p"
+                    );
+                }
                 // ensure we didn't receive any blob transactions as these are disallowed to be
                 // broadcasted in full
 
@@ -1332,10 +1391,33 @@ where
             return
         }
 
+        // Log each transaction being imported
+        for tx in &transactions.0 {
+            info!(
+                target: "net::tx",
+                tx_hash = %tx.tx_hash(),
+                peer_id = %peer_id,
+                function = "import_transactions",
+                location = "crates/net/network/src/transactions/mod.rs",
+                source = ?source,
+                "Starting import process for transaction"
+            );
+        }
+
         let Some(peer) = self.peers.get_mut(&peer_id) else { return };
         let mut transactions = transactions.0;
 
         // mark the transactions as received
+        for tx in &transactions {
+            info!(
+                target: "net::tx",
+                tx_hash = %tx.tx_hash(),
+                peer_id = %peer_id,
+                function = "import_transactions",
+                location = "crates/net/network/src/transactions/mod.rs",
+                "Marking transaction as received, removing from fetcher"
+            );
+        }
         self.transaction_fetcher
             .remove_hashes_from_transaction_fetcher(transactions.iter().map(|tx| tx.tx_hash()));
 
@@ -1358,6 +1440,16 @@ where
             self.metrics
                 .occurrences_transactions_already_in_pool
                 .increment(already_known_txns_count as u64);
+        }
+        for tx in &transactions {
+            info!(
+                target: "net::tx",
+                tx_hash = %tx.tx_hash(),
+                peer_id = %peer_id,
+                function = "import_transactions",
+                location = "crates/net/network/src/transactions/mod.rs",
+                "Transaction passed pool filter, proceeding to validation"
+            );
         }
 
         // tracks the quality of the given transactions
@@ -1400,6 +1492,15 @@ where
                         // this is a new transaction that should be imported into the pool
 
                         let pool_transaction = Pool::Transaction::from_pooled(tx);
+                        let tx_hash = *pool_transaction.hash();
+                        info!(
+                            target: "net::tx",
+                            tx_hash = %tx_hash,
+                            peer_id = %peer_id,
+                            function = "import_transactions",
+                            location = "crates/net/network/src/transactions/mod.rs",
+                            "Transaction validated, preparing for pool import"
+                        );
                         new_txs.push(pool_transaction);
 
                         entry.insert(HashSet::from([peer_id]));
@@ -1425,6 +1526,17 @@ where
                 self.pending_pool_imports_info.pending_pool_imports.clone();
 
             trace!(target: "net::tx::propagation", new_txs_len=?new_txs.len(), "Importing new transactions");
+            // Log before starting pool import
+            for tx in &new_txs {
+                info!(
+                    target: "net::tx",
+                    tx_hash = %tx.hash(),
+                    peer_id = %peer_id,
+                    function = "import_transactions",
+                    location = "crates/net/network/src/transactions/mod.rs",
+                    "Calling add_external_transactions to add transaction to pool"
+                );
+            }
             let import = Box::pin(async move {
                 let added = new_txs.len();
                 let res = pool.add_external_transactions(new_txs).await;
@@ -1930,6 +2042,7 @@ impl PooledTransactionsHashesBuilder {
 }
 
 /// How we received the transactions.
+#[derive(Debug)]
 enum TransactionSource {
     /// Transactions were broadcast to us via [`Transactions`] message.
     Broadcast,

@@ -31,7 +31,7 @@ use reth_tasks::{
 };
 use reth_transaction_pool::{
     blobstore::BlobSidecarConverter, noop::NoopTransactionPool, AddedTransactionOutcome,
-    BatchTxProcessor, BatchTxRequest, TransactionPool,
+    BatchTxProcessor, BatchTxRequest, PoolTransaction, TransactionPool,
 };
 use tokio::sync::{broadcast, mpsc, Mutex};
 
@@ -558,6 +558,14 @@ where
         &self,
         transaction: <N::Pool as TransactionPool>::Transaction,
     ) -> Result<AddedTransactionOutcome, EthApiError> {
+        let tx_hash = *transaction.hash();
+        tracing::info!(
+            target: "rpc::eth::tx",
+            tx_hash = %tx_hash,
+            function = "add_pool_transaction",
+            location = "crates/rpc/rpc/src/eth/core.rs",
+            "Adding transaction to pool batch sender"
+        );
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let request = reth_transaction_pool::BatchTxRequest::new(transaction, response_tx);
 
@@ -565,7 +573,15 @@ where
             .send(request)
             .map_err(|_| reth_rpc_eth_types::EthApiError::BatchTxSendError)?;
 
-        Ok(response_rx.await??)
+        let result = response_rx.await??;
+        tracing::info!(
+            target: "rpc::eth::tx",
+            tx_hash = %result.hash,
+            function = "add_pool_transaction",
+            location = "crates/rpc/rpc/src/eth/core.rs",
+            "Transaction added to pool successfully, pending propagation"
+        );
+        Ok(result)
     }
 
     /// Returns the pending block kind
