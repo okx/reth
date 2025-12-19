@@ -558,11 +558,9 @@ where
                 mdbx_state_root,
                 triedb_state_root
             );
-            // For now, use the triedb root, but log the mismatch
-            // You may want to panic or handle this differently based on your needs
         } else {
             tracing::debug!(
-                "reth::evm - State roots match: {:?}",
+                "reth::evm - State root match: {:?}",
                 triedb_state_root
             );
         }

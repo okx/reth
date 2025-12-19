@@ -110,6 +110,7 @@ impl<Provider: DBProvider + Sync> StateRootProvider for LatestStateProviderRef<'
         &self,
         plain_state: PlainPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
+        tracing::debug!("latest_state_provider state_root_with_updates_triedb");
         let triedb_provider = get_triedb_provider()
             .ok_or_else(|| ProviderError::UnsupportedProvider)?;
 

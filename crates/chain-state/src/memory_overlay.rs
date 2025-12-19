@@ -152,7 +152,39 @@ impl<N: NodePrimitives> StateRootProvider for MemoryOverlayStateProviderRef<'_, 
         &self,
         plain_state: PlainPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        self.historical.state_root_with_updates_triedb(plain_state)
+        use std::collections::HashMap;
+        let mut cached_plain_state = PlainPostState::default();
+        
+        for block in &self.in_memory {
+            let bundle_state = &block.execution_output.bundle;
+            for (address, bundle_account) in bundle_state.state() {
+                let account = if bundle_account.was_destroyed() || bundle_account.info.is_none() {
+                    None
+                } else {
+                    bundle_account.info.as_ref().map(|info| reth_primitives_traits::Account::from(info))
+                };
+                cached_plain_state.accounts.insert(*address, account);
+                
+                let storage_map = cached_plain_state.storages.entry(*address).or_insert_with(HashMap::new);
+                for (slot, storage_slot) in &bundle_account.storage {
+                    let slot_b256 = B256::from_slice(&slot.to_be_bytes::<32>());
+                    storage_map.insert(slot_b256, storage_slot.present_value);
+                }
+            }
+        }
+        
+        let mut merged_state = cached_plain_state;
+        
+        for (address, account) in plain_state.accounts {
+            merged_state.accounts.insert(address, account);
+        }
+        
+        for (address, storage) in plain_state.storages {
+            let merged_storage = merged_state.storages.entry(address).or_insert_with(HashMap::new);
+            merged_storage.extend(storage);
+        }
+        
+        self.historical.state_root_with_updates_triedb(merged_state)
     }
 }
 

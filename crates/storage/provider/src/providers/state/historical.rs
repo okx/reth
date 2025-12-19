@@ -322,6 +322,7 @@ impl<Provider: DBProvider + BlockNumReader> StateRootProvider
         &self,
         _plain_state: PlainPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
+        tracing::debug!("latest_state_provider state_root_with_updates_triedb");
         todo!()
     }
 }

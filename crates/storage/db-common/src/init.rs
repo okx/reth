@@ -113,7 +113,6 @@ where
         + AsRef<PF::ProviderRW>,
     PF::ChainSpec: EthChainSpec<Header = <PF::Primitives as NodePrimitives>::BlockHeader>,
 {
-    println!("init_genesis");
     let chain = factory.chain_spec();
 
     let genesis = chain.genesis();
@@ -170,12 +169,9 @@ where
 
     // }
     // #[cfg(not(feature = "trie-db-ext"))]
-    println!("start compute_state_root");
     let ret = compute_state_root(&provider_rw, None)?;
-    println!("compute_state_root done {:?}", ret);
 
     // Calculate state root using triedb
-    println!("start compute_state_root_triedb");
     match compute_state_root_triedb(alloc.iter()) {
         Ok(triedb_state_root) => {
             println!("compute_state_root_triedb done: {:?}", triedb_state_root);
