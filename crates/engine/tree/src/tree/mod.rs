@@ -1376,11 +1376,11 @@ where
             if let Some(new_tip_num) = self.find_disk_reorg()? {
                 self.remove_blocks(new_tip_num)
             } else if self.should_persist() {
-                debug!("start persist blocks");
+                debug!("should persist blocks");
                 let blocks_to_persist = self.get_canonical_blocks_to_persist()?;
                 self.persist_blocks(blocks_to_persist);
             } else {
-                debug!("start not persist blocks");
+                debug!("should not persist blocks");
             }
         }
 
@@ -1736,10 +1736,9 @@ where
             return false
         }
 
-        // let min_block = self.persistence_state.last_persisted_block.number;
-        // self.state.tree_state.canonical_block_number().saturating_sub(min_block) >
-        //     self.config.persistence_threshold()
-        return true
+        let min_block = self.persistence_state.last_persisted_block.number;
+        self.state.tree_state.canonical_block_number().saturating_sub(min_block) >
+            self.config.persistence_threshold()
     }
 
     /// Returns a batch of consecutive canonical blocks to persist in the range
@@ -1854,8 +1853,10 @@ where
         let header = self.state.tree_state.sealed_header_by_hash(&hash);
 
         if header.is_some() {
+            debug!(target: "engine::tree", "found in memory Sealed block with hash {hash:?}");
             Ok(header)
         } else {
+            debug!(target: "engine::tree", "found in disk Sealed block with hash {hash:?}");
             self.provider.sealed_header_by_hash(hash)
         }
     }
@@ -2504,7 +2505,7 @@ where
                 // We now assume that we already have this block in the tree. However, we need to
                 // run the conversion to ensure that the block hash is valid.
                 convert_to_block(self, input)?;
-                
+                debug!(target: "engine::tree", block=?block_num_hash, "block already seen");
                 // X Layer: Even if block is already seen, update timing metrics if it was built locally
                 // Block was built locally but already exists in tree
                 // Set insert timing to 0 for now, will be updated in event handler if elapsed > 0
@@ -2519,6 +2520,8 @@ where
             }
             _ => {}
         };
+
+        debug!(target: "engine::tree", block=?block_num_hash, "block not already seen");
 
         // Ensure that the parent state is available.
         match self.state_provider_builder(block_id.parent) {

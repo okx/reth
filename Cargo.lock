@@ -8414,6 +8414,7 @@ dependencies = [
  "reth-optimism-chainspec",
  "reth-optimism-forks",
  "reth-payload-builder",
+ "reth-payload-builder-primitives",
  "reth-payload-primitives",
  "reth-storage-api",
  "reth-transaction-pool",

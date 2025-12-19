@@ -7,6 +7,7 @@ use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
+use reth_payload_builder_primitives::PayloadEvents;
 use reth_payload_primitives::{
     BuiltPayload, EngineApiMessageVersion, PayloadAttributesBuilder, PayloadKind, PayloadTypes,
 };
@@ -21,7 +22,7 @@ use std::{
 };
 use tokio::time::Interval;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::error;
+use tracing::{error, debug};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -190,8 +191,8 @@ where
         Ok(())
     }
 
-    /// Generates payload attributes for a new block, passes them to FCU and inserts built payload
-    /// through newPayload.
+    /// Generates payload attributes for a new block, waits for InsertExecutedBlock to be processed,
+    /// then calls newPayload.
     async fn advance(&mut self) -> eyre::Result<()> {
         let timestamp = std::cmp::max(
             self.last_timestamp.saturating_add(1),
@@ -200,6 +201,11 @@ where
                 .expect("cannot be earlier than UNIX_EPOCH")
                 .as_secs(),
         );
+
+        // Subscribe to payload events BEFORE building the payload to ensure we don't miss it
+        let payload_events = self.payload_builder.subscribe().await
+            .map_err(|e| eyre::eyre!("Failed to subscribe to payload events: {:?}", e))?;
+        let mut built_stream = payload_events.into_built_payload_stream();
 
         let res = self
             .to_engine
@@ -223,17 +229,62 @@ where
         };
 
         let block = payload.block();
+        let block_hash = block.hash();
+
+        // Wait for the built_payloads stream to process this payload
+        // The payload builder emits payloads to the stream, which sends InsertExecutedBlock
+        // We wait for our specific payload to appear in the stream
+        debug!(target: "engine::local", block_hash=?block_hash, "Waiting for InsertExecutedBlock to be processed");
+        
+        let mut found = false;
+        let timeout = tokio::time::Duration::from_millis(1000);
+        let start = tokio::time::Instant::now();
+        
+        while !found && start.elapsed() < timeout {
+            tokio::select! {
+                result = built_stream.next() => {
+                    match result {
+                        Some(p) => {
+                            if let Some(executed_block) = p.executed_block() {
+                                if executed_block.recovered_block().hash() == block_hash {
+                                    debug!(target: "engine::local", block_hash=?block_hash, "Found payload in built_payloads stream, InsertExecutedBlock should be processed");
+                                    found = true;
+                                    // Give a small additional delay to ensure InsertExecutedBlock is fully processed
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            debug!(target: "engine::local", "Payload event stream ended");
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
+                    // Continue waiting, but check timeout
+                    if start.elapsed() >= timeout {
+                        debug!(target: "engine::local", block_hash=?block_hash, "Timeout waiting for payload in built_payloads stream");
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !found {
+            debug!(target: "engine::local", block_hash=?block_hash, "Did not find payload in built_payloads stream, proceeding anyway");
+        }
 
         let payload = T::block_to_payload(payload.block().clone());
-        tracing::debug!("start new_payload");
+        debug!(target: "engine::local", block_hash=?block_hash, "start new_payload");
         let res = self.to_engine.new_payload(payload).await?;
-        tracing::debug!("end new_payload");
+        debug!(target: "engine::local", block_hash=?block_hash, "end new_payload");
         if !res.is_valid() {
             eyre::bail!("Invalid payload")
         }
 
         self.last_timestamp = timestamp;
-        self.last_block_hashes.push_back(block.hash());
+        self.last_block_hashes.push_back(block_hash);
         // ensure we keep at most 64 blocks
         if self.last_block_hashes.len() > 64 {
             self.last_block_hashes.pop_front();

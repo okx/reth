@@ -17,6 +17,7 @@ reth-payload-builder.workspace = true
 reth-payload-primitives.workspace = true
 reth-storage-api.workspace = true
 reth-transaction-pool.workspace = true
+reth-payload-builder-primitives.workspace = true
 
 # alloy
 alloy-consensus.workspace = true
