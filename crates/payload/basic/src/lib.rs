@@ -520,7 +520,7 @@ where
             empty_payload: empty_payload.filter(|_| kind != PayloadKind::WaitForPending),
         };
 
-        (fut, KeepPayloadJobAlive::Yes)
+        (fut, KeepPayloadJobAlive::No)
     }
 }
 
