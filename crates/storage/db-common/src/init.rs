@@ -163,13 +163,7 @@ where
 
     insert_genesis_state(&provider_rw, alloc.iter())?;
 
-    // compute state root to populate trie tables
-    // #[cfg(feature = "trie-db-ext")]
-    // {
-
-    // }
-    // #[cfg(not(feature = "trie-db-ext"))]
-    let ret = compute_state_root(&provider_rw, None)?;
+    // let ret = compute_state_root(&provider_rw, None)?;
 
     // Calculate state root using triedb
     match compute_state_root_triedb(alloc.iter()) {
