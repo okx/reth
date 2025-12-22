@@ -22,11 +22,13 @@ use reth_storage_api::{PlainPostState, StateProvider};
 pub use reth_storage_errors::provider::ProviderError;
 use reth_trie_common::{updates::TrieUpdates, HashedPostState};
 use std::collections::HashMap;
+use std::time::Instant;
 use alloy_primitives::U256;
 use revm::{
     context::result::ExecutionResult,
     database::{states::bundle_state::BundleRetention, BundleState, State},
 };
+use tracing::info;
 
 /// A type that knows how to execute a block. It is assumed to operate on a
 /// [`crate::Evm`] internally and use [`State`] as database.
@@ -547,9 +549,11 @@ where
         }
         
         // Calculate state root using triedb method
+        let start = Instant::now();
         let pr = state.state_root_with_updates_triedb(plain_state);
         let (triedb_state_root, triedb_trie_updates) =
             pr.map_err(BlockExecutionError::other)?;
+        info!("state_root_with_updates_triedb, elapsed: {:?}", start.elapsed().as_millis());
 
         // // Compare the two state roots
         // if mdbx_state_root != triedb_state_root {
