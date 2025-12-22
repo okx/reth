@@ -45,7 +45,10 @@ use reth_optimism_payload_builder::{
 };
 use reth_optimism_primitives::{DepositReceipt, OpPrimitives};
 use reth_optimism_rpc::{
-    eth::{ext::OpEthExtApi, ext_xlayer::XLayerEthApiExt, OpEthApiBuilder},
+    eth::{
+        ext::OpEthExtApi, ext_xlayer::XLayerEthApiExt, pubsub::OpEthPubSub, OpEthApi,
+        OpEthApiBuilder, OpEthApiFlashblocksExt,
+    },
     historical::{HistoricalRpc, HistoricalRpcClient},
     miner::{MinerApiExtServer, OpMinerExtApi},
     witness::{DebugExecutionWitnessApiServer, OpDebugWitnessApi},
@@ -526,6 +529,7 @@ where
         Pool: TransactionPool<Transaction: OpPooledTx>,
     >,
     EthB: EthApiBuilder<N>,
+    EthB::EthApi: OpEthApiFlashblocksExt,
     PVB: Send,
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,
@@ -639,6 +643,17 @@ where
                     XLayerEthApiExtServer::<OpTransactionRequest>::into_rpc(xlayer_eth_ext),
                 )?;
 
+                // install flashblocks pubsub extension in the eth namespace
+                let eth_pubsub = registry.eth_handlers().pubsub.clone();
+                let flashblocks_tx = OpEthApiFlashblocksExt::flashblocks_sender(registry.eth_api());
+                let op_eth_pubsub = OpEthPubSub::new(eth_pubsub, flashblocks_tx);
+                modules.merge_if_module_configured(
+                    RethRpcModule::Eth,
+                    reth_optimism_rpc::eth::pubsub::FlashblocksPubSubApiServer::into_rpc(
+                        op_eth_pubsub,
+                    ),
+                )?;
+
                 Ok(())
             })
             .await
@@ -664,6 +679,7 @@ where
     >,
     <<N as FullNodeComponents>::Pool as TransactionPool>::Transaction: OpPooledTx,
     EthB: EthApiBuilder<N>,
+    EthB::EthApi: OpEthApiFlashblocksExt,
     PVB: PayloadValidatorBuilder<N>,
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,
