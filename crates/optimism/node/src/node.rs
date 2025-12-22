@@ -644,10 +644,15 @@ where
                 )?;
 
                 // install flashblocks pubsub extension in the eth namespace
+                // Replace the base EthPubSub with OpEthPubSub to avoid duplicate eth_subscribe
+                // registration
                 let eth_pubsub = registry.eth_handlers().pubsub.clone();
                 let flashblocks_tx = OpEthApiFlashblocksExt::flashblocks_sender(registry.eth_api());
                 let op_eth_pubsub = OpEthPubSub::new(eth_pubsub, flashblocks_tx);
-                modules.merge_if_module_configured(RethRpcModule::Eth, op_eth_pubsub.into_rpc())?;
+                modules.add_or_replace_if_module_configured(
+                    RethRpcModule::Eth,
+                    op_eth_pubsub.into_rpc(),
+                )?;
 
                 Ok(())
             })
