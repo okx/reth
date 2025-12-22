@@ -104,11 +104,12 @@ where
         }
 
         // if the real state root should be computed
-        let BlockBuilderOutcome { execution_result, block, hashed_state, .. } =
+        let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } =
             if args.compute_state_root {
-                trace!(target: "flashblocks", "Computing block state root");
+                trace!(target: "flashblocks", "Computing block state root with trie updates");
                 builder.finish(&state_provider)?
             } else {
+                trace!(target: "flashblocks", "Building block without state root computation");
                 builder.finish(NoopProvider::default())?
             };
 
@@ -125,7 +126,7 @@ where
                 recovered_block: block.into(),
                 execution_output: Arc::new(execution_outcome),
                 hashed_state: Arc::new(hashed_state),
-                trie_updates: Arc::default(),
+                trie_updates: Arc::new(trie_updates),
             },
         );
         let pending_flashblock = PendingFlashBlock::new(
