@@ -897,7 +897,7 @@ dependencies = [
  "arrayvec",
  "derive_arbitrary",
  "derive_more",
- "nybbles",
+ "nybbles 0.4.6",
  "proptest",
  "proptest-derive 0.5.1",
  "serde",
@@ -4234,6 +4234,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 
 [[package]]
+name = "fxhash"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "gcc"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6240,6 +6249,19 @@ dependencies = [
 
 [[package]]
 name = "nybbles"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8983bb634df7248924ee0c4c3a749609b5abcb082c28fffe3254b3eb3602b307"
+dependencies = [
+ "alloy-rlp",
+ "const-hex",
+ "proptest",
+ "serde",
+ "smallvec",
+]
+
+[[package]]
+name = "nybbles"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c4b5ecbd0beec843101bffe848217f770e8b8da81d8355b7d6e226f2199b3dc"
@@ -7502,6 +7524,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
 
 [[package]]
+name = "remove_dir_all"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3acd125665422973a33ac9d3dd2df85edad0f4ae9b00dafb1a05e43a9f5ef8e7"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.11.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7774,6 +7805,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "triedb",
 ]
 
 [[package]]
@@ -8094,8 +8126,11 @@ dependencies = [
  "alloy-consensus",
  "alloy-genesis",
  "alloy-primitives",
+ "alloy-trie",
  "boyer-moore-magiclen",
+ "codspeed-criterion-compat",
  "eyre",
+ "rand 0.8.5",
  "reth-chainspec",
  "reth-codecs",
  "reth-config",
@@ -8109,12 +8144,16 @@ dependencies = [
  "reth-provider",
  "reth-stages-types",
  "reth-static-file-types",
+ "reth-storage-api",
  "reth-trie",
+ "reth-trie-common",
  "reth-trie-db",
  "serde",
  "serde_json",
+ "tempdir",
  "thiserror 2.0.17",
  "tracing",
+ "triedb",
 ]
 
 [[package]]
@@ -8351,7 +8390,9 @@ dependencies = [
  "reth-engine-primitives",
  "reth-ethereum-engine-primitives",
  "reth-optimism-chainspec",
+ "reth-optimism-forks",
  "reth-payload-builder",
+ "reth-payload-builder-primitives",
  "reth-payload-primitives",
  "reth-storage-api",
  "reth-transaction-pool",
@@ -8423,6 +8464,8 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
+ "alloy-signer",
+ "alloy-signer-local",
  "assert_matches",
  "codspeed-criterion-compat",
  "crossbeam-channel",
@@ -8455,6 +8498,7 @@ dependencies = [
  "reth-exex-types",
  "reth-metrics",
  "reth-network-p2p",
+ "reth-node-core",
  "reth-node-ethereum",
  "reth-node-metrics",
  "reth-payload-builder",
@@ -8467,10 +8511,12 @@ dependencies = [
  "reth-stages",
  "reth-stages-api",
  "reth-static-file",
+ "reth-storage-api",
  "reth-tasks",
  "reth-testing-utils",
  "reth-tracing",
  "reth-trie",
+ "reth-trie-common",
  "reth-trie-parallel",
  "reth-trie-sparse",
  "reth-trie-sparse-parallel",
@@ -8483,6 +8529,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tracing",
+ "triedb",
  "xlayer-db",
 ]
 
@@ -8850,6 +8897,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "revm",
+ "tracing",
 ]
 
 [[package]]
@@ -8884,7 +8932,7 @@ dependencies = [
  "alloy-evm",
  "alloy-primitives",
  "alloy-rlp",
- "nybbles",
+ "nybbles 0.4.6",
  "reth-storage-errors",
  "thiserror 2.0.17",
 ]
@@ -9796,11 +9844,13 @@ name = "reth-optimism-node"
 version = "1.9.3"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-genesis",
  "alloy-network",
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
+ "alloy-sol-types",
  "clap",
  "eyre",
  "futures",
@@ -9830,6 +9880,7 @@ dependencies = [
  "reth-optimism-storage",
  "reth-optimism-txpool",
  "reth-payload-builder",
+ "reth-payload-primitives",
  "reth-payload-util",
  "reth-primitives-traits",
  "reth-provider",
@@ -10172,6 +10223,7 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rpc-types-engine",
+ "alloy-trie",
  "assert_matches",
  "dashmap 6.1.0",
  "eyre",
@@ -10207,9 +10259,11 @@ dependencies = [
  "revm-database-interface",
  "revm-state",
  "strum 0.27.2",
+ "tempdir",
  "tempfile",
  "tokio",
  "tracing",
+ "triedb",
 ]
 
 [[package]]
@@ -10696,6 +10750,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "triedb",
 ]
 
 [[package]]
@@ -10915,6 +10970,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "revm-database",
+ "triedb",
 ]
 
 [[package]]
@@ -11097,22 +11153,28 @@ dependencies = [
  "codspeed-criterion-compat",
  "itertools 0.14.0",
  "metrics",
+ "nybbles 0.3.4",
+ "nybbles 0.4.6",
  "parking_lot",
  "pretty_assertions",
  "proptest",
  "proptest-arbitrary-interop",
+ "reth-chainspec",
  "reth-ethereum-primitives",
  "reth-execution-errors",
  "reth-metrics",
  "reth-primitives-traits",
+ "reth-provider",
  "reth-stages-types",
  "reth-storage-errors",
  "reth-tracing",
  "reth-trie-common",
+ "reth-trie-db",
  "reth-trie-sparse",
  "revm-database",
  "revm-state",
  "tracing",
+ "triedb",
  "triehash",
 ]
 
@@ -11135,7 +11197,7 @@ dependencies = [
  "derive_more",
  "hash-db",
  "itertools 0.14.0",
- "nybbles",
+ "nybbles 0.4.6",
  "plain_hasher",
  "proptest",
  "proptest-arbitrary-interop",
@@ -11164,13 +11226,17 @@ dependencies = [
  "reth-execution-errors",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-storage-api",
  "reth-trie",
  "reth-trie-common",
+ "reth-trie-db",
  "revm",
  "revm-database",
  "serde_json",
  "similar-asserts",
+ "tempdir",
  "tracing",
+ "triedb",
  "triehash",
 ]
 
@@ -11938,6 +12004,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "sealed"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f968c5ea23d555e670b449c1c5e7b2fc399fdaec1d304a17cd48e288abc107"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12699,6 +12776,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempdir"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15f2b5fb00ccdf689e0149d1b1b3c03fead81c2b37735d812fa8bddbbf41b6d8"
+dependencies = [
+ "rand 0.4.6",
+ "remove_dir_all",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13437,6 +13524,28 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.111",
+]
+
+[[package]]
+name = "triedb"
+version = "0.1.0"
+source = "git+https://github.com/base/triedb.git#cedd1a33084ddb2724240193c39df3fbdec1dba0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "arrayvec",
+ "fxhash",
+ "memmap2",
+ "metrics",
+ "metrics-derive",
+ "parking_lot",
+ "proptest",
+ "proptest-derive 0.6.0",
+ "rayon",
+ "sealed",
+ "static_assertions",
+ "zerocopy",
 ]
 
 [[package]]
