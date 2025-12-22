@@ -413,16 +413,6 @@ where
         chain_spec: &ChainSpec,
     ) -> Result<Self, PayloadBuilderError> {
         let extra_data = if chain_spec.is_jovian_active_at_timestamp(attributes.timestamp()) {
-            // Log min_base_fee from attributes
-            if let Some(min_base_fee) = attributes.min_base_fee {
-                info!(
-                target: "payload_builder",
-                parent_number = parent.number(),
-                timestamp = attributes.timestamp(),
-                min_base_fee = min_base_fee,
-                "Using min_base_fee from payload attributes for Jovian block"
-            );
-            }
             attributes
                 .get_jovian_extra_data(
                     chain_spec.base_fee_params_at_timestamp(attributes.timestamp()),

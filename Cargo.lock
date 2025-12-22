@@ -9739,6 +9739,7 @@ dependencies = [
  "reth-storage-errors",
  "revm",
  "thiserror 2.0.17",
+ "tracing",
 ]
 
 [[package]]
