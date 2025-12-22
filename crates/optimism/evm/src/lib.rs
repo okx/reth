@@ -162,6 +162,17 @@ where
         parent: &Header,
         attributes: &Self::NextBlockEnvCtx,
     ) -> Result<EvmEnv<OpSpecId>, Self::Error> {
+        let base_fee = self.chain_spec().next_block_base_fee(parent, attributes.timestamp).unwrap_or_default();
+
+        tracing::info!(
+        target: "evm::op",
+        parent_number = parent.number(),
+        parent_base_fee = parent.base_fee_per_gas().unwrap_or_default(),
+        next_block_base_fee = base_fee,
+        timestamp = attributes.timestamp,
+        gas_limit = attributes.gas_limit,
+        "Setting base fee for next block EVM environment"
+    );
         Ok(EvmEnv::for_op_next_block(
             parent,
             NextEvmEnvAttributes {

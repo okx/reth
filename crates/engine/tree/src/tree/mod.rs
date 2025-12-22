@@ -228,37 +228,6 @@ impl OnStateHook for MeteredStateHook {
     }
 }
 
-/// Helper function to update block timing metrics for insert phase.
-///
-/// This function handles the common pattern of:
-/// 1. Getting existing timing metrics (if block was built locally)
-/// 2. Creating new metrics (if block was received from network)
-/// 3. Setting insert timing values
-/// 4. Calculating total as the sum of validate_and_execute + insert_to_tree
-/// 5. Storing the updated metrics
-fn update_insert_timing_metrics(
-    block_hash: B256,
-    validate_and_execute: std::time::Duration,
-    insert_to_tree: std::time::Duration,
-) {
-    use reth_node_metrics::block_timing::{get_block_timing, store_block_timing, BlockTimingMetrics};
-    
-    let mut timing_metrics = if let Some(existing) = get_block_timing(&block_hash) {
-        // Block was built locally, update insert timing
-        existing
-    } else {
-        // Block was received from network, create timing metrics with insert timing only
-        BlockTimingMetrics::default()
-    };
-    
-    timing_metrics.insert.validate_and_execute = validate_and_execute;
-    timing_metrics.insert.insert_to_tree = insert_to_tree;
-    // Total should be the sum of validate_and_execute + insert_to_tree
-    timing_metrics.insert.total = timing_metrics.insert.validate_and_execute + timing_metrics.insert.insert_to_tree;
-    
-    store_block_timing(block_hash, timing_metrics);
-}
-
 /// The engine API tree handler implementation.
 ///
 /// This type is responsible for processing engine API requests, maintaining the canonical state and
@@ -577,6 +546,12 @@ where
 
         let block_hash = num_hash.hash;
 
+        // X Layer: Log block receive end (record immediately after receiving the block,
+        // before processing/insertion starts, to ensure correct timestamp ordering)
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_block(block_hash, block_number, TransactionProcessId::RpcBlockReceiveEnd);
+        }
+
         // Check for invalid ancestors
         if let Some(invalid) = self.find_invalid_ancestor(&payload) {
             let status = self.handle_invalid_ancestor_payload(payload, invalid)?;
@@ -591,8 +566,7 @@ where
         } else {
             self.try_buffer_payload(payload)?
         };
-        debug!("try_insert_payload status: {:?}", status);
-        debug!("is_sync_target_head: {:?}", self.is_sync_target_head(block_hash));
+
         let mut outcome = TreeOutcome::new(status);
         // if the block is valid and it is the current sync target head, make it canonical
         if outcome.outcome.is_valid() && self.is_sync_target_head(block_hash) {
@@ -606,11 +580,6 @@ where
 
         // record total newPayload duration
         self.metrics.block_validation.total_duration.record(start.elapsed().as_secs_f64());
-
-        // X Layer: Log block receive end
-        if let Some(tracer) = get_global_tracer() {
-            tracer.log_block(block_hash, block_number, TransactionProcessId::RpcBlockReceiveEnd);
-        }
 
         Ok(outcome)
     }
@@ -1338,7 +1307,6 @@ where
     /// If we're currently awaiting a response this will try to receive the response (non-blocking)
     /// or send a new persistence action if necessary.
     fn advance_persistence(&mut self) -> Result<(), AdvancePersistenceError> {
-        debug!("start advance persistence");
         if self.persistence_state.in_progress() {
             let (mut rx, start_time, current_action) = self
                 .persistence_state
@@ -1376,11 +1344,8 @@ where
             if let Some(new_tip_num) = self.find_disk_reorg()? {
                 self.remove_blocks(new_tip_num)
             } else if self.should_persist() {
-                debug!("should persist blocks");
                 let blocks_to_persist = self.get_canonical_blocks_to_persist()?;
                 self.persist_blocks(blocks_to_persist);
-            } else {
-                debug!("should not persist blocks");
             }
         }
 
@@ -1428,13 +1393,7 @@ where
                         let insert_tree_elapsed = insert_tree_start.elapsed();
                         self.metrics.engine.inserted_already_executed_blocks.increment(1);
                         let elapsed = now.elapsed();
-                        
-                        // X Layer: Update timing metrics for InsertExecutedBlock path
-                        // Note: validate_exec time is 0 because block was already executed during build
-                        use std::time::Duration;
-                        let block_hash = block.recovered_block().hash();
-                        update_insert_timing_metrics(block_hash, Duration::from_nanos(0), insert_tree_elapsed);
-                        
+
                         self.emit_event(EngineApiEvent::BeaconConsensus(
                             ConsensusEngineEvent::CanonicalBlockAdded(block, elapsed),
                         ));
@@ -1853,10 +1812,8 @@ where
         let header = self.state.tree_state.sealed_header_by_hash(&hash);
 
         if header.is_some() {
-            debug!(target: "engine::tree", "found in memory Sealed block with hash {hash:?}");
             Ok(header)
         } else {
-            debug!(target: "engine::tree", "found in disk Sealed block with hash {hash:?}");
             self.provider.sealed_header_by_hash(hash)
         }
     }
@@ -1935,14 +1892,7 @@ where
     /// See [`ForkchoiceStateTracker::sync_target_state`]
     fn is_sync_target_head(&self, block_hash: B256) -> bool {
         if let Some(target) = self.state.forkchoice_state_tracker.sync_target_state() {
-            debug!(
-                target: "engine::tree",
-                ?block_hash,
-                head_block_hash = ?target.head_block_hash,
-            );
             return target.head_block_hash == block_hash
-        } else {
-            debug!(target: "engine::tree", "no sync target state");
         }
         false
     }
@@ -2505,23 +2455,11 @@ where
                 // We now assume that we already have this block in the tree. However, we need to
                 // run the conversion to ensure that the block hash is valid.
                 convert_to_block(self, input)?;
-                debug!(target: "engine::tree", block=?block_num_hash, "block already seen");
-                // X Layer: Even if block is already seen, update timing metrics if it was built locally
-                // Block was built locally but already exists in tree
-                // Set insert timing to 0 for now, will be updated in event handler if elapsed > 0
-                use reth_node_metrics::block_timing::get_block_timing;
-                use std::time::Duration;
-                let block_hash = block_num_hash.hash;
-                if get_block_timing(&block_hash).is_some() {
-                    update_insert_timing_metrics(block_hash, Duration::from_nanos(0), Duration::from_nanos(0));
-                }
-                
+
                 return Ok(InsertPayloadOk::AlreadySeen(BlockStatus::Valid))
             }
             _ => {}
         };
-
-        debug!(target: "engine::tree", block=?block_num_hash, "block not already seen");
 
         // Ensure that the parent state is available.
         match self.state_provider_builder(block_id.parent) {
@@ -2562,12 +2500,21 @@ where
 
         let ctx = TreeCtx::new(&mut self.state, &self.canonical_in_memory_state);
 
-        // X Layer: Track insert timing
-        let validate_exec_start = Instant::now();
+        // X Layer: Track insert timing with RAII
         let start = Instant::now();
+        let block_hash = block_num_hash.hash;
 
-        let executed = execute(&mut self.payload_validator, input, ctx)?;
-        let validate_exec_elapsed = validate_exec_start.elapsed();
+        // Create timing context with Prometheus support
+        // We'll create Prometheus metrics from the handler's metrics if needed
+        use reth_node_metrics::block_timing::{BlockTimingContext, BlockTimingPrometheusMetrics};
+        let prom_metrics = BlockTimingPrometheusMetrics::default();
+        let mut timing_ctx = BlockTimingContext::new_with_prometheus(block_hash, prom_metrics);
+
+        // validate and execute
+        let executed = {
+            let _guard = timing_ctx.time_validate_and_execute();
+            execute(&mut self.payload_validator, input, ctx)?
+        };
 
         // if the parent is the canonical head, we can insert the block as the pending block
         if self.state.tree_state.canonical_block_hash() == executed.recovered_block().parent_hash()
@@ -2576,17 +2523,18 @@ where
             self.canonical_in_memory_state.set_pending_block(executed.clone());
         }
 
-        let insert_tree_start = Instant::now();
-        self.state.tree_state.insert_executed(executed.clone());
-        let insert_tree_elapsed = insert_tree_start.elapsed();
+        // insert to tree
+        {
+            let _guard = timing_ctx.time_insert_to_tree();
+            self.state.tree_state.insert_executed(executed.clone());
+        }
         self.metrics.engine.executed_blocks.set(self.state.tree_state.block_count() as f64);
 
         // emit insert event
         let elapsed = start.elapsed();
-        
-        // X Layer: Update timing metrics with insert timing
-        let block_hash = executed.recovered_block().hash();
-        update_insert_timing_metrics(block_hash, validate_exec_elapsed, insert_tree_elapsed);
+
+        // X Layer: Update timing metrics (auto-updates and stores on drop)
+        timing_ctx.update_totals();
         let engine_event = if is_fork {
             ConsensusEngineEvent::ForkBlockAdded(executed.clone(), elapsed)
         } else {
