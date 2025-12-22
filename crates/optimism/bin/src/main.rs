@@ -27,7 +27,7 @@ fn main() {
 
     if let Err(err) =
         Cli::<OpChainSpecParser, RollupArgs>::parse().run(async move |builder, rollup_args| {
-            info!(target: "reth::cli", "Launching node");
+            info!(target: "reth::cli", "Launching node triedb");
 
             // For X Layer
             if rollup_args.xlayer_args.apollo.enabled {
