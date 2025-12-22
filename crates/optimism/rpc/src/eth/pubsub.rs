@@ -1,7 +1,12 @@
-use alloy_rpc_types_eth::Header;
+use alloy_json_rpc::RpcObject;
+use alloy_rpc_types_eth::{
+    pubsub::{Params, SubscriptionKind},
+    Header,
+};
 use futures::StreamExt;
 use jsonrpsee::{
-    server::SubscriptionMessage, types::ErrorObject, PendingSubscriptionSink, SubscriptionSink,
+    proc_macros::rpc, server::SubscriptionMessage, types::ErrorObject, PendingSubscriptionSink,
+    SubscriptionSink,
 };
 use reth_optimism_flashblocks::FlashBlock;
 use reth_rpc::eth::pubsub::EthPubSub;
@@ -12,7 +17,25 @@ use std::{pin::Pin, sync::Arc};
 use tokio_stream::{wrappers::BroadcastStream, Stream};
 use tracing::info;
 
-/// `Eth` pubsub RPC implementation for Optimism with flashblocks support.`.
+/// Flashblocks pubsub RPC interface.
+///
+/// This trait provides the same interface as `EthPubSubApi` but with relaxed trait bounds
+/// to allow implementation for `OpEthPubSub` without requiring `SignedTx = PoolConsensusTx<Pool>`.
+#[rpc(server, namespace = "eth")]
+pub trait FlashblocksPubSubApi<T: RpcObject> {
+    /// Create an ethereum subscription for the given params
+    #[subscription(
+        name = "subscribe" => "subscription",
+        unsubscribe = "unsubscribe",
+        item = alloy_rpc_types::pubsub::SubscriptionResult
+    )]
+    async fn subscribe(
+        &self,
+        kind: SubscriptionKind,
+        params: Option<Params>,
+    ) -> jsonrpsee::core::SubscriptionResult;
+}
+
 #[derive(Clone, Debug)]
 pub struct OpEthPubSub<Eth> {
     /// Standard eth pubsub handler
@@ -33,6 +56,22 @@ impl<Eth> OpEthPubSub<Eth> {
     /// Returns a reference to the wrapped `EthPubSub`.
     pub fn eth_pubsub(&self) -> &EthPubSub<Eth> {
         &self.eth_pubsub
+    }
+
+    /// Converts this `OpEthPubSub` into an RPC module.
+    ///
+    /// This method uses `FlashblocksPubSubApiServer` which has relaxed trait bounds,
+    /// allowing it to be used in contexts where `EthPubSubApiServer` bounds aren't satisfied.
+    pub fn into_rpc(self) -> jsonrpsee::RpcModule<()>
+    where
+        Eth: reth_rpc_eth_api::EthApiTypes,
+        OpEthPubSub<Eth>:
+            FlashblocksPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>>,
+    {
+        <OpEthPubSub<Eth> as FlashblocksPubSubApiServer<
+            reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>,
+        >>::into_rpc(self)
+        .remove_context()
     }
 
     /// Returns a stream that yields all new RPC headers from flashblocks.
@@ -102,6 +141,45 @@ where
         self.eth_pubsub.subscribe(pending, kind, params).await
     }
 }
+
+#[async_trait::async_trait]
+impl<Eth> FlashblocksPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>>
+    for OpEthPubSub<Eth>
+where
+    Eth: reth_rpc_eth_api::RpcNodeCore<
+            Provider: reth_storage_api::BlockNumReader + reth_chain_state::CanonStateSubscriptions,
+            Pool: reth_transaction_pool::TransactionPool,
+        > + reth_rpc_eth_api::EthApiTypes<
+            RpcConvert: reth_rpc_eth_api::RpcConvert<
+                Primitives: reth_primitives_traits::NodePrimitives,
+            >,
+        > + 'static,
+{
+    async fn subscribe(
+        &self,
+        pending: PendingSubscriptionSink,
+        kind: SubscriptionKind,
+        params: Option<Params>,
+    ) -> jsonrpsee::core::SubscriptionResult {
+        info!("XXX line 163: {:?}", kind);
+        if matches!(kind, SubscriptionKind::NewHeads) {
+            if let Some(flashblocks_tx) = &self.flashblocks_tx {
+                return self.subscribe_flashblocks_as_headers(pending, flashblocks_tx, params).await;
+            }
+        }
+
+        info!("XXX line 173");
+        // TODO: Implement full fallback logic or ensure standard pubsub is merged after this
+        let err = internal_rpc_err(
+            "This subscription type should be handled by the standard pubsub. \
+             FlashblocksPubSubApiServer only handles newHeads with flashblocks enabled.",
+        );
+        pending.accept().await?;
+
+        Err(jsonrpsee::core::SubscriptionError::from(err))
+    }
+}
+
 impl<Eth> OpEthPubSub<Eth>
 where
     Eth: reth_rpc_eth_api::RpcNodeCore<Provider: reth_storage_api::BlockNumReader>
@@ -120,7 +198,7 @@ where
     ) -> jsonrpsee::core::SubscriptionResult {
         let sink = pending.accept().await?;
         let flashblocks_rx = flashblocks_tx.subscribe();
-        info!("XXX line 125: {:?}", flashblocks_rx);
+        info!("XXX line 202: {:?}", flashblocks_rx);
         // Convert flashblocks stream to headers stream, filtering out errors
         let headers_stream = BroadcastStream::new(flashblocks_rx).filter_map(|result| async move {
             match result {
@@ -131,7 +209,7 @@ where
                 }
             }
         });
-        info!("XXX line 136");
+        info!("XXX line 213");
         let pinned_stream = Box::pin(headers_stream);
 
         tokio::spawn(async move {
@@ -190,13 +268,6 @@ fn extract_header_from_flashblock<BlockHeader>(
 where
     BlockHeader: alloy_consensus::BlockHeader,
 {
-    // TODO: Extract header information from flashblock.base or flashblock payload
-    // This depends on the actual structure of OpFlashblockPayload
-    // You may need to:
-    // 1. Extract block number, parent hash, etc. from flashblock.base
-    // 2. Construct a Header object
-    // 3. Return it
-
-    // Placeholder implementation - needs to be filled based on actual structure
+    info!("XXX line 272: {:?}", _flashblock);
     Err(internal_rpc_err("Header extraction from flashblock not yet implemented"))
 }

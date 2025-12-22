@@ -647,12 +647,7 @@ where
                 let eth_pubsub = registry.eth_handlers().pubsub.clone();
                 let flashblocks_tx = OpEthApiFlashblocksExt::flashblocks_sender(registry.eth_api());
                 let op_eth_pubsub = OpEthPubSub::new(eth_pubsub, flashblocks_tx);
-                modules.merge_if_module_configured(
-                    RethRpcModule::Eth,
-                    reth_optimism_rpc::eth::pubsub::FlashblocksPubSubApiServer::into_rpc(
-                        op_eth_pubsub,
-                    ),
-                )?;
+                modules.merge_if_module_configured(RethRpcModule::Eth, op_eth_pubsub.into_rpc())?;
 
                 Ok(())
             })
