@@ -518,7 +518,9 @@ where
         db.merge_transitions(BundleRetention::Reverts);
 
         // calculate the state root
+        let start = Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
+        info!("hashed_post_state, elapsed: {:?}", start.elapsed().as_millis());
         
         // // Calculate state root using the previous method (mdbx)
         // let (mdbx_state_root, mdbx_trie_updates) = state
