@@ -22,6 +22,7 @@ use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionKind {
+    /// Standard Ethereum subscription.
     Standard(AlloySubscriptionKind),
     /// Flashblocks subscription.
     Flashblocks,
