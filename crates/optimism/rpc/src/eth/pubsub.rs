@@ -163,7 +163,9 @@ where
     ) -> jsonrpsee::core::SubscriptionResult {
         info!("XXX line 163: {:?}", kind);
         if matches!(kind, SubscriptionKind::NewHeads) {
+            info!("XXX line 166: {:?}", kind);
             if let Some(flashblocks_tx) = &self.flashblocks_tx {
+                info!("XXX line 167: {:?}", flashblocks_tx);
                 return self.subscribe_flashblocks_as_headers(pending, flashblocks_tx, params).await;
             }
         }
