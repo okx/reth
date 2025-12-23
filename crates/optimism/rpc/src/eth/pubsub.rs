@@ -1,4 +1,7 @@
+use alloy_consensus::{Header as ConsensusHeader, EMPTY_OMMER_ROOT_HASH};
+use alloy_eips::merge::BEACON_NONCE;
 use alloy_json_rpc::RpcObject;
+use alloy_primitives::{FixedBytes, U256};
 use alloy_rpc_types_eth::{
     pubsub::{Params, SubscriptionKind},
     Header,
@@ -9,6 +12,7 @@ use jsonrpsee::{
     SubscriptionSink,
 };
 use reth_optimism_flashblocks::FlashBlock;
+use reth_primitives_traits::header::SealedHeader;
 use reth_rpc::eth::pubsub::EthPubSub;
 use reth_rpc_eth_api::pubsub::EthPubSubApiServer;
 use reth_rpc_server_types::result::internal_rpc_err;
@@ -82,21 +86,14 @@ impl<Eth> OpEthPubSub<Eth> {
     /// Returns `None` if flashblocks are not available.
     pub fn new_flashblocks_header_stream(
         &self,
-    ) -> Option<
-        impl Stream<
-            Item = Header<<Eth::Primitives as reth_primitives_traits::NodePrimitives>::BlockHeader>,
-        >,
-    >
+    ) -> Option<impl Stream<Item = Header<ConsensusHeader>>>
     where
         Eth: reth_rpc_eth_api::RpcNodeCore,
     {
         self.flashblocks_tx.as_ref().map(|flashblocks_tx| {
             BroadcastStream::new(flashblocks_tx.subscribe()).filter_map(|result| async move {
                 match result {
-                    Ok(flashblock) => extract_header_from_flashblock::<
-                        <Eth::Primitives as reth_primitives_traits::NodePrimitives>::BlockHeader,
-                    >(&flashblock)
-                    .ok(),
+                    Ok(flashblock) => extract_header_from_flashblock(&flashblock).ok(),
                     Err(_) => {
                         // BroadcastStream lagged, skip
                         None
@@ -200,18 +197,19 @@ where
     ) -> jsonrpsee::core::SubscriptionResult {
         let sink = pending.accept().await?;
         let flashblocks_rx = flashblocks_tx.subscribe();
-        info!("XXX line 202: {:?}", flashblocks_rx);
         // Convert flashblocks stream to headers stream, filtering out errors
         let headers_stream = BroadcastStream::new(flashblocks_rx).filter_map(|result| async move {
             match result {
-                Ok(flashblock) => Some(flashblock),
+                Ok(flashblock) => {
+                    // Convert flashblock to RPC Header
+                    extract_header_from_flashblock(&flashblock).ok()
+                }
                 Err(_) => {
                     // BroadcastStream lagged, skip
                     None
                 }
             }
         });
-        info!("XXX line 213");
         let pinned_stream = Box::pin(headers_stream);
 
         tokio::spawn(async move {
@@ -264,12 +262,70 @@ where
 }
 
 /// Extract Header from FlashBlock
-fn extract_header_from_flashblock<BlockHeader>(
-    _flashblock: &FlashBlock,
-) -> Result<Header<BlockHeader>, ErrorObject<'static>>
-where
-    BlockHeader: alloy_consensus::BlockHeader,
-{
-    info!("XXX line 272: {:?}", _flashblock);
-    Err(internal_rpc_err("Header extraction from flashblock not yet implemented"))
+///
+/// Constructs an Ethereum RPC `Header` from a flashblock payload by combining
+/// the immutable `base` fields with the mutable `diff` fields.
+///
+/// Returns `Header<alloy_consensus::Header>` which can be converted to other header types
+/// if needed by the caller.
+fn extract_header_from_flashblock(
+    flashblock: &FlashBlock,
+) -> Result<Header<ConsensusHeader>, ErrorObject<'static>> {
+    // Get base fields (immutable, only present in first flashblock)
+    let base = flashblock.base.as_ref().ok_or_else(|| {
+        internal_rpc_err("Flashblock missing base fields required for header construction")
+    })?;
+
+    // Get diff fields (mutable, updated with each flashblock)
+    let diff = &flashblock.diff;
+
+    // // Compute transactions root from the transactions list
+    // let transactions_root = if diff.transactions.is_empty() {
+    //     // Empty transactions list has a specific root
+    //     proofs::calculate_transaction_root(&[])
+    // } else {
+    //     // Calculate root from transaction bytes
+    //     // Note: diff.transactions is Vec<Bytes>, we need to decode them or compute root directly
+    //     // For now, we'll use the receipts_root as a proxy if transactions_root isn't directly
+    // available     // In a proper implementation, we'd decode transactions and compute the
+    // root     // This is a limitation - we'd need the actual transaction objects to compute
+    // the root correctly     // For now, we'll use a placeholder that should be computed from
+    // the actual transactions     proofs::calculate_transaction_root(&[])
+    // };
+
+    // Construct consensus header fields
+    // TODO: Properly compute transactions_root from diff.transactions (RLP-encoded bytes)
+    // For now, using empty root as placeholder - this should be computed from actual transactions
+    let consensus_header = ConsensusHeader {
+        parent_hash: base.parent_hash,
+        ommers_hash: EMPTY_OMMER_ROOT_HASH,
+        beneficiary: base.fee_recipient,
+        state_root: diff.state_root,
+        transactions_root: FixedBytes::default(),
+        receipts_root: diff.receipts_root,
+        withdrawals_root: Some(diff.withdrawals_root),
+        logs_bloom: diff.logs_bloom,
+        timestamp: base.timestamp,
+        mix_hash: base.prev_randao,
+        nonce: BEACON_NONCE.into(),
+        base_fee_per_gas: base.base_fee_per_gas.to::<u64>().into(),
+        number: base.block_number,
+        gas_limit: base.gas_limit,
+        difficulty: U256::ZERO, // PoS chains have zero difficulty
+        gas_used: diff.gas_used,
+        extra_data: base.extra_data.clone(),
+        parent_beacon_block_root: Some(base.parent_beacon_block_root),
+        blob_gas_used: None,   // Not available in flashblock diff structure
+        excess_blob_gas: None, // Not available in flashblock, would need to compute
+        requests_hash: None,   // Not available in flashblock
+    };
+
+    // Seal the header with the block hash from diff
+    // Use the known block hash from diff instead of computing it
+    let sealed_header = SealedHeader::new(consensus_header, diff.block_hash);
+
+    // Convert to RPC Header format
+    // Note: We don't have block size, so we pass None
+    // The sealed header is converted with .into() to match the expected type for from_consensus
+    Ok(Header::from_consensus(sealed_header.into(), None, None))
 }
