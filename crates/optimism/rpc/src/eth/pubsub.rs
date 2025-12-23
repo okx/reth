@@ -23,18 +23,64 @@ use tracing::info;
 
 /// Extended subscription kind that wraps Alloy's `SubscriptionKind` and adds Optimism-specific
 /// variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionKind {
     /// Wraps all standard Alloy subscription kinds.
-    #[serde(with = "alloy_rpc_types_eth::pubsub::SubscriptionKind")]
     Standard(AlloySubscriptionKind),
     /// Flashblocks subscription.
     ///
     /// Returns flashblocks as they are received from the sequencer.
     /// This is an Optimism-specific extension to the standard Ethereum subscription types.
-    #[serde(rename = "flashblocks")]
     Flashblocks,
+}
+
+impl<'de> Deserialize<'de> for SubscriptionKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+
+        // Check for flashblocks first
+        if s == "flashblocks" {
+            return Ok(SubscriptionKind::Flashblocks);
+        }
+
+        // Try to parse as standard Alloy subscription kind
+        match s.as_str() {
+            "newHeads" => Ok(SubscriptionKind::Standard(AlloySubscriptionKind::NewHeads)),
+            "logs" => Ok(SubscriptionKind::Standard(AlloySubscriptionKind::Logs)),
+            "newPendingTransactions" => {
+                Ok(SubscriptionKind::Standard(AlloySubscriptionKind::NewPendingTransactions))
+            }
+            "syncing" => Ok(SubscriptionKind::Standard(AlloySubscriptionKind::Syncing)),
+            _ => Err(serde::de::Error::unknown_variant(
+                &s,
+                &["flashblocks", "newHeads", "logs", "newPendingTransactions", "syncing"],
+            )),
+        }
+    }
+}
+
+impl Serialize for SubscriptionKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            SubscriptionKind::Standard(kind) => {
+                // Serialize the standard kind as its string representation
+                let s = match kind {
+                    AlloySubscriptionKind::NewHeads => "newHeads",
+                    AlloySubscriptionKind::Logs => "logs",
+                    AlloySubscriptionKind::NewPendingTransactions => "newPendingTransactions",
+                    AlloySubscriptionKind::Syncing => "syncing",
+                };
+                serializer.serialize_str(s)
+            }
+            SubscriptionKind::Flashblocks => serializer.serialize_str("flashblocks"),
+        }
+    }
 }
 
 impl SubscriptionKind {
