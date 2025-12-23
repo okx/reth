@@ -8,6 +8,7 @@ pub mod transaction;
 mod block;
 mod call;
 mod pending_block;
+pub mod pubsub;
 
 use crate::{
     eth::{receipt::OpReceiptConverter, transaction::OpTxInfoMapper},
@@ -25,7 +26,7 @@ use reth_evm::ConfigureEvm;
 use reth_node_api::{FullNodeComponents, FullNodeTypes, HeaderTy, NodeTypes};
 use reth_node_builder::rpc::{EthApiBuilder, EthApiCtx};
 use reth_optimism_flashblocks::{
-    FlashBlockBuildInfo, FlashBlockCompleteSequence, FlashBlockCompleteSequenceRx,
+    FlashBlock, FlashBlockBuildInfo, FlashBlockCompleteSequence, FlashBlockCompleteSequenceRx,
     FlashBlockConsensusClient, FlashBlockRx, FlashBlockService, FlashblocksListeners,
     PendingBlockRx, PendingFlashBlock, WsFlashBlockStream,
 };
@@ -123,6 +124,11 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
         self.inner.flashblocks.as_ref().map(|f| f.received_flashblocks.subscribe())
     }
 
+    /// Returns the flashblocks broadcast sender, if available.
+    pub fn flashblocks_sender(&self) -> Option<tokio::sync::broadcast::Sender<Arc<FlashBlock>>> {
+        self.inner.flashblocks.as_ref().map(|f| f.received_flashblocks.clone())
+    }
+
     /// Returns a new subscription to flashblock sequences.
     pub fn subscribe_flashblock_sequence(&self) -> Option<FlashBlockCompleteSequenceRx> {
         self.inner.flashblocks.as_ref().map(|f| f.flashblocks_sequence.subscribe())
@@ -148,7 +154,7 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
         parent_hash: B256,
     ) -> eyre::Result<Option<PendingBlock<N::Primitives>>> {
         let Some(rx) = self.inner.flashblocks.as_ref().map(|f| &f.pending_block_rx) else {
-            return Ok(None)
+            return Ok(None);
         };
 
         // Check if a flashblock is being built
@@ -575,5 +581,21 @@ where
 {
     fn legacy_rpc_client(&self) -> Option<&Arc<LegacyRpcClient>> {
         self.inner.eth_api.legacy_rpc_client()
+    }
+}
+
+/// Trait extension for accessing flashblocks functionality from EthApi
+pub trait OpEthApiFlashblocksExt<P: reth_primitives_traits::NodePrimitives> {
+    /// Returns the flashblocks broadcast sender, if available.
+    fn pending_blocks_rx(&self) -> Option<PendingBlockRx<P>>;
+}
+
+impl<N, Rpc> OpEthApiFlashblocksExt<N::Primitives> for OpEthApi<N, Rpc>
+where
+    N: RpcNodeCore,
+    Rpc: RpcConvert,
+{
+    fn pending_blocks_rx(&self) -> Option<PendingBlockRx<N::Primitives>> {
+        self.inner.flashblocks.as_ref().map(|f| f.pending_block_rx.clone())
     }
 }
