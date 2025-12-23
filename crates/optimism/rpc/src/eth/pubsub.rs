@@ -1,9 +1,9 @@
 use alloy_consensus::{Header as ConsensusHeader, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_json_rpc::RpcObject;
-use alloy_primitives::{FixedBytes, U256};
+use alloy_primitives::{Address, FixedBytes, U256};
 use alloy_rpc_types_eth::{
-    pubsub::{Params, SubscriptionKind},
+    pubsub::{Params, SubscriptionKind as AlloySubscriptionKind},
     Header,
 };
 use futures::StreamExt;
@@ -16,10 +16,131 @@ use reth_primitives_traits::header::SealedHeader;
 use reth_rpc::eth::pubsub::EthPubSub;
 use reth_rpc_eth_api::pubsub::EthPubSubApiServer;
 use reth_rpc_server_types::result::internal_rpc_err;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use tokio_stream::{wrappers::WatchStream, Stream};
 use tracing::info;
+
+/// Extended subscription kind that wraps Alloy's `SubscriptionKind` and adds Optimism-specific
+/// variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum SubscriptionKind {
+    /// Wraps all standard Alloy subscription kinds.
+    #[serde(with = "alloy_rpc_types_eth::pubsub::SubscriptionKind")]
+    Standard(AlloySubscriptionKind),
+    /// Flashblocks subscription.
+    ///
+    /// Returns flashblocks as they are received from the sequencer.
+    /// This is an Optimism-specific extension to the standard Ethereum subscription types.
+    #[serde(rename = "flashblocks")]
+    Flashblocks,
+}
+
+impl SubscriptionKind {
+    /// Returns `true` if this is a flashblocks subscription.
+    pub const fn is_flashblocks(&self) -> bool {
+        matches!(self, Self::Flashblocks)
+    }
+
+    /// Returns `true` if this is a `NewHeads` subscription.
+    pub fn is_new_heads(&self) -> bool {
+        matches!(self, Self::Standard(AlloySubscriptionKind::NewHeads))
+    }
+
+    /// Returns the inner standard subscription kind, if any.
+    pub const fn as_standard(&self) -> Option<&AlloySubscriptionKind> {
+        match self {
+            Self::Standard(kind) => Some(kind),
+            Self::Flashblocks => None,
+        }
+    }
+}
+
+impl From<AlloySubscriptionKind> for SubscriptionKind {
+    fn from(kind: AlloySubscriptionKind) -> Self {
+        Self::Standard(kind)
+    }
+}
+
+impl From<SubscriptionKind> for AlloySubscriptionKind {
+    fn from(kind: SubscriptionKind) -> Self {
+        match kind {
+            SubscriptionKind::Standard(alloy_kind) => alloy_kind,
+            SubscriptionKind::Flashblocks => {
+                // Flashblocks is not a standard subscription kind, so we can't convert it
+                // This should only be called when we know it's not Flashblocks
+                unreachable!("Cannot convert Flashblocks to AlloySubscriptionKind")
+            }
+        }
+    }
+}
+
+/// Criteria for filtering and enriching flashblock subscription data.
+///
+/// This allows clients to customize what data is included in flashblock updates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamCriteria {
+    /// Include new block headers in the stream.
+    #[serde(default)]
+    pub new_heads: bool,
+
+    /// Include extra transaction information (sender, gas used, etc.).
+    #[serde(default)]
+    pub transaction_extra_info: bool,
+
+    /// Include transaction receipts.
+    #[serde(default)]
+    pub transaction_receipt: bool,
+
+    /// Include internal transactions (traces).
+    #[serde(default)]
+    pub transaction_inner_txs: bool,
+
+    /// Only include transactions involving these addresses (empty = all transactions).
+    #[serde(default)]
+    pub subscribed_addresses: Vec<Address>,
+}
+
+impl StreamCriteria {
+    /// Creates a new `StreamCriteria` with all options disabled.
+    pub const fn new() -> Self {
+        Self {
+            new_heads: false,
+            transaction_extra_info: false,
+            transaction_receipt: false,
+            transaction_inner_txs: false,
+            subscribed_addresses: Vec::new(),
+        }
+    }
+
+    /// Creates criteria for receiving only block headers.
+    pub fn headers_only() -> Self {
+        Self { new_heads: true, ..Default::default() }
+    }
+
+    /// Creates criteria for receiving full transaction details.
+    pub fn full_transactions() -> Self {
+        Self {
+            new_heads: true,
+            transaction_extra_info: true,
+            transaction_receipt: true,
+            transaction_inner_txs: false,
+            subscribed_addresses: Vec::new(),
+        }
+    }
+
+    /// Returns `true` if any transaction-related fields are enabled.
+    pub const fn includes_transactions(&self) -> bool {
+        self.transaction_extra_info || self.transaction_receipt || self.transaction_inner_txs
+    }
+
+    /// Returns `true` if address filtering is enabled.
+    pub fn has_address_filter(&self) -> bool {
+        !self.subscribed_addresses.is_empty()
+    }
+}
 
 /// Flashblocks pubsub RPC interface.
 ///
@@ -114,42 +235,40 @@ impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N> {
     }
 }
 
-#[async_trait::async_trait]
-impl<Eth, N: reth_primitives_traits::NodePrimitives>
-    EthPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>> for OpEthPubSub<Eth, N>
-where
-    Eth: reth_rpc_eth_api::RpcNodeCore<
-            Provider: reth_storage_api::BlockNumReader + reth_chain_state::CanonStateSubscriptions,
-            Pool: reth_transaction_pool::TransactionPool,
-        > + reth_rpc_eth_api::EthApiTypes<
-            RpcConvert: reth_rpc_eth_api::RpcConvert<
-                Primitives: reth_primitives_traits::NodePrimitives<
-                    SignedTx = reth_transaction_pool::PoolConsensusTx<Eth::Pool>,
-                >,
-            >,
-        > + 'static,
-{
-    async fn subscribe(
-        &self,
-        pending: PendingSubscriptionSink,
-        kind: alloy_rpc_types_eth::pubsub::SubscriptionKind,
-        params: Option<alloy_rpc_types_eth::pubsub::Params>,
-    ) -> jsonrpsee::core::SubscriptionResult {
-        // Intercept newHeads subscription and use flashblocks if available
-        info!("XXX subscribe: {:?}", kind);
-        if matches!(kind, alloy_rpc_types_eth::pubsub::SubscriptionKind::NewHeads) {
-            if let Some(pending_block_rx) = &self.pending_block_rx {
-                info!("XXX line 96: {:?}", kind);
-                return self
-                    .subscribe_pending_blocks_as_headers(pending, pending_block_rx, params)
-                    .await;
-            }
-        }
+// #[async_trait::async_trait]
+// impl<Eth, N: reth_primitives_traits::NodePrimitives>
+//     EthPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>> for OpEthPubSub<Eth,
+// N> where
+//     Eth: reth_rpc_eth_api::RpcNodeCore<
+//             Provider: reth_storage_api::BlockNumReader +
+// reth_chain_state::CanonStateSubscriptions,             Pool:
+// reth_transaction_pool::TransactionPool,
+//         > + reth_rpc_eth_api::EthApiTypes< RpcConvert: reth_rpc_eth_api::RpcConvert< Primitives:
+//         > reth_primitives_traits::NodePrimitives< SignedTx =
+//         > reth_transaction_pool::PoolConsensusTx<Eth::Pool>, >, >,
+//         > + 'static,
+// {
+//     async fn subscribe(
+//         &self,
+//         pending: PendingSubscriptionSink,
+//         kind: AlloySubscriptionKind,
+//         params: Option<alloy_rpc_types_eth::pubsub::Params>,
+//     ) -> jsonrpsee::core::SubscriptionResult {
+//         // Intercept newHeads subscription and use flashblocks if available
+//         info!("XXX subscribe: {:?}", kind);
+//         if matches!(kind, AlloySubscriptionKind::NewHeads) {
+//             if let Some(pending_block_rx) = &self.pending_block_rx {
+//                 info!("XXX line 96: {:?}", kind);
+//                 return self
+//                     .subscribe_pending_blocks_as_headers(pending, pending_block_rx, params)
+//                     .await;
+//             }
+//         }
 
-        // Fall back to standard handler for all other cases
-        self.eth_pubsub.subscribe(pending, kind, params).await
-    }
-}
+//         // Fall back to standard handler for all other cases
+//         self.eth_pubsub.subscribe(pending, kind, params).await
+//     }
+// }
 
 #[async_trait::async_trait]
 impl<Eth, N: reth_primitives_traits::NodePrimitives>
@@ -171,26 +290,74 @@ where
         kind: SubscriptionKind,
         params: Option<Params>,
     ) -> jsonrpsee::core::SubscriptionResult {
-        info!("XXX line 163: {:?}", kind);
-        if matches!(kind, SubscriptionKind::NewHeads) {
-            info!("XXX line 166: {:?}", kind);
-            if let Some(pending_block_rx) = &self.pending_block_rx {
-                info!("XXX line 167: pending_block_rx available");
-                return self
-                    .subscribe_pending_blocks_as_headers(pending, pending_block_rx, params)
-                    .await;
+        info!("XXX line 163: {:?}, params: {:?}", kind, params);
+
+        // Parse StreamCriteria from params if provided
+        let criteria = Self::parse_stream_criteria(&params);
+        info!("XXX parsed criteria: {:?}", criteria);
+
+        match kind {
+            SubscriptionKind::Flashblocks => {
+                // Handle flashblocks subscription
+                if let Some(pending_block_rx) = &self.pending_block_rx {
+                    info!(
+                        "XXX flashblocks subscription with pending_block_rx available, criteria: {:?}",
+                        criteria
+                    );
+                    // TODO: Implement flashblocks-specific subscription that returns full
+                    // FlashBlock data Use the criteria to filter/enrich the data
+                    return self
+                        .subscribe_pending_blocks_as_headers(pending, pending_block_rx, params)
+                        .await;
+                } else {
+                    let err = internal_rpc_err("Flashblocks are not available on this node");
+                    pending.accept().await?;
+                    return Err(jsonrpsee::core::SubscriptionError::from(err));
+                }
+            }
+            SubscriptionKind::Standard(alloy_kind) => {
+                // Handle standard subscriptions, with optional flashblocks integration for newHeads
+                if matches!(alloy_kind, AlloySubscriptionKind::NewHeads) {
+                    if let Some(pending_block_rx) = &self.pending_block_rx {
+                        info!(
+                            "XXX newHeads subscription with flashblocks available, criteria: {:?}",
+                            criteria
+                        );
+                        return self
+                            .subscribe_pending_blocks_as_headers(pending, pending_block_rx, params)
+                            .await;
+                    }
+                }
+
+                // For standard subscriptions, return an error since this API only handles
+                // flashblocks Clients should use the standard eth_subscribe
+                // endpoint
+                let err = internal_rpc_err(
+                    "This subscription type should be handled by the standard eth_subscribe endpoint. \
+                     This endpoint only supports 'flashblocks' and 'newHeads' (with flashblocks)."
+                );
+                pending.accept().await?;
+                Err(jsonrpsee::core::SubscriptionError::from(err))
             }
         }
+    }
+}
 
-        info!("XXX line 173");
-        // TODO: Implement full fallback logic or ensure standard pubsub is merged after this
-        let err = internal_rpc_err(
-            "This subscription type should be handled by the standard pubsub. \
-             FlashblocksPubSubApiServer only handles newHeads with flashblocks enabled.",
-        );
-        pending.accept().await?;
-
-        Err(jsonrpsee::core::SubscriptionError::from(err))
+impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N> {
+    /// Parse `StreamCriteria` from the subscription params.
+    ///
+    /// The params can contain an optional `StreamCriteria` object as the first element.
+    /// If not provided or parsing fails, returns a default criteria.
+    fn parse_stream_criteria(params: &Option<Params>) -> StreamCriteria {
+        params
+            .as_ref()
+            .and_then(|p| match p {
+                // Standard Ethereum subscription params don't contain StreamCriteria
+                Params::Bool(_) | Params::None | Params::Logs(_) => None,
+                // In the future, if you extend Params to include StreamCriteria,
+                // parse it here. For now, always return None and use default.
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -282,77 +449,5 @@ fn extract_header_from_pending_block<N: reth_primitives_traits::NodePrimitives>(
 
     // Convert to RPC Header format
     // Note: We don't have block size, so we pass None
-    Ok(Header::from_consensus(sealed_header.into(), None, None))
-}
-
-/// Extract Header from FlashBlock
-///
-/// Constructs an Ethereum RPC `Header` from a flashblock payload by combining
-/// the immutable `base` fields with the mutable `diff` fields.
-///
-/// Returns `Header<alloy_consensus::Header>` which can be converted to other header types
-/// if needed by the caller.
-fn extract_header_from_flashblock(
-    flashblock: &FlashBlock,
-) -> Result<Header<ConsensusHeader>, ErrorObject<'static>> {
-    // Get base fields (immutable, only present in first flashblock)
-    info!("XXX line 275: {:?}", flashblock.payload_id);
-    let base = flashblock.base.as_ref().ok_or_else(|| {
-        internal_rpc_err("Flashblock missing base fields required for header construction")
-    })?;
-
-    // Get diff fields (mutable, updated with each flashblock)
-    let diff = &flashblock.diff;
-
-    // // Compute transactions root from the transactions list
-    // let transactions_root = if diff.transactions.is_empty() {
-    //     // Empty transactions list has a specific root
-    //     proofs::calculate_transaction_root(&[])
-    // } else {
-    //     // Calculate root from transaction bytes
-    //     // Note: diff.transactions is Vec<Bytes>, we need to decode them or compute root directly
-    //     // For now, we'll use the receipts_root as a proxy if transactions_root isn't directly
-    // available     // In a proper implementation, we'd decode transactions and compute the
-    // root     // This is a limitation - we'd need the actual transaction objects to compute
-    // the root correctly     // For now, we'll use a placeholder that should be computed from
-    // the actual transactions     proofs::calculate_transaction_root(&[])
-    // };
-
-    info!("XXX line 301");
-    // Construct consensus header fields
-    // TODO: Properly compute transactions_root from diff.transactions (RLP-encoded bytes)
-    // For now, using empty root as placeholder - this should be computed from actual transactions
-    let consensus_header = ConsensusHeader {
-        parent_hash: base.parent_hash,
-        ommers_hash: EMPTY_OMMER_ROOT_HASH,
-        beneficiary: base.fee_recipient,
-        state_root: diff.state_root,
-        transactions_root: FixedBytes::default(),
-        receipts_root: diff.receipts_root,
-        withdrawals_root: Some(diff.withdrawals_root),
-        logs_bloom: diff.logs_bloom,
-        timestamp: base.timestamp,
-        mix_hash: base.prev_randao,
-        nonce: BEACON_NONCE.into(),
-        base_fee_per_gas: base.base_fee_per_gas.to::<u64>().into(),
-        number: base.block_number,
-        gas_limit: base.gas_limit,
-        difficulty: U256::ZERO, // PoS chains have zero difficulty
-        gas_used: diff.gas_used,
-        extra_data: base.extra_data.clone(),
-        parent_beacon_block_root: Some(base.parent_beacon_block_root),
-        blob_gas_used: None,   // Not available in flashblock diff structure
-        excess_blob_gas: None, // Not available in flashblock, would need to compute
-        requests_hash: None,   // Not available in flashblock
-    };
-    info!("XXX line 327");
-
-    // Seal the header with the block hash from diff
-    // Use the known block hash from diff instead of computing it
-    let sealed_header = SealedHeader::new(consensus_header, diff.block_hash);
-    info!("XXX line 331: {:?}", sealed_header);
-    // Convert to RPC Header format
-    // Note: We don't have block size, so we pass None
-    // The sealed header is converted with .into() to match the expected type for from_consensus
     Ok(Header::from_consensus(sealed_header.into(), None, None))
 }
