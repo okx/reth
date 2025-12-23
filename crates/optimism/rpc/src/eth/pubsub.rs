@@ -135,18 +135,21 @@ impl<'de> Deserialize<'de> for Params {
         // Try to deserialize as a generic JSON value first
         let value = serde_json::Value::deserialize(deserializer)?;
 
-        // Try to parse as StreamCriteria first
+        if value.is_null() {
+            return Ok(Params::None);
+        }
+
         if let Ok(criteria) = serde_json::from_value::<StreamCriteria>(value.clone()) {
             return Ok(Params::StreamCriteria(criteria));
         }
 
-        // Try to parse as standard Alloy Params
-        if let Ok(standard_params) = serde_json::from_value::<AlloyParams>(value) {
+        if let Ok(standard_params) = serde_json::from_value::<AlloyParams>(value.clone()) {
             return Ok(Params::Standard(standard_params));
         }
 
-        // If neither works, treat as None
-        Ok(Params::None)
+        Err(serde::de::Error::custom(
+            "Invalid subscription parameters: must be valid StreamCriteria or Filter",
+        ))
     }
 }
 
@@ -185,7 +188,7 @@ impl Params {
 ///
 /// This allows clients to customize what data is included in flashblock updates.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StreamCriteria {
     /// Include new block headers in the stream.
     #[serde(default)]
