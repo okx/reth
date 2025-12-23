@@ -96,6 +96,7 @@ impl<Eth> OpEthPubSub<Eth> {
                     Ok(flashblock) => extract_header_from_flashblock(&flashblock).ok(),
                     Err(_) => {
                         // BroadcastStream lagged, skip
+                        info!("XXX line 99: {:?}", result);
                         None
                     }
                 }
@@ -272,6 +273,7 @@ fn extract_header_from_flashblock(
     flashblock: &FlashBlock,
 ) -> Result<Header<ConsensusHeader>, ErrorObject<'static>> {
     // Get base fields (immutable, only present in first flashblock)
+    info!("XXX line 275: {:?}", flashblock.payload_id);
     let base = flashblock.base.as_ref().ok_or_else(|| {
         internal_rpc_err("Flashblock missing base fields required for header construction")
     })?;
@@ -293,6 +295,7 @@ fn extract_header_from_flashblock(
     // the actual transactions     proofs::calculate_transaction_root(&[])
     // };
 
+    info!("XXX line 301");
     // Construct consensus header fields
     // TODO: Properly compute transactions_root from diff.transactions (RLP-encoded bytes)
     // For now, using empty root as placeholder - this should be computed from actual transactions
@@ -319,11 +322,12 @@ fn extract_header_from_flashblock(
         excess_blob_gas: None, // Not available in flashblock, would need to compute
         requests_hash: None,   // Not available in flashblock
     };
+    info!("XXX line 327");
 
     // Seal the header with the block hash from diff
     // Use the known block hash from diff instead of computing it
     let sealed_header = SealedHeader::new(consensus_header, diff.block_hash);
-
+    info!("XXX line 331: {:?}", sealed_header);
     // Convert to RPC Header format
     // Note: We don't have block size, so we pass None
     // The sealed header is converted with .into() to match the expected type for from_consensus
