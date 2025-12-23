@@ -1,9 +1,9 @@
-use alloy_consensus::BlockHeader;
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt};
 use alloy_json_rpc::RpcObject;
 use alloy_primitives::Address;
 use alloy_rpc_types_eth::{
     pubsub::{Params as AlloyParams, SubscriptionKind as AlloySubscriptionKind},
-    Header,
+    Header, TransactionInfo,
 };
 use futures::StreamExt;
 use jsonrpsee::{
@@ -11,8 +11,9 @@ use jsonrpsee::{
     SubscriptionSink,
 };
 use reth_optimism_flashblocks::{PendingBlockRx, PendingFlashBlock};
+use reth_primitives_traits::{Recovered, TransactionMeta};
 use reth_rpc::eth::pubsub::EthPubSub;
-use reth_rpc_convert::RpcConvert;
+use reth_rpc_convert::{transaction::ConvertReceiptInput, RpcConvert};
 use reth_rpc_eth_api::pubsub::EthPubSubApiServer;
 use reth_rpc_server_types::result::internal_rpc_err;
 use serde::{Deserialize, Serialize};
@@ -454,8 +455,6 @@ where
         criteria: &StreamCriteria,
         api: &Eth,
     ) -> Option<EnrichedFlashblock<N::BlockHeader>> {
-        use alloy_consensus::transaction::TxHashRef;
-
         // Extract header if requested
         let header = if criteria.new_heads {
             Some(extract_header_from_pending_block(pending_block).ok()?)
@@ -489,8 +488,6 @@ where
                 let tx_hash = *tx.tx_hash();
 
                 let tx_data = if criteria.transaction_extra_info {
-                    use alloy_rpc_types_eth::TransactionInfo;
-
                     let recovered =
                         reth_primitives_traits::Recovered::new_unchecked(tx.clone(), *sender);
 
@@ -513,10 +510,6 @@ where
                 };
 
                 let receipt_json = if criteria.transaction_receipt {
-                    use alloy_consensus::TxReceipt;
-                    use reth_primitives_traits::{Recovered, TransactionMeta};
-                    use reth_rpc_convert::transaction::ConvertReceiptInput;
-
                     let gas_used = receipt.cumulative_gas_used();
 
                     let next_log_index =
@@ -564,8 +557,6 @@ where
         receipt: Option<&N::Receipt>,
         addresses: &[Address],
     ) -> bool {
-        use alloy_consensus::{Transaction, TxReceipt};
-
         // Check sender
         if addresses.contains(&sender) {
             return true;
