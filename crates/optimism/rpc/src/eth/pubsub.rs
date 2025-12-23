@@ -355,11 +355,14 @@ impl<Eth, N: reth_primitives_traits::NodePrimitives>
     for OpEthPubSub<Eth, N>
 where
     Eth: reth_rpc_eth_api::RpcNodeCore<
-            Provider: reth_storage_api::BlockNumReader + reth_chain_state::CanonStateSubscriptions,
+            Provider: reth_storage_api::BlockNumReader
+                          + reth_chain_state::CanonStateSubscriptions<Primitives = N>,
             Pool: reth_transaction_pool::TransactionPool,
         > + reth_rpc_eth_api::EthApiTypes<
             RpcConvert: reth_rpc_eth_api::RpcConvert<
-                Primitives: reth_primitives_traits::NodePrimitives,
+                Primitives: reth_primitives_traits::NodePrimitives<
+                    SignedTx = reth_transaction_pool::PoolConsensusTx<Eth::Pool>,
+                >,
             >,
         > + 'static,
 {
@@ -413,15 +416,17 @@ where
                     }
                 }
 
-                // For standard subscriptions, return an error since this API only handles
-                // flashblocks Clients should use the standard eth_subscribe
-                // endpoint
-                let err = internal_rpc_err(
-                    "This subscription type should be handled by the standard eth_subscribe endpoint. \
-                     This endpoint only supports 'flashblocks' and 'newHeads' (with flashblocks)."
-                );
-                pending.accept().await?;
-                Err(jsonrpsee::core::SubscriptionError::from(err))
+                // // For other standard subscriptions (logs, newPendingTransactions, syncing),
+                // // forward to the standard eth_pubsub handler
+                // let sink = pending.accept().await?;
+
+                // // Extract standard params if present
+                let standard_params = params.and_then(|p| p.as_standard().cloned());
+
+                // // Use handle_accepted to process the subscription
+                // self.eth_pubsub.handle_accepted(sink, alloy_kind, standard_params).await?;
+                self.eth_pubsub.subscribe(pending, alloy_kind, standard_params).await?;
+                Ok(())
             }
         }
     }
