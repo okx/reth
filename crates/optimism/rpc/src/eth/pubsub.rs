@@ -3,7 +3,7 @@ use alloy_eips::merge::BEACON_NONCE;
 use alloy_json_rpc::RpcObject;
 use alloy_primitives::{Address, FixedBytes, U256};
 use alloy_rpc_types_eth::{
-    pubsub::{Params, SubscriptionKind as AlloySubscriptionKind},
+    pubsub::{Params as AlloyParams, SubscriptionKind as AlloySubscriptionKind},
     Header,
 };
 use futures::StreamExt;
@@ -41,13 +41,8 @@ impl<'de> Deserialize<'de> for SubscriptionKind {
     {
         let s = String::deserialize(deserializer)?;
 
-        // Check for flashblocks first
-        if s == "flashblocks" {
-            return Ok(SubscriptionKind::Flashblocks);
-        }
-
-        // Try to parse as standard Alloy subscription kind
         match s.as_str() {
+            "flashblocks" => Ok(SubscriptionKind::Flashblocks),
             "newHeads" => Ok(SubscriptionKind::Standard(AlloySubscriptionKind::NewHeads)),
             "logs" => Ok(SubscriptionKind::Standard(AlloySubscriptionKind::Logs)),
             "newPendingTransactions" => {
@@ -122,6 +117,71 @@ impl From<SubscriptionKind> for AlloySubscriptionKind {
     }
 }
 
+/// Extended params that wraps Alloy's `Params` and adds Optimism-specific variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Params {
+    /// Standard Ethereum subscription params (for logs, etc.)
+    Standard(AlloyParams),
+    /// Flashblocks stream criteria
+    StreamCriteria(StreamCriteria),
+    /// No params
+    None,
+}
+
+impl<'de> Deserialize<'de> for Params {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Try to deserialize as a generic JSON value first
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        // Try to parse as StreamCriteria first
+        if let Ok(criteria) = serde_json::from_value::<StreamCriteria>(value.clone()) {
+            return Ok(Params::StreamCriteria(criteria));
+        }
+
+        // Try to parse as standard Alloy Params
+        if let Ok(standard_params) = serde_json::from_value::<AlloyParams>(value) {
+            return Ok(Params::Standard(standard_params));
+        }
+
+        // If neither works, treat as None
+        Ok(Params::None)
+    }
+}
+
+impl Serialize for Params {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Params::Standard(params) => params.serialize(serializer),
+            Params::StreamCriteria(criteria) => criteria.serialize(serializer),
+            Params::None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl Params {
+    /// Returns the inner `StreamCriteria` if this is a `StreamCriteria` variant.
+    pub fn as_stream_criteria(&self) -> Option<&StreamCriteria> {
+        match self {
+            Params::StreamCriteria(criteria) => Some(criteria),
+            _ => None,
+        }
+    }
+
+    /// Returns the inner standard `Params` if this is a `Standard` variant.
+    pub fn as_standard(&self) -> Option<&AlloyParams> {
+        match self {
+            Params::Standard(params) => Some(params),
+            _ => None,
+        }
+    }
+}
+
 /// Criteria for filtering and enriching flashblock subscription data.
 ///
 /// This allows clients to customize what data is included in flashblock updates.
@@ -192,9 +252,17 @@ impl StreamCriteria {
 ///
 /// This trait provides the same interface as `EthPubSubApi` but with relaxed trait bounds
 /// to allow implementation for `OpEthPubSub` without requiring `SignedTx = PoolConsensusTx<Pool>`.
+///
+/// Supports standard Ethereum subscriptions plus custom "flashblocks" subscriptions with
+/// optional `StreamCriteria` for filtering.
 #[rpc(server, namespace = "eth")]
 pub trait FlashblocksPubSubApi<T: RpcObject> {
     /// Create an ethereum subscription for the given params
+    ///
+    /// # Parameters
+    /// - `kind`: Subscription type ("flashblocks", "newHeads", "logs", etc.)
+    /// - `params`: Optional parameters - for flashblocks, this can be `StreamCriteria`; for logs,
+    ///   this is a `Filter`
     #[subscription(
         name = "subscribe" => "subscription",
         unsubscribe = "unsubscribe",
@@ -281,41 +349,6 @@ impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N> {
     }
 }
 
-// #[async_trait::async_trait]
-// impl<Eth, N: reth_primitives_traits::NodePrimitives>
-//     EthPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>> for OpEthPubSub<Eth,
-// N> where
-//     Eth: reth_rpc_eth_api::RpcNodeCore<
-//             Provider: reth_storage_api::BlockNumReader +
-// reth_chain_state::CanonStateSubscriptions,             Pool:
-// reth_transaction_pool::TransactionPool,
-//         > + reth_rpc_eth_api::EthApiTypes< RpcConvert: reth_rpc_eth_api::RpcConvert< Primitives:
-//         > reth_primitives_traits::NodePrimitives< SignedTx =
-//         > reth_transaction_pool::PoolConsensusTx<Eth::Pool>, >, >,
-//         > + 'static,
-// {
-//     async fn subscribe(
-//         &self,
-//         pending: PendingSubscriptionSink,
-//         kind: AlloySubscriptionKind,
-//         params: Option<alloy_rpc_types_eth::pubsub::Params>,
-//     ) -> jsonrpsee::core::SubscriptionResult {
-//         // Intercept newHeads subscription and use flashblocks if available
-//         info!("XXX subscribe: {:?}", kind);
-//         if matches!(kind, AlloySubscriptionKind::NewHeads) {
-//             if let Some(pending_block_rx) = &self.pending_block_rx {
-//                 info!("XXX line 96: {:?}", kind);
-//                 return self
-//                     .subscribe_pending_blocks_as_headers(pending, pending_block_rx, params)
-//                     .await;
-//             }
-//         }
-
-//         // Fall back to standard handler for all other cases
-//         self.eth_pubsub.subscribe(pending, kind, params).await
-//     }
-// }
-
 #[async_trait::async_trait]
 impl<Eth, N: reth_primitives_traits::NodePrimitives>
     FlashblocksPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>>
@@ -338,9 +371,10 @@ where
     ) -> jsonrpsee::core::SubscriptionResult {
         info!("XXX line 163: {:?}, params: {:?}", kind, params);
 
-        // Parse StreamCriteria from params if provided
-        let criteria = Self::parse_stream_criteria(&params);
-        info!("XXX parsed criteria: {:?}", criteria);
+        // Extract StreamCriteria from params if present
+        let criteria =
+            params.as_ref().and_then(|p| p.as_stream_criteria()).cloned().unwrap_or_default();
+        info!("XXX using criteria: {:?}", criteria);
 
         match kind {
             SubscriptionKind::Flashblocks => {
@@ -353,7 +387,7 @@ where
                     // TODO: Implement flashblocks-specific subscription that returns full
                     // FlashBlock data Use the criteria to filter/enrich the data
                     return self
-                        .subscribe_pending_blocks_as_headers(pending, pending_block_rx, params)
+                        .subscribe_pending_blocks_as_headers(pending, pending_block_rx, &criteria)
                         .await;
                 } else {
                     let err = internal_rpc_err("Flashblocks are not available on this node");
@@ -370,7 +404,11 @@ where
                             criteria
                         );
                         return self
-                            .subscribe_pending_blocks_as_headers(pending, pending_block_rx, params)
+                            .subscribe_pending_blocks_as_headers(
+                                pending,
+                                pending_block_rx,
+                                &criteria,
+                            )
                             .await;
                     }
                 }
@@ -398,10 +436,10 @@ impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N> {
         params
             .as_ref()
             .and_then(|p| match p {
+                // Extract StreamCriteria if present
+                Params::StreamCriteria(criteria) => Some(criteria.clone()),
                 // Standard Ethereum subscription params don't contain StreamCriteria
-                Params::Bool(_) | Params::None | Params::Logs(_) => None,
-                // In the future, if you extend Params to include StreamCriteria,
-                // parse it here. For now, always return None and use default.
+                Params::Standard(_) | Params::None => None,
             })
             .unwrap_or_default()
     }
@@ -421,7 +459,7 @@ where
         &self,
         pending: PendingSubscriptionSink,
         pending_block_rx: &PendingBlockRx<N>,
-        _params: Option<alloy_rpc_types_eth::pubsub::Params>,
+        _criteria: &StreamCriteria,
     ) -> jsonrpsee::core::SubscriptionResult {
         let sink = pending.accept().await?;
         let pending_block_rx = pending_block_rx.clone();
