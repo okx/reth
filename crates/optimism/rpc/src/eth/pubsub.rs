@@ -1,3 +1,4 @@
+use alloy_consensus::BlockHeader;
 use alloy_json_rpc::RpcObject;
 use alloy_primitives::Address;
 use alloy_rpc_types_eth::{
@@ -11,6 +12,7 @@ use jsonrpsee::{
 };
 use reth_optimism_flashblocks::{PendingBlockRx, PendingFlashBlock};
 use reth_rpc::eth::pubsub::EthPubSub;
+use reth_rpc_convert::RpcConvert;
 use reth_rpc_eth_api::pubsub::EthPubSubApiServer;
 use reth_rpc_server_types::result::internal_rpc_err;
 use serde::{Deserialize, Serialize};
@@ -302,6 +304,8 @@ pub struct OpEthPubSub<Eth, N: reth_primitives_traits::NodePrimitives> {
     eth_pubsub: EthPubSub<Eth>,
     /// Pending block receiver from flashblocks, if available
     pending_block_rx: Option<PendingBlockRx<N>>,
+    /// Direct reference to eth API for RPC conversion
+    eth_api: Eth,
 }
 
 impl<Eth, N: reth_primitives_traits::NodePrimitives> Clone for OpEthPubSub<Eth, N>
@@ -312,6 +316,7 @@ where
         Self {
             eth_pubsub: self.eth_pubsub.clone(),
             pending_block_rx: self.pending_block_rx.clone(),
+            eth_api: self.eth_api.clone(),
         }
     }
 }
@@ -327,8 +332,12 @@ impl<Eth, N: reth_primitives_traits::NodePrimitives> std::fmt::Debug for OpEthPu
 
 impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N> {
     /// Creates a new `OpEthPubSub` instance.
-    pub fn new(eth_pubsub: EthPubSub<Eth>, pending_block_rx: Option<PendingBlockRx<N>>) -> Self {
-        Self { eth_pubsub, pending_block_rx }
+    pub fn new(
+        eth_pubsub: EthPubSub<Eth>,
+        pending_block_rx: Option<PendingBlockRx<N>>,
+        eth_api: Eth,
+    ) -> Self {
+        Self { eth_pubsub, pending_block_rx, eth_api }
     }
 
     /// Returns a reference to the wrapped `EthPubSub`.
@@ -377,16 +386,12 @@ impl<Eth, N: reth_primitives_traits::NodePrimitives>
     for OpEthPubSub<Eth, N>
 where
     Eth: reth_rpc_eth_api::RpcNodeCore<
+            Primitives = N,
             Provider: reth_storage_api::BlockNumReader
                           + reth_chain_state::CanonStateSubscriptions<Primitives = N>,
             Pool: reth_transaction_pool::TransactionPool,
-        > + reth_rpc_eth_api::EthApiTypes<
-            RpcConvert: reth_rpc_eth_api::RpcConvert<
-                Primitives: reth_primitives_traits::NodePrimitives<
-                    SignedTx = reth_transaction_pool::PoolConsensusTx<Eth::Pool>,
-                >,
-            >,
-        > + 'static,
+        > + reth_rpc_eth_api::EthApiTypes<RpcConvert: reth_rpc_convert::RpcConvert<Primitives = N>>
+        + 'static,
 {
     async fn subscribe(
         &self,
@@ -446,12 +451,13 @@ where
 
 impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N>
 where
-    Eth: reth_rpc_eth_api::RpcNodeCore<Provider: reth_storage_api::BlockNumReader>
-        + reth_rpc_eth_api::EthApiTypes<
-            RpcConvert: reth_rpc_eth_api::RpcConvert<
-                Primitives: reth_primitives_traits::NodePrimitives,
-            >,
-        >,
+    Eth: reth_rpc_eth_api::RpcNodeCore<
+            Primitives = N,
+            Provider: reth_storage_api::BlockNumReader
+                          + reth_chain_state::CanonStateSubscriptions<Primitives = N>,
+            Pool: reth_transaction_pool::TransactionPool,
+        > + reth_rpc_eth_api::EthApiTypes<RpcConvert: reth_rpc_convert::RpcConvert<Primitives = N>>
+        + 'static,
 {
     /// Subscribe to pending blocks and convert them to Header format for newHeads
     async fn subscribe_pending_blocks_as_headers(
@@ -487,13 +493,15 @@ where
         let sink = pending.accept().await?;
         let pending_block_rx = pending_block_rx.clone();
         let criteria = criteria.clone();
+        let api = self.eth_api.clone();
 
         let flashblocks_stream =
             WatchStream::new(pending_block_rx).filter_map(move |pending_block_opt| {
                 let criteria = criteria.clone();
+                let api = api.clone();
                 async move {
                     pending_block_opt.and_then(|pending_block| {
-                        Self::filter_and_enrich_flashblock_static(&pending_block, &criteria)
+                        Self::filter_and_enrich_flashblock(&pending_block, &criteria, &api)
                     })
                 }
             });
@@ -506,16 +514,14 @@ where
         Ok(())
     }
 
-    /// Filter and enrich a flashblock based on the provided criteria.
+    /// Filter and enrich a flashblock based on the provided criteria using RpcConvert.
     ///
     /// Returns `None` if the block should be filtered out (e.g., no transactions match address
     /// filter).
-    ///
-    /// NOTE: This is a simplified implementation. For full receipt building with proper
-    /// gas calculations and log indices, you would need to use `RpcConvert` trait methods.
-    fn filter_and_enrich_flashblock_static(
+    fn filter_and_enrich_flashblock(
         pending_block: &PendingFlashBlock<N>,
         criteria: &StreamCriteria,
+        api: &Eth,
     ) -> Option<EnrichedFlashblock<N::BlockHeader>> {
         use alloy_consensus::transaction::TxHashRef;
 
@@ -529,6 +535,8 @@ where
         // Get block and receipts
         let block = pending_block.block();
         let receipts = pending_block.receipts.as_ref();
+        let sealed_block = block.sealed_block();
+        let rpc_convert = api.tx_resp_builder();
 
         // Filter and enrich transactions using transactions_with_sender
         let transactions: Vec<EnrichedTransaction> = block
@@ -551,16 +559,70 @@ where
                 let receipt = receipts.get(idx)?;
                 let tx_hash = *tx.tx_hash();
 
-                // Build TxData if requested
+                // Build TxData if requested using RpcConvert
                 let tx_data = if criteria.transaction_extra_info {
-                    Some(Self::build_tx_data_json(*sender, tx))
+                    use alloy_rpc_types_eth::TransactionInfo;
+
+                    // Create Recovered transaction
+                    let recovered =
+                        reth_primitives_traits::Recovered::new_unchecked(tx.clone(), *sender);
+
+                    // Convert using RpcConvert::fill()
+                    let rpc_tx = rpc_convert
+                        .fill(
+                            recovered,
+                            TransactionInfo {
+                                hash: Some(tx_hash),
+                                index: Some(idx as u64),
+                                block_hash: Some(sealed_block.hash()),
+                                block_number: Some(sealed_block.header().number()),
+                                base_fee: sealed_block.header().base_fee_per_gas(),
+                            },
+                        )
+                        .ok()?;
+
+                    // Serialize to JSON
+                    Some(serde_json::to_value(rpc_tx).ok()?)
                 } else {
                     None
                 };
 
-                // Build Receipt if requested
+                // Build Receipt if requested using RpcConvert
                 let receipt_json = if criteria.transaction_receipt {
-                    Some(Self::build_receipt_json(tx_hash, receipt, block, idx))
+                    use alloy_consensus::TxReceipt;
+                    use reth_primitives_traits::{Recovered, TransactionMeta};
+                    use reth_rpc_convert::transaction::ConvertReceiptInput;
+
+                    // Calculate cumulative gas used up to this transaction
+                    let gas_used = receipt.cumulative_gas_used();
+
+                    // Calculate log index offset (sum of logs from previous transactions)
+                    let next_log_index =
+                        receipts.iter().take(idx).map(|r| r.logs().len()).sum::<usize>();
+
+                    // Convert using RpcConvert::convert_receipts_with_block()
+                    let receipt_input = ConvertReceiptInput {
+                        receipt: receipt.clone(),
+                        tx: Recovered::new_unchecked(tx, *sender),
+                        gas_used,
+                        next_log_index,
+                        meta: TransactionMeta {
+                            tx_hash,
+                            index: idx as u64,
+                            block_hash: sealed_block.hash(),
+                            block_number: sealed_block.header().number(),
+                            base_fee: sealed_block.header().base_fee_per_gas(),
+                            excess_blob_gas: sealed_block.header().excess_blob_gas(),
+                            timestamp: sealed_block.header().timestamp(),
+                        },
+                    };
+
+                    let rpc_receipts = rpc_convert
+                        .convert_receipts_with_block(vec![receipt_input], &sealed_block)
+                        .ok()?;
+
+                    // Get the first receipt and serialize to JSON
+                    rpc_receipts.first().and_then(|r| serde_json::to_value(r).ok())
                 } else {
                     None
                 };
@@ -609,89 +671,6 @@ where
         }
 
         false
-    }
-
-    /// Build TxData JSON matching the user's specified format
-    fn build_tx_data_json(sender: Address, tx: &N::SignedTx) -> serde_json::Value {
-        use alloy_consensus::{transaction::TxHashRef, Transaction};
-        use alloy_eips::eip2718::Typed2718;
-        use alloy_primitives::hex;
-        use serde_json::json;
-
-        let tx_hash = *tx.tx_hash();
-        let to = tx.to();
-        let chain_id = tx.chain_id();
-        let tx_type = tx.ty();
-
-        let max_fee_per_gas = tx.max_fee_per_gas();
-        let max_fee_per_gas_opt =
-            if max_fee_per_gas > 0 { Some(format!("0x{:x}", max_fee_per_gas)) } else { None };
-
-        json!({
-            "type": format!("0x{:x}", tx_type),
-            "nonce": format!("0x{:x}", tx.nonce()),
-            "gasPrice": tx.gas_price().map(|gp| format!("0x{:x}", gp)),
-            "maxFeePerGas": max_fee_per_gas_opt,
-            "maxPriorityFeePerGas": tx.max_priority_fee_per_gas().map(|fee| format!("0x{:x}", fee)),
-            "gas": format!("0x{:x}", tx.gas_limit()),
-            "value": format!("0x{:x}", tx.value()),
-            "input": format!("0x{}", hex::encode(tx.input())),
-            "from": format!("{:?}", sender),
-            "to": to.map(|addr| format!("{:?}", addr)),
-            "chainId": chain_id.map(|id| format!("0x{:x}", id)),
-            "hash": format!("{:?}", tx_hash),
-        })
-    }
-
-    /// Build Receipt JSON matching the user's specified format
-    fn build_receipt_json(
-        tx_hash: alloy_primitives::TxHash,
-        receipt: &N::Receipt,
-        block: &reth_primitives_traits::RecoveredBlock<N::Block>,
-        index: usize,
-    ) -> serde_json::Value {
-        use alloy_consensus::{BlockHeader, TxReceipt};
-        use alloy_primitives::hex;
-        use serde_json::json;
-
-        let sealed_block = block.sealed_block();
-        let block_hash = sealed_block.hash();
-        let block_number = sealed_block.header().number();
-
-        // Build logs array
-        let logs: Vec<serde_json::Value> = receipt
-            .logs()
-            .iter()
-            .enumerate()
-            .map(|(log_idx, log)| {
-                json!({
-                    "address": format!("{:?}", log.address),
-                    "topics": log.topics().iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>(),
-                    "data": format!("0x{}", hex::encode(&log.data.data)),
-                    "blockNumber": format!("0x{:x}", block_number),
-                    "blockHash": format!("{:?}", block_hash),
-                    "transactionHash": format!("{:?}", tx_hash),
-                    "transactionIndex": format!("0x{:x}", index),
-                    "logIndex": format!("0x{:x}", log_idx),
-                    "removed": false,
-                })
-            })
-            .collect();
-
-        // Build the receipt JSON object
-        json!({
-            "root": "0x",
-            "status": format!("0x{:x}", if receipt.status() { 1 } else { 0 }),
-            "cumulativeGasUsed": format!("0x{:x}", receipt.cumulative_gas_used()),
-            "logsBloom": format!("0x{}", hex::encode(receipt.bloom().as_slice())),
-            "logs": logs,
-            "transactionHash": format!("{:?}", tx_hash),
-            "contractAddress": "0x0000000000000000000000000000000000000000",
-            "gasUsed": format!("0x{:x}", receipt.cumulative_gas_used()),
-            "blockHash": format!("{:?}", block_hash),
-            "blockNumber": format!("0x{:x}", block_number),
-            "transactionIndex": format!("0x{:x}", index),
-        })
     }
 }
 

@@ -654,7 +654,9 @@ where
                 let op_eth_pubsub = OpEthPubSub::<
                     _,
                     <EthB::EthApi as reth_rpc_eth_api::RpcNodeCore>::Primitives,
-                >::new(eth_pubsub, pending_blocks_rx);
+                >::new(
+                    eth_pubsub, pending_blocks_rx, registry.eth_api().clone()
+                );
                 modules.add_or_replace_if_module_configured(
                     RethRpcModule::Eth,
                     op_eth_pubsub.into_rpc(),
