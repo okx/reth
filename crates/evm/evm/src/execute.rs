@@ -518,9 +518,9 @@ where
         db.merge_transitions(BundleRetention::Reverts);
 
         // calculate the state root
-        let start = Instant::now();
-        let hashed_state = state.hashed_post_state(&db.bundle_state);
-        info!("hashed_post_state, elapsed: {:?}", start.elapsed().as_millis());
+        // let start = Instant::now();
+        // let hashed_state = state.hashed_post_state(&db.bundle_state);
+        // info!("hashed_post_state, elapsed: {:?}", start.elapsed().as_millis());
         
         // // Calculate state root using the previous method (mdbx)
         // let (mdbx_state_root, mdbx_trie_updates) = state
@@ -528,9 +528,12 @@ where
         //     .map_err(BlockExecutionError::other)?;
         
         // Convert BundleState to PlainPostState for triedb computation
+        let start = Instant::now();
+        tracing::info!("BasicBlockBuilder::finish, plain_state total_accts: {:?}", db.bundle_state.state().len());
+
+        let mut total_storage = 0;
         let mut plain_state = PlainPostState::default();
         for (address, bundle_account) in db.bundle_state.state() {
-            // Convert account - None if destroyed, Some(Account) if exists/updated
             let account = if bundle_account.was_destroyed() || bundle_account.info.is_none() {
                 None
             } else {
@@ -538,7 +541,6 @@ where
             };
             plain_state.accounts.insert(*address, account);
             
-            // Convert storage (BundleState uses U256 keys, PlainPostState uses B256 keys)
             let mut storage_map = HashMap::new();
             for (slot, storage_slot) in &bundle_account.storage {
                 // Convert U256 slot to B256 (32-byte representation)
@@ -547,8 +549,12 @@ where
             }
             if !storage_map.is_empty() {
                 plain_state.storages.insert(*address, storage_map);
+                total_storage += bundle_account.storage.len();
             }
+
         }
+        tracing::info!("BasicBlockBuilder::finish, plain_state total_storage: {:?}", total_storage);
+        info!("BasicBlockBuilder::finish, convert elapsed: {:?}", start.elapsed().as_millis());
         
         // Calculate state root using triedb method
         let start = Instant::now();
@@ -591,7 +597,7 @@ where
 
         let block = RecoveredBlock::new_unhashed(block, senders);
 
-        Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
+        Ok(BlockBuilderOutcome { execution_result: result, hashed_state: HashedPostState::default(), trie_updates, block })
     }
 
     fn executor_mut(&mut self) -> &mut Self::Executor {

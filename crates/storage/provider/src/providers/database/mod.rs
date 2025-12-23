@@ -33,14 +33,15 @@ use std::{
     path::Path,
     sync::Arc,
 };
-
+use std::ops::Add;
 use tracing::trace;
 
 mod provider;
 pub use provider::{DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW};
-
+use fixed_cache::Cache;
 use super::ProviderNodeTypes;
 use reth_trie::KeccakKeyHasher;
+use triedb::path::AddressPath;
 
 mod builder;
 pub use builder::{ProviderFactoryBuilder, ReadOnlyConfig};
@@ -86,7 +87,9 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
     ) -> Self {
         // Initialize the static triedb_provider
         let _ = crate::providers::state::latest::set_triedb_provider(triedb_provider.clone());
-        
+        let cache: Cache<Address, AddressPath> = Cache::new(65536, Default::default());
+        let _ = crate::providers::state::latest::set_fixed_cache(cache);
+
         Self {
             db,
             chain_spec,

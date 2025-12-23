@@ -591,7 +591,8 @@ mini-moka = "0.10"
 tar-no-std = { version = "0.3.2", default-features = false }
 miniz_oxide = { version = "0.8.4", default-features = false }
 chrono = "0.4.41"
-
+fixed-cache = "0.1"
+rapidhash = "4.2.0"
 # metrics
 metrics = "0.24.0"
 metrics-derive = "0.1"

@@ -56,7 +56,8 @@ parking_lot.workspace = true
 dashmap = { workspace = true, features = ["inline"] }
 strum.workspace = true
 eyre.workspace = true
-
+fixed-cache.workspace=true
+rapidhash.workspace = true
 # test-utils
 reth-ethereum-engine-primitives = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"], optional = true }

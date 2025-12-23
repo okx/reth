@@ -1,3 +1,4 @@
+use std::ops::Add;
 use crate::{
     providers::state::macros::delegate_provider_impls, AccountReader, BlockHashReader,
     HashedPostStateProvider, StateProvider, StateRootProvider,
@@ -27,9 +28,11 @@ use triedb::{
     overlay::{OverlayStateMut, OverlayValue},
     path::{AddressPath, StoragePath},
 };
+use fixed_cache::{static_cache,Cache};
 
 /// Static storage for the triedb provider instance
 static TRIEDB_PROVIDER: OnceLock<Arc<crate::providers::triedb::TriedbProvider>> = OnceLock::new();
+static FIXED_CACHE: OnceLock<Cache<Address, AddressPath>> = OnceLock::new();
 
 /// Initialize the static triedb provider
 pub fn set_triedb_provider(provider: Arc<crate::providers::triedb::TriedbProvider>) -> Result<(), Arc<crate::providers::triedb::TriedbProvider>> {
@@ -39,6 +42,10 @@ pub fn set_triedb_provider(provider: Arc<crate::providers::triedb::TriedbProvide
 /// Get the static triedb provider
 pub fn get_triedb_provider() -> Option<&'static Arc<crate::providers::triedb::TriedbProvider>> {
     TRIEDB_PROVIDER.get()
+}
+pub fn set_fixed_cache(cache: Cache<Address,AddressPath>) -> Result<(), Cache<Address, AddressPath>> {
+    tracing::info!("set_fixed_cache");
+    FIXED_CACHE.set(cache)
 }
 
 /// State provider over latest state that takes tx reference.
@@ -115,33 +122,53 @@ impl<Provider: DBProvider + Sync> StateRootProvider for LatestStateProviderRef<'
         let triedb_provider = get_triedb_provider()
             .ok_or_else(|| ProviderError::UnsupportedProvider)?;
         let start = Instant::now();
+        let address_cache = FIXED_CACHE.get().unwrap();
         let mut overlay_mut = OverlayStateMut::new();
-        
+
         for (address, account_opt) in &plain_state.accounts {
-            let address_path = AddressPath::for_address(*address);
-            
+            let address_path = address_cache.get_or_insert_with(*address, |address| {
+                AddressPath::for_address(*address)
+            });
             if let Some(account) = account_opt {
                 let trie_account = TrieDBAccount::new(
                     account.nonce,
                     account.balance,
-                    EMPTY_ROOT_HASH, // Storage root will be computed from storage overlay
+                    EMPTY_ROOT_HASH,
                     account.bytecode_hash.unwrap_or(KECCAK_EMPTY),
                 );
                 overlay_mut.insert(address_path.clone().into(), Some(OverlayValue::Account(trie_account)));
             } else {
-                // Account is being destroyed
                 overlay_mut.insert(address_path.clone().into(), None);
             }
         }
-        
+        let total_accts = plain_state.accounts.len();
+        tracing::info!("latest_state_provider total acct: {total_accts:?}");
+
+        let mut total_storage = 0;
+
         for (address, storage) in &plain_state.storages {
-            let address_path = AddressPath::for_address(*address);
-            
+            let address_path = address_cache.get_or_insert_with(*address, |address| {
+                AddressPath::for_address(*address)
+            });
+
+            total_storage += storage.len();
             for (storage_key, storage_value) in storage {
                 let raw_slot = U256::from_be_slice(storage_key.as_slice());
+                let storage_key_typed = StorageKey::from(raw_slot);
+                
+                // let storage_path = storage_path_cache.get_or_insert_with(
+                //     (*address, storage_key_typed),
+                //     |(address, key)| {
+                //         StoragePath::for_address_path_and_slot(
+                //             address_path.clone(),
+                //             *key,
+                //         )
+                //     }
+                // );
+
                 let storage_path = StoragePath::for_address_path_and_slot(
                     address_path.clone(),
-                    StorageKey::from(raw_slot),
+                    storage_key_typed,
                 );
                 
                 if storage_value.is_zero() {
@@ -156,10 +183,15 @@ impl<Provider: DBProvider + Sync> StateRootProvider for LatestStateProviderRef<'
                 }
             }
         }
-        
-        let overlay = overlay_mut.freeze();
+        tracing::info!("latest_state_provider total storage: {total_storage:?}");
         let elapsed = start.elapsed().as_millis();
         tracing::info!("latest_state_provider overlay prepare elapsed: {elapsed:?}");
+
+        let start = Instant::now();
+        let overlay = overlay_mut.freeze();
+        let elapsed = start.elapsed().as_millis();
+        tracing::info!("latest_state_provider overlay freeze elapsed: {elapsed:?}");
+
 
         let start = Instant::now();
         let mut tx = triedb_provider.inner.begin_ro()
