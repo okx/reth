@@ -1,7 +1,5 @@
-use alloy_consensus::{Header as ConsensusHeader, EMPTY_OMMER_ROOT_HASH};
-use alloy_eips::merge::BEACON_NONCE;
 use alloy_json_rpc::RpcObject;
-use alloy_primitives::{Address, FixedBytes, U256};
+use alloy_primitives::Address;
 use alloy_rpc_types_eth::{
     pubsub::{Params as AlloyParams, SubscriptionKind as AlloySubscriptionKind},
     Header,
@@ -11,8 +9,7 @@ use jsonrpsee::{
     proc_macros::rpc, server::SubscriptionMessage, types::ErrorObject, PendingSubscriptionSink,
     SubscriptionSink,
 };
-use reth_optimism_flashblocks::{FlashBlock, PendingBlockRx, PendingFlashBlock};
-use reth_primitives_traits::header::SealedHeader;
+use reth_optimism_flashblocks::{PendingBlockRx, PendingFlashBlock};
 use reth_rpc::eth::pubsub::EthPubSub;
 use reth_rpc_eth_api::pubsub::EthPubSubApiServer;
 use reth_rpc_server_types::result::internal_rpc_err;
@@ -298,6 +295,8 @@ pub trait FlashblocksPubSubApi<T: RpcObject> {
     ) -> jsonrpsee::core::SubscriptionResult;
 }
 
+/// Optimism-specific Ethereum pubsub handler that extends standard subscriptions with flashblocks
+/// support.
 pub struct OpEthPubSub<Eth, N: reth_primitives_traits::NodePrimitives> {
     /// Standard eth pubsub handler
     eth_pubsub: EthPubSub<Eth>,
@@ -410,8 +409,6 @@ where
                         "XXX flashblocks subscription with pending_block_rx available, criteria: {:?}",
                         criteria
                     );
-                    // TODO: Implement flashblocks-specific subscription that returns full
-                    // FlashBlock data Use the criteria to filter/enrich the data
                     return self
                         .filter_flashblocks_stream(pending, pending_block_rx, &criteria)
                         .await;
@@ -444,24 +441,6 @@ where
                 Ok(())
             }
         }
-    }
-}
-
-impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N> {
-    /// Parse `StreamCriteria` from the subscription params.
-    ///
-    /// The params can contain an optional `StreamCriteria` object as the first element.
-    /// If not provided or parsing fails, returns a default criteria.
-    fn parse_stream_criteria(params: &Option<Params>) -> StreamCriteria {
-        params
-            .as_ref()
-            .and_then(|p| match p {
-                // Extract StreamCriteria if present
-                Params::StreamCriteria(criteria) => Some(criteria.clone()),
-                // Standard Ethereum subscription params don't contain StreamCriteria
-                Params::Standard(_) | Params::None => None,
-            })
-            .unwrap_or_default()
     }
 }
 
@@ -538,8 +517,7 @@ where
         pending_block: &PendingFlashBlock<N>,
         criteria: &StreamCriteria,
     ) -> Option<EnrichedFlashblock<N::BlockHeader>> {
-        use alloy_consensus::{transaction::TxHashRef, BlockHeader, TxReceipt};
-        use reth_primitives_traits::SignedTransaction;
+        use alloy_consensus::transaction::TxHashRef;
 
         // Extract header if requested
         let header = if criteria.new_heads {
@@ -575,7 +553,7 @@ where
 
                 // Build TxData if requested
                 let tx_data = if criteria.transaction_extra_info {
-                    Some(Self::build_tx_data_json(*sender, tx, block))
+                    Some(Self::build_tx_data_json(*sender, tx))
                 } else {
                     None
                 };
@@ -608,7 +586,6 @@ where
         addresses: &[Address],
     ) -> bool {
         use alloy_consensus::{Transaction, TxReceipt};
-        use reth_primitives_traits::SignedTransaction;
 
         // Check sender
         if addresses.contains(&sender) {
@@ -635,11 +612,7 @@ where
     }
 
     /// Build TxData JSON matching the user's specified format
-    fn build_tx_data_json(
-        sender: Address,
-        tx: &N::SignedTx,
-        block: &reth_primitives_traits::RecoveredBlock<N::Block>,
-    ) -> serde_json::Value {
+    fn build_tx_data_json(sender: Address, tx: &N::SignedTx) -> serde_json::Value {
         use alloy_consensus::{transaction::TxHashRef, Transaction};
         use alloy_eips::eip2718::Typed2718;
         use alloy_primitives::hex;
@@ -650,7 +623,6 @@ where
         let chain_id = tx.chain_id();
         let tx_type = tx.ty();
 
-        // Build the JSON object matching the user's specified format
         let max_fee_per_gas = tx.max_fee_per_gas();
         let max_fee_per_gas_opt =
             if max_fee_per_gas > 0 { Some(format!("0x{:x}", max_fee_per_gas)) } else { None };
@@ -680,7 +652,6 @@ where
     ) -> serde_json::Value {
         use alloy_consensus::{BlockHeader, TxReceipt};
         use alloy_primitives::hex;
-        use reth_primitives_traits::Block;
         use serde_json::json;
 
         let sealed_block = block.sealed_block();
