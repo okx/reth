@@ -22,6 +22,7 @@ use tokio_stream::{wrappers::WatchStream, Stream};
 use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Subscription kind.
 pub enum SubscriptionKind {
     /// Standard Ethereum subscription.
     Standard(AlloySubscriptionKind),
