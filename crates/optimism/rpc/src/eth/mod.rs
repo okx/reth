@@ -585,17 +585,17 @@ where
 }
 
 /// Trait extension for accessing flashblocks functionality from EthApi
-pub trait OpEthApiFlashblocksExt {
+pub trait OpEthApiFlashblocksExt<P: reth_primitives_traits::NodePrimitives> {
     /// Returns the flashblocks broadcast sender, if available.
-    fn flashblocks_sender(&self) -> Option<tokio::sync::broadcast::Sender<Arc<FlashBlock>>>;
+    fn pending_blocks_rx(&self) -> Option<PendingBlockRx<P>>;
 }
 
-impl<N, Rpc> OpEthApiFlashblocksExt for OpEthApi<N, Rpc>
+impl<N, Rpc> OpEthApiFlashblocksExt<N::Primitives> for OpEthApi<N, Rpc>
 where
     N: RpcNodeCore,
     Rpc: RpcConvert,
 {
-    fn flashblocks_sender(&self) -> Option<tokio::sync::broadcast::Sender<Arc<FlashBlock>>> {
-        self.inner.flashblocks.as_ref().map(|f| f.received_flashblocks.clone())
+    fn pending_blocks_rx(&self) -> Option<PendingBlockRx<N::Primitives>> {
+        self.inner.flashblocks.as_ref().map(|f| f.pending_block_rx.clone())
     }
 }

@@ -64,6 +64,7 @@ use reth_rpc_api::{
     eth::{EthApiTypes, RpcTypes},
     DebugApiServer, L2EthApiExtServer, XLayerEthApiExtServer,
 };
+use reth_rpc_eth_api::RpcNodeCore;
 use reth_rpc_server_types::RethRpcModule;
 use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::{
@@ -529,7 +530,8 @@ where
         Pool: TransactionPool<Transaction: OpPooledTx>,
     >,
     EthB: EthApiBuilder<N>,
-    EthB::EthApi: OpEthApiFlashblocksExt,
+    EthB::EthApi: OpEthApiFlashblocksExt<<N::Types as NodeTypes>::Primitives>
+        + RpcNodeCore<Primitives = <N::Types as NodeTypes>::Primitives>,
     PVB: Send,
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,
@@ -647,8 +649,12 @@ where
                 // Replace the base EthPubSub with OpEthPubSub to avoid duplicate eth_subscribe
                 // registration
                 let eth_pubsub = registry.eth_handlers().pubsub.clone();
-                let flashblocks_tx = OpEthApiFlashblocksExt::flashblocks_sender(registry.eth_api());
-                let op_eth_pubsub = OpEthPubSub::new(eth_pubsub, flashblocks_tx);
+                let pending_blocks_rx =
+                    OpEthApiFlashblocksExt::pending_blocks_rx(registry.eth_api());
+                let op_eth_pubsub = OpEthPubSub::<
+                    _,
+                    <EthB::EthApi as reth_rpc_eth_api::RpcNodeCore>::Primitives,
+                >::new(eth_pubsub, pending_blocks_rx);
                 modules.add_or_replace_if_module_configured(
                     RethRpcModule::Eth,
                     op_eth_pubsub.into_rpc(),
@@ -679,7 +685,8 @@ where
     >,
     <<N as FullNodeComponents>::Pool as TransactionPool>::Transaction: OpPooledTx,
     EthB: EthApiBuilder<N>,
-    EthB::EthApi: OpEthApiFlashblocksExt,
+    EthB::EthApi: OpEthApiFlashblocksExt<<N::Types as NodeTypes>::Primitives>
+        + RpcNodeCore<Primitives = <N::Types as NodeTypes>::Primitives>,
     PVB: PayloadValidatorBuilder<N>,
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,

@@ -11,14 +11,14 @@ use jsonrpsee::{
     proc_macros::rpc, server::SubscriptionMessage, types::ErrorObject, PendingSubscriptionSink,
     SubscriptionSink,
 };
-use reth_optimism_flashblocks::FlashBlock;
+use reth_optimism_flashblocks::{FlashBlock, PendingBlockRx, PendingFlashBlock};
 use reth_primitives_traits::header::SealedHeader;
 use reth_rpc::eth::pubsub::EthPubSub;
 use reth_rpc_eth_api::pubsub::EthPubSubApiServer;
 use reth_rpc_server_types::result::internal_rpc_err;
 use serde::Serialize;
-use std::{pin::Pin, sync::Arc};
-use tokio_stream::{wrappers::BroadcastStream, Stream};
+use std::pin::Pin;
+use tokio_stream::{wrappers::WatchStream, Stream};
 use tracing::info;
 
 /// Flashblocks pubsub RPC interface.
@@ -40,21 +40,38 @@ pub trait FlashblocksPubSubApi<T: RpcObject> {
     ) -> jsonrpsee::core::SubscriptionResult;
 }
 
-#[derive(Clone, Debug)]
-pub struct OpEthPubSub<Eth> {
+pub struct OpEthPubSub<Eth, N: reth_primitives_traits::NodePrimitives> {
     /// Standard eth pubsub handler
     eth_pubsub: EthPubSub<Eth>,
-    /// Flashblocks broadcast sender, if available
-    flashblocks_tx: Option<tokio::sync::broadcast::Sender<Arc<FlashBlock>>>,
+    /// Pending block receiver from flashblocks, if available
+    pending_block_rx: Option<PendingBlockRx<N>>,
 }
 
-impl<Eth> OpEthPubSub<Eth> {
+impl<Eth, N: reth_primitives_traits::NodePrimitives> Clone for OpEthPubSub<Eth, N>
+where
+    Eth: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            eth_pubsub: self.eth_pubsub.clone(),
+            pending_block_rx: self.pending_block_rx.clone(),
+        }
+    }
+}
+
+impl<Eth, N: reth_primitives_traits::NodePrimitives> std::fmt::Debug for OpEthPubSub<Eth, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpEthPubSub")
+            .field("eth_pubsub", &self.eth_pubsub)
+            .field("pending_block_rx", &self.pending_block_rx.is_some())
+            .finish()
+    }
+}
+
+impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N> {
     /// Creates a new `OpEthPubSub` instance.
-    pub fn new(
-        eth_pubsub: EthPubSub<Eth>,
-        flashblocks_tx: Option<tokio::sync::broadcast::Sender<Arc<FlashBlock>>>,
-    ) -> Self {
-        Self { eth_pubsub, flashblocks_tx }
+    pub fn new(eth_pubsub: EthPubSub<Eth>, pending_block_rx: Option<PendingBlockRx<N>>) -> Self {
+        Self { eth_pubsub, pending_block_rx }
     }
 
     /// Returns a reference to the wrapped `EthPubSub`.
@@ -69,10 +86,10 @@ impl<Eth> OpEthPubSub<Eth> {
     pub fn into_rpc(self) -> jsonrpsee::RpcModule<()>
     where
         Eth: reth_rpc_eth_api::EthApiTypes,
-        OpEthPubSub<Eth>:
+        OpEthPubSub<Eth, N>:
             FlashblocksPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>>,
     {
-        <OpEthPubSub<Eth> as FlashblocksPubSubApiServer<
+        <OpEthPubSub<Eth, N> as FlashblocksPubSubApiServer<
             reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>,
         >>::into_rpc(self)
         .remove_context()
@@ -86,28 +103,20 @@ impl<Eth> OpEthPubSub<Eth> {
     /// Returns `None` if flashblocks are not available.
     pub fn new_flashblocks_header_stream(
         &self,
-    ) -> Option<impl Stream<Item = Header<ConsensusHeader>>>
-    where
-        Eth: reth_rpc_eth_api::RpcNodeCore,
-    {
-        self.flashblocks_tx.as_ref().map(|flashblocks_tx| {
-            BroadcastStream::new(flashblocks_tx.subscribe()).filter_map(|result| async move {
-                match result {
-                    Ok(flashblock) => extract_header_from_flashblock(&flashblock).ok(),
-                    Err(_) => {
-                        // BroadcastStream lagged, skip
-                        info!("XXX line 99: {:?}", result);
-                        None
-                    }
-                }
+    ) -> Option<impl Stream<Item = Header<N::BlockHeader>>> {
+        self.pending_block_rx.as_ref().map(|pending_block_rx| {
+            WatchStream::new(pending_block_rx.clone()).filter_map(|pending_block_opt| async move {
+                pending_block_opt.and_then(|pending_block| {
+                    extract_header_from_pending_block(&pending_block).ok()
+                })
             })
         })
     }
 }
 
 #[async_trait::async_trait]
-impl<Eth> EthPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>>
-    for OpEthPubSub<Eth>
+impl<Eth, N: reth_primitives_traits::NodePrimitives>
+    EthPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>> for OpEthPubSub<Eth, N>
 where
     Eth: reth_rpc_eth_api::RpcNodeCore<
             Provider: reth_storage_api::BlockNumReader + reth_chain_state::CanonStateSubscriptions,
@@ -129,9 +138,11 @@ where
         // Intercept newHeads subscription and use flashblocks if available
         info!("XXX subscribe: {:?}", kind);
         if matches!(kind, alloy_rpc_types_eth::pubsub::SubscriptionKind::NewHeads) {
-            if let Some(flashblocks_tx) = &self.flashblocks_tx {
+            if let Some(pending_block_rx) = &self.pending_block_rx {
                 info!("XXX line 96: {:?}", kind);
-                return self.subscribe_flashblocks_as_headers(pending, flashblocks_tx, params).await;
+                return self
+                    .subscribe_pending_blocks_as_headers(pending, pending_block_rx, params)
+                    .await;
             }
         }
 
@@ -141,8 +152,9 @@ where
 }
 
 #[async_trait::async_trait]
-impl<Eth> FlashblocksPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>>
-    for OpEthPubSub<Eth>
+impl<Eth, N: reth_primitives_traits::NodePrimitives>
+    FlashblocksPubSubApiServer<reth_rpc_eth_api::RpcTransaction<Eth::NetworkTypes>>
+    for OpEthPubSub<Eth, N>
 where
     Eth: reth_rpc_eth_api::RpcNodeCore<
             Provider: reth_storage_api::BlockNumReader + reth_chain_state::CanonStateSubscriptions,
@@ -162,9 +174,11 @@ where
         info!("XXX line 163: {:?}", kind);
         if matches!(kind, SubscriptionKind::NewHeads) {
             info!("XXX line 166: {:?}", kind);
-            if let Some(flashblocks_tx) = &self.flashblocks_tx {
-                info!("XXX line 167: {:?}", flashblocks_tx);
-                return self.subscribe_flashblocks_as_headers(pending, flashblocks_tx, params).await;
+            if let Some(pending_block_rx) = &self.pending_block_rx {
+                info!("XXX line 167: pending_block_rx available");
+                return self
+                    .subscribe_pending_blocks_as_headers(pending, pending_block_rx, params)
+                    .await;
             }
         }
 
@@ -180,7 +194,7 @@ where
     }
 }
 
-impl<Eth> OpEthPubSub<Eth>
+impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N>
 where
     Eth: reth_rpc_eth_api::RpcNodeCore<Provider: reth_storage_api::BlockNumReader>
         + reth_rpc_eth_api::EthApiTypes<
@@ -189,28 +203,22 @@ where
             >,
         >,
 {
-    /// Subscribe to flashblocks and convert them to Header format for newHeads
-    async fn subscribe_flashblocks_as_headers(
+    /// Subscribe to pending blocks and convert them to Header format for newHeads
+    async fn subscribe_pending_blocks_as_headers(
         &self,
         pending: PendingSubscriptionSink,
-        flashblocks_tx: &tokio::sync::broadcast::Sender<Arc<FlashBlock>>,
+        pending_block_rx: &PendingBlockRx<N>,
         _params: Option<alloy_rpc_types_eth::pubsub::Params>,
     ) -> jsonrpsee::core::SubscriptionResult {
         let sink = pending.accept().await?;
-        let flashblocks_rx = flashblocks_tx.subscribe();
-        // Convert flashblocks stream to headers stream, filtering out errors
-        let headers_stream = BroadcastStream::new(flashblocks_rx).filter_map(|result| async move {
-            match result {
-                Ok(flashblock) => {
-                    // Convert flashblock to RPC Header
-                    extract_header_from_flashblock(&flashblock).ok()
-                }
-                Err(_) => {
-                    // BroadcastStream lagged, skip
-                    None
-                }
-            }
-        });
+        let pending_block_rx = pending_block_rx.clone();
+        // Convert pending blocks stream to headers stream
+        let headers_stream =
+            WatchStream::new(pending_block_rx).filter_map(|pending_block_opt| async move {
+                pending_block_opt.and_then(|pending_block| {
+                    extract_header_from_pending_block(&pending_block).ok()
+                })
+            });
         let pinned_stream = Box::pin(headers_stream);
 
         tokio::spawn(async move {
@@ -260,6 +268,21 @@ where
             }
         }
     }
+}
+
+/// Extract Header from PendingFlashBlock
+///
+/// Constructs an Ethereum RPC `Header` from a pending flashblock by extracting
+/// the header from the executed block.
+fn extract_header_from_pending_block<N: reth_primitives_traits::NodePrimitives>(
+    pending_block: &PendingFlashBlock<N>,
+) -> Result<Header<N::BlockHeader>, ErrorObject<'static>> {
+    let block = pending_block.block();
+    let sealed_header = block.clone_sealed_header();
+
+    // Convert to RPC Header format
+    // Note: We don't have block size, so we pass None
+    Ok(Header::from_consensus(sealed_header.into(), None, None))
 }
 
 /// Extract Header from FlashBlock
