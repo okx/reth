@@ -1298,7 +1298,7 @@ where
         debug!(target: "engine::tree", count=blocks_to_persist.len(), blocks = ?blocks_to_persist.iter().map(|block| block.recovered_block().num_hash()).collect::<Vec<_>>(), "Persisting blocks");
         let (tx, rx) = oneshot::channel();
         let _ = self.persistence.save_blocks(blocks_to_persist, tx);
-
+        info!("start save blocks");
         self.persistence_state.start_save(highest_num_hash, rx);
     }
 

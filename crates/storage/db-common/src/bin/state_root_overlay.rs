@@ -44,8 +44,6 @@ fn main() -> eyre::Result<()> {
     let main_file_name_path = dir.path().join("triedb");
     let triedb = Database::create_new(&main_file_name_path).unwrap();
 
-    // let tdb_pre_root = triedb.state_root();
-
     setup_tdb_database(&triedb, &base_addresses, &base_accounts_map, &base_storage_map).unwrap();
 
     let mut account_overlay_mut = OverlayStateMut::new();
@@ -111,11 +109,6 @@ fn main() -> eyre::Result<()> {
             .build(),
     );
     let provider_factory = create_test_provider_factory_with_chain_spec(empty_chain_spec);
-
-    // let db_provider_ro_pre = provider_factory.database_provider_ro()?;
-    // let latest_ro_pre = LatestStateProvider::new(db_provider_ro_pre);
-    // let empty_state = HashedPostState::default();
-    // let (mdbx_pre_root, _) = latest_ro_pre.state_root_with_updates(empty_state)?;
 
     // Insert base data
     {

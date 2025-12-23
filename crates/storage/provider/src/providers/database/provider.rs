@@ -83,9 +83,10 @@ use std::{
     ops::{Deref, DerefMut, Not, Range, RangeBounds, RangeFrom, RangeInclusive},
     sync::Arc,
 };
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_trie::EMPTY_ROOT_HASH;
+use tokio::time::Instant;
 use triedb::{
     account::Account as TrieDBAccount,
     path::{AddressPath, StoragePath},
@@ -353,6 +354,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         self.update_pipeline_stages(last_block_number, false)?;
 
         // Write merged state to triedb
+        let start = Instant::now();
         if let Some(triedb_provider) = triedb_provider_opt {
             let mut tx = triedb_provider.inner.begin_rw()
                 .map_err(|e| ProviderError::TrieWitnessError(format!("Failed to begin triedb transaction: {e:?}")))?;
@@ -409,7 +411,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             tx.commit()
                 .map_err(|e| ProviderError::TrieWitnessError(format!("Failed to commit triedb transaction: {e:?}")))?;
         }
-
+        let elapsed = start.elapsed().as_millis();
+        info!("save to trie db elapsed {:?}", elapsed);
         debug!(target: "providers::db", range = ?first_number..=last_block_number, "Appended block data");
 
         Ok(())

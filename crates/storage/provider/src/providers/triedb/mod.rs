@@ -14,15 +14,40 @@ impl TriedbProvider {
     pub fn new(db_path: impl AsRef<Path>) -> Self {
         let db_path = db_path.as_ref();
         let db = if db_path.exists() {
-            TrieDbDatabase::open(db_path).unwrap()
+            println!("Opening triedb database at {}", db_path.display());
+            // Try to open existing database
+            match TrieDbDatabase::open(db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    println!("Failed to open existing triedb database: {e:?}. Removing and creating new database.");
+                    // Remove the existing directory and create fresh
+                    if db_path.is_dir() {
+                        std::fs::remove_dir_all(db_path).unwrap_or_else(|e| {
+                            panic!("Failed to remove existing triedb directory at {:?}: {e:?}", db_path);
+                        });
+                    } else {
+                        std::fs::remove_file(db_path).unwrap_or_else(|e| {
+                            panic!("Failed to remove existing triedb file at {:?}: {e:?}", db_path);
+                        });
+                    }
+                    // Ensure parent directory exists
+                    if let Some(parent) = db_path.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    TrieDbDatabase::create_new(db_path).unwrap()
+                }
+            }
         } else {
+            // Ensure parent directory exists
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
             TrieDbDatabase::create_new(db_path).unwrap()
         };
         Self {
             inner: Arc::new(db),
         }
     }
-
     pub fn set_account(
         &self,
         address: Address,
