@@ -20,16 +20,10 @@ use std::pin::Pin;
 use tokio_stream::{wrappers::WatchStream, Stream};
 use tracing::info;
 
-/// Extended subscription kind that wraps Alloy's `SubscriptionKind` and adds Optimism-specific
-/// variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionKind {
-    /// Wraps all standard Alloy subscription kinds.
     Standard(AlloySubscriptionKind),
     /// Flashblocks subscription.
-    ///
-    /// Returns flashblocks as they are received from the sequencer.
-    /// This is an Optimism-specific extension to the standard Ethereum subscription types.
     Flashblocks,
 }
 
@@ -63,7 +57,6 @@ impl Serialize for SubscriptionKind {
     {
         match self {
             SubscriptionKind::Standard(kind) => {
-                // Serialize the standard kind as its string representation
                 let s = match kind {
                     AlloySubscriptionKind::NewHeads => "newHeads",
                     AlloySubscriptionKind::Logs => "logs",
@@ -78,16 +71,6 @@ impl Serialize for SubscriptionKind {
 }
 
 impl SubscriptionKind {
-    /// Returns `true` if this is a flashblocks subscription.
-    pub const fn is_flashblocks(&self) -> bool {
-        matches!(self, Self::Flashblocks)
-    }
-
-    /// Returns `true` if this is a `NewHeads` subscription.
-    pub fn is_new_heads(&self) -> bool {
-        matches!(self, Self::Standard(AlloySubscriptionKind::NewHeads))
-    }
-
     /// Returns the inner standard subscription kind, if any.
     pub const fn as_standard(&self) -> Option<&AlloySubscriptionKind> {
         match self {
@@ -119,7 +102,7 @@ impl From<SubscriptionKind> for AlloySubscriptionKind {
 /// Extended params that wraps Alloy's `Params` and adds Optimism-specific variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Params {
-    /// Standard Ethereum subscription params (for logs, etc.)
+    /// Standard Ethereum subscription params
     Standard(AlloyParams),
     /// Flashblocks stream criteria
     StreamCriteria(StreamCriteria),
@@ -132,7 +115,6 @@ impl<'de> Deserialize<'de> for Params {
     where
         D: serde::Deserializer<'de>,
     {
-        // Try to deserialize as a generic JSON value first
         let value = serde_json::Value::deserialize(deserializer)?;
 
         if value.is_null() {
@@ -185,8 +167,6 @@ impl Params {
 }
 
 /// Criteria for filtering and enriching flashblock subscription data.
-///
-/// This allows clients to customize what data is included in flashblock updates.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StreamCriteria {
@@ -224,7 +204,7 @@ pub struct EnrichedFlashblock<H> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct EnrichedTransaction {
-    /// Transaction hash (always included)
+    /// Transaction hash
     pub tx_hash: alloy_primitives::TxHash,
 
     /// Transaction data (if `transaction_extra_info` is true in criteria)
@@ -237,36 +217,6 @@ pub struct EnrichedTransaction {
 }
 
 impl StreamCriteria {
-    /// Creates a new `StreamCriteria` with all options disabled.
-    pub const fn new() -> Self {
-        Self {
-            new_heads: false,
-            transaction_extra_info: false,
-            transaction_receipt: false,
-            subscribed_addresses: Vec::new(),
-        }
-    }
-
-    /// Creates criteria for receiving only block headers.
-    pub fn headers_only() -> Self {
-        Self { new_heads: true, ..Default::default() }
-    }
-
-    /// Creates criteria for receiving full transaction details.
-    pub fn full_transactions() -> Self {
-        Self {
-            new_heads: true,
-            transaction_extra_info: true,
-            transaction_receipt: true,
-            subscribed_addresses: Vec::new(),
-        }
-    }
-
-    /// Returns `true` if any transaction-related fields are enabled.
-    pub const fn includes_transactions(&self) -> bool {
-        self.transaction_extra_info || self.transaction_receipt
-    }
-
     /// Returns `true` if address filtering is enabled.
     pub fn has_address_filter(&self) -> bool {
         !self.subscribed_addresses.is_empty()
@@ -274,20 +224,9 @@ impl StreamCriteria {
 }
 
 /// Flashblocks pubsub RPC interface.
-///
-/// This trait provides the same interface as `EthPubSubApi` but with relaxed trait bounds
-/// to allow implementation for `OpEthPubSub` without requiring `SignedTx = PoolConsensusTx<Pool>`.
-///
-/// Supports standard Ethereum subscriptions plus custom "flashblocks" subscriptions with
-/// optional `StreamCriteria` for filtering.
 #[rpc(server, namespace = "eth")]
 pub trait FlashblocksPubSubApi<T: RpcObject> {
     /// Create an ethereum subscription for the given params
-    ///
-    /// # Parameters
-    /// - `kind`: Subscription type ("flashblocks", "newHeads", "logs", etc.)
-    /// - `params`: Optional parameters - for flashblocks, this can be `StreamCriteria`; for logs,
-    ///   this is a `Filter`
     #[subscription(
         name = "subscribe" => "subscription",
         unsubscribe = "unsubscribe",
@@ -349,9 +288,6 @@ impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N> {
     }
 
     /// Converts this `OpEthPubSub` into an RPC module.
-    ///
-    /// This method uses `FlashblocksPubSubApiServer` which has relaxed trait bounds,
-    /// allowing it to be used in contexts where `EthPubSubApiServer` bounds aren't satisfied.
     pub fn into_rpc(self) -> jsonrpsee::RpcModule<()>
     where
         Eth: reth_rpc_eth_api::EthApiTypes,
@@ -365,11 +301,6 @@ impl<Eth, N: reth_primitives_traits::NodePrimitives> OpEthPubSub<Eth, N> {
     }
 
     /// Returns a stream that yields all new RPC headers from flashblocks.
-    ///
-    /// This stream converts flashblocks to headers, filtering out any errors
-    /// (e.g., when the broadcast stream lags).
-    ///
-    /// Returns `None` if flashblocks are not available.
     pub fn new_flashblocks_header_stream(
         &self,
     ) -> Option<impl Stream<Item = Header<N::BlockHeader>>> {
@@ -471,7 +402,6 @@ where
     ) -> jsonrpsee::core::SubscriptionResult {
         let sink = pending.accept().await?;
         let pending_block_rx = pending_block_rx.clone();
-        // Convert pending blocks stream to headers stream
         let headers_stream =
             WatchStream::new(pending_block_rx).filter_map(|pending_block_opt| async move {
                 pending_block_opt.and_then(|pending_block| {
@@ -518,9 +448,6 @@ where
     }
 
     /// Filter and enrich a flashblock based on the provided criteria using RpcConvert.
-    ///
-    /// Returns `None` if the block should be filtered out (e.g., no transactions match address
-    /// filter).
     fn filter_and_enrich_flashblock(
         pending_block: &PendingFlashBlock<N>,
         criteria: &StreamCriteria,
@@ -535,7 +462,6 @@ where
             None
         };
 
-        // Get block and receipts
         let block = pending_block.block();
         let receipts = pending_block.receipts.as_ref();
         let sealed_block = block.sealed_block();
@@ -546,9 +472,8 @@ where
             .transactions_with_sender()
             .enumerate()
             .filter_map(|(idx, (sender, tx))| {
-                // Apply address filtering if specified
                 if criteria.has_address_filter() {
-                    let matches_filter = Self::transaction_matches_addresses_simple(
+                    let matches_filter = Self::is_address_in_transaction(
                         *sender,
                         tx,
                         receipts.get(idx),
@@ -562,15 +487,12 @@ where
                 let receipt = receipts.get(idx)?;
                 let tx_hash = *tx.tx_hash();
 
-                // Build TxData if requested using RpcConvert
                 let tx_data = if criteria.transaction_extra_info {
                     use alloy_rpc_types_eth::TransactionInfo;
 
-                    // Create Recovered transaction
                     let recovered =
                         reth_primitives_traits::Recovered::new_unchecked(tx.clone(), *sender);
 
-                    // Convert using RpcConvert::fill()
                     let rpc_tx = rpc_convert
                         .fill(
                             recovered,
@@ -584,26 +506,21 @@ where
                         )
                         .ok()?;
 
-                    // Serialize to JSON
                     Some(serde_json::to_value(rpc_tx).ok()?)
                 } else {
                     None
                 };
 
-                // Build Receipt if requested using RpcConvert
                 let receipt_json = if criteria.transaction_receipt {
                     use alloy_consensus::TxReceipt;
                     use reth_primitives_traits::{Recovered, TransactionMeta};
                     use reth_rpc_convert::transaction::ConvertReceiptInput;
 
-                    // Calculate cumulative gas used up to this transaction
                     let gas_used = receipt.cumulative_gas_used();
 
-                    // Calculate log index offset (sum of logs from previous transactions)
                     let next_log_index =
                         receipts.iter().take(idx).map(|r| r.logs().len()).sum::<usize>();
 
-                    // Convert using RpcConvert::convert_receipts_with_block()
                     let receipt_input = ConvertReceiptInput {
                         receipt: receipt.clone(),
                         tx: Recovered::new_unchecked(tx, *sender),
@@ -624,18 +541,15 @@ where
                         .convert_receipts_with_block(vec![receipt_input], &sealed_block)
                         .ok()?;
 
-                    // Get the first receipt and serialize to JSON
                     rpc_receipts.first().and_then(|r| serde_json::to_value(r).ok())
                 } else {
                     None
                 };
 
-                // Build enriched transaction
                 Some(EnrichedTransaction { tx_hash, tx_data, receipt: receipt_json })
             })
             .collect();
 
-        // If address filtering is enabled but no transactions matched, skip this block
         if criteria.has_address_filter() && transactions.is_empty() {
             return None;
         }
@@ -643,8 +557,7 @@ where
         Some(EnrichedFlashblock { header, transactions })
     }
 
-    /// Check if a transaction matches any of the subscribed addresses (simplified version).
-    fn transaction_matches_addresses_simple(
+    fn is_address_in_transaction(
         sender: Address,
         tx: &N::SignedTx,
         receipt: Option<&N::Receipt>,
@@ -678,8 +591,6 @@ where
 }
 
 /// Pipes all stream items to the subscription sink.
-///
-/// This is a reusable helper function similar to the one in `reth_rpc::eth::pubsub`.
 async fn pipe_from_stream<T, St>(
     sink: SubscriptionSink,
     stream: Pin<Box<St>>,
@@ -719,16 +630,11 @@ where
 }
 
 /// Extract Header from PendingFlashBlock
-///
-/// Constructs an Ethereum RPC `Header` from a pending flashblock by extracting
-/// the header from the executed block.
 fn extract_header_from_pending_block<N: reth_primitives_traits::NodePrimitives>(
     pending_block: &PendingFlashBlock<N>,
 ) -> Result<Header<N::BlockHeader>, ErrorObject<'static>> {
     let block = pending_block.block();
     let sealed_header = block.clone_sealed_header();
 
-    // Convert to RPC Header format
-    // Note: We don't have block size, so we pass None
     Ok(Header::from_consensus(sealed_header.into(), None, None))
 }
