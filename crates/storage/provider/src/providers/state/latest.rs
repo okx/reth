@@ -8,6 +8,7 @@ use reth_primitives_traits::{Account, Bytecode};
 use reth_storage_api::{BytecodeReader, DBProvider, PlainPostState, StateProofProvider, StorageRootProvider};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use reth_trie::{
     proof::{Proof, StorageProof},
     updates::TrieUpdates,
@@ -110,10 +111,10 @@ impl<Provider: DBProvider + Sync> StateRootProvider for LatestStateProviderRef<'
         &self,
         plain_state: PlainPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        tracing::debug!("latest_state_provider state_root_with_updates_triedb");
+        tracing::info!("latest_state_provider state_root_with_updates_triedb");
         let triedb_provider = get_triedb_provider()
             .ok_or_else(|| ProviderError::UnsupportedProvider)?;
-
+        let start = Instant::now();
         let mut overlay_mut = OverlayStateMut::new();
         
         for (address, account_opt) in &plain_state.accounts {
@@ -157,16 +158,23 @@ impl<Provider: DBProvider + Sync> StateRootProvider for LatestStateProviderRef<'
         }
         
         let overlay = overlay_mut.freeze();
+        let elapsed = start.elapsed().as_millis();
+        tracing::info!("latest_state_provider overlay prepare elapsed: {elapsed:?}");
 
+        let start = Instant::now();
         let mut tx = triedb_provider.inner.begin_ro()
             .map_err(|e| ProviderError::TrieWitnessError(format!("Failed to begin triedb transaction: {e:?}")))?;
 
         let result = tx.compute_root_with_overlay(overlay)
             .map_err(|e| ProviderError::TrieWitnessError(format!("Failed to compute triedb root: {e:?}")))?;
+        let elapsed = start.elapsed().as_millis();
+        tracing::info!("latest_state_provider compute_root_with_overlay elapsed: {elapsed:?}");
 
+        let start = Instant::now();
         tx.commit()
             .map_err(|e| ProviderError::TrieWitnessError(format!("Failed to commit triedb transaction: {e:?}")))?;
-
+        let elapsed = start.elapsed().as_millis();
+        tracing::info!("latest_state_provider commit elapsed: {elapsed:?}");
         Ok((result.root, TrieUpdates::default()))
     }
 }
