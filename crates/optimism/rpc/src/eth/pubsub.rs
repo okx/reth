@@ -200,13 +200,38 @@ pub struct StreamCriteria {
     #[serde(default)]
     pub transaction_receipt: bool,
 
-    /// Include internal transactions (traces).
-    #[serde(default)]
-    pub transaction_inner_txs: bool,
-
     /// Only include transactions involving these addresses (empty = all transactions).
     #[serde(default)]
     pub subscribed_addresses: Vec<Address>,
+}
+
+/// Enriched flashblock data returned to subscribers based on StreamCriteria.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrichedFlashblock<H> {
+    /// Block header (if `new_heads` is true in criteria)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<Header<H>>,
+
+    /// Filtered transactions with optional enrichment
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub transactions: Vec<EnrichedTransaction>,
+}
+
+/// Transaction data with optional enrichment based on StreamCriteria.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct EnrichedTransaction {
+    /// Transaction hash (always included)
+    pub tx_hash: alloy_primitives::TxHash,
+
+    /// Transaction data (if `transaction_extra_info` is true in criteria)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_data: Option<serde_json::Value>,
+
+    /// Transaction receipt (if `transaction_receipt` is true in criteria)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl StreamCriteria {
@@ -216,7 +241,6 @@ impl StreamCriteria {
             new_heads: false,
             transaction_extra_info: false,
             transaction_receipt: false,
-            transaction_inner_txs: false,
             subscribed_addresses: Vec::new(),
         }
     }
@@ -232,14 +256,13 @@ impl StreamCriteria {
             new_heads: true,
             transaction_extra_info: true,
             transaction_receipt: true,
-            transaction_inner_txs: false,
             subscribed_addresses: Vec::new(),
         }
     }
 
     /// Returns `true` if any transaction-related fields are enabled.
     pub const fn includes_transactions(&self) -> bool {
-        self.transaction_extra_info || self.transaction_receipt || self.transaction_inner_txs
+        self.transaction_extra_info || self.transaction_receipt
     }
 
     /// Returns `true` if address filtering is enabled.
@@ -390,7 +413,7 @@ where
                     // TODO: Implement flashblocks-specific subscription that returns full
                     // FlashBlock data Use the criteria to filter/enrich the data
                     return self
-                        .subscribe_pending_blocks_as_headers(pending, pending_block_rx, &criteria)
+                        .filter_flashblocks_stream(pending, pending_block_rx, &criteria)
                         .await;
                 } else {
                     let err = internal_rpc_err("Flashblocks are not available on this node");
@@ -399,7 +422,6 @@ where
                 }
             }
             SubscriptionKind::Standard(alloy_kind) => {
-                // Handle standard subscriptions, with optional flashblocks integration for newHeads
                 if matches!(alloy_kind, AlloySubscriptionKind::NewHeads) {
                     if let Some(pending_block_rx) = &self.pending_block_rx {
                         info!(
@@ -416,15 +438,8 @@ where
                     }
                 }
 
-                // // For other standard subscriptions (logs, newPendingTransactions, syncing),
-                // // forward to the standard eth_pubsub handler
-                // let sink = pending.accept().await?;
-
-                // // Extract standard params if present
                 let standard_params = params.and_then(|p| p.as_standard().cloned());
 
-                // // Use handle_accepted to process the subscription
-                // self.eth_pubsub.handle_accepted(sink, alloy_kind, standard_params).await?;
                 self.eth_pubsub.subscribe(pending, alloy_kind, standard_params).await?;
                 Ok(())
             }
@@ -482,6 +497,230 @@ where
         });
 
         Ok(())
+    }
+
+    async fn filter_flashblocks_stream(
+        &self,
+        pending: PendingSubscriptionSink,
+        pending_block_rx: &PendingBlockRx<N>,
+        criteria: &StreamCriteria,
+    ) -> jsonrpsee::core::SubscriptionResult {
+        let sink = pending.accept().await?;
+        let pending_block_rx = pending_block_rx.clone();
+        let criteria = criteria.clone();
+
+        let flashblocks_stream =
+            WatchStream::new(pending_block_rx).filter_map(move |pending_block_opt| {
+                let criteria = criteria.clone();
+                async move {
+                    pending_block_opt.and_then(|pending_block| {
+                        Self::filter_and_enrich_flashblock_static(&pending_block, &criteria)
+                    })
+                }
+            });
+        let pinned_stream = Box::pin(flashblocks_stream);
+
+        tokio::spawn(async move {
+            let _ = pipe_from_stream(sink, pinned_stream).await;
+        });
+
+        Ok(())
+    }
+
+    /// Filter and enrich a flashblock based on the provided criteria.
+    ///
+    /// Returns `None` if the block should be filtered out (e.g., no transactions match address
+    /// filter).
+    ///
+    /// NOTE: This is a simplified implementation. For full receipt building with proper
+    /// gas calculations and log indices, you would need to use `RpcConvert` trait methods.
+    fn filter_and_enrich_flashblock_static(
+        pending_block: &PendingFlashBlock<N>,
+        criteria: &StreamCriteria,
+    ) -> Option<EnrichedFlashblock<N::BlockHeader>> {
+        use alloy_consensus::{transaction::TxHashRef, BlockHeader, TxReceipt};
+        use reth_primitives_traits::SignedTransaction;
+
+        // Extract header if requested
+        let header = if criteria.new_heads {
+            Some(extract_header_from_pending_block(pending_block).ok()?)
+        } else {
+            None
+        };
+
+        // Get block and receipts
+        let block = pending_block.block();
+        let receipts = pending_block.receipts.as_ref();
+
+        // Filter and enrich transactions using transactions_with_sender
+        let transactions: Vec<EnrichedTransaction> = block
+            .transactions_with_sender()
+            .enumerate()
+            .filter_map(|(idx, (sender, tx))| {
+                // Apply address filtering if specified
+                if criteria.has_address_filter() {
+                    let matches_filter = Self::transaction_matches_addresses_simple(
+                        *sender,
+                        tx,
+                        receipts.get(idx),
+                        &criteria.subscribed_addresses,
+                    );
+                    if !matches_filter {
+                        return None;
+                    }
+                }
+
+                let receipt = receipts.get(idx)?;
+                let tx_hash = *tx.tx_hash();
+
+                // Build TxData if requested
+                let tx_data = if criteria.transaction_extra_info {
+                    Some(Self::build_tx_data_json(*sender, tx, block))
+                } else {
+                    None
+                };
+
+                // Build Receipt if requested
+                let receipt_json = if criteria.transaction_receipt {
+                    Some(Self::build_receipt_json(tx_hash, receipt, block, idx))
+                } else {
+                    None
+                };
+
+                // Build enriched transaction
+                Some(EnrichedTransaction { tx_hash, tx_data, receipt: receipt_json })
+            })
+            .collect();
+
+        // If address filtering is enabled but no transactions matched, skip this block
+        if criteria.has_address_filter() && transactions.is_empty() {
+            return None;
+        }
+
+        Some(EnrichedFlashblock { header, transactions })
+    }
+
+    /// Check if a transaction matches any of the subscribed addresses (simplified version).
+    fn transaction_matches_addresses_simple(
+        sender: Address,
+        tx: &N::SignedTx,
+        receipt: Option<&N::Receipt>,
+        addresses: &[Address],
+    ) -> bool {
+        use alloy_consensus::{Transaction, TxReceipt};
+        use reth_primitives_traits::SignedTransaction;
+
+        // Check sender
+        if addresses.contains(&sender) {
+            return true;
+        }
+
+        // Check recipient
+        if let Some(to) = tx.to() {
+            if addresses.contains(&to) {
+                return true;
+            }
+        }
+
+        // Check log addresses
+        if let Some(receipt) = receipt {
+            for log in receipt.logs() {
+                if addresses.contains(&log.address) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Build TxData JSON matching the user's specified format
+    fn build_tx_data_json(
+        sender: Address,
+        tx: &N::SignedTx,
+        block: &reth_primitives_traits::RecoveredBlock<N::Block>,
+    ) -> serde_json::Value {
+        use alloy_consensus::{transaction::TxHashRef, Transaction};
+        use alloy_eips::eip2718::Typed2718;
+        use alloy_primitives::hex;
+        use serde_json::json;
+
+        let tx_hash = *tx.tx_hash();
+        let to = tx.to();
+        let chain_id = tx.chain_id();
+        let tx_type = tx.ty();
+
+        // Build the JSON object matching the user's specified format
+        let max_fee_per_gas = tx.max_fee_per_gas();
+        let max_fee_per_gas_opt =
+            if max_fee_per_gas > 0 { Some(format!("0x{:x}", max_fee_per_gas)) } else { None };
+
+        json!({
+            "type": format!("0x{:x}", tx_type),
+            "nonce": format!("0x{:x}", tx.nonce()),
+            "gasPrice": tx.gas_price().map(|gp| format!("0x{:x}", gp)),
+            "maxFeePerGas": max_fee_per_gas_opt,
+            "maxPriorityFeePerGas": tx.max_priority_fee_per_gas().map(|fee| format!("0x{:x}", fee)),
+            "gas": format!("0x{:x}", tx.gas_limit()),
+            "value": format!("0x{:x}", tx.value()),
+            "input": format!("0x{}", hex::encode(tx.input())),
+            "from": format!("{:?}", sender),
+            "to": to.map(|addr| format!("{:?}", addr)),
+            "chainId": chain_id.map(|id| format!("0x{:x}", id)),
+            "hash": format!("{:?}", tx_hash),
+        })
+    }
+
+    /// Build Receipt JSON matching the user's specified format
+    fn build_receipt_json(
+        tx_hash: alloy_primitives::TxHash,
+        receipt: &N::Receipt,
+        block: &reth_primitives_traits::RecoveredBlock<N::Block>,
+        index: usize,
+    ) -> serde_json::Value {
+        use alloy_consensus::{BlockHeader, TxReceipt};
+        use alloy_primitives::hex;
+        use reth_primitives_traits::Block;
+        use serde_json::json;
+
+        let sealed_block = block.sealed_block();
+        let block_hash = sealed_block.hash();
+        let block_number = sealed_block.header().number();
+
+        // Build logs array
+        let logs: Vec<serde_json::Value> = receipt
+            .logs()
+            .iter()
+            .enumerate()
+            .map(|(log_idx, log)| {
+                json!({
+                    "address": format!("{:?}", log.address),
+                    "topics": log.topics().iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>(),
+                    "data": format!("0x{}", hex::encode(&log.data.data)),
+                    "blockNumber": format!("0x{:x}", block_number),
+                    "blockHash": format!("{:?}", block_hash),
+                    "transactionHash": format!("{:?}", tx_hash),
+                    "transactionIndex": format!("0x{:x}", index),
+                    "logIndex": format!("0x{:x}", log_idx),
+                    "removed": false,
+                })
+            })
+            .collect();
+
+        // Build the receipt JSON object
+        json!({
+            "root": "0x",
+            "status": format!("0x{:x}", if receipt.status() { 1 } else { 0 }),
+            "cumulativeGasUsed": format!("0x{:x}", receipt.cumulative_gas_used()),
+            "logsBloom": format!("0x{}", hex::encode(receipt.bloom().as_slice())),
+            "logs": logs,
+            "transactionHash": format!("{:?}", tx_hash),
+            "contractAddress": "0x0000000000000000000000000000000000000000",
+            "gasUsed": format!("0x{:x}", receipt.cumulative_gas_used()),
+            "blockHash": format!("{:?}", block_hash),
+            "blockNumber": format!("0x{:x}", block_number),
+            "transactionIndex": format!("0x{:x}", index),
+        })
     }
 }
 
