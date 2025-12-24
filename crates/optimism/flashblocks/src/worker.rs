@@ -103,10 +103,11 @@ where
 
         // Build the block without computing state root
         trace!(target: "flashblocks", "Building block without state root computation");
-        let execution = builder.finish(NoopProvider::default())?;
+        let execution = builder.finish(&state_provider, false)?;
+        let hashed_state = state_provider.hashed_post_state(&execution.bundle_state);
 
         let execution_outcome = ExecutionOutcome::new(
-            state.take_bundle(),
+            execution.bundle_state,
             vec![execution.execution_result.receipts],
             execution.block.number(),
             vec![execution.execution_result.requests],
@@ -117,7 +118,7 @@ where
             ExecutedBlock {
                 recovered_block: execution.block.into(),
                 execution_output: Arc::new(execution_outcome),
-                hashed_state: Arc::new(execution.hashed_state.clone()),
+                hashed_state: Arc::new(hashed_state.clone()),
                 trie_updates: Arc::default(),
             },
         );
@@ -125,7 +126,7 @@ where
             pending_block,
             args.last_flashblock_index,
             args.last_flashblock_hash,
-            execution.hashed_state,
+            hashed_state,
             args.compute_state_root,
         );
 
@@ -139,7 +140,7 @@ where
     where
         N::BlockHeader: HeaderMut,
     {
-        let state_provider = self.provider.state_by_block_hash(computed_block.parent_hash())?;
+        let state_provider = self.provider.history_by_block_hash(computed_block.parent_hash())?;
         let (state_root, trie_updates) =
             state_provider.state_root_with_updates(computed_block.hashed_state.clone())?;
 

@@ -103,7 +103,7 @@ where
     }
 
     // Pass noop provider to skip state root calculations.
-    let result = builder.finish(NoopProvider::default())?;
+    let result = builder.finish(NoopProvider::default(), false)?;
 
     Ok((result, results))
 }
