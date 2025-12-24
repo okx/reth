@@ -23,14 +23,14 @@ use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Subscription kind.
-pub enum SubscriptionKind {
+pub enum OpSubscriptionKind {
     /// Standard Ethereum subscription.
     Standard(AlloySubscriptionKind),
     /// Flashblocks subscription.
     Flashblocks,
 }
 
-impl<'de> Deserialize<'de> for SubscriptionKind {
+impl<'de> Deserialize<'de> for OpSubscriptionKind {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -38,13 +38,13 @@ impl<'de> Deserialize<'de> for SubscriptionKind {
         let s = String::deserialize(deserializer)?;
 
         match s.as_str() {
-            "flashblocks" => Ok(SubscriptionKind::Flashblocks),
-            "newHeads" => Ok(SubscriptionKind::Standard(AlloySubscriptionKind::NewHeads)),
-            "logs" => Ok(SubscriptionKind::Standard(AlloySubscriptionKind::Logs)),
+            "flashblocks" => Ok(OpSubscriptionKind::Flashblocks),
+            "newHeads" => Ok(OpSubscriptionKind::Standard(AlloySubscriptionKind::NewHeads)),
+            "logs" => Ok(OpSubscriptionKind::Standard(AlloySubscriptionKind::Logs)),
             "newPendingTransactions" => {
-                Ok(SubscriptionKind::Standard(AlloySubscriptionKind::NewPendingTransactions))
+                Ok(OpSubscriptionKind::Standard(AlloySubscriptionKind::NewPendingTransactions))
             }
-            "syncing" => Ok(SubscriptionKind::Standard(AlloySubscriptionKind::Syncing)),
+            "syncing" => Ok(OpSubscriptionKind::Standard(AlloySubscriptionKind::Syncing)),
             _ => Err(serde::de::Error::unknown_variant(
                 &s,
                 &["flashblocks", "newHeads", "logs", "newPendingTransactions", "syncing"],
@@ -53,13 +53,13 @@ impl<'de> Deserialize<'de> for SubscriptionKind {
     }
 }
 
-impl Serialize for SubscriptionKind {
+impl Serialize for OpSubscriptionKind {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         match self {
-            SubscriptionKind::Standard(kind) => {
+            OpSubscriptionKind::Standard(kind) => {
                 let s = match kind {
                     AlloySubscriptionKind::NewHeads => "newHeads",
                     AlloySubscriptionKind::Logs => "logs",
@@ -68,12 +68,12 @@ impl Serialize for SubscriptionKind {
                 };
                 serializer.serialize_str(s)
             }
-            SubscriptionKind::Flashblocks => serializer.serialize_str("flashblocks"),
+            OpSubscriptionKind::Flashblocks => serializer.serialize_str("flashblocks"),
         }
     }
 }
 
-impl SubscriptionKind {
+impl OpSubscriptionKind {
     /// Returns the inner standard subscription kind, if any.
     pub const fn as_standard(&self) -> Option<&AlloySubscriptionKind> {
         match self {
@@ -83,19 +83,17 @@ impl SubscriptionKind {
     }
 }
 
-impl From<AlloySubscriptionKind> for SubscriptionKind {
+impl From<AlloySubscriptionKind> for OpSubscriptionKind {
     fn from(kind: AlloySubscriptionKind) -> Self {
         Self::Standard(kind)
     }
 }
 
-impl From<SubscriptionKind> for AlloySubscriptionKind {
-    fn from(kind: SubscriptionKind) -> Self {
+impl From<OpSubscriptionKind> for AlloySubscriptionKind {
+    fn from(kind: OpSubscriptionKind) -> Self {
         match kind {
-            SubscriptionKind::Standard(alloy_kind) => alloy_kind,
-            SubscriptionKind::Flashblocks => {
-                // Flashblocks is not a standard subscription kind, so we can't convert it
-                // This should only be called when we know it's not Flashblocks
+            OpSubscriptionKind::Standard(alloy_kind) => alloy_kind,
+            OpSubscriptionKind::Flashblocks => {
                 unreachable!("Cannot convert Flashblocks to AlloySubscriptionKind")
             }
         }
@@ -107,8 +105,8 @@ impl From<SubscriptionKind> for AlloySubscriptionKind {
 pub enum Params {
     /// Standard Ethereum subscription params
     Standard(AlloyParams),
-    /// Flashblocks stream criteria
-    StreamCriteria(StreamCriteria),
+    /// Flashblocks stream filter
+    FlashBlocksFilter(FlashBlocksFilter),
     /// No params
     None,
 }
@@ -124,8 +122,8 @@ impl<'de> Deserialize<'de> for Params {
             return Ok(Params::None);
         }
 
-        if let Ok(criteria) = serde_json::from_value::<StreamCriteria>(value.clone()) {
-            return Ok(Params::StreamCriteria(criteria));
+        if let Ok(filter) = serde_json::from_value::<FlashBlocksFilter>(value.clone()) {
+            return Ok(Params::FlashBlocksFilter(filter));
         }
 
         if let Ok(standard_params) = serde_json::from_value::<AlloyParams>(value.clone()) {
@@ -133,7 +131,7 @@ impl<'de> Deserialize<'de> for Params {
         }
 
         Err(serde::de::Error::custom(
-            "Invalid subscription parameters: must be valid StreamCriteria or Filter",
+            "Invalid subscription parameters: must be valid FlashBlocksFilter or Filter",
         ))
     }
 }
@@ -145,17 +143,17 @@ impl Serialize for Params {
     {
         match self {
             Params::Standard(params) => params.serialize(serializer),
-            Params::StreamCriteria(criteria) => criteria.serialize(serializer),
+            Params::FlashBlocksFilter(filter) => filter.serialize(serializer),
             Params::None => serializer.serialize_none(),
         }
     }
 }
 
 impl Params {
-    /// Returns the inner `StreamCriteria` if this is a `StreamCriteria` variant.
-    pub fn as_stream_criteria(&self) -> Option<&StreamCriteria> {
+    /// Returns the inner `FlashBlocksFilter` if this is a `FlashBlocksFilter` variant.
+    pub fn as_flashblocks_filter(&self) -> Option<&FlashBlocksFilter> {
         match self {
-            Params::StreamCriteria(criteria) => Some(criteria),
+            Params::FlashBlocksFilter(filter) => Some(filter),
             _ => None,
         }
     }
@@ -172,29 +170,47 @@ impl Params {
 /// Criteria for filtering and enriching flashblock subscription data.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct StreamCriteria {
+pub struct FlashBlocksFilter {
     /// Include new block headers in the stream.
     #[serde(default)]
-    pub new_heads: bool,
+    pub header_info: bool,
 
-    /// Include extra transaction information (sender, gas used, etc.).
+    /// SubTxFilter
     #[serde(default)]
-    pub transaction_extra_info: bool,
+    pub sub_tx_filter: SubTxFilter,
+}
+
+/// Criteria for filtering and enriching transaction subscription data.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubTxFilter {
+    /// Include extra transaction information
+    #[serde(default)]
+    pub tx_info: bool,
 
     /// Include transaction receipts.
     #[serde(default)]
-    pub transaction_receipt: bool,
+    pub tx_receipt: bool,
 
-    /// Only include transactions involving these addresses (empty = all transactions).
+    /// Only include transactions involving these addresses
+    /// If no addresses are provided, no transactions should be included
     #[serde(default)]
-    pub subscribed_addresses: Vec<Address>,
+    pub subscribe_addresses: Vec<Address>, /* TODO required if txInfo is true , maybe
+                                            * subscribeAddress? */
 }
 
-/// Enriched flashblock data returned to subscribers based on StreamCriteria.
+impl SubTxFilter {
+    /// Returns `true` if address filtering is enabled.
+    pub fn has_address_filter(&self) -> bool {
+        !self.subscribe_addresses.is_empty()
+    }
+}
+
+/// Enriched flashblock data returned to subscribers based on FlashBlocksFilter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnrichedFlashblock<H> {
-    /// Block header (if `new_heads` is true in criteria)
+    /// Block header (if `header_info` is true in criteria)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<Header<H>>,
 
@@ -203,7 +219,7 @@ pub struct EnrichedFlashblock<H> {
     pub transactions: Vec<EnrichedTransaction>,
 }
 
-/// Transaction data with optional enrichment based on StreamCriteria.
+/// Transaction data with optional enrichment based on FlashBlocksFilter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct EnrichedTransaction {
@@ -211,18 +227,20 @@ pub struct EnrichedTransaction {
     pub tx_hash: alloy_primitives::TxHash,
 
     /// Transaction data (if `transaction_extra_info` is true in criteria)
+    /// TODO change type
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_data: Option<serde_json::Value>,
 
     /// Transaction receipt (if `transaction_receipt` is true in criteria)
+    /// TODO change type
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt: Option<serde_json::Value>,
 }
 
-impl StreamCriteria {
+impl FlashBlocksFilter {
     /// Returns `true` if address filtering is enabled.
-    pub fn has_address_filter(&self) -> bool {
-        !self.subscribed_addresses.is_empty()
+    pub fn has_sub_tx_filter(&self) -> bool {
+        self.sub_tx_filter.has_address_filter()
     }
 }
 
@@ -237,7 +255,7 @@ pub trait FlashblocksPubSubApi<T: RpcObject> {
     )]
     async fn subscribe(
         &self,
-        kind: SubscriptionKind,
+        kind: OpSubscriptionKind,
         params: Option<Params>,
     ) -> jsonrpsee::core::SubscriptionResult;
 }
@@ -333,50 +351,32 @@ where
     async fn subscribe(
         &self,
         pending: PendingSubscriptionSink,
-        kind: SubscriptionKind,
+        kind: OpSubscriptionKind,
         params: Option<Params>,
     ) -> jsonrpsee::core::SubscriptionResult {
         info!("XXX line 163: {:?}, params: {:?}", kind, params);
 
-        // Extract StreamCriteria from params if present
-        let criteria =
-            params.as_ref().and_then(|p| p.as_stream_criteria()).cloned().unwrap_or_default();
-        info!("XXX using criteria: {:?}", criteria);
+        // Extract FlashBlocksFilter from params if present
+        let filter =
+            params.as_ref().and_then(|p| p.as_flashblocks_filter()).cloned().unwrap_or_default();
+        info!("XXX using filter: {:?}", filter);
 
         match kind {
-            SubscriptionKind::Flashblocks => {
+            OpSubscriptionKind::Flashblocks => {
                 // Handle flashblocks subscription
                 if let Some(pending_block_rx) = &self.pending_block_rx {
                     info!(
-                        "XXX flashblocks subscription with pending_block_rx available, criteria: {:?}",
-                        criteria
+                        "XXX flashblocks subscription with pending_block_rx available, filter: {:?}",
+                        filter
                     );
-                    return self
-                        .filter_flashblocks_stream(pending, pending_block_rx, &criteria)
-                        .await;
+                    return self.filter_flashblocks_stream(pending, pending_block_rx, &filter).await;
                 } else {
                     let err = internal_rpc_err("Flashblocks are not available on this node");
                     pending.accept().await?;
                     return Err(jsonrpsee::core::SubscriptionError::from(err));
                 }
             }
-            SubscriptionKind::Standard(alloy_kind) => {
-                if matches!(alloy_kind, AlloySubscriptionKind::NewHeads) {
-                    if let Some(pending_block_rx) = &self.pending_block_rx {
-                        info!(
-                            "XXX newHeads subscription with flashblocks available, criteria: {:?}",
-                            criteria
-                        );
-                        return self
-                            .subscribe_pending_blocks_as_headers(
-                                pending,
-                                pending_block_rx,
-                                &criteria,
-                            )
-                            .await;
-                    }
-                }
-
+            OpSubscriptionKind::Standard(alloy_kind) => {
                 let standard_params = params.and_then(|p| p.as_standard().cloned());
 
                 self.eth_pubsub.subscribe(pending, alloy_kind, standard_params).await?;
@@ -396,48 +396,24 @@ where
         > + reth_rpc_eth_api::EthApiTypes<RpcConvert: reth_rpc_convert::RpcConvert<Primitives = N>>
         + 'static,
 {
-    /// Subscribe to pending blocks and convert them to Header format for newHeads
-    async fn subscribe_pending_blocks_as_headers(
-        &self,
-        pending: PendingSubscriptionSink,
-        pending_block_rx: &PendingBlockRx<N>,
-        _criteria: &StreamCriteria,
-    ) -> jsonrpsee::core::SubscriptionResult {
-        let sink = pending.accept().await?;
-        let pending_block_rx = pending_block_rx.clone();
-        let headers_stream =
-            WatchStream::new(pending_block_rx).filter_map(|pending_block_opt| async move {
-                pending_block_opt.and_then(|pending_block| {
-                    extract_header_from_pending_block(&pending_block).ok()
-                })
-            });
-        let pinned_stream = Box::pin(headers_stream);
-
-        tokio::spawn(async move {
-            let _ = pipe_from_stream(sink, pinned_stream).await;
-        });
-
-        Ok(())
-    }
-
     async fn filter_flashblocks_stream(
         &self,
         pending: PendingSubscriptionSink,
         pending_block_rx: &PendingBlockRx<N>,
-        criteria: &StreamCriteria,
+        filter: &FlashBlocksFilter,
     ) -> jsonrpsee::core::SubscriptionResult {
         let sink = pending.accept().await?;
         let pending_block_rx = pending_block_rx.clone();
-        let criteria = criteria.clone();
+        let filter = filter.clone();
         let api = self.eth_api.clone();
 
         let flashblocks_stream =
             WatchStream::new(pending_block_rx).filter_map(move |pending_block_opt| {
-                let criteria = criteria.clone();
+                let filter = filter.clone();
                 let api = api.clone();
                 async move {
                     pending_block_opt.and_then(|pending_block| {
-                        Self::filter_and_enrich_flashblock(&pending_block, &criteria, &api)
+                        Self::filter_and_enrich_flashblock(&pending_block, &filter, &api)
                     })
                 }
             });
@@ -453,11 +429,11 @@ where
     /// Filter and enrich a flashblock based on the provided criteria using RpcConvert.
     fn filter_and_enrich_flashblock(
         pending_block: &PendingFlashBlock<N>,
-        criteria: &StreamCriteria,
+        filter: &FlashBlocksFilter,
         api: &Eth,
     ) -> Option<EnrichedFlashblock<N::BlockHeader>> {
         // Extract header if requested
-        let header = if criteria.new_heads {
+        let header = if filter.header_info {
             Some(extract_header_from_pending_block(pending_block).ok()?)
         } else {
             None
@@ -473,12 +449,12 @@ where
             .transactions_with_sender()
             .enumerate()
             .filter_map(|(idx, (sender, tx))| {
-                if criteria.has_address_filter() {
+                if filter.has_sub_tx_filter() {
                     let matches_filter = Self::is_address_in_transaction(
                         *sender,
                         tx,
                         receipts.get(idx),
-                        &criteria.subscribed_addresses,
+                        &filter.sub_tx_filter.subscribe_addresses,
                     );
                     if !matches_filter {
                         return None;
@@ -488,7 +464,7 @@ where
                 let receipt = receipts.get(idx)?;
                 let tx_hash = *tx.tx_hash();
 
-                let tx_data = if criteria.transaction_extra_info {
+                let tx_data = if filter.sub_tx_filter.tx_info {
                     let recovered =
                         reth_primitives_traits::Recovered::new_unchecked(tx.clone(), *sender);
 
@@ -510,7 +486,7 @@ where
                     None
                 };
 
-                let receipt_json = if criteria.transaction_receipt {
+                let receipt_json = if filter.sub_tx_filter.tx_receipt {
                     let gas_used = receipt.cumulative_gas_used();
 
                     let next_log_index =
@@ -545,7 +521,7 @@ where
             })
             .collect();
 
-        if criteria.has_address_filter() && transactions.is_empty() {
+        if filter.sub_tx_filter.has_address_filter() && transactions.is_empty() {
             return None;
         }
 
@@ -584,6 +560,9 @@ where
 }
 
 /// Pipes all stream items to the subscription sink.
+///
+/// Takes `Pin<Box<St>>` because streams created with async closures in `filter_map()`
+/// are !Unpin. This is necessary when using `WatchStream` with async transformations.
 async fn pipe_from_stream<T, St>(
     sink: SubscriptionSink,
     stream: Pin<Box<St>>,
