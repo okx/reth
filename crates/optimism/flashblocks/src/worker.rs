@@ -117,7 +117,7 @@ where
             ExecutedBlock {
                 recovered_block: execution.block.into(),
                 execution_output: Arc::new(execution_outcome),
-                hashed_state: Arc::new(hashed_state),
+                hashed_state: Arc::new(execution.hashed_state.clone()),
                 trie_updates: Arc::default(),
             },
         );
@@ -150,16 +150,15 @@ where
         header.set_state_root(state_root);
 
         // Re-populate the executed block
-        Ok(ExecutedBlock::new(
-            Arc::new(RecoveredBlock::new_unhashed(N::Block::new(header, body), senders)),
-            computed_block.pending.executed_block.execution_output.clone(),
-            ExecutedBlock {
-                recovered_block: execution.block.into(),
-                execution_output: Arc::new(execution_outcome),
-                hashed_state: Arc::new(hashed_state),
-                trie_updates: Arc::new(trie_updates),
-            },
-        ))
+        Ok(ExecutedBlock {
+            recovered_block: Arc::new(RecoveredBlock::new_unhashed(
+                N::Block::new(header, body),
+                senders,
+            )),
+            execution_output: computed_block.pending.executed_block.execution_output.clone(),
+            hashed_state: Arc::new(computed_block.hashed_state),
+            trie_updates: Arc::new(trie_updates),
+        })
     }
 }
 
