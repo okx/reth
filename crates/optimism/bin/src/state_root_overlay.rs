@@ -1,11 +1,11 @@
 use alloy_primitives::{keccak256, Address, B256, U256, StorageKey, StorageValue};
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
-use reth_chainspec::{ChainSpecBuilder, MAINNET};
-use reth_primitives_traits::Account;
+use reth_optimism_chainspec::OpChainSpecBuilder;
 use reth_provider::{
     test_utils::create_test_provider_factory_with_chain_spec,
     DatabaseProviderFactory, HashingWriter, LatestStateProvider, TrieWriter,
 };
+use reth_primitives_traits::Account;
 use reth_storage_api::{StateRootProvider};
 use reth_trie_common::{HashedPostState, HashedStorage};
 use std::collections::HashMap;
@@ -24,9 +24,10 @@ use reth_db::{init_db, ClientVersion, DatabaseEnv};
 use reth_db::mdbx::DatabaseArguments;
 use reth_db_common::init::compute_state_root;
 use reth_node_types::NodeTypesWithDBAdapter;
+use reth_optimism_node::OpNode;
+use reth_optimism_primitives::OpPrimitives;
 use crate::util::{setup_tdb_database};
 
-#[path = "../../benches/util.rs"]
 mod util;
 
 fn main() -> eyre::Result<()> {
@@ -104,12 +105,10 @@ fn main() -> eyre::Result<()> {
 
     // ===== Setup MDBX =====
     println!("\nSetting up MDBX...");
-    // Create a chain spec with empty genesis allocation but keep MAINNET hardforks
+    // Create a chain spec with empty genesis allocation but keep base mainnet hardforks
     let empty_chain_spec = Arc::new(
-        ChainSpecBuilder::default()
-            .chain(MAINNET.chain)
+        OpChainSpecBuilder::base_mainnet()
             .genesis(Genesis::default())  // Empty genesis with no alloc
-            .with_forks(MAINNET.hardforks.clone())  // Keep MAINNET hardforks
             .build(),
     );
 
@@ -128,18 +127,19 @@ fn main() -> eyre::Result<()> {
     )?);
 
     use reth_provider::providers::StaticFileProvider;
-    let sfp: StaticFileProvider<EthPri> = StaticFileProvider::read_write(sf_path)?;
+    let sfp: StaticFileProvider<OpPrimitives> = StaticFileProvider::read_write(sf_path)?;
 
     use reth_provider::providers::triedb::TriedbProvider;
     let triedb_provider = Arc::new(TriedbProvider::new(&triedb_path));
 
     use reth_provider::providers::ProviderFactory;
-    let provider_factory = ProviderFactory::new(
-        db,
-        empty_chain_spec.clone(),
-        sfp,
-        triedb_provider,
-    );
+    let provider_factory: ProviderFactory<NodeTypesWithDBAdapter<OpNode, Arc<DatabaseEnv>>> = 
+        ProviderFactory::new(
+            db,
+            empty_chain_spec.clone(),
+            sfp,
+            triedb_provider,
+        );
     // Insert base data
     {
         let mut provider_rw = provider_factory.provider_rw()?;

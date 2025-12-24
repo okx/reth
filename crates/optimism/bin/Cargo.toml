@@ -20,14 +20,29 @@ reth-optimism-payload-builder.workspace = true
 reth-optimism-primitives.workspace = true
 reth-optimism-forks.workspace = true
 reth-apollo.workspace = true
-
+reth-chainspec.workspace = true
+alloy-genesis.workspace = true
+reth-provider.workspace = true
+reth-storage-api.workspace = true
+reth-trie-common.workspace = true
+reth-db.workspace = true
+reth-db-common.workspace = true
+reth-node-types.workspace = true
+reth-fs-util.workspace = true
+reth-primitives-traits.workspace = true
+alloy-primitives.workspace = true
+alloy-trie.workspace = true
+tracing-subscriber.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 tracing.workspace = true
-
+uuid = { version = "1", features = ["v4", "fast-rng"] }
 # xlayer
 xlayer-rpc.workspace = true
 xlayer-db.workspace = true
-
+tempdir.workspace = true
+triedb.workspace = true
+eyre.workspace = true
+rand.workspace = true
 [lints]
 workspace = true
 
@@ -60,3 +75,7 @@ min-trace-logs = ["tracing/release_max_level_trace"]
 [[bin]]
 name = "op-reth"
 path = "src/main.rs"
+
+[[bin]]
+name = "state_root_overlay"
+path = "src/state_root_overlay.rs"

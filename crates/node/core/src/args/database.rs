@@ -62,7 +62,8 @@ impl DatabaseArgs {
             Some(0) => Some(MaxReadTransactionDuration::Unbounded), // if 0, disable timeout
             Some(secs) => Some(MaxReadTransactionDuration::Set(Duration::from_secs(secs))),
         };
-
+        tracing::info!("mdbx config, exclusive {:?}, max_read_transaction_duration {:?}, geometry_max_size {:?}, growth_step {:?}, max_readers {:?}, sync_mode {:?}",
+            self.exclusive, max_read_transaction_duration, self.max_size, self.growth_step, self.max_readers, self.sync_mode);
         reth_db::mdbx::DatabaseArguments::new(client_version)
             .with_log_level(self.log_level)
             .with_exclusive(self.exclusive)
