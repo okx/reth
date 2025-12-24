@@ -221,7 +221,7 @@ pub struct EnrichedFlashblock<H> {
 
 /// Transaction data with optional enrichment based on FlashBlocksFilter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "camelCase")]
 pub struct EnrichedTransaction {
     /// Transaction hash
     pub tx_hash: alloy_primitives::TxHash,
