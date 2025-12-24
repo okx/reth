@@ -193,10 +193,8 @@ pub struct SubTxFilter {
     pub tx_receipt: bool,
 
     /// Only include transactions involving these addresses
-    /// If no addresses are provided, no transactions should be included
     #[serde(default)]
-    pub subscribe_addresses: Vec<Address>, /* TODO required if txInfo is true , maybe
-                                            * subscribeAddress? */
+    pub subscribe_addresses: Vec<Address>,
 }
 
 impl SubTxFilter {
@@ -358,6 +356,16 @@ where
         let filter =
             params.as_ref().and_then(|p| p.as_flashblocks_filter()).cloned().unwrap_or_default();
         info!("XXX using filter: {:?}", filter);
+
+        if (filter.sub_tx_filter.tx_info || filter.sub_tx_filter.tx_receipt) &&
+            filter.sub_tx_filter.subscribe_addresses.is_empty()
+        {
+            let err = internal_rpc_err(
+                "subscribeAddresses is required when txInfo or txReceipt is enabled. Provide at least one address to monitor.",
+            );
+            pending.accept().await?;
+            return Err(jsonrpsee::core::SubscriptionError::from(err));
+        }
 
         match kind {
             OpSubscriptionKind::Flashblocks => {
