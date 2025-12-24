@@ -209,32 +209,30 @@ impl SubTxFilter {
 /// Enriched flashblock data returned to subscribers based on FlashBlocksFilter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EnrichedFlashblock<H> {
+pub struct EnrichedFlashblock<H, Tx, R> {
     /// Block header (if `header_info` is true in criteria)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<Header<H>>,
 
     /// Filtered transactions with optional enrichment
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub transactions: Vec<EnrichedTransaction>,
+    pub transactions: Vec<EnrichedTransaction<Tx, R>>,
 }
 
 /// Transaction data with optional enrichment based on FlashBlocksFilter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EnrichedTransaction {
+pub struct EnrichedTransaction<Tx, R> {
     /// Transaction hash
     pub tx_hash: alloy_primitives::TxHash,
 
-    /// Transaction data (if `transaction_extra_info` is true in criteria)
-    /// TODO change type
+    /// Transaction data (if `tx_info` is true in criteria)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_data: Option<serde_json::Value>,
+    pub tx_data: Option<Tx>,
 
-    /// Transaction receipt (if `transaction_receipt` is true in criteria)
-    /// TODO change type
+    /// Transaction receipt (if `tx_receipt` is true in criteria)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt: Option<serde_json::Value>,
+    pub receipt: Option<R>,
 }
 
 impl FlashBlocksFilter {
@@ -431,7 +429,17 @@ where
         pending_block: &PendingFlashBlock<N>,
         filter: &FlashBlocksFilter,
         api: &Eth,
-    ) -> Option<EnrichedFlashblock<N::BlockHeader>> {
+    ) -> Option<
+        EnrichedFlashblock<
+            N::BlockHeader,
+            reth_rpc_eth_api::RpcTransaction<
+                <Eth::RpcConvert as reth_rpc_convert::RpcConvert>::Network,
+            >,
+            reth_rpc_eth_api::RpcReceipt<
+                <Eth::RpcConvert as reth_rpc_convert::RpcConvert>::Network,
+            >,
+        >,
+    > {
         // Extract header if requested
         let header = if filter.header_info {
             Some(extract_header_from_pending_block(pending_block).ok()?)
@@ -445,7 +453,16 @@ where
         let rpc_convert = api.tx_resp_builder();
 
         // Filter and enrich transactions using transactions_with_sender
-        let transactions: Vec<EnrichedTransaction> = block
+        let transactions: Vec<
+            EnrichedTransaction<
+                reth_rpc_eth_api::RpcTransaction<
+                    <Eth::RpcConvert as reth_rpc_convert::RpcConvert>::Network,
+                >,
+                reth_rpc_eth_api::RpcReceipt<
+                    <Eth::RpcConvert as reth_rpc_convert::RpcConvert>::Network,
+                >,
+            >,
+        > = block
             .transactions_with_sender()
             .enumerate()
             .filter_map(|(idx, (sender, tx))| {
@@ -481,7 +498,7 @@ where
                         )
                         .ok()?;
 
-                    Some(serde_json::to_value(rpc_tx).ok()?)
+                    Some(rpc_tx)
                 } else {
                     None
                 };
@@ -512,7 +529,7 @@ where
                         .convert_receipts_with_block(vec![receipt_input], &sealed_block)
                         .ok()?;
 
-                    rpc_receipts.first().and_then(|r| serde_json::to_value(r).ok())
+                    rpc_receipts.first().cloned()
                 } else {
                     None
                 };
@@ -609,4 +626,76 @@ fn extract_header_from_pending_block<N: reth_primitives_traits::NodePrimitives>(
     let sealed_header = block.clone_sealed_header();
 
     Ok(Header::from_consensus(sealed_header.into(), None, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::address;
+
+    #[test]
+    fn test_flashblocks_filter_serialization() {
+        let filter = FlashBlocksFilter {
+            header_info: true,
+            sub_tx_filter: SubTxFilter {
+                tx_info: true,
+                tx_receipt: false,
+                subscribe_addresses: vec![address!("0x1234567890123456789012345678901234567890")],
+            },
+        };
+
+        let json = serde_json::to_string(&filter).unwrap();
+        println!("Serialized: {}", json);
+
+        let deserialized: FlashBlocksFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(filter, deserialized);
+    }
+
+    #[test]
+    fn test_params_deserialization() {
+        let json = r#"{"headerInfo": true, "subTxFilter": {"txInfo": true, "txReceipt": false, "subscribeAddresses": ["0x1234567890123456789012345678901234567890"]}}"#;
+
+        let params: Params = serde_json::from_str(json).unwrap();
+
+        match params {
+            Params::FlashBlocksFilter(filter) => {
+                assert!(filter.header_info);
+                assert!(filter.sub_tx_filter.tx_info);
+                assert!(!filter.sub_tx_filter.tx_receipt);
+                assert_eq!(filter.sub_tx_filter.subscribe_addresses.len(), 1);
+            }
+            _ => panic!("Expected FlashBlocksFilter variant"),
+        }
+    }
+
+    #[test]
+    fn test_params_with_empty_sub_tx_filter() {
+        let json = r#"{"headerInfo": true}"#;
+
+        let params: Params = serde_json::from_str(json).unwrap();
+
+        match params {
+            Params::FlashBlocksFilter(filter) => {
+                assert!(filter.header_info);
+                assert!(!filter.sub_tx_filter.tx_info);
+                assert!(!filter.sub_tx_filter.tx_receipt);
+                assert_eq!(filter.sub_tx_filter.subscribe_addresses.len(), 0);
+            }
+            _ => panic!("Expected FlashBlocksFilter variant"),
+        }
+    }
+
+    #[test]
+    fn test_params_none_from_null() {
+        let json = r#"null"#;
+        let params: Params = serde_json::from_str(json).unwrap();
+        assert!(matches!(params, Params::None));
+    }
+
+    #[test]
+    fn test_option_params_none() {
+        let json = r#"null"#;
+        let params: Option<Params> = serde_json::from_str(json).unwrap();
+        assert!(params.is_none());
+    }
 }
