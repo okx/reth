@@ -77,7 +77,8 @@ where
             Err(err) => {
                 // If it is the genesis block (i.e. block number is 0), there is no L1 info, so
                 // we return an empty l1_block_info.
-                let genesis_number = self.provider.chain_spec().genesis().number.unwrap_or_default();
+                let genesis_number =
+                    self.provider.chain_spec().genesis().number.unwrap_or_default();
                 if block.header().number() == genesis_number {
                     return Ok(vec![]);
                 }
