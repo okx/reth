@@ -1497,6 +1497,7 @@ where
                                 // handle the event if any
                                 self.on_maybe_tree_event(maybe_event)?;
                             }
+                            BeaconEngineMessage::FlashblocksSequence { .. } => {}
                         }
                     }
                 }
