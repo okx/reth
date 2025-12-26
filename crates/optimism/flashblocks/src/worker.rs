@@ -12,7 +12,7 @@ use reth_primitives_traits::{
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase, db::State};
 use reth_rpc_eth_types::{EthApiError, PendingBlock};
-use reth_storage_api::{noop::NoopProvider, BlockReaderIdExt, StateProviderFactory};
+use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
