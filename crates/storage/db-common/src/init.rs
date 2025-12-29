@@ -28,6 +28,7 @@ use reth_trie::{
 use reth_trie_db::{DatabaseStateRoot, DatabaseTrieCursorFactory};
 use serde::{Deserialize, Serialize};
 use std::io::BufRead;
+use std::time::Instant;
 use tracing::{debug, error, info, trace};
 use reth_trie::{trie_cursor::{TrieCursor, TrieCursorFactory}};
 use reth_provider::providers::state::latest::get_triedb_provider;
@@ -111,6 +112,7 @@ where
         + AsRef<PF::ProviderRW>,
     PF::ChainSpec: EthChainSpec<Header = <PF::Primitives as NodePrimitives>::BlockHeader>,
 {
+    let start = Instant::now();
     let chain = factory.chain_spec();
 
     let genesis = chain.genesis();
@@ -200,7 +202,7 @@ where
     // `commit_unwind`` will first commit the DB and then the static file provider, which is
     // necessary on `init_genesis`.
     provider_rw.commit()?;
-
+    info!("time elapsed in init_genesis: {:?}", start.elapsed().as_millis());
     Ok(hash)
 }
 

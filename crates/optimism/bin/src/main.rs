@@ -27,18 +27,6 @@ fn main() {
         }
     }
 
-    let fmt_layer = fmt::layer()
-        .with_current_span(true)   // include span fields on each log
-        .with_span_list(false)     // or true to show the full stack
-        .with_span_events(FmtSpan::NONE);
-
-    Registry::default()
-        .with(fmt_layer)
-        .init();
-
-    let root = tracing::info_span!("app", trace_id = %Uuid::now_v4());
-    let _enter = root.enter();
-
     if let Err(err) =
         Cli::<OpChainSpecParser, RollupArgs>::parse().run(async move |builder, rollup_args| {
             info!(target: "reth::cli", "Launching node triedb");

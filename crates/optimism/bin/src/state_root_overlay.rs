@@ -2,16 +2,16 @@ use alloy_primitives::{keccak256, Address, B256, U256, StorageKey, StorageValue}
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use reth_optimism_chainspec::OpChainSpecBuilder;
 use reth_provider::{
-    test_utils::create_test_provider_factory_with_chain_spec,
     DatabaseProviderFactory, HashingWriter, LatestStateProvider, TrieWriter,
 };
 use reth_primitives_traits::Account;
 use reth_storage_api::{StateRootProvider};
 use reth_trie_common::{HashedPostState, HashedStorage};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use alloy_genesis::Genesis;
+use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_primitives::map::B256Map;
 use tempdir::TempDir;
 use triedb::{
@@ -42,8 +42,46 @@ fn main() -> eyre::Result<()> {
             util::BATCH_SIZE,
         );
 
-    println!("Generated {} base addresses, {} overlay accounts",
-             base_addresses.len(), overlay_acct.len());
+    println!("Generated {} base addresses, {} overlay accounts, overlay storage {}", base_addresses.len(), overlay_acct.len(), overlay_storage.len());
+
+    // Convert base_accounts_map and base_storage_map to genesis alloc format
+    let mut genesis_alloc: BTreeMap<Address, GenesisAccount> = BTreeMap::new();
+
+    for (address, account) in &base_accounts_map {
+        // Convert storage from HashMap<B256, U256> to BTreeMap<B256, B256>
+        let storage = base_storage_map.get(address).map(|storage_map| {
+            storage_map
+                .iter()
+                .filter(|(_, v)| !v.is_zero()) // Only include non-zero storage values
+                .map(|(k, v)| {
+                    // Convert U256 to B256 for storage value
+                    (*k, B256::from_slice(&v.to_be_bytes::<32>()))
+                })
+                .collect::<BTreeMap<B256, B256>>()
+        });
+
+        let genesis_account = GenesisAccount {
+            nonce: Some(account.nonce),
+            balance: account.balance,
+            code: None, // We only have bytecode_hash, not the actual code
+            storage: storage.filter(|s| !s.is_empty()),
+            private_key: None,
+        };
+        
+        genesis_alloc.insert(*address, genesis_account);
+    }
+
+    // Create Genesis struct with the alloc
+    let genesis = Genesis {
+        alloc: genesis_alloc,
+        ..Genesis::default()
+    };
+
+    // Write to genesis.json file
+    let genesis_json_path = PathBuf::from("genesis_random.json");
+    let json_string = serde_json::to_string_pretty(&genesis)?;
+    std::fs::write(&genesis_json_path, json_string)?;
+    println!("Written genesis alloc to {}", genesis_json_path.display());
 
     let dir = TempDir::new("triedb_overlay_base").unwrap();
     let main_file_name_path = dir.path().join("triedb");

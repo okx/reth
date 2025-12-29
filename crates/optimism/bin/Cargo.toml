@@ -43,6 +43,7 @@ tempdir.workspace = true
 triedb.workspace = true
 eyre.workspace = true
 rand.workspace = true
+serde_json.workspace = true
 [lints]
 workspace = true
 
@@ -79,3 +80,7 @@ path = "src/main.rs"
 [[bin]]
 name = "state_root_overlay"
 path = "src/state_root_overlay.rs"
+
+[[bin]]
+name = "merge_genesis"
+path = "src/merge_genesis.rs"

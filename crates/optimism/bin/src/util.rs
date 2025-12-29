@@ -19,7 +19,7 @@ use std::{
 };
 use std::collections::HashMap;
 
-pub const BATCH_SIZE: usize = 10_000;
+pub const BATCH_SIZE: usize = 20_000;
 
 pub fn generate_random_address(rng: &mut StdRng) -> AddressPath {
     let mut bytes = [0u8; 20];
@@ -28,8 +28,8 @@ pub fn generate_random_address(rng: &mut StdRng) -> AddressPath {
     AddressPath::for_address(addr)
 }
 
-pub const DEFAULT_SETUP_DB_EOA_SIZE: usize = 1_000_000;
-pub const DEFAULT_SETUP_DB_CONTRACT_SIZE: usize = 100_000;
+pub const DEFAULT_SETUP_DB_EOA_SIZE: usize = 2_000_000;
+pub const DEFAULT_SETUP_DB_CONTRACT_SIZE: usize = 500_000;
 pub const DEFAULT_SETUP_DB_STORAGE_PER_CONTRACT: usize = 10;
 pub const SEED_EOA: u64 = 42; // EOA seeding value
 pub const SEED_CONTRACT: u64 = 43; // contract account seeding value
