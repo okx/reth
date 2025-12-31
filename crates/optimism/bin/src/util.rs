@@ -30,7 +30,7 @@ pub fn generate_random_address(rng: &mut StdRng) -> AddressPath {
 
 pub const DEFAULT_SETUP_DB_EOA_SIZE: usize = 2_000_000;
 pub const DEFAULT_SETUP_DB_CONTRACT_SIZE: usize = 500_000;
-pub const DEFAULT_SETUP_DB_STORAGE_PER_CONTRACT: usize = 10;
+pub const DEFAULT_SETUP_DB_STORAGE_PER_CONTRACT: usize = 40;
 pub const SEED_EOA: u64 = 42; // EOA seeding value
 pub const SEED_CONTRACT: u64 = 43; // contract account seeding value
 
