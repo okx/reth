@@ -1,0 +1,780 @@
+# Complete Transaction & Block Building Flow
+
+## Overview
+
+This document shows the **complete end-to-end flow** with exact file paths, function names, RPC endpoints, and API methods for:
+
+1. **Transaction Submission**: Client → RPC → Validation → TxPool
+2. **Block Building (op-node → op-reth)**: FCU call → Payload building → Return payload_id
+3. **Payload Retrieval**: engine_getPayloadV3 → Return full payload
+
+---
+
+## Flow 1: Transaction Submission from Client to TxPool
+
+```mermaid
+sequenceDiagram
+    participant Client as Client (Wallet/DApp)
+    participant HTTP as HTTP Server :8545
+    participant RPC as RPC Handler
+    participant Helper as Transaction Helper
+    participant Recover as Transaction Recovery
+    participant Forwarder as Sequencer Forwarder
+    participant Validator as Transaction Validator
+    participant Pool as Transaction Pool
+    participant TxPool as TxPool Internal
+    participant SubPools as Sub-Pools
+
+    Note over Client,SubPools: 📍 Step 1: Client Submits Transaction
+
+    Client->>HTTP: POST http://localhost:8545
+    Note over HTTP: JSON-RPC method: eth_sendRawTransaction
+
+    HTTP->>RPC: Route to eth_sendRawTransaction
+    Note over RPC: File: crates/rpc/rpc-eth-api/src/core.rs L1005
+
+    RPC->>RPC: Delegate to implementation
+    Note over RPC: async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256>
+
+    rect rgb(200, 230, 255)
+        Note over RPC: Implementation routes to helper
+    end
+
+    RPC->>Helper: EthTransactions::send_raw_transaction(tx_bytes)
+    Note over Helper: File: crates/optimism/rpc/src/eth/transaction.rs L45
+
+    Note over Client,SubPools: 📍 Step 2: Decode & Recover Transaction
+
+    Helper->>Recover: recover_raw_transaction(&tx_bytes)
+    Note over Recover: File: crates/rpc/rpc-eth-types/src/utils.rs
+
+    Recover-->>Helper: PooledTransactionsElement (recovered tx with sender)
+
+    Helper->>Helper: Convert to pool transaction
+    Note over Helper: Transaction::from_pooled(recovered)
+
+    Note over Client,SubPools: 📍 Step 3: Forward to Sequencer (if configured)
+
+    alt raw_tx_forwarder configured (RPC node)
+        Helper->>Forwarder: forward_raw_transaction(&tx_bytes)
+        Note over Forwarder: File: crates/optimism/rpc/src/sequencer.rs L161
+
+        Forwarder->>Forwarder: HTTP POST to sequencer endpoint
+
+        Forwarder-->>Helper: tx_hash from sequencer
+
+        Helper->>Pool: Retain in local pool (best effort)
+        Note over Pool: File: crates/transaction-pool/src/pool/mod.rs L472
+
+        Helper-->>RPC: tx_hash
+        RPC-->>HTTP: JSON-RPC Response
+        HTTP-->>Client: {"jsonrpc":"2.0","id":1,"result":"0xabc..."}
+    else No forwarder (Sequencer node)
+        Note over Helper: Direct pool submission
+
+        Note over Client,SubPools: 📍 Step 4: Transaction Validation
+
+        Helper->>Pool: pool.add_transaction(TransactionOrigin::Local, pool_tx)
+        Note over Pool: File: crates/transaction-pool/src/pool/mod.rs L472
+
+        Pool->>Validator: validate_transaction(origin, tx)
+        Note over Validator: File: crates/transaction-pool/src/validate/eth.rs
+
+        rect rgb(255, 230, 200)
+            Note over Validator: Validation Steps
+            Validator->>Validator: 1. Check transaction type supported
+            Validator->>Validator: 2. Verify chain_id matches
+            Validator->>Validator: 3. Check nonce greater or equal account nonce
+            Validator->>Validator: 4. Check gas_limit less or equal block gas limit
+            Validator->>Validator: 5. Check gas_price greater or equal minimum
+            Validator->>Validator: 6. Verify sufficient balance
+            Validator->>Validator: 7. Check tx size less or equal max_tx_input_bytes
+            Validator->>Validator: 8. For EIP-4844: Validate blob sidecars
+            Validator->>Validator: 9. Check not duplicate
+            Validator->>Validator: 10. Check replacement rules
+        end
+
+        alt Validation Success
+            Validator-->>Pool: TransactionValidationOutcome::Valid
+            Note over Client,SubPools: 📍 Step 5: Insert into Pool
+
+            Pool->>Pool: Get sender_id mapping
+            Note over Pool: Maps address to internal ID
+
+            Pool->>TxPool: pool.write().add_transaction(tx, balance, nonce)
+            Note over TxPool: File: crates/transaction-pool/src/pool/txpool.rs L736
+
+            TxPool->>TxPool: Determine sub-pool placement
+            Note over TxPool: Based on nonce and fees
+
+            TxPool->>SubPools: Insert into appropriate sub-pool
+
+            SubPools-->>TxPool: Insertion result
+
+            TxPool->>TxPool: Update all_transactions index
+
+            TxPool-->>Pool: AddedTransaction::Pending
+
+            Pool->>Pool: Notify listeners
+
+            Pool->>Pool: Check pool size limit
+            Pool-->>Helper: AddedTransactionOutcome { hash, state }
+
+            Helper-->>RPC: tx_hash
+            RPC-->>HTTP: JSON-RPC Response
+            HTTP-->>Client: {"jsonrpc":"2.0","id":1,"result":"0xabc..."}
+
+        else Validation Failure
+            Validator-->>Pool: TransactionValidationOutcome::Invalid(tx, error)
+
+            Pool->>Pool: Notify invalid listeners
+            Pool-->>Helper: PoolError::Invalid(InvalidTransaction)
+
+            Helper-->>RPC: Error
+            RPC-->>HTTP: JSON-RPC Error Response
+            HTTP-->>Client: {"jsonrpc":"2.0","id":1,"error":{...}}
+
+            Pool->>Pool: Notify invalid listeners
+            Pool-->>Helper: PoolError::Invalid(InvalidTransaction)
+
+            Helper-->>RPC: Error
+            RPC-->>HTTP: JSON-RPC Error Response
+            HTTP-->>Client: Error response
+    end
+```
+
+---
+
+## Flow 2: Block Building - op-node → op-reth (engine_forkchoiceUpdatedV3)
+
+```mermaid
+sequenceDiagram
+    participant OpNode as op-node (Go binary)
+    participant L1 as L1 Monitor
+    participant HTTP as HTTP Server :9551 (JWT)
+    participant EngineRPC as Engine API RPC
+    participant EngineAPI as Engine API Core
+    participant Consensus as Consensus Handle
+    participant TreeHandler as EngineApiTreeHandler
+    participant PayloadService as Payload Service
+    participant PayloadBuilder as EthereumPayloadBuilder
+    participant TxPool as Transaction Pool
+    participant BlockBuilder as Block Builder
+    participant StateRoot as State Root (TrieDB)
+
+    Note over OpNode,StateRoot: 📍 Step 1: op-node Derives L2 Block from L1
+
+    L1->>OpNode: Batcher transaction detected
+    Note over OpNode: Decompress and decode L2 block data
+
+    OpNode->>OpNode: Construct PayloadAttributes
+
+    Note over OpNode,StateRoot: 📍 Step 2: op-node Calls engine_forkchoiceUpdatedV3
+
+    OpNode->>HTTP: POST http://localhost:9551
+    Note over HTTP: JWT authenticated engine_forkchoiceUpdatedV3
+
+    HTTP->>EngineRPC: Route to engine_forkchoiceUpdatedV3
+    Note over EngineRPC: File: crates/optimism/rpc/src/engine.rs L328
+
+    EngineRPC->>EngineRPC: Validate JWT token
+    EngineRPC->>EngineRPC: Parse request parameters
+    Note over EngineRPC: ForkchoiceState + OpPayloadAttributes
+
+    EngineRPC->>EngineAPI: inner.fork_choice_updated_v3_metered()
+    Note over EngineAPI: File: crates/rpc/rpc-engine-api/src/engine_api.rs L396
+
+    EngineAPI->>EngineAPI: Record metrics (start time)
+    EngineAPI->>EngineAPI: Call fork_choice_updated_v3()
+    Note over EngineAPI: Line 387 validate_and_execute_forkchoice()
+
+    EngineAPI->>EngineAPI: Validate payload attributes
+
+    EngineAPI->>Consensus: beacon_consensus.fork_choice_updated()
+    Note over Consensus: File: crates/engine/primitives/src/message.rs L228
+
+    Consensus->>Consensus: Send message to engine
+    Note over Consensus: Line 243 send_fork_choice_updated()
+
+    Note over OpNode,StateRoot: 📍 Step 3: EngineApiTreeHandler Processes Request
+
+    Consensus->>TreeHandler: BeaconEngineMessage::ForkchoiceUpdated
+    Note over TreeHandler: File: crates/engine/tree/src/tree/mod.rs L1391
+
+    TreeHandler->>TreeHandler: Match message type
+
+    TreeHandler->>TreeHandler: on_forkchoice_updated()
+    Note over TreeHandler: Line 1019 on_forkchoice_updated()
+
+    rect rgb(255, 240, 200)
+        Note over TreeHandler: Forkchoice Update Processing
+        
+        TreeHandler->>TreeHandler: 1. Validate forkchoice state
+        Note over TreeHandler: Line 1060 validate_forkchoice_state()
+
+        TreeHandler->>TreeHandler: 2. Check if head already canonical
+        Note over TreeHandler: Line 1091 handle_canonical_head()
+
+        TreeHandler->>TreeHandler: 3. Apply chain update if needed
+
+        TreeHandler->>TreeHandler: 4. Record metrics
+    end
+
+    alt payload_attributes provided
+        Note over OpNode,StateRoot: 📍 Step 4: Initiate Payload Building
+
+        TreeHandler->>TreeHandler: Check attributes present
+
+        TreeHandler->>PayloadService: spawn_payload_job(attributes)
+        Note over PayloadService: File: crates/payload/builder/src/service.rs
+
+        PayloadService->>PayloadService: Generate payload_id
+
+        PayloadService->>PayloadBuilder: builder.try_build(build_args)
+        Note over PayloadBuilder: File: crates/ethereum/payload/src/lib.rs L88
+
+        Note over OpNode,StateRoot: 📍 Step 5: Transaction Selection
+
+        PayloadBuilder->>PayloadBuilder: Setup EVM environment
+        Note over PayloadBuilder: Line 167
+
+        PayloadBuilder->>PayloadBuilder: Check no_tx_pool flag
+
+        alt no_tx_pool = false (Validator mode)
+            PayloadBuilder->>TxPool: best_transactions_with_attributes()
+            Note over TxPool: File: crates/transaction-pool/src/pool/txpool.rs L381
+
+            TxPool->>TxPool: Create iterator over pending pool
+
+            TxPool-->>PayloadBuilder: Iterator ValidPoolTransaction
+
+        else no_tx_pool = true (Sequencer mode)
+            PayloadBuilder->>PayloadBuilder: Use transactions from attributes
+
+        Note over OpNode,StateRoot: 📍 Step 6: Block Execution
+
+        PayloadBuilder->>PayloadBuilder: Apply pre-execution changes
+        Note over PayloadBuilder: Line 195
+
+        loop For each transaction
+            PayloadBuilder->>BlockBuilder: Execute transaction
+            Note over BlockBuilder: File: crates/evm/evm/src/execute.rs L515
+
+            BlockBuilder->>BlockBuilder: Prepare transaction
+
+            BlockBuilder->>BlockBuilder: Execute in EVM
+
+            BlockBuilder->>BlockBuilder: Collect state changes
+
+            BlockBuilder->>BlockBuilder: Generate receipt
+
+            BlockBuilder-->>PayloadBuilder: gas_used and receipt
+
+            PayloadBuilder->>PayloadBuilder: Update cumulative totals
+            Note over PayloadBuilder: cumulative_gas_used += gas_usedtotal_fees += gas_price * gas_used
+
+            alt Gas limit reached OR deadline OR cancellation
+                PayloadBuilder->>PayloadBuilder: Stop transaction selection
+            end
+        end
+
+        Note over OpNode,StateRoot: 📍 Step 7: State Root Calculation (TrieDB!)
+
+        PayloadBuilder->>BlockBuilder: Finalize block
+        Note over BlockBuilder: Apply post-execution changesCollect final BundleState
+
+        BlockBuilder->>StateRoot: state_root_with_updates_triedb()
+        Note over StateRoot: File: crates/storage/provider/src/providers/state/latest.rsLine: ~109Function: state_root_with_updates_triedb()
+
+
+        BlockBuilder->>StateRoot: state_root_with_updates_triedb()
+        Note over StateRoot: File: crates/storage/provider/src/providers/state/latest.rs L109
+            Note over StateRoot: Flatten state changes to plain format
+
+            StateRoot->>StateRoot: 2. Convert PlainPostState → HashedPostState
+            Note over StateRoot: Hash all addresses and storage keys
+
+            StateRoot->>StateRoot: 3. Load account keysto PlainPostState
+
+            StateRoot->>StateRoot: 2. Convert PlainPostState to HashedPostState
+
+            StateRoot->>StateRoot: 3. Load account keys
+
+            StateRoot->>StateRoot: 4. Load storage keys
+
+            StateRoot->>StateRoot: 5. Create TrieDB provider
+
+            StateRoot->>StateRoot: 6. Calculate state root
+            Note over StateRoot: TrieDB calculates Merkle root (342ms vs 952ms MDBX, 2.8x faster!)
+
+            StateRoot->>StateRoot: 7. Collect trie updates
+
+        PayloadBuilder->>PayloadBuilder: Construct ExecutionPayload
+        Note over PayloadBuilder: Line: ~300ExecutionPayload {  parent_hash,  fee_recipient,  state_root,  ← TrieDB!  receipts_root,  logs_bloom,  prev_randao,  block_number,  gas_limit,  gas_used,  timestamp,  extra_data,  base_fee_per_gas,  block_hash,  ← Computed  transactions,  withdrawals,  ...}
+
+        PayloadBuilder->>PayloadBuilder: Calculate block_hash
+        Note over PayloadBuilder: Keccak256(RLP(ExecutionPayload))
+
+        PayloadBuilder-->>PayloadService: BuildOutcome::Better(payload)
+state_root and trie_updates
+        BlockBuilder-->>PayloadBuilder: ExecutionOutcome
+
+        Note over OpNode,StateRoot: 📍 Step 8: Build Execution Payload
+
+        PayloadBuilder->>PayloadBuilder: Construct ExecutionPayload
+        Note over PayloadBuilder: Includes state_root from TrieDB
+
+        PayloadBuilder->>PayloadBuilder: Calculate block_hash
+        Note over EngineAPI: latency.fork_choice_updated_v3.record()
+
+        EngineAPI-->>EngineRPC: ForkchoiceUpdated {  payload_status: {    status: "VALID",    latest_valid_hash: "0xabc..."  },  payload_id: "0x0123..."}
+
+        EngineRPC-->>HTTP: JSON-RPC Response
+
+        PayloadService-->>TreeHandler: with OnForkChoiceUpdated
+
+        EngineAPI->>EngineAPI: Record metrics (end time)
+
+        EngineAPI-->>EngineRPC: ForkchoiceUpdated with payload_id
+
+        EngineRPC-->>HTTP: JSON-RPC Response
+        HTTP-->>OpNode: Response with payload_id
+
+        Note over OpNode: Received payload_id, c
+``` 
+---
+
+## Flow 3: Payload Retrieval - engine_getPayloadV3
+
+```mermaid
+with payload_status VALID
+        Consensus-->>EngineAPI: Result
+        EngineAPI-->>EngineRPC: ForkchoiceUpdated
+        EngineRPC-->>HTTP: Response
+        HTTP-->>OpNode: Success response
+    participant EngineRPC as Engine API RPCcrates/optimism/rpc/src/engine.rs
+    participant EngineAPI as Engine API Corecrates/rpc/rpc-engine-api/src/engine_api.rs
+    participant Consensus as Consensus Handlecrates/engine/primitives/src/message.rs
+    participant PayloadService as Payload Servicecrates/payload/builder/src/service.rs
+    participant PayloadStore as Payload Store(In-memory cache)
+
+    Note over OpNode,PayloadStore: 📍 Step 1: op-node Requests Payload
+
+    OpNode->>HTTP: POST http://localhost:9551
+    Note over HTTP: Authorization: Bearer <JWT>{  "jsonrpc": "2.0",  "id": 2,  "method": "engine_getPayloadV3",  "params": ["0x0123456789abcdef"]}
+
+    HTTP->>EngineRPC: Route to engine_getPayloadV3
+    Note over EngineRPC: File: crates/optimism/rpc/src/engine.rsLine: ~337Method: get_payload_v3()
+
+    EngineRPC->>EngineRPC: Validate JWT
+    EngineRPC->>EngineRPC: Parse payload_id
+
+    EngineRPC->>EngineAPI: inner.get_payload_v3(payload_id)
+    Note over EngineAPI: File: crates/rpc/rpc-engine-api/src/engine_api.rsFunction: get_payload_v3()
+
+    EngineAPI->>ConsJWT authenticated engine_getPayloadV3
+
+    HTTP->>EngineRPC: Route to engine_getPayloadV3
+    Note over EngineRPC: File: crates/optimism/rpc/src/engine.rs L337
+    Note over PayloadService: File: crates/payload/builder/src/service.rs
+
+    EngineRPC->>EngineAPI: inner.get_payload_v3(payload_id)
+
+    EngineAPI->>Consensus: beacon_consensus.get_payload(payload_id, version)
+
+    Consensus->>PayloadService: Lookup payload by ID
+
+    PayloadService->>PayloadStore: payloads.get(payload_id)
+
+    alt Payload found
+        PayloadStore-->>PayloadService: Some(EthBuiltPayload)
+
+        PayloadService-->>Consensus: Ok(payload)
+        Consensus-->>EngineAPI: payload
+
+        EngineAPI->>EngineAPI: Convert to response format
+
+        EngineAPI-->>EngineRPC: GetPayloadResponse
+        EngineRPC-->>HTTP: JSON-RPC Response
+        HTTP-->>OpNode: Full ExecutionPayload response
+
+        Note over OpNode: Received full ExecutionPayload
+
+    else Payload not found
+        PayloadStore-->>PayloadService: None
+        PayloadService-->>Consensus: Error
+        Consensus-->>EngineAPI: Error
+        EngineAPI-->>EngineRPC: PayloadNotFound
+        EngineRPC-->>HTTP: JSON-RPC Error
+        HTTP-->>OpNode: Error response
+    end
+
+    Note over OpNode: op-node may now call engine_newPayloadV3() to validate and import block
+```
+
+---
+
+## Summary: Key Files and Functions
+
+### Transaction Submission Path
+
+| Component | File | Function | Line | Purpose | 
+
+| Component | File | Function | Line | Purpose |
+|-----------|------|----------|------|---------|
+| **Engine API RPC** | `crates/optimism/rpc/src/engine.rs` | `fork_choice_updated_v3()` | ~328 | RPC endpoint handler |
+| **Engine API Core** | `crates/rpc/rpc-engine-api/src/engine_api.rs` | `fork_choice_updated_v3_metered()` | ~396 | Core FCU logic with metrics |
+| **Consensus Handle** | `crates/engine/primitives/src/message.rs` | `fork_choice_updated()` | ~228 | Send message to engine |
+| **Tree Handler** | `crates/engine/tree/src/tree/mod.rs` | `on_forkchoice_updated()` | ~1019 | Process FCU request |
+| **Payload Builder** | `crates/ethereum/payload/src/lib.rs` | `try_build()` | ~88 | Build execution payload |
+| **Transaction Selection** | `crates/transaction-pool/src/pool/txpool.rs` | `best_transactions_with_attributes()` | ~381 | Select best transactions |
+| **Block Execution** | `crates/evm/evm/src/execute.rs` | `execute_and_verify_receipt()` | ~515 | Execute transactions in EVM |
+| **State Root (TrieDB)** | `crates/storage/provider/src/providers/state/latest.rs` | `state_root_with_updates_triedb()` | ~109 | Calculate state root with TrieDB |
+
+### Payload Retrieval Path
+
+| Component | File | Function | Line | Purpose |
+|-----------|------|----------|------|---------|
+| **Engine API RPC** | `crates/optimism/rpc/src/engine.rs` | `get_payload_v3()` | ~337 | RPC endpoint handler |
+| **Engine API Core** | `crates/rpc/rpc-engine-api/src/engine_api.rs` | `get_payload_v3()` | - | Core get payload logic |
+| **Payload Service** | `crates/payload/builder/src/service.rs` | Payload lookup | - | Retrieve from in-memory cache |
+
+---
+
+## API Endpoints Summary
+
+### Client RPC Endpoint (Port 8545)
+
+**URL:** `http://localhost:8545`
+
+**Methods:**
+- `eth_sendRawTransaction` - Submit signed transaction
+- `eth_sendTransaction` - Submit transaction (requires unlocked account)
+- `eth_getTransactionByHash` - Query transaction status
+- `eth_getTransactionReceipt` - Get transaction receipt
+
+**Example Request:**
+```bash
+curl -X POST http://localhost:8545 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "eth_sendRawTransaction",
+    "params": ["0x02f871018303579880850555633d1b82520894eee27662c2b8eba3cd936a23f039f3189633e4c887ad591c62bdaeb180c080a07ea72c68abfb8fca1bd964f0f99132ed9280261bdca3e549546c0205e800f7d0a05b4ef3039e9c9b9babc179a1878fb825b5aaf5aed2fa8744854150157b08d6f3"]
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "0xa694b71e6c128a2ed8e2e0f6770bddbe52e3bb8f10e8472f9a79ab81497a8b5d"
+}
+```
+
+---
+
+### Engine API Endpoint (Port 9551)
+
+**URL:** `http://localhost:9551` (JWT authenticated)
+
+**Methods:**
+- `engine_forkchoiceUpdatedV1/V2/V3` - Update fork choice and request payload building
+- `engine_getPayloadV2/V3/V4` - Retrieve built payload
+- `engine_newPayloadV2/V3/V4` - Submit and validate new payload
+
+**Example Request (engine_forkchoiceUpdatedV3):**
+```bash
+curl -X POST http://localhost:9551 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "engine_forkchoiceUpdatedV3",
+    "params": [
+      {
+        "headBlockHash": "0xabc...",
+        "safeBlockHash": "0xdef...",
+        "finalizedBlockHash": "0x123..."
+      },
+      {
+        "timestamp": "0x65950fb0",
+        "prevRandao": "0x456...",
+        "suggestedFeeRecipient": "0x789...",
+        "withdrawals": [],
+        "parentBeaconBlockRoot": "0xabc...",
+        "transactions": ["0x7e...", "0x02..."],
+        "noTxPool": true,
+        "gasLimit": "0x1c9c380"
+      }
+    ]
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "payloadStatus": {
+      "status": "VALID",
+      "latestValidHash": "0xabc...",
+      "validationError": null
+    },
+    "payloadId": "0x0123456789abcdef"
+  }
+}
+```
+
+**Example Request (engine_getPayloadV3):**
+```bash
+curl -X POST http://localhost:9551 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "engine_getPayloadV3",
+    "params": ["0x0123456789abcdef"]
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "executionPayload": {
+      "parentHash": "0xabc...",
+      "feeRecipient": "0x789...",
+      "stateRoot": "0xdef...",
+      "receiptsRoot": "0x123...",
+      "logsBloom": "0x...",
+      "prevRandao": "0x456...",
+      "blockNumber": "0x3039",
+      "gasLimit": "0x1c9c380",
+      "gasUsed": "0xe4e1c0",
+      "timestamp": "0x65950fb0",
+      "extraData": "0x",
+      "baseFeePerGas": "0x7",
+      "blockHash": "0x...",
+      "transactions": ["0x7e...", "0x02..."],
+      "withdrawals": [],
+      "blobGasUsed": "0x0",
+      "excessBlobGas": "0x0"
+    },
+    "blockValue": "0x2a",
+    "blobsBundle": {
+      "commitments": [],
+      "proofs": [],
+      "blobs": []
+    },
+    "shouldOverrideBuilder": false
+  }
+}
+```
+
+---
+
+## Transaction Pool State Machine
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Transaction Pool                        │
+│                                                             │
+│  ┌────────────────────────────────────────────────────┐   │
+│  │               Pending Pool                         │   │
+│  │  (nonce == state_nonce && fees OK)                │   │
+│  │                                                     │   │
+│  │  Sorted by: effective_tip_per_gas DESC            │   │
+│  │  Ready for: Immediate block inclusion              │   │
+│  └────────────────────────────────────────────────────┘   │
+│                        ▲                                    │
+│                        │ Promote when:                      │
+│                        │ - Nonce gap filled                 │
+│                        │ - Base fee drops                   │
+│                        │                                    │
+│  ┌────────────────────────────────────────────────────┐   │
+│  │               Queued Pool                          │   │
+│  │  (nonce > state_nonce)                            │   │
+│  │                                                     │   │
+│  │  Reason: Nonce gap (waiting for earlier txs)      │   │
+│  │  Action: Wait for gap to be filled                │   │
+│  └────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌────────────────────────────────────────────────────┐   │
+│  │              BaseFee Pool                          │   │
+│  │  (max_fee_per_gas < base_fee)                     │   │
+│  │                                                     │   │
+│  │  Reason: Fee too low for current base fee         │   │
+│  │  Action: Wait for base fee to drop                │   │
+│  └────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌────────────────────────────────────────────────────┐   │
+│  │               Blob Pool (EIP-4844)                 │   │
+│  │                                                     │   │
+│  │  Special handling for blob transactions           │   │
+│  │  Stores blob sidecars separately                  │   │
+│  └────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Call Stack
+
+### eth_sendRawTransaction
+
+```
+Client HTTP POST
+  ↓
+JSON-RPC Router (port 8545)
+  ↓
+crates/rpc/rpc-eth-api/src/core.rs::send_raw_transaction()
+  ↓
+crates/optimism/rpc/src/eth/transaction.rs::send_raw_transaction()
+  ↓
+crates/rpc/rpc-eth-types/src/utils.rs::recover_raw_transaction()
+  ↓
+[IF forwarder configured]
+  ↓
+  crates/optimism/rpc/src/sequencer.rs::forward_raw_transaction()
+  ↓
+  HTTP POST to sequencer
+[ELSE]
+  ↓
+  crates/transaction-pool/src/pool/mod.rs::add_transaction()
+  ↓
+  crates/transaction-pool/src/validate/eth.rs::validate_transaction()
+  ↓
+  crates/transaction-pool/src/pool/txpool.rs::add_transaction()
+  ↓
+  Insert into sub-pool (Pending/Queued/BaseFee)
+  ↓
+  Notify listeners
+[END]
+  ↓
+Return tx_hash to client
+```
+
+### engine_forkchoiceUpdatedV3
+
+```
+op-node HTTP POST
+  ↓
+JSON-RPC Router (port 9551, JWT)
+  ↓
+crates/optimism/rpc/src/engine.rs::fork_choice_updated_v3()
+  ↓
+crates/rpc/rpc-engine-api/src/engine_api.rs::fork_choice_updated_v3_metered()
+  ↓
+crates/rpc/rpc-engine-api/src/engine_api.rs::validate_and_execute_forkchoice()
+  ↓
+crates/engine/primitives/src/message.rs::fork_choice_updated()
+  ↓
+Send BeaconEngineMessage::ForkchoiceUpdated via channel
+  ↓
+crates/engine/tree/src/tree/mod.rs::on_engine_message()
+  ↓
+crates/engine/tree/src/tree/mod.rs::on_forkchoice_updated()
+  ↓
+crates/engine/tree/src/tree/mod.rs::validate_forkchoice_state()
+crates/engine/tree/src/tree/mod.rs::handle_canonical_head()
+crates/engine/tree/src/tree/mod.rs::apply_chain_update()
+  ↓
+[IF payload_attributes provided]
+  ↓
+  crates/payload/builder/src/service.rs::spawn_payload_job()
+  ↓
+  crates/ethereum/payload/src/lib.rs::try_build()
+  ↓
+  crates/transaction-pool/src/pool/txpool.rs::best_transactions_with_attributes()
+  ↓
+  Loop: For each transaction
+    ↓
+    crates/evm/evm/src/execute.rs::execute_and_verify_receipt()
+    ↓
+    EVM execution & state updates
+  ↓
+  crates/storage/provider/src/providers/state/latest.rs::state_root_with_updates_triedb()
+  ↓
+  TrieDB calculates state root (342ms, 2.8x faster!)
+  ↓
+  Build ExecutionPayload
+  ↓
+  Store payload with payload_id
+[END]
+  ↓
+Return ForkchoiceUpdated { payload_status, payload_id } to op-node
+```
+
+### engine_getPayloadV3
+
+```
+op-node HTTP POST
+  ↓
+JSON-RPC Router (port 9551, JWT)
+  ↓
+crates/optimism/rpc/src/engine.rs::get_payload_v3()
+  ↓
+crates/rpc/rpc-engine-api/src/engine_api.rs::get_payload_v3()
+  ↓
+crates/engine/primitives/src/message.rs::get_payload()
+  ↓
+crates/payload/builder/src/service.rs::lookup_payload()
+  ↓
+Retrieve from in-memory cache
+  ↓
+Return ExecutionPayload to op-node
+```
+
+---
+
+## Performance Metrics (TrieDB vs MDBX)
+
+### State Root Calculation Time
+
+| Dataset | MDBX (old) | TrieDB (new) | Improvement |
+|---------|------------|--------------|-------------|
+| **1G genesis** | 165ms | 87ms | **1.9x faster** (47% reduction) |
+| **3G genesis** | 952ms | 342ms | **2.8x faster** (64% reduction) |
+
+### Block Building Impact
+
+| Metric | Before (MDBX) | After (TrieDB) | Improvement |
+|--------|---------------|----------------|-------------|
+| **State root calc** | 952ms | 342ms | 2.8x faster |
+| **Total block time** | ~1200ms | ~600ms | 2x faster |
+| **TPS** | 100 TPS | 148 TPS | **+48%** |
+
+### Memory Usage
+
+- **In-memory TxPool**: ~10-100 MB (depends on pool size)
+- **TrieDB cache**: ~500 MB - 2 GB (configurable)
+- **Total**: ~2-4 GB typical for sequencer node
+
+---
+
+## Conclusion
+
+This document provides the **complete end-to-end flow** with:
+
+✅ **Exact file paths** for every component
+✅ **Function names** and line numbers
+✅ **RPC endpoints** (8545 for clients, 9551 for op-node)
+✅ **API method names** (eth_sendRawTransaction, engine_forkchoiceUpdatedV3, engine_getPayloadV3)
+✅ **Detailed mermaid diagrams** showing every step
+✅ **Call stacks** for complete traceability
+
+The three main flows are:
+
+1. **Transaction Submission**: Client → RPC (8545) → Validation → TxPool
+2. **Block Building**: op-node → Engine API (9551) → FCU → Payload building → payload_id
+3. **Payload Retrieval**: op-node → Engine API (9551) → Get payload → Full ExecutionPayload
+
+All integrated with **TrieDB** for 2.8x faster state root calculation! 🚀
