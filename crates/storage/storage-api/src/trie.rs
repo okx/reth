@@ -7,15 +7,15 @@ use reth_trie_common::{
     StorageProof, TrieInput,
 };
 use reth_primitives_traits::Account;
-use std::collections::HashMap;
+use alloc::collections::BTreeMap;
 
 /// Plain (unhashed) post state updates for TrieDB computation
 #[derive(Debug, Clone, Default)]
 pub struct PlainPostState {
     /// Mapping of address to account info, `None` if destroyed
-    pub accounts: HashMap<Address, Option<Account>>,
+    pub accounts: BTreeMap<Address, Option<Account>>,
     /// Mapping of address to storage entries (slot -> value)
-    pub storages: HashMap<Address, HashMap<B256, U256>>,
+    pub storages: BTreeMap<Address, BTreeMap<B256, U256>>,
 }
 /// A type that can compute the state root of a given post state.
 #[auto_impl::auto_impl(&, Box, Arc)]

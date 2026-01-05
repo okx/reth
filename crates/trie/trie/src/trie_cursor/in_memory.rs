@@ -3,6 +3,7 @@ use crate::{forward_cursor::ForwardInMemoryCursor, updates::TrieUpdatesSorted};
 use alloy_primitives::B256;
 use reth_storage_errors::db::DatabaseError;
 use reth_trie_common::{BranchNodeCompact, Nibbles};
+use std::sync::Arc;
 
 /// The trie cursor factory for the trie updates.
 #[derive(Debug, Clone)]
@@ -45,7 +46,7 @@ where
         hashed_address: B256,
     ) -> Result<Self::StorageTrieCursor<'_>, DatabaseError> {
         // if the storage trie has no updates then we use this as the in-memory overlay.
-        static EMPTY_UPDATES: Vec<(Nibbles, Option<BranchNodeCompact>)> = Vec::new();
+        static EMPTY_UPDATES: Vec<(Nibbles, Option<Arc<BranchNodeCompact>>)> = Vec::new();
 
         let storage_trie_updates =
             self.trie_updates.as_ref().storage_tries_ref().get(&hashed_address);
@@ -72,7 +73,7 @@ pub struct InMemoryTrieCursor<'a, C> {
     /// Entry that `cursor` is currently pointing to.
     cursor_entry: Option<(Nibbles, BranchNodeCompact)>,
     /// Forward-only in-memory cursor over storage trie nodes.
-    in_memory_cursor: ForwardInMemoryCursor<'a, Nibbles, Option<BranchNodeCompact>>,
+    in_memory_cursor: ForwardInMemoryCursor<'a, Nibbles, Option<std::sync::Arc<BranchNodeCompact>>>,
     /// The key most recently returned from the Cursor.
     last_key: Option<Nibbles>,
     #[cfg(debug_assertions)]
@@ -85,7 +86,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
     /// in-memory trie nodes.
     pub fn new(
         cursor: Option<C>,
-        trie_updates: &'a [(Nibbles, Option<BranchNodeCompact>)],
+        trie_updates: &'a [(Nibbles, Option<std::sync::Arc<BranchNodeCompact>>)],
     ) -> Self {
         let in_memory_cursor = ForwardInMemoryCursor::new(trie_updates);
         Self {
@@ -168,8 +169,8 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
                     if self.cursor_entry.as_ref().is_none_or(|(db_key, _)| &mem_key <= db_key) =>
                 {
                     // If overlay returns a node prior to the DB's node, or the DB is exhausted,
-                    // then we return the overlay's node.
-                    return Ok(Some((mem_key, node)))
+                    // then we return the overlay's node. Clone the Arc to get the actual node.
+                    return Ok(Some((mem_key, (*node).clone())))
                 }
                 // All other cases:
                 // - mem_key > db_key
@@ -196,7 +197,7 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
 
         let entry = match (mem_entry, &self.cursor_entry) {
             (Some((mem_key, entry_inner)), _) if mem_key == key => {
-                entry_inner.map(|node| (key, node))
+                entry_inner.as_ref().map(|node| (key, (**node).clone()))
             }
             (_, Some((db_key, node))) if db_key == &key => Some((key, node.clone())),
             _ => None,
