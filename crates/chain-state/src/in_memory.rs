@@ -871,7 +871,7 @@ mod tests {
     use reth_ethereum_primitives::{EthPrimitives, Receipt};
     use reth_primitives_traits::{Account, Bytecode};
     use reth_storage_api::{
-        AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider,
+        AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, PlainPostState,
         StateProofProvider, StateProvider, StateRootProvider, StorageRootProvider,
     };
     use reth_trie::{

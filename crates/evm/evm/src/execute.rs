@@ -21,7 +21,7 @@ use reth_primitives_traits::{
 use reth_storage_api::{PlainPostState, StateProvider};
 pub use reth_storage_errors::provider::ProviderError;
 use reth_trie_common::{updates::TrieUpdates, HashedPostState};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::Instant;
 use alloy_primitives::U256;
 use revm::{
@@ -541,7 +541,7 @@ where
             };
             plain_state.accounts.insert(*address, account);
             
-            let mut storage_map = BTreeMap::new();
+            let mut storage_map = HashMap::new();
             for (slot, storage_slot) in &bundle_account.storage {
                 // Convert U256 slot to B256 (32-byte representation)
                 let slot_b256 = B256::from_slice(&slot.to_be_bytes::<32>());
