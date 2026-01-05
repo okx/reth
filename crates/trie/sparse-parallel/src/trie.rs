@@ -1,5 +1,5 @@
 use crate::LowerSparseSubtrie;
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, sync::Arc};
 use alloy_primitives::{
     map::{Entry, HashMap},
     B256,
@@ -1347,7 +1347,7 @@ impl ParallelSparseTrie {
                         updates.updated_nodes.remove(&path);
                     }
                     SparseTrieUpdatesAction::InsertUpdated(path, branch_node) => {
-                        updates.updated_nodes.insert(path, branch_node);
+                        updates.updated_nodes.insert(path, Arc::new(branch_node));
                     }
                 }
             }

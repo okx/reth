@@ -767,7 +767,7 @@ mod tests {
 #[cfg(feature = "serde-bincode-compat")]
 pub mod serde_bincode_compat {
     use crate::{BranchNodeCompact, Nibbles};
-    use alloc::borrow::Cow;
+    use alloc::{borrow::Cow, sync::Arc};
     use alloy_primitives::map::{B256Map, HashMap, HashSet};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use serde_with::{DeserializeAs, SerializeAs};
@@ -797,7 +797,9 @@ pub mod serde_bincode_compat {
     impl<'a> From<&'a super::TrieUpdates> for TrieUpdates<'a> {
         fn from(value: &'a super::TrieUpdates) -> Self {
             Self {
-                account_nodes: Cow::Borrowed(&value.account_nodes),
+                account_nodes: Cow::Owned(
+                    value.account_nodes.iter().map(|(k, v)| (*k, (**v).clone())).collect()
+                ),
                 removed_nodes: Cow::Borrowed(&value.removed_nodes),
                 storage_tries: value.storage_tries.iter().map(|(k, v)| (*k, v.into())).collect(),
             }
@@ -807,7 +809,7 @@ pub mod serde_bincode_compat {
     impl<'a> From<TrieUpdates<'a>> for super::TrieUpdates {
         fn from(value: TrieUpdates<'a>) -> Self {
             Self {
-                account_nodes: value.account_nodes.into_owned(),
+                account_nodes: value.account_nodes.into_owned().into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
                 removed_nodes: value.removed_nodes.into_owned(),
                 storage_tries: value
                     .storage_tries
@@ -862,7 +864,9 @@ pub mod serde_bincode_compat {
         fn from(value: &'a super::StorageTrieUpdates) -> Self {
             Self {
                 is_deleted: value.is_deleted,
-                storage_nodes: Cow::Borrowed(&value.storage_nodes),
+                storage_nodes: Cow::Owned(
+                    value.storage_nodes.iter().map(|(k, v)| (*k, (**v).clone())).collect()
+                ),
                 removed_nodes: Cow::Borrowed(&value.removed_nodes),
             }
         }
@@ -872,7 +876,7 @@ pub mod serde_bincode_compat {
         fn from(value: StorageTrieUpdates<'a>) -> Self {
             Self {
                 is_deleted: value.is_deleted,
-                storage_nodes: value.storage_nodes.into_owned(),
+                storage_nodes: value.storage_nodes.into_owned().into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
                 removed_nodes: value.removed_nodes.into_owned(),
             }
         }
@@ -906,6 +910,7 @@ pub mod serde_bincode_compat {
             updates::{StorageTrieUpdates, TrieUpdates},
             BranchNodeCompact, Nibbles,
         };
+        use alloc::sync::Arc;
         use alloy_primitives::B256;
         use serde::{Deserialize, Serialize};
         use serde_with::serde_as;

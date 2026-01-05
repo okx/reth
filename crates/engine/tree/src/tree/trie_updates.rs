@@ -120,8 +120,12 @@ pub(super) fn compare_trie_updates(
         let (task, regular) = (task.account_nodes.remove(&key), regular.account_nodes.remove(&key));
         let database = account_trie_cursor.seek_exact(key)?.map(|x| x.1);
 
-        if !branch_nodes_equal(task.as_ref(), regular.as_ref(), database.as_ref())? {
-            diff.account_nodes.insert(key, EntryDiff { task, regular, database });
+        if !branch_nodes_equal(task.as_ref().map(|n| &**n), regular.as_ref().map(|n| &**n), database.as_ref())? {
+            diff.account_nodes.insert(key, EntryDiff { 
+                task: task.map(|n| (*n).clone()), 
+                regular: regular.map(|n| (*n).clone()), 
+                database 
+            });
         }
     }
 
@@ -211,8 +215,12 @@ fn compare_storage_trie_updates<C: TrieCursor>(
     {
         let (task, regular) = (task.storage_nodes.remove(&key), regular.storage_nodes.remove(&key));
         let database = storage_trie_cursor.seek_exact(key)?.map(|x| x.1);
-        if !branch_nodes_equal(task.as_ref(), regular.as_ref(), database.as_ref())? {
-            diff.storage_nodes.insert(key, EntryDiff { task, regular, database });
+        if !branch_nodes_equal(task.as_ref().map(|n| &**n), regular.as_ref().map(|n| &**n), database.as_ref())? {
+            diff.storage_nodes.insert(key, EntryDiff { 
+                task: task.map(|n| (*n).clone()), 
+                regular: regular.map(|n| (*n).clone()), 
+                database 
+            });
         }
     }
 

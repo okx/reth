@@ -323,7 +323,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
 
                     merged_plain_state.accounts.insert(*address, account);
 
-                    let storage_map = merged_plain_state.storages.entry(*address).or_insert_with(HashMap::new);
+                    let storage_map = merged_plain_state.storages.entry(*address).or_insert_with(BTreeMap::new);
                     for (slot, storage_slot) in &bundle_account.storage {
                         let slot_b256 = B256::from_slice(&slot.to_be_bytes::<32>());
                         storage_map.insert(slot_b256, storage_slot.present_value);
@@ -2250,7 +2250,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
         let mut db_account_cursor = DatabaseAccountTrieCursor::new(curr_values_cursor);
 
         // Static empty array for when updates_overlay is None
-        static EMPTY_ACCOUNT_UPDATES: Vec<(Nibbles, Option<BranchNodeCompact>)> = Vec::new();
+        static EMPTY_ACCOUNT_UPDATES: Vec<(Nibbles, Option<Arc<BranchNodeCompact>>)> = Vec::new();
 
         // Get the overlay updates for account trie, or use an empty array
         let account_overlay_updates = updates_overlay
@@ -2329,7 +2329,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> TrieReader for DatabaseProvider<TX, N> {
             let (_, TrieChangeSetsEntry { nibbles, node }) = entry?;
             // Only keep the first (oldest) version of each node
             if seen_account_keys.insert(nibbles.0) {
-                account_nodes.push((nibbles.0, node));
+                account_nodes.push((nibbles.0, node.map(Arc::new)));
             }
         }
 
@@ -2362,7 +2362,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> TrieReader for DatabaseProvider<TX, N> {
             .into_iter()
             .map(|(address, mut nodes)| {
                 nodes.sort_by_key(|(path, _)| *path);
-                (address, StorageTrieUpdatesSorted { storage_nodes: nodes, is_deleted: false })
+                (address, StorageTrieUpdatesSorted { storage_nodes: nodes.into_iter().map(|(p, n)| (p, n.map(Arc::new))).collect(), is_deleted: false })
             })
             .collect();
 
@@ -2393,7 +2393,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> TrieReader for DatabaseProvider<TX, N> {
         for entry in accounts_trie_cursor.walk_dup(Some(block_number), None)? {
             let (_, TrieChangeSetsEntry { nibbles, .. }) = entry?;
             // Look up the current value of this trie node using the overlay cursor
-            let node_value = account_cursor.seek_exact(nibbles.0)?.map(|(_, node)| node);
+            let node_value = account_cursor.seek_exact(nibbles.0)?.map(|(_, node)| Arc::new(node));
             account_nodes.push((nibbles.0, node_value));
         }
 
@@ -2421,7 +2421,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> TrieReader for DatabaseProvider<TX, N> {
             // Look up the current value of this storage trie node
             let cursor =
                 storage_cursor.as_mut().expect("storage_cursor was just initialized above");
-            let node_value = cursor.seek_exact(nibbles.0)?.map(|(_, node)| node);
+            let node_value = cursor.seek_exact(nibbles.0)?.map(|(_, node)| Arc::new(node));
             storage_tries
                 .entry(hashed_address)
                 .or_insert_with(|| StorageTrieUpdatesSorted {
@@ -2498,7 +2498,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
         );
 
         // Static empty array for when updates_overlay is None
-        static EMPTY_UPDATES: Vec<(Nibbles, Option<BranchNodeCompact>)> = Vec::new();
+        static EMPTY_UPDATES: Vec<(Nibbles, Option<Arc<BranchNodeCompact>>)> = Vec::new();
 
         for (hashed_address, storage_trie_updates) in storage_tries {
             let changeset_key = BlockNumberHashedAddress((block_number, *hashed_address));

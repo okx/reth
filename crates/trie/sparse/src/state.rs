@@ -633,7 +633,7 @@ where
 
         let (root, updates) = (revealed.root(), revealed.take_updates());
         let updates = TrieUpdates {
-            account_nodes: updates.updated_nodes.into_iter().map(|(k, v)| (k, alloc::sync::Arc::new(v))).collect(),
+            account_nodes: updates.updated_nodes,
             removed_nodes: updates.removed_nodes,
             storage_tries,
         };
@@ -652,7 +652,7 @@ where
                 let updates = trie.take_updates();
                 let updates = StorageTrieUpdates {
                     is_deleted: updates.wiped,
-                    storage_nodes: updates.updated_nodes.into_iter().map(|(k, v)| (k, alloc::sync::Arc::new(v))).collect(),
+                    storage_nodes: updates.updated_nodes,
                     removed_nodes: updates.removed_nodes,
                 };
                 (*address, updates)
@@ -669,7 +669,7 @@ where
         self.state.as_revealed_mut().map(|state| {
             let updates = state.take_updates();
             TrieUpdates {
-                account_nodes: updates.updated_nodes.into_iter().map(|(k, v)| (k, alloc::sync::Arc::new(v))).collect(),
+                account_nodes: updates.updated_nodes,
                 removed_nodes: updates.removed_nodes,
                 storage_tries,
             }

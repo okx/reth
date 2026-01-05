@@ -152,7 +152,7 @@ impl<N: NodePrimitives> StateRootProvider for MemoryOverlayStateProviderRef<'_, 
         &self,
         plain_state: PlainPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
         let mut cached_plain_state = PlainPostState::default();
         
         for block in &self.in_memory {
@@ -165,7 +165,7 @@ impl<N: NodePrimitives> StateRootProvider for MemoryOverlayStateProviderRef<'_, 
                 };
                 cached_plain_state.accounts.insert(*address, account);
                 
-                let storage_map = cached_plain_state.storages.entry(*address).or_insert_with(HashMap::new);
+                let storage_map = cached_plain_state.storages.entry(*address).or_insert_with(BTreeMap::new);
                 for (slot, storage_slot) in &bundle_account.storage {
                     let slot_b256 = B256::from_slice(&slot.to_be_bytes::<32>());
                     storage_map.insert(slot_b256, storage_slot.present_value);
@@ -180,7 +180,7 @@ impl<N: NodePrimitives> StateRootProvider for MemoryOverlayStateProviderRef<'_, 
         }
         
         for (address, storage) in plain_state.storages {
-            let merged_storage = merged_state.storages.entry(address).or_insert_with(HashMap::new);
+            let merged_storage = merged_state.storages.entry(address).or_insert_with(BTreeMap::new);
             merged_storage.extend(storage);
         }
         

@@ -970,6 +970,13 @@ mod tests {
         ) -> ProviderResult<(B256, TrieUpdates)> {
             Ok((B256::random(), TrieUpdates::default()))
         }
+
+        fn state_root_with_updates_triedb(
+            &self,
+            _plain_state: PlainPostState,
+        ) -> ProviderResult<(B256, TrieUpdates)> {
+            Ok((B256::random(), TrieUpdates::default()))
+        }
     }
 
     impl HashedPostStateProvider for MockStateProvider {
