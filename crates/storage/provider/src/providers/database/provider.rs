@@ -86,7 +86,7 @@ use std::{
 use tracing::{debug, info, trace};
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_trie::EMPTY_ROOT_HASH;
-use tokio::time::Instant;
+use std::time::Instant;
 use triedb::{
     account::Account as TrieDBAccount,
     path::{AddressPath, StoragePath},
