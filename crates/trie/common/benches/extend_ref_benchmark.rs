@@ -37,10 +37,10 @@
 //! - Compare "with_arc" vs "without_arc_deep_clone" for same scenario
 //! - Example: 440 µs (Arc) vs 1,357 µs (deep clone) = 3.08x speedup
 
-use alloy_primitives::map::DefaultHashBuilder;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use reth_trie_common::{updates::TrieUpdates, BranchNodeCompact, Nibbles};
 use std::{collections::HashMap, sync::Arc};
+use alloy_primitives::{map::DefaultHashBuilder, B256};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use reth_trie_common::{updates::{StorageTrieUpdates, TrieUpdates}, BranchNodeCompact, Nibbles};
 
 /// Print a comparison summary after running benchmarks.
 /// 
@@ -66,11 +66,20 @@ fn print_comparison_summary() {
 /// Creates a realistic block update with the specified number of trie nodes.
 ///
 /// Each node is wrapped in Arc to simulate the optimized implementation.
+/// 
+/// Storage tries are typically much larger than account tries in real-world scenarios,
+/// so we create multiple storage nodes per account (5x multiplier simulates realistic ratios).
 fn create_realistic_block_update(num_nodes: usize) -> TrieUpdates {
     let mut updates = TrieUpdates::default();
 
     for i in 0..num_nodes {
-        let path = Nibbles::from_nibbles(&[i as u8 % 16, (i / 16) as u8 % 16]);
+        // Create realistic 64-nibble path (32 bytes = 64 nibbles for Ethereum account hash)
+        // Distribute nibbles across the path to create realistic patterns
+        let mut nibbles = [0u8; 64];
+        for j in 0..64 {
+            nibbles[j] = ((i + j) % 16) as u8;
+        }
+        let path = Nibbles::from_nibbles(&nibbles);
 
         // Create branch node - using default (empty) for simplicity
         // In production, these would have children, but for benchmarking
@@ -78,6 +87,27 @@ fn create_realistic_block_update(num_nodes: usize) -> TrieUpdates {
         let node = BranchNodeCompact::default();
 
         updates.account_nodes.insert(path, Arc::new(node));
+        
+        // Add storage nodes (typically 5x more storage nodes than account nodes)
+        // This simulates real contracts with multiple storage slots
+        let mut storage_updates = StorageTrieUpdates::default();
+        for storage_idx in 0..5 {
+            let mut storage_nibbles = [0u8; 64];
+            for j in 0..64 {
+                storage_nibbles[j] = ((i + storage_idx * 1000 + j) % 16) as u8;
+            }
+            let storage_path = Nibbles::from_nibbles(&storage_nibbles);
+            let storage_node = BranchNodeCompact::default();
+            
+            storage_updates.storage_nodes.insert(storage_path, Arc::new(storage_node));
+        }
+        
+        // Use account hash as key for storage trie
+        let mut account_hash = [0u8; 32];
+        for j in 0..32 {
+            account_hash[j] = ((i + j) % 256) as u8;
+        }
+        updates.storage_tries.insert(B256::from(account_hash), storage_updates);
     }
 
     updates
@@ -87,15 +117,25 @@ fn create_realistic_block_update(num_nodes: usize) -> TrieUpdates {
 ///
 /// This function dereferences the Arc and clones the actual BranchNodeCompact (112 bytes),
 /// simulating the performance characteristics of the pre-optimization implementation.
+/// Handles both account nodes and storage nodes.
 fn extend_with_deep_clone(
-    target: &mut HashMap<Nibbles, Arc<BranchNodeCompact>, DefaultHashBuilder>,
-    source: &HashMap<Nibbles, Arc<BranchNodeCompact>, DefaultHashBuilder>,
+    target: &mut TrieUpdates,
+    source: &TrieUpdates,
 ) {
-    target.extend(source.iter().map(|(k, v)| {
+    // Clone account nodes
+    target.account_nodes.extend(source.account_nodes.iter().map(|(k, v)| {
         // Dereference Arc and clone the actual BranchNodeCompact (112 bytes)
         // This simulates the old behavior before Arc optimization
-        (*k, Arc::new((**v).clone()))
+        (*k, Arc::new(v.as_ref().clone()))
     }));
+    
+    // Clone storage tries (typically much larger volume)
+    for (account_hash, storage_updates) in &source.storage_tries {
+        let target_storage = target.storage_tries.entry(*account_hash).or_default();
+        target_storage.storage_nodes.extend(storage_updates.storage_nodes.iter().map(|(k, v)| {
+            (*k, Arc::new(v.as_ref().clone()))
+        }));
+    }
 }
 
 /// Benchmarks extend_ref() performance for cached block accumulation scenarios.
@@ -143,10 +183,11 @@ fn bench_extend_ref_cached_blocks(c: &mut Criterion) {
                 let block_update = create_realistic_block_update(50);
 
                 b.iter(|| {
-                    let mut accumulated = HashMap::<Nibbles, Arc<BranchNodeCompact>, DefaultHashBuilder>::default();
+                    let mut accumulated = TrieUpdates::default();
                     for _ in 0..count {
                         // Simulates old behavior: deep clone entire BranchNodeCompact (112 bytes)
-                        extend_with_deep_clone(&mut accumulated, &block_update.account_nodes);
+                        // for both account and storage nodes
+                        extend_with_deep_clone(&mut accumulated, &block_update);
                     }
                     accumulated
                 });
@@ -195,11 +236,12 @@ fn bench_single_extend_ref(c: &mut Criterion) {
             node_count,
             |b, &count| {
                 let source = create_realistic_block_update(count);
-                let mut target = HashMap::<Nibbles, Arc<BranchNodeCompact>, DefaultHashBuilder>::default();
+                let mut target = TrieUpdates::default();
 
                 b.iter(|| {
-                    target.clear();
-                    extend_with_deep_clone(&mut target, &source.account_nodes);
+                    target.account_nodes.clear();
+                    target.storage_tries.clear();
+                    extend_with_deep_clone(&mut target, &source);
                 });
             },
         );

@@ -798,7 +798,7 @@ pub mod serde_bincode_compat {
         fn from(value: &'a super::TrieUpdates) -> Self {
             Self {
                 account_nodes: Cow::Owned(
-                    value.account_nodes.iter().map(|(k, v)| (*k, (**v).clone())).collect()
+                    value.account_nodes.iter().map(|(k, v)| (*k, v.as_ref().clone())).collect()
                 ),
                 removed_nodes: Cow::Borrowed(&value.removed_nodes),
                 storage_tries: value.storage_tries.iter().map(|(k, v)| (*k, v.into())).collect(),
@@ -865,7 +865,7 @@ pub mod serde_bincode_compat {
             Self {
                 is_deleted: value.is_deleted,
                 storage_nodes: Cow::Owned(
-                    value.storage_nodes.iter().map(|(k, v)| (*k, (**v).clone())).collect()
+                    value.storage_nodes.iter().map(|(k, v)| (*k, v.as_ref().clone())).collect()
                 ),
                 removed_nodes: Cow::Borrowed(&value.removed_nodes),
             }

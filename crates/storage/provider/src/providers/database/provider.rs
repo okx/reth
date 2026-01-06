@@ -1,3 +1,8 @@
+use tokio::time::Instant;
+use triedb::{
+    account::Account as TrieDBAccount,
+    path::{AddressPath, StoragePath},
+};
 use crate::{
     changesets_utils::{
         storage_trie_wiped_changeset_iter, StorageRevertsIter, StorageTrieCurrentValuesIter,
@@ -86,11 +91,7 @@ use std::{
 use tracing::{debug, info, trace};
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_trie::EMPTY_ROOT_HASH;
-use std::time::Instant;
-use triedb::{
-    account::Account as TrieDBAccount,
-    path::{AddressPath, StoragePath},
-};
+
 
 /// A [`DatabaseProvider`] that holds a read-only database transaction.
 pub type DatabaseProviderRO<DB, N> = DatabaseProvider<<DB as Database>::TX, N>;
@@ -3505,7 +3506,7 @@ mod tests {
 
         // Create account trie updates: one Some (update) and one None (removal)
         let account_nodes = vec![
-            (account_nibbles1, Some(Arc::new(node1.clone()))), // This will update existing node
+            (account_nibbles1, Some(&node1)), // This will update existing node
             (account_nibbles2, None),                // This will be a removal (no existing node)
         ];
 
@@ -3814,11 +3815,14 @@ mod tests {
 
         let overlay = TrieUpdatesSorted::new(overlay_account_nodes, overlay_storage_tries);
 
+        let storage_node_1 = Arc::new(storage_node1.clone());
+        let storage_node_2 = Arc::new(storage_node2.clone());
+
         // Normal storage trie: one Some (update) and one None (new)
         let storage_trie1 = StorageTrieUpdatesSorted {
             is_deleted: false,
             storage_nodes: vec![
-                (storage_nibbles1, Some(Arc::new(storage_node1.clone()))), // This will update overlay node
+                (storage_nibbles1, Some(Arc::new(storage_node1))), // This will update overlay node
                 (storage_nibbles2, None),                        // This is a new node
             ],
         };
@@ -3827,8 +3831,8 @@ mod tests {
         let storage_trie2 = StorageTrieUpdatesSorted {
             is_deleted: true,
             storage_nodes: vec![
-                (storage_nibbles1, Some(Arc::new(storage_node1.clone()))), // Updated node from overlay
-                (storage_nibbles2, Some(Arc::new(storage_node2.clone()))), /* Updated node not in overlay
+                (storage_nibbles1, Some(Arc::new(storage_node1))), // Updated node from overlay
+                (storage_nibbles2, Some(Arc::new(storage_node2))), /* Updated node not in overlay
                                                                   * storage_nibbles3 is in
                                                                   * overlay
                                                                   * but not updated */

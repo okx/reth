@@ -1,9 +1,9 @@
+use std::sync::Arc;
 use super::{TrieCursor, TrieCursorFactory};
 use crate::{forward_cursor::ForwardInMemoryCursor, updates::TrieUpdatesSorted};
 use alloy_primitives::B256;
 use reth_storage_errors::db::DatabaseError;
 use reth_trie_common::{BranchNodeCompact, Nibbles};
-use std::sync::Arc;
 
 /// The trie cursor factory for the trie updates.
 #[derive(Debug, Clone)]
@@ -170,7 +170,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
                 {
                     // If overlay returns a node prior to the DB's node, or the DB is exhausted,
                     // then we return the overlay's node. Clone the Arc to get the actual node.
-                    return Ok(Some((mem_key, (*node).clone())))
+                    return Ok(Some((mem_key, node.as_ref().clone())))
                 }
                 // All other cases:
                 // - mem_key > db_key
@@ -197,7 +197,7 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
 
         let entry = match (mem_entry, &self.cursor_entry) {
             (Some((mem_key, entry_inner)), _) if mem_key == key => {
-                entry_inner.as_ref().map(|node| (key, (**node).clone()))
+                entry_inner.as_ref().map(|node| (key, node.as_ref().clone()))
             }
             (_, Some((db_key, node))) if db_key == &key => Some((key, node.clone())),
             _ => None,
