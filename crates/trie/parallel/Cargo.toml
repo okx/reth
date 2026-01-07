@@ -46,6 +46,8 @@ reth-primitives-traits.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-trie-db.workspace = true
 reth-trie = { workspace = true, features = ["test-utils"] }
+reth-db.workspace = true
+reth-db-common.workspace = true
 
 # misc
 rand.workspace = true
@@ -68,4 +70,8 @@ test-utils = [
 
 [[bench]]
 name = "root"
+harness = false
+
+[[bench]]
+name = "proof_generation"
 harness = false
