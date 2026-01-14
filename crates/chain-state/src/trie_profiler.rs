@@ -229,7 +229,13 @@ impl TrieProfiler {
         trie_updates: &reth_trie::updates::TrieUpdates,
     ) -> BlockTrieStats {
         let account_nodes_count = trie_updates.account_nodes.len();
+<<<<<<< Updated upstream
         let storage_nodes_count: usize = trie_updates.storage_tries.values().map(|st| st.storage_nodes.len()).sum();
+=======
+        let storage_nodes_count: usize = trie_updates.storage_tries.values()
+            .map(|trie| trie.storage_nodes.len())
+            .sum();
+>>>>>>> Stashed changes
 
         // Estimate memory size: BranchNodeCompact is roughly 96-128 bytes
         // We'll use 112 bytes as average (state_mask=32b, tree_mask=32b, hash_mask=32b, 
