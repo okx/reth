@@ -1,0 +1,166 @@
+   Compiling reth-trie-common v1.9.2 (/Users/lakshmikanth/Documents/xlayer/reth/crates/trie/common)
+warning: missing documentation for the crate
+   --> crates/trie/common/benches/extend_ref_benchmark.rs:1:1
+    |
+1   | / use alloy_primitives::map::DefaultHashBuilder;
+2   | | use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+3   | | use reth_trie_common::{updates::TrieUpdates, BranchNodeCompact, Nibbles};
+4   | | use std::{collections::HashMap, sync::Arc};
+...   |
+117 | | criterion_group!(benches, bench_extend_ref_cached_blocks, bench_single_extend_ref);
+118 | | criterion_main!(benches);
+    | |_________________________^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for a function
+   --> crates/trie/common/benches/extend_ref_benchmark.rs:117:1
+    |
+117 | criterion_group!(benches, bench_extend_ref_cached_blocks, bench_single_extend_ref);
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this warning originates in the macro `$crate::criterion_group` which comes from the expansion of the macro `criterion_group` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `reth-trie-common` (bench "extend_ref_benchmark") generated 2 warnings
+    Finished `bench` profile [optimized + debuginfo] target(s) in 8.68s
+     Running benches/extend_ref_benchmark.rs (/Users/lakshmikanth/Documents/xlayer/reth/target/release/deps/extend_ref_benchmark-5292950fdb48b5c7)
+Gnuplot not found, using plotters backend
+Benchmarking extend_ref_accumulation/with_arc/256
+Benchmarking extend_ref_accumulation/with_arc/256: Warming up for 3.0000 s
+Benchmarking extend_ref_accumulation/with_arc/256: Collecting 100 samples in estimated 5.0483 s (45k iterations)
+Benchmarking extend_ref_accumulation/with_arc/256: Analyzing
+extend_ref_accumulation/with_arc/256
+                        time:   [112.23 µs 114.17 µs 116.89 µs]
+Found 12 outliers among 100 measurements (12.00%)
+  5 (5.00%) high mild
+  7 (7.00%) high severe
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/256
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/256: Warming up for 3.0000 s
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/256: Collecting 100 samples in estimated 5.0646 s (15k iterations)
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/256: Analyzing
+extend_ref_accumulation/without_arc_deep_clone/256
+                        time:   [332.08 µs 342.39 µs 360.40 µs]
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+Benchmarking extend_ref_accumulation/with_arc/512
+Benchmarking extend_ref_accumulation/with_arc/512: Warming up for 3.0000 s
+Benchmarking extend_ref_accumulation/with_arc/512: Collecting 100 samples in estimated 5.7557 s (25k iterations)
+Benchmarking extend_ref_accumulation/with_arc/512: Analyzing
+extend_ref_accumulation/with_arc/512
+                        time:   [221.38 µs 222.92 µs 224.88 µs]
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/512
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/512: Warming up for 3.0000 s
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/512: Collecting 100 samples in estimated 6.8235 s (10k iterations)
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/512: Analyzing
+extend_ref_accumulation/without_arc_deep_clone/512
+                        time:   [660.71 µs 665.45 µs 671.01 µs]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking extend_ref_accumulation/with_arc/1024
+Benchmarking extend_ref_accumulation/with_arc/1024: Warming up for 3.0000 s
+Benchmarking extend_ref_accumulation/with_arc/1024: Collecting 100 samples in estimated 6.9017 s (15k iterations)
+Benchmarking extend_ref_accumulation/with_arc/1024: Analyzing
+extend_ref_accumulation/with_arc/1024
+                        time:   [440.70 µs 442.98 µs 445.78 µs]
+Found 8 outliers among 100 measurements (8.00%)
+  6 (6.00%) high mild
+  2 (2.00%) high severe
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/1024
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/1024: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 7.0s, enable flat sampling, or reduce sample count to 50.
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/1024: Collecting 100 samples in estimated 7.0373 s (5050 iterations)
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/1024: Analyzing
+extend_ref_accumulation/without_arc_deep_clone/1024
+                        time:   [1.3291 ms 1.3571 ms 1.4011 ms]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+Benchmarking extend_ref_accumulation/with_arc/2048
+Benchmarking extend_ref_accumulation/with_arc/2048: Warming up for 3.0000 s
+Benchmarking extend_ref_accumulation/with_arc/2048: Collecting 100 samples in estimated 9.2432 s (10k iterations)
+Benchmarking extend_ref_accumulation/with_arc/2048: Analyzing
+extend_ref_accumulation/with_arc/2048
+                        time:   [886.63 µs 901.58 µs 921.73 µs]
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) high mild
+  5 (5.00%) high severe
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/2048
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/2048: Warming up for 3.0000 s
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/2048: Collecting 100 samples in estimated 5.0367 s (1900 iterations)
+Benchmarking extend_ref_accumulation/without_arc_deep_clone/2048: Analyzing
+extend_ref_accumulation/without_arc_deep_clone/2048
+                        time:   [2.5869 ms 2.6012 ms 2.6175 ms]
+Found 14 outliers among 100 measurements (14.00%)
+  8 (8.00%) high mild
+  6 (6.00%) high severe
+
+Benchmarking extend_ref_single_call/with_arc/10
+Benchmarking extend_ref_single_call/with_arc/10: Warming up for 3.0000 s
+Benchmarking extend_ref_single_call/with_arc/10: Collecting 100 samples in estimated 5.0001 s (44M iterations)
+Benchmarking extend_ref_single_call/with_arc/10: Analyzing
+extend_ref_single_call/with_arc/10
+                        time:   [107.25 ns 108.98 ns 110.91 ns]
+Found 9 outliers among 100 measurements (9.00%)
+  5 (5.00%) high mild
+  4 (4.00%) high severe
+Benchmarking extend_ref_single_call/without_arc_deep_clone/10
+Benchmarking extend_ref_single_call/without_arc_deep_clone/10: Warming up for 3.0000 s
+Benchmarking extend_ref_single_call/without_arc_deep_clone/10: Collecting 100 samples in estimated 5.0010 s (12M iterations)
+Benchmarking extend_ref_single_call/without_arc_deep_clone/10: Analyzing
+extend_ref_single_call/without_arc_deep_clone/10
+                        time:   [410.77 ns 413.05 ns 415.41 ns]
+Benchmarking extend_ref_single_call/with_arc/50
+Benchmarking extend_ref_single_call/with_arc/50: Warming up for 3.0000 s
+Benchmarking extend_ref_single_call/with_arc/50: Collecting 100 samples in estimated 5.0015 s (10M iterations)
+Benchmarking extend_ref_single_call/with_arc/50: Analyzing
+extend_ref_single_call/with_arc/50
+                        time:   [459.45 ns 462.74 ns 466.48 ns]
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+Benchmarking extend_ref_single_call/without_arc_deep_clone/50
+Benchmarking extend_ref_single_call/without_arc_deep_clone/50: Warming up for 3.0000 s
+Benchmarking extend_ref_single_call/without_arc_deep_clone/50: Collecting 100 samples in estimated 5.0053 s (2.2M iterations)
+Benchmarking extend_ref_single_call/without_arc_deep_clone/50: Analyzing
+extend_ref_single_call/without_arc_deep_clone/50
+                        time:   [2.1876 µs 2.3070 µs 2.4738 µs]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+Benchmarking extend_ref_single_call/with_arc/100
+Benchmarking extend_ref_single_call/with_arc/100: Warming up for 3.0000 s
+Benchmarking extend_ref_single_call/with_arc/100: Collecting 100 samples in estimated 5.0013 s (5.2M iterations)
+Benchmarking extend_ref_single_call/with_arc/100: Analyzing
+extend_ref_single_call/with_arc/100
+                        time:   [913.35 ns 918.98 ns 924.90 ns]
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+Benchmarking extend_ref_single_call/without_arc_deep_clone/100
+Benchmarking extend_ref_single_call/without_arc_deep_clone/100: Warming up for 3.0000 s
+Benchmarking extend_ref_single_call/without_arc_deep_clone/100: Collecting 100 samples in estimated 5.0107 s (1.1M iterations)
+Benchmarking extend_ref_single_call/without_arc_deep_clone/100: Analyzing
+extend_ref_single_call/without_arc_deep_clone/100
+                        time:   [4.4268 µs 4.4510 µs 4.4757 µs]
+Benchmarking extend_ref_single_call/with_arc/200
+Benchmarking extend_ref_single_call/with_arc/200: Warming up for 3.0000 s
+Benchmarking extend_ref_single_call/with_arc/200: Collecting 100 samples in estimated 5.0006 s (2.6M iterations)
+Benchmarking extend_ref_single_call/with_arc/200: Analyzing
+extend_ref_single_call/with_arc/200
+                        time:   [1.8299 µs 1.8403 µs 1.8515 µs]
+Found 8 outliers among 100 measurements (8.00%)
+  1 (1.00%) high mild
+  7 (7.00%) high severe
+Benchmarking extend_ref_single_call/without_arc_deep_clone/200
+Benchmarking extend_ref_single_call/without_arc_deep_clone/200: Warming up for 3.0000 s
+Benchmarking extend_ref_single_call/without_arc_deep_clone/200: Collecting 100 samples in estimated 5.0178 s (540k iterations)
+Benchmarking extend_ref_single_call/without_arc_deep_clone/200: Analyzing
+extend_ref_single_call/without_arc_deep_clone/200
+                        time:   [8.9423 µs 8.9788 µs 9.0170 µs]
+Found 12 outliers among 100 measurements (12.00%)
+  3 (3.00%) high mild
+  9 (9.00%) high severe
+
