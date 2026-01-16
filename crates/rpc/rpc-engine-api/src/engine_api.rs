@@ -19,6 +19,7 @@ use jsonrpsee_core::{server::RpcModule, RpcResult};
 use parking_lot::Mutex;
 use reth_chainspec::EthereumHardforks;
 use reth_engine_primitives::{ConsensusEngineHandle, EngineApiValidator, EngineTypes};
+use reth_monitor::{get_global_tracer, TransactionProcessId};
 use reth_payload_builder::PayloadStore;
 use reth_payload_primitives::{
     validate_payload_timestamp, EngineApiMessageVersion, ExecutionPayload, PayloadOrAttributes,
@@ -196,6 +197,13 @@ where
         &self,
         payload: PayloadT::ExecutionData,
     ) -> EngineApiResult<PayloadStatus> {
+        // X Layer: Log block send start
+        let block_hash = payload.block_hash();
+        let block_number = payload.block_number();
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_block(block_hash, block_number, TransactionProcessId::SeqBlockSendStart);
+        }
+
         let start = Instant::now();
         let gas_used = payload.gas_used();
 
@@ -233,6 +241,13 @@ where
         &self,
         payload: PayloadT::ExecutionData,
     ) -> RpcResult<PayloadStatus> {
+        // X Layer: Log block send start
+        let block_hash = payload.block_hash();
+        let block_number = payload.block_number();
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_block(block_hash, block_number, TransactionProcessId::SeqBlockSendStart);
+        }
+
         let start = Instant::now();
         let gas_used = payload.gas_used();
 

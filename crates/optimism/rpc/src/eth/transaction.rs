@@ -6,6 +6,7 @@ use alloy_rpc_types_eth::TransactionInfo;
 use futures::StreamExt;
 use op_alloy_consensus::{transaction::OpTransactionInfo, OpTransaction};
 use reth_chain_state::CanonStateSubscriptions;
+use reth_monitor::{get_global_tracer, TransactionProcessId};
 use reth_optimism_primitives::DepositReceipt;
 use reth_primitives_traits::{BlockBody, SignedTransaction, SignerRecoverable};
 use reth_rpc_eth_api::{
@@ -54,8 +55,15 @@ where
         // blocks that it builds.
         if let Some(client) = self.raw_tx_forwarder().as_ref() {
             tracing::debug!(target: "rpc::eth", hash = %pool_transaction.hash(), "forwarding raw transaction to sequencer");
+            let tx_hash = *pool_transaction.hash();
+
+            // X Layer: Log RPC receive end
+            if let Some(tracer) = get_global_tracer() {
+                tracer.log_transaction(tx_hash, TransactionProcessId::RpcReceiveTxEnd, None);
+            }
+
             let hash = client.forward_raw_transaction(&tx).await.inspect_err(|err| {
-                    tracing::debug!(target: "rpc::eth", %err, hash=% *pool_transaction.hash(), "failed to forward raw transaction");
+                    tracing::debug!(target: "rpc::eth", %err, hash=%tx_hash, "failed to forward raw transaction");
                 })?;
 
             // Retain tx in local tx pool after forwarding, for local RPC usage.
@@ -67,11 +75,17 @@ where
         }
 
         // submit the transaction to the pool with a `Local` origin
+        let tx_hash = *pool_transaction.hash();
         let AddedTransactionOutcome { hash, .. } = self
             .pool()
             .add_transaction(TransactionOrigin::Local, pool_transaction)
             .await
             .map_err(Self::Error::from_eth_err)?;
+
+        // X Layer: Log sequencer receive end
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_transaction(tx_hash, TransactionProcessId::SeqReceiveTxEnd, None);
+        }
 
         Ok(hash)
     }

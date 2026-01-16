@@ -8167,6 +8167,7 @@ dependencies = [
  "reth-execution-types",
  "reth-exex-types",
  "reth-metrics",
+ "reth-monitor",
  "reth-network-p2p",
  "reth-node-ethereum",
  "reth-payload-builder",
@@ -8809,6 +8810,14 @@ dependencies = [
  "metrics-derive",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "reth-monitor"
+version = "1.9.3"
+dependencies = [
+ "alloy-primitives",
+ "tracing",
 ]
 
 [[package]]
@@ -9571,6 +9580,7 @@ dependencies = [
  "reth-chainspec",
  "reth-evm",
  "reth-execution-types",
+ "reth-monitor",
  "reth-optimism-evm",
  "reth-optimism-forks",
  "reth-optimism-primitives",
@@ -9652,6 +9662,7 @@ dependencies = [
  "reth-chainspec",
  "reth-evm",
  "reth-metrics",
+ "reth-monitor",
  "reth-node-api",
  "reth-node-builder",
  "reth-optimism-chainspec",
@@ -10275,6 +10286,7 @@ dependencies = [
  "reth-ethereum-engine-primitives",
  "reth-ethereum-primitives",
  "reth-metrics",
+ "reth-monitor",
  "reth-node-ethereum",
  "reth-payload-builder",
  "reth-payload-builder-primitives",
