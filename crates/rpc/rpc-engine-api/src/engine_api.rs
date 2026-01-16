@@ -241,6 +241,13 @@ where
         &self,
         payload: PayloadT::ExecutionData,
     ) -> RpcResult<PayloadStatus> {
+        // X Layer: Log block send start
+        let block_hash = payload.block_hash();
+        let block_number = payload.block_number();
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_block(block_hash, block_number, TransactionProcessId::SeqBlockSendStart);
+        }
+
         let start = Instant::now();
         let gas_used = payload.gas_used();
 
