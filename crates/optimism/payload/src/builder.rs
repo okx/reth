@@ -712,10 +712,13 @@ where
         let block_da_limit = self.builder_config.da_config.max_da_block_size();
         let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
         let base_fee = builder.evm_mut().block().basefee();
+        let block_number: u64 = builder.evm_mut().block().number().saturating_to();
 
         while let Some(tx) = best_txs.next(()) {
             let interop = tx.interop_deadline();
             let tx_da_size = tx.estimated_da_size();
+            // X Layer: Get transaction hash before converting to consensus
+            let tx_hash = *tx.hash();
             let tx = tx.into_consensus();
 
             let da_footprint_gas_scalar = self
@@ -762,11 +765,29 @@ where
             }
 
             let gas_used = match builder.execute_transaction(tx.clone()) {
-                Ok(gas_used) => gas_used,
+                Ok(gas_used) => {
+                    // X Layer: Log transaction execution end (success)
+                    if let Some(tracer) = get_global_tracer() {
+                        tracer.log_transaction(
+                            tx_hash,
+                            TransactionProcessId::SeqTxExecutionEnd,
+                            Some(block_number),
+                        );
+                    }
+                    gas_used
+                }
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
                     ..
                 })) => {
+                    // X Layer: Log transaction execution end (failed)
+                    if let Some(tracer) = get_global_tracer() {
+                        tracer.log_transaction(
+                            tx_hash,
+                            TransactionProcessId::SeqTxExecutionEnd,
+                            Some(block_number),
+                        );
+                    }
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
                         trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
@@ -779,6 +800,14 @@ where
                     continue
                 }
                 Err(err) => {
+                    // X Layer: Log transaction execution end (fatal error)
+                    if let Some(tracer) = get_global_tracer() {
+                        tracer.log_transaction(
+                            tx_hash,
+                            TransactionProcessId::SeqTxExecutionEnd,
+                            Some(block_number),
+                        );
+                    }
                     // this is an error that we should treat as fatal for this attempt
                     return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)))
                 }
