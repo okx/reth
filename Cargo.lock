@@ -8812,6 +8812,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-monitor"
+version = "1.9.3"
+dependencies = [
+ "alloy-primitives",
+ "tracing",
+]
+
+[[package]]
 name = "reth-net-banlist"
 version = "1.9.3"
 dependencies = [
