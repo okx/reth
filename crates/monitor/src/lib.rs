@@ -152,14 +152,18 @@ pub struct TransactionTracer {
 impl TransactionTracer {
     /// Create a new transaction tracer
     pub fn new(enabled: bool, output_path: Option<PathBuf>, node_type: NodeType) -> Self {
-        let output_file = if let Some(ref path) = output_path {
-            let file_path = if path.to_string_lossy().ends_with('/') ||
-                path.to_string_lossy().ends_with('\\') ||
-                (path.extension().is_none() && !path.exists())
+        // Default path if not specified: /data/logs/trace.log
+        let default_path = PathBuf::from("/data/logs/trace.log");
+        let final_path = output_path.unwrap_or(default_path);
+
+        let output_file = {
+            let file_path = if final_path.to_string_lossy().ends_with('/') ||
+                final_path.to_string_lossy().ends_with('\\') ||
+                (final_path.extension().is_none() && !final_path.exists())
             {
-                path.join("trace.log")
+                final_path.join("trace.log")
             } else {
-                path.clone()
+                final_path.clone()
             };
 
             // Create parent directories if they don't exist
@@ -193,14 +197,12 @@ impl TransactionTracer {
                     None
                 }
             }
-        } else {
-            None
         };
 
         Self {
             inner: Arc::new(TransactionTracerInner {
                 enabled,
-                output_path: output_path.clone(),
+                output_path: Some(final_path),
                 output_file: Mutex::new(output_file),
                 node_type,
                 write_count: AtomicU64::new(0),

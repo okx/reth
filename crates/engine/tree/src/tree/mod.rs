@@ -23,6 +23,7 @@ use reth_engine_primitives::{
 };
 use reth_errors::{ConsensusError, ProviderResult};
 use reth_evm::{ConfigureEvm, OnStateHook};
+use reth_monitor::{get_global_tracer, TransactionProcessId};
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{
     BuiltPayload, EngineApiMessageVersion, NewPayloadError, PayloadBuilderAttributes, PayloadTypes,
@@ -542,6 +543,13 @@ where
         self.emit_event(EngineApiEvent::BeaconConsensus(engine_event));
 
         let block_hash = num_hash.hash;
+        let block_number = payload.block_number();
+
+        // X Layer: Log block receive end (record immediately after receiving the block,
+        // before processing/insertion starts, to ensure correct timestamp ordering)
+        if let Some(tracer) = get_global_tracer() {
+            tracer.log_block(block_hash, block_number, TransactionProcessId::RpcBlockReceiveEnd);
+        }
 
         // Check for invalid ancestors
         if let Some(invalid) = self.find_invalid_ancestor(&payload) {
@@ -2504,11 +2512,22 @@ where
         // emit insert event
         let elapsed = start.elapsed();
         let engine_event = if is_fork {
-            ConsensusEngineEvent::ForkBlockAdded(executed, elapsed)
+            ConsensusEngineEvent::ForkBlockAdded(executed.clone(), elapsed)
         } else {
-            ConsensusEngineEvent::CanonicalBlockAdded(executed, elapsed)
+            ConsensusEngineEvent::CanonicalBlockAdded(executed.clone(), elapsed)
         };
         self.emit_event(EngineApiEvent::BeaconConsensus(engine_event));
+
+        // X Layer: Log block insertion end
+        if let Some(tracer) = get_global_tracer() {
+            let is_canonical = !is_fork;
+
+            if is_canonical {
+                let block_hash = executed.recovered_block().hash();
+                let block_number = executed.recovered_block().number();
+                tracer.log_block(block_hash, block_number, TransactionProcessId::RpcBlockInsertEnd);
+            }
+        }
 
         self.metrics
             .engine

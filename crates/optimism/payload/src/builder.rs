@@ -20,6 +20,7 @@ use reth_evm::{
     ConfigureEvm, Database,
 };
 use reth_execution_types::ExecutionOutcome;
+use reth_monitor::{get_global_tracer, TransactionProcessId};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::{transaction::OpTransaction, ADDRESS_L2_TO_L1_MESSAGE_PASSER};
 use reth_optimism_txpool::{
@@ -40,7 +41,7 @@ use reth_revm::{
 use reth_storage_api::{errors::ProviderError, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use revm::context::{Block, BlockEnv};
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::SystemTime};
 use tracing::{debug, trace, warn};
 
 /// Optimism's payload builder
@@ -338,6 +339,10 @@ impl<Txs> OpBuilder<'_, Txs> {
         let Self { best } = self;
         debug!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
 
+        // X Layer: Save block build start timestamp
+        let build_start_timestamp =
+            SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+
         let mut db = State::builder().with_database(db).with_bundle_update().build();
 
         // Load the L1 block contract into the database cache. If the L1 block contract is not
@@ -395,6 +400,22 @@ impl<Txs> OpBuilder<'_, Txs> {
 
         let payload =
             OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed));
+
+        // X Layer: Log block build start and end
+        let block_hash = payload.block().hash();
+        let block_number = payload.block().number();
+        if let Some(tracer) = get_global_tracer() {
+            // Log block build start using saved timestamp (now we have the block hash)
+            tracer.log_block_with_timestamp(
+                block_hash,
+                block_number,
+                TransactionProcessId::SeqBlockBuildStart,
+                build_start_timestamp,
+            );
+
+            // Log block build end
+            tracer.log_block(block_hash, block_number, TransactionProcessId::SeqBlockBuildEnd);
+        }
 
         if no_tx_pool {
             // if `no_tx_pool` is set only transactions from the payload attributes will be included
