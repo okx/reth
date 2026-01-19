@@ -79,6 +79,7 @@ impl EngineApiMetrics {
         let mut senders = Vec::with_capacity(transaction_count);
         let mut executor = executor.with_state_hook(Some(Box::new(wrapper)));
 
+        // Closure that executes the block with detailed metrics (from v1.10.0)
         let f = || {
             let start = Instant::now();
             debug_span!(target: "engine::tree", "pre execution")
@@ -100,7 +101,7 @@ impl EngineApiMetrics {
                 let enter = span.entered();
                 trace!(target: "engine::tree", "Executing transaction");
                 let start = Instant::now();
-                let gas_used = executor.execute_transaction(tx)?;
+                let gas_used = executor.execute_transaction(&tx)?;
                 self.executor.transaction_execution_histogram.record(start.elapsed());
 
                 // record the tx gas used
@@ -118,28 +119,9 @@ impl EngineApiMetrics {
             result
         };
 
-        // X Layer: Collect all transactions into a reusable vector
-        let transactions: Vec<_> = transactions.collect::<Result<Vec<_>, _>>()?;
         // Use metered to execute and track timing/gas metrics
         let (mut db, result) = self.metered(|| {
-            let res = (|| -> Result<_, BlockExecutionError> {
-                executor.apply_pre_execution_changes()?;
-
-                // First pass: execute all transactions
-                for tx in &transactions {
-                    let span =
-                        debug_span!(target: "engine::tree", "execute_tx", tx_hash=?tx.tx().tx_hash());
-                    let _enter = span.enter();
-                    trace!(target: "engine::tree", "Executing transaction");
-                    executor.execute_transaction(tx)?;
-                }
-
-                // State commit
-                let (db, result) = executor.finish().map(|(evm, result)| (evm.into_db(), result))?;
-
-                Ok((db, result))
-            })();
-
+            let res = f();
             let gas_used = res.as_ref().map(|r| r.1.gas_used).unwrap_or(0);
             (gas_used, res)
         })?;

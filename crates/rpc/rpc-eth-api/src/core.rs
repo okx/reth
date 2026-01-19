@@ -604,7 +604,8 @@ where
             EthTransactions::transaction_by_hash(self, hash)
                 .await?
                 .map(|tx| tx.into_transaction(self.converter()))
-                .transpose()?,
+                .transpose()
+                .map_err(T::Error::from)?,
             self.legacy_rpc_client().unwrap().get_transaction_by_hash(hash)
         )
     }

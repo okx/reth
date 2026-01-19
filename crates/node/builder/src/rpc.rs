@@ -393,7 +393,11 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> RpcHandle<Node, EthApi> {
     ) -> &EventSender<ConsensusEngineEvent<<Node::Types as NodeTypes>::Primitives>> {
         &self.engine_events
     }
+}
 
+impl<Node: FullNodeComponents, EthApi: EthApiTypes + reth_rpc_eth_api::helpers::LegacyRpc>
+    RpcHandle<Node, EthApi>
+{
     /// Returns the `EthApi` instance of the rpc server.
     pub const fn eth_api(&self) -> &EthApi {
         self.rpc_registry.registry.eth_api()

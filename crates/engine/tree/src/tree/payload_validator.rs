@@ -632,14 +632,14 @@ where
             .without_state_clear()
             .build();
 
-        let spec_id = *env.evm_env.spec_id();
+        // XLayer: Create TraceCollector for extracting internal transactions
         let mut inspector = TraceCollector::default();
+        let spec_id = *env.evm_env.spec_id();
         let evm = self.evm_config.evm_with_env_and_inspector(
             &mut db,
             env.evm_env.clone(),
             &mut inspector,
         );
-
         let ctx =
             self.execution_ctx_for(input).map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
         let mut executor = self.evm_config.create_executor(evm, ctx);
@@ -663,6 +663,7 @@ where
 
         let execution_start = Instant::now();
         let state_hook = Box::new(handle.state_hook());
+        // XLayer: Collect tx hashes and gas limits for internal transaction tracking
         let mut tx_hashes = Vec::<TxHash>::default();
         let mut tx_gas_limits = Vec::<u64>::default();
         let (output, senders) = self.metrics.execute_metered(

@@ -11,9 +11,6 @@ use reth_provider::{
 use reth_prune_types::{
     PruneCheckpoint, PruneMode, PruneSegment, MERKLE_CHANGESETS_RETENTION_BLOCKS,
 };
-use reth_prune_types::{
-    PruneCheckpoint, PruneMode, PruneSegment, MERKLE_CHANGESETS_RETENTION_BLOCKS,
-};
 
 use reth_stages_api::{
     BlockErrorKind, ExecInput, ExecOutput, Stage, StageCheckpoint, StageError, StageId,

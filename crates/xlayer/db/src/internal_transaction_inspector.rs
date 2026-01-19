@@ -1,57 +1,108 @@
+//! XLayer Internal Transaction Inspector
+//!
+//! This module provides `TraceCollector`, an EVM inspector that traces internal transactions
+//! (CALL, CREATE, SELFDESTRUCT operations) during EVM execution.
+//!
+//! # Implementation Note
+//!
+//! Due to Rust's type system limitations (lack of specialization), `TraceCollector` provides
+//! a generic `Inspector` implementation. For `CallInput::SharedBuffer`, the implementation
+//! uses `ContextTr::local().shared_memory_buffer_slice()` when the context implements `ContextTr`.
+//!
+//! In practice, all EVM contexts in reth (including `OpContext`) implement `ContextTr`,
+//! so the shared memory buffer is always accessible correctly.
+
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
+use std::{cell::Ref, cmp::Ordering};
 
 use crate::utils;
 use alloy_primitives::{Address, Bytes, U256};
 
 use reth_revm::{
+    context_interface::{ContextTr, LocalContextTr},
     interpreter::{
         interpreter::EthInterpreter, CallInput, CallInputs, CallOutcome, CreateInputs,
         CreateOutcome, InstructionResult,
     },
     Inspector,
 };
-use revm_context_interface::{ContextTr, LocalContextTr};
 
+/// Represents a single internal transaction within an EVM execution.
+///
+/// Internal transactions include CALL, CALLCODE, DELEGATECALL, STATICCALL,
+/// CREATE, CREATE2, and SELFDESTRUCT operations.
 #[derive(Debug, Clone, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
 pub struct InternalTransaction {
+    /// Call depth (0 = top-level call)
     dept: u64,
+    /// Index within the current depth level
     internal_index: u64,
+    /// Type of call (call, callcode, delegatecall, staticcall, create, create2, selfdestruct)
     call_type: String,
+    /// Unique name combining call type and trace path (e.g., "call_0_1")
     name: String,
+    /// For delegatecall, stores the original caller address
     trace_address: String,
+    /// For callcode, stores the code address
     code_address: String,
+    /// Caller address
     from: String,
+    /// Target address (or created contract address for CREATE)
     to: String,
+    /// Call input data
     input: Bytes,
+    /// Call output data
     output: Bytes,
+    /// Whether the call reverted or failed
     is_error: bool,
+    /// Gas limit for this call
     gas: u64,
+    /// Actual gas consumed
     gas_used: u64,
+    /// Value transferred (legacy format)
     value: String,
+    /// Value transferred in wei (decimal string)
     value_wei: String,
+    /// Value transferred in wei (hex format)
     call_value_wei: String,
+    /// Error message if the call failed
     error: String,
 }
 
 impl InternalTransaction {
+    /// Sets the gas limit and gas used for the transaction.
     pub fn set_transaction_gas(&mut self, gas_limit: u64, gas_used: u64) {
         self.gas = gas_limit;
         self.gas_used = gas_used;
     }
 }
 
+/// `TraceCollector` is an EVM inspector that collects internal transaction traces.
+///
+/// It records all CALL, CREATE, and SELFDESTRUCT operations during EVM execution,
+/// building a tree of internal transactions that can be used for debugging,
+/// analytics, or indexing purposes.
+///
+/// # XLayer Feature
+///
+/// This inspector is part of XLayer's internal transaction tracking functionality.
+/// It can be enabled/disabled via the `is_inner_tx_enabled()` configuration.
 #[derive(Debug, Clone)]
 pub struct TraceCollector {
+    /// Whether tracing is enabled
     enabled: bool,
+    /// All completed transaction traces (one per top-level tx)
     all_traces: Vec<Vec<InternalTransaction>>,
+    /// Current transaction's traces being built
     traces: Vec<InternalTransaction>,
-    // depth
+    /// Current call path (indices at each depth level)
     current_path: Vec<usize>,
-    // internal_index
+    /// Last observed depth (for sibling tracking)
     last_depth: usize,
+    /// Count of siblings at each depth level
     sibling_count: Vec<usize>,
+    /// Stack of trace indices (for matching call/call_end)
     trace_stack: Vec<usize>,
 }
 
@@ -75,6 +126,26 @@ impl TraceCollector {
         }
     }
 
+    /// Create a new `TraceCollector` with an explicit enabled state.
+    pub fn with_enabled(enabled: bool) -> Self {
+        Self {
+            enabled,
+            all_traces: Vec::<Vec<InternalTransaction>>::default(),
+            traces: Vec::<InternalTransaction>::default(),
+            current_path: Vec::<usize>::default(),
+            last_depth: 0,
+            sibling_count: vec![0],
+            trace_stack: Vec::<usize>::default(),
+        }
+    }
+
+    /// Returns whether this collector is enabled.
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Formats an EVM instruction result into a human-readable error message.
     fn format_error(result: &InstructionResult) -> String {
         match result {
             InstructionResult::Revert => "execution reverted".to_string(),
@@ -137,10 +208,11 @@ impl TraceCollector {
                 "created contract starts with invalid bytes 0xEF".to_string()
             }
             InstructionResult::FatalExternalError => "fatal external error".to_string(),
-            _ => format!("{:?}", result),
+            _ => format!("{result:?}"),
         }
     }
 
+    /// Initializes a new internal operation trace.
     fn init_op(
         &mut self,
         call_type: String,
@@ -162,7 +234,7 @@ impl TraceCollector {
         txn.gas = gas_limit;
         txn.value_wei = if value_wei.is_empty() { "0" } else { &value_wei }.to_string();
         txn.call_value_wei = match value_wei.parse::<u128>() {
-            Ok(value) => format!("0x{:x}", value),
+            Ok(value) => format!("0x{value:x}"),
             _ => String::from("0x0"),
         };
 
@@ -182,6 +254,7 @@ impl TraceCollector {
         self.traces.push(txn);
     }
 
+    /// Called before processing an operation to set up depth tracking.
     fn before_op(&mut self) {
         if !self.enabled {
             return;
@@ -222,6 +295,7 @@ impl TraceCollector {
         txn.name = txn.call_type.clone() + &txn.name;
     }
 
+    /// Called after processing an operation to update tracking state.
     fn after_op(&mut self) {
         if !self.enabled {
             return;
@@ -233,6 +307,9 @@ impl TraceCollector {
         }
     }
 
+    /// Returns all collected internal transaction traces.
+    ///
+    /// Each inner `Vec` represents the traces for a single top-level transaction.
     pub fn get(&mut self) -> Vec<Vec<InternalTransaction>> {
         if !self.enabled {
             return Vec::new();
@@ -240,6 +317,7 @@ impl TraceCollector {
         self.all_traces.clone()
     }
 
+    /// Resets the collector state for reuse.
     pub fn reset(&mut self) {
         self.traces.clear();
         self.current_path.clear();
@@ -247,8 +325,29 @@ impl TraceCollector {
         self.sibling_count = vec![0];
         self.trace_stack.clear();
     }
+
+    /// Extracts bytes from `CallInput` using the context to access shared memory.
+    ///
+    /// This method properly handles `SharedBuffer` by reading from the shared memory buffer
+    /// via `ContextTr::local().shared_memory_buffer_slice()`.
+    #[inline]
+    fn extract_call_input<CTX: ContextTr>(ctx: &CTX, input: &CallInput) -> Bytes {
+        match input {
+            CallInput::Bytes(b) => b.clone(),
+            CallInput::SharedBuffer(range) => ctx
+                .local()
+                .shared_memory_buffer_slice(range.clone())
+                .map(|s: Ref<'_, [u8]>| Bytes::from(s.to_vec()))
+                .unwrap_or_default(),
+        }
+    }
 }
 
+/// Generic implementation of `Inspector` for `TraceCollector`.
+///
+/// This implementation requires `CTX: ContextTr` to properly handle `CallInput::SharedBuffer`.
+/// All EVM contexts in reth (including `OpContext`) implement `ContextTr`, so this
+/// constraint is always satisfied when used with valid EVM implementations.
 impl<CTX> Inspector<CTX, EthInterpreter> for TraceCollector
 where
     CTX: ContextTr,
@@ -265,14 +364,8 @@ where
         }
         .to_string();
 
-        let call_input = match &inputs.input {
-            CallInput::SharedBuffer(range) => ctx
-                .local()
-                .shared_memory_buffer_slice(range.clone())
-                .map(|s| Bytes::from(s.to_vec()))
-                .unwrap_or_default(),
-            CallInput::Bytes(b) => b.clone(),
-        };
+        // Properly extract call input using ContextTr
+        let call_input = Self::extract_call_input(ctx, &inputs.input);
 
         self.init_op(
             call_type,
@@ -321,7 +414,7 @@ where
         }
         let call_type = match inputs.scheme {
             reth_revm::interpreter::CreateScheme::Create => "create".to_string(),
-            reth_revm::interpreter::CreateScheme::Create2 { salt: _ } => "create2".to_string(), /* code_address */
+            reth_revm::interpreter::CreateScheme::Create2 { salt: _ } => "create2".to_string(),
             reth_revm::interpreter::CreateScheme::Custom { address: _ } => "custom".to_string(),
         };
 

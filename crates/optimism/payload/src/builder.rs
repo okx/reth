@@ -922,7 +922,7 @@ where
 /// Writes internal transactions to XLayer database for a payload builder execution.
 fn write_internal_transactions<N>(
     inspector: &mut TraceCollector,
-    executed: &ExecutedBlock<N>,
+    executed: &BuiltPayloadExecutedBlock<N>,
     block_hash: B256,
 ) -> Result<(), PayloadBuilderError>
 where
@@ -939,7 +939,7 @@ where
     })?;
 
     let mut prev_cumulative_gas = 0u64;
-    for (index, tx) in executed.recovered_block().transactions_recovered().enumerate() {
+    for (index, tx) in executed.recovered_block.transactions_recovered().enumerate() {
         let success = executed.execution_output.receipts[0][index].status();
 
         let current_cumulative_gas =

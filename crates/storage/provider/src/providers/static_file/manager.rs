@@ -367,8 +367,6 @@ pub struct StaticFileProviderInner<N> {
     blocks_per_file: StaticFileMap<u64>,
     /// Write lock for when access is [`StaticFileAccess::RW`].
     _lock_file: Option<StorageLock>,
-    /// Genesis block number, default is 0;
-    genesis_block_number: u64,
 }
 
 impl<N: NodePrimitives> StaticFileProviderInner<N> {
@@ -396,7 +394,6 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             genesis_block_number: 0,
             blocks_per_file,
             _lock_file,
-            genesis_block_number: 0,
         };
 
         Ok(provider)

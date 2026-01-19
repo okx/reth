@@ -500,9 +500,7 @@ where
             static_file_provider,
             rocksdb_provider,
         )?
-        .with_prune_modes(self.prune_modes())
-        .with_static_files_metrics()
-        .with_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default());
+        .with_prune_modes(self.prune_modes());
 
         // Keep MDBX, static files, and RocksDB aligned. If any check fails, unwind to the
         // earliest consistent block.

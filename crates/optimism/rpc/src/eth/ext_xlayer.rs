@@ -538,16 +538,11 @@ where
             Err(e) => return Err(e.into()),
         };
 
-        let api = self.eth_api.clone();
         self.eth_api
-            .spawn_with_state_at_block(at, move |state| {
-                let mut db = reth_revm::db::CacheDB::new(
-                    reth_revm::database::StateProviderDatabase::new(state),
-                );
-
+            .spawn_with_state_at_block(at, move |api, mut db| {
                 if let Some(overrides) = state_overrides {
                     if let Err(e) = apply_state_overrides(overrides, &mut db) {
-                        let res = PreExecError::unknown(format!("state override error: {:?}", e))
+                        let res = PreExecError::unknown(format!("state override error: {e:?}"))
                             .into_result(0, evm_env.block_env.number());
                         return Ok(vec![res]);
                     }

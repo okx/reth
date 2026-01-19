@@ -3,7 +3,7 @@
 use crate::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, RpcServerArgs, TransactionTraceArgs, StaticFilesArgs, TxPoolArgs,
+        PruningArgs, RpcServerArgs, StaticFilesArgs, TransactionTraceArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
@@ -259,6 +259,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine,
             era,
             static_files,
+            tx_trace,
             ..
         } = self;
         NodeConfig {
@@ -278,6 +279,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine,
             era,
             static_files,
+            tx_trace,
         }
     }
 

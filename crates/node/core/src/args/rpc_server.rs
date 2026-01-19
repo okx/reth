@@ -869,6 +869,9 @@ impl Default for RpcServerArgs {
             rpc_state_cache,
             gas_price_oracle,
             rpc_send_raw_transaction_sync_timeout,
+            legacy_rpc_url: None,
+            legacy_rpc_timeout: None,
+            legacy_cutoff_block: None,
         }
     }
 }
