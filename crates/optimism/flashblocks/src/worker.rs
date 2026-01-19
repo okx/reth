@@ -116,10 +116,10 @@ where
         let pending_block = PendingBlock::with_executed_block(
             Instant::now() + Duration::from_secs(1),
             ExecutedBlock::new(
-                block.into(),
+                execution.block.into(),
                 Arc::new(execution_outcome),
                 ComputedTrieData::without_trie_input(
-                    Arc::new(hashed_state.into_sorted()),
+                    Arc::new(hashed_state.clone().into_sorted()),
                     Arc::default(),
                 ),
             ),
