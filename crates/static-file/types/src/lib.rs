@@ -21,6 +21,9 @@ use core::ops::RangeInclusive;
 pub use event::StaticFileProducerEvent;
 pub use segment::{SegmentConfig, SegmentHeader, SegmentRangeInclusive, StaticFileSegment};
 
+/// Map keyed by [`StaticFileSegment`].
+pub type StaticFileMap<T> = alloc::boxed::Box<fixed_map::Map<StaticFileSegment, T>>;
+
 /// Default static file block count.
 pub const DEFAULT_BLOCKS_PER_STATIC_FILE: u64 = 500_000;
 
@@ -78,7 +81,7 @@ impl StaticFileTargets {
 }
 
 /// Each static file has a fixed number of blocks. This gives out the range where the requested
-/// block is positioned. Used for segment filename.
+/// block is positioned, according to the specified number of blocks per static file.
 pub const fn find_fixed_range(
     block: BlockNumber,
     blocks_per_static_file: u64,

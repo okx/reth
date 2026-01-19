@@ -18,6 +18,10 @@ use std::{sync::Arc, time::Duration};
 #[derive(Parser, Debug)]
 /// The arguments for the `reth db stats` command
 pub struct Command {
+    /// Skip consistency checks for static files.
+    #[arg(long, default_value_t = false)]
+    pub(crate) skip_consistency_checks: bool,
+
     /// Show only the total size for static files.
     #[arg(long, default_value_t = false)]
     detailed_sizes: bool,
@@ -84,7 +88,7 @@ impl Command {
 
                 let stats = tx
                     .inner
-                    .db_stat(&table_db)
+                    .db_stat(table_db.dbi())
                     .wrap_err(format!("Could not find table: {db_table}"))?;
 
                 // Defaults to 16KB right now but we should
@@ -125,7 +129,8 @@ impl Command {
             table.add_row(row);
 
             let freelist = tx.inner.env().freelist()?;
-            let pagesize = tx.inner.db_stat(&mdbx::Database::freelist_db())?.page_size() as usize;
+            let pagesize =
+                tx.inner.db_stat(mdbx::Database::freelist_db().dbi())?.page_size() as usize;
             let freelist_size = freelist * pagesize;
 
             let mut row = Row::new();
@@ -191,10 +196,11 @@ impl Command {
                 mut segment_config_size,
             ) = (0, 0, 0, 0, 0, 0);
 
-            for (block_range, tx_range) in &ranges {
-                let fixed_block_range = static_file_provider.find_fixed_range(block_range.start());
+            for (block_range, header) in &ranges {
+                let fixed_block_range =
+                    static_file_provider.find_fixed_range(segment, block_range.start());
                 let jar_provider = static_file_provider
-                    .get_segment_provider(segment, || Some(fixed_block_range), None)?
+                    .get_segment_provider_for_range(segment, || Some(fixed_block_range), None)?
                     .ok_or_else(|| {
                         eyre::eyre!("Failed to get segment provider for segment: {}", segment)
                     })?;
@@ -220,7 +226,7 @@ impl Command {
                     row.add_cell(Cell::new(segment))
                         .add_cell(Cell::new(format!("{block_range}")))
                         .add_cell(Cell::new(
-                            tx_range.map_or("N/A".to_string(), |tx_range| format!("{tx_range}")),
+                            header.tx_range().map_or("N/A".to_string(), |range| format!("{range}")),
                         ))
                         .add_cell(Cell::new(format!("{columns} x {rows}")));
                     if self.detailed_sizes {
@@ -270,10 +276,12 @@ impl Command {
                 let tx_range = {
                     let start = ranges
                         .iter()
-                        .find_map(|(_, tx_range)| tx_range.map(|r| r.start()))
+                        .find_map(|(_, header)| header.tx_range().map(|range| range.start()))
                         .unwrap_or_default();
-                    let end =
-                        ranges.iter().rev().find_map(|(_, tx_range)| tx_range.map(|r| r.end()));
+                    let end = ranges
+                        .iter()
+                        .rev()
+                        .find_map(|(_, header)| header.tx_range().map(|range| range.end()));
                     end.map(|end| SegmentRangeInclusive::new(start, end))
                 };
 
