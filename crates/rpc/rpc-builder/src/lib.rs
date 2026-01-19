@@ -361,7 +361,8 @@ where
         engine_events: EventSender<ConsensusEngineEvent<N>>,
     ) -> RpcRegistryInner<Provider, Pool, Network, EthApi, EvmConfig, Consensus>
     where
-        EthApi: FullEthApiServer<Provider = Provider, Pool = Pool> + reth_rpc_eth_api::helpers::LegacyRpc,
+        EthApi: FullEthApiServer<Provider = Provider, Pool = Pool>
+            + reth_rpc_eth_api::helpers::LegacyRpc,
     {
         let Self { provider, pool, network, executor, consensus, evm_config, .. } = self;
         RpcRegistryInner::new(
