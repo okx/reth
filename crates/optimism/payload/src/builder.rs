@@ -3,9 +3,10 @@ use crate::{
     config::OpBuilderConfig, error::OpPayloadBuilderError, intercept_xlayer::BridgeInterceptConfig,
     payload::OpBuiltPayload, OpAttributes, OpPayloadBuilderAttributes, OpPayloadPrimitives,
 };
-use alloy_consensus::{BlockHeader, Transaction, Typed2718};
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt, Typed2718};
 use alloy_evm::Evm as AlloyEvm;
 use alloy_primitives::{B256, U256};
+use alloy_rlp::encode;
 use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_rpc_types_engine::PayloadId;
 use reth_basic_payload_builder::*;
@@ -20,7 +21,10 @@ use reth_evm::{
     ConfigureEvm, Database,
 };
 use reth_execution_types::ExecutionOutcome;
-use reth_node_metrics::transaction_trace_xlayer::{get_global_tracer, TransactionProcessId};
+use reth_node_metrics::{
+    block_timing::{store_block_timing, BlockTimingContext, BlockTimingPrometheusMetrics},
+    transaction_trace_xlayer::{get_global_tracer, TransactionProcessId},
+};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::{transaction::OpTransaction, ADDRESS_L2_TO_L1_MESSAGE_PASSER};
 use reth_optimism_txpool::{
@@ -36,15 +40,18 @@ use reth_primitives_traits::{
 };
 use reth_revm::{
     cancelled::CancelOnDrop, database::StateProviderDatabase, db::State,
-    witness::ExecutionWitnessRecord,
+    primitives::alloy_primitives::TxHash, witness::ExecutionWitnessRecord,
 };
 use reth_storage_api::{errors::ProviderError, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use revm::context::{Block, BlockEnv};
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::Instant};
 use tracing::{debug, trace, warn};
-use reth_node_metrics::block_timing::{BlockTimingMetrics, BuildTiming, DeliverTxsTiming, store_block_timing};
-use std::time::Instant;
+use xlayer_db::{
+    internal_transaction_inspector::TraceCollector,
+    structs::{BlockTable, TxTable},
+    utils::{is_inner_tx_enabled, rw_batch_end, rw_batch_start, rw_batch_write, write_single},
+};
 
 /// Optimism's payload builder
 #[derive(Debug)]
@@ -363,10 +370,6 @@ impl<Txs> OpBuilder<'_, Txs> {
             .unwrap_or_default()
             .as_millis();
 
-        // X Layer: Initialize timing metrics
-        let build_start = Instant::now();
-        let mut timing_metrics = BlockTimingMetrics::default();
-
         let mut db = State::builder().with_database(db).with_bundle_update().build();
 
         // Load the L1 block contract into the database cache. If the L1 block contract is not
@@ -374,31 +377,67 @@ impl<Txs> OpBuilder<'_, Txs> {
         // scalar.
         db.load_cache_account(L1_BLOCK_CONTRACT).map_err(BlockExecutionError::other)?;
 
-        let mut builder = ctx.block_builder(&mut db)?;
+        // X Layer: Create TraceCollector for extracting internal transactions
+        let mut inspector = TraceCollector::default();
+        let next_env =
+            Evm::NextBlockEnvCtx::build_next_env(ctx.attributes(), ctx.parent(), &ctx.chain_spec)
+                .map_err(PayloadBuilderError::other)?;
+
+        let evm_env = ctx
+            .evm_config
+            .next_evm_env(ctx.parent(), &next_env)
+            .map_err(PayloadBuilderError::other)?;
+
+        let evm = ctx.evm_config.evm_with_env_and_inspector(&mut db, evm_env, &mut inspector);
+
+        let ctx_for_builder = ctx
+            .evm_config
+            .context_for_next_block(ctx.parent(), next_env)
+            .map_err(PayloadBuilderError::other)?;
+
+        let mut builder = ctx.evm_config.create_block_builder(evm, ctx.parent(), ctx_for_builder);
+
+        // X Layer: Initialize timing context with RAII and Prometheus support
+        // Note: We'll get the block hash after building, so we create an empty context first
+        // and update it later. For now, we use a placeholder hash.
+        let build_start = Instant::now();
+        let prom_metrics = BlockTimingPrometheusMetrics::default();
+        let mut timing_ctx =
+            BlockTimingContext::new_empty_with_prometheus(B256::ZERO, prom_metrics);
 
         // 1. apply pre-execution changes
-        let pre_exec_start = Instant::now();
-        builder.apply_pre_execution_changes().map_err(|err| {
-            warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
-            PayloadBuilderError::Internal(err.into())
-        })?;
-        timing_metrics.build.apply_pre_execution_changes = pre_exec_start.elapsed();
+        {
+            let _guard = timing_ctx.time_apply_pre_execution_changes();
+            builder.apply_pre_execution_changes().map_err(|err| {
+                warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
+                PayloadBuilderError::Internal(err.into())
+            })?;
+        }
 
         // 2. execute sequencer transactions
-        let seq_txs_start = Instant::now();
-        let mut info = ctx.execute_sequencer_transactions(&mut builder)?;
-        let seq_txs_elapsed = seq_txs_start.elapsed();
-        timing_metrics.build.execute_sequencer_transactions = seq_txs_elapsed;
+        let mut info = {
+            let _guard = timing_ctx.time_exec_sequencer_transactions();
+            ctx.execute_sequencer_transactions(&mut builder)?
+        };
 
         // 3. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool() {
-            let mempool_txs_start = Instant::now();
-            let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
-            if ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?.is_some() {
-                return Ok(BuildOutcomeKind::Cancelled)
+            // 3.1. select/pack mempool transactions
+            let best_txs = {
+                let _guard = timing_ctx.time_select_mempool_transactions();
+                best(ctx.best_transaction_attributes(builder.evm_mut().block()))
+            };
+
+            // 3.2. execute mempool transactions
+            {
+                let _guard = timing_ctx.time_exec_mempool_transactions();
+                if ctx
+                    .execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?
+                    .is_some()
+                {
+                    return Ok(BuildOutcomeKind::Cancelled)
+                }
             }
-            let mempool_txs_elapsed = mempool_txs_start.elapsed();
-            timing_metrics.build.execute_mempool_transactions = mempool_txs_elapsed;
 
             // check if the new payload is even more valuable
             if !ctx.is_better_payload(info.total_fees) {
@@ -407,13 +446,11 @@ impl<Txs> OpBuilder<'_, Txs> {
             }
         }
 
-        let finish_start = Instant::now();
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            builder.finish(state_provider)?;
-        timing_metrics.build.finish = finish_start.elapsed();
-        timing_metrics.build.total = build_start.elapsed();
-        // Calculate DeliverTxs total from BuildTiming to avoid duplication
-        timing_metrics.deliver_txs.total = timing_metrics.build.execute_sequencer_transactions + timing_metrics.build.execute_mempool_transactions;
+        // 4. finish (calculate state root)
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = {
+            let _guard = timing_ctx.time_calc_state_root();
+            builder.finish(state_provider)?
+        };
 
         let sealed_block = Arc::new(block.sealed_block().clone());
         debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
@@ -439,8 +476,20 @@ impl<Txs> OpBuilder<'_, Txs> {
         let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
 
-        // X Layer: Store timing metrics for this block (will be updated with insert timing later)
-        store_block_timing(block_hash, timing_metrics.clone());
+        // XLayer internal transactions
+        if is_inner_tx_enabled() {
+            write_internal_transactions(&mut inspector, &executed, block_hash)?;
+        }
+
+        // X Layer: Update timing context with actual block hash and total times
+        timing_ctx.set_block_hash(block_hash);
+        // Note: update_totals() will calculate build.total from individual components,
+        // so we don't need to manually set it here
+        timing_ctx.update_totals();
+
+        // Store timing metrics for this block (will be updated with insert timing later)
+        // Context will auto-store on drop, but we can also manually store here
+        timing_ctx.store();
 
         let payload =
             OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed));
@@ -868,4 +917,72 @@ where
 
         Ok(None)
     }
+}
+
+/// Writes internal transactions to XLayer database for a payload builder execution.
+fn write_internal_transactions<N>(
+    inspector: &mut TraceCollector,
+    executed: &ExecutedBlock<N>,
+    block_hash: B256,
+) -> Result<(), PayloadBuilderError>
+where
+    N: OpPayloadPrimitives,
+{
+    let mut internal_transactions = inspector.get();
+    let mut tx_hashes = Vec::<TxHash>::default();
+
+    let (rw_tx, rw_db) = rw_batch_start::<TxTable>().map_err(|e| {
+        PayloadBuilderError::other(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("XLayer db error: {e}"),
+        ))
+    })?;
+
+    let mut prev_cumulative_gas = 0u64;
+    for (index, tx) in executed.recovered_block().transactions_recovered().enumerate() {
+        let success = executed.execution_output.receipts[0][index].status();
+
+        let current_cumulative_gas =
+            executed.execution_output.receipts[0][index].cumulative_gas_used();
+        let tx_gas_used = current_cumulative_gas - prev_cumulative_gas;
+        prev_cumulative_gas = current_cumulative_gas;
+
+        if !success || (!internal_transactions.is_empty() && internal_transactions[index].len() > 0)
+        {
+            if !internal_transactions.is_empty() && !internal_transactions[index].is_empty() {
+                if let Some(first_inner_tx) = internal_transactions[index].first_mut() {
+                    first_inner_tx.set_transaction_gas(tx.gas_limit(), tx_gas_used);
+                }
+            }
+
+            tx_hashes.push(*tx.tx_hash());
+            rw_batch_write::<TxTable>(
+                &rw_tx,
+                &rw_db,
+                tx.tx_hash().to_vec(),
+                encode(internal_transactions[index].clone()),
+            )
+            .map_err(|e| {
+                PayloadBuilderError::other(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("XLayer db write error: {e}"),
+                ))
+            })?;
+        }
+    }
+    rw_batch_end::<TxTable>(rw_tx).map_err(|e| {
+        PayloadBuilderError::other(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("XLayer db commit error: {e}"),
+        ))
+    })?;
+
+    write_single::<BlockTable, Vec<TxHash>>(block_hash.to_vec(), tx_hashes).map_err(|e| {
+        PayloadBuilderError::other(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("XLayer db write error: {e}"),
+        ))
+    })?;
+
+    Ok(())
 }
