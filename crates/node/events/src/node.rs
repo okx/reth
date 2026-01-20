@@ -263,7 +263,7 @@ impl NodeState {
                     "Block added to canonical chain"
                 );
 
-                // Clean up timing metrics after logging
+                // X Layer, clean up timing metrics after logging
                 remove_block_timing(&block.hash());
             }
             ConsensusEngineEvent::CanonicalChainCommitted(head, elapsed) => {

@@ -161,7 +161,7 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
             rocksdb_provider,
         )?
         .with_prune_modes(prune_modes.clone())
-        .with_genesis_block_number(self.chain.genesis().number.unwrap());
+        .with_genesis_block_number(self.chain.genesis().number.unwrap()); // X Layer, for the genesis block number
 
         // Check for consistency between database and static files.
         if !access.is_read_only_inconsistent() &&

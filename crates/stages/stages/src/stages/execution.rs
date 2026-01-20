@@ -1325,6 +1325,7 @@ mod tests {
     }
 }
 
+// X Layer, for innertx
 use alloy_consensus::{transaction::TxHashRef, TxReceipt};
 use alloy_rlp::encode;
 use reth_evm::{block::BlockExecutionError, execute::BlockExecutor};
