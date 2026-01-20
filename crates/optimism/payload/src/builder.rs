@@ -19,6 +19,8 @@ use reth_evm::{
     op_revm::{constants::L1_BLOCK_CONTRACT, L1BlockInfo},
     ConfigureEvm, Database,
 };
+
+// For X Layer block time
 use reth_node_metrics::{
     block_timing::{store_block_timing, BlockTimingContext, BlockTimingPrometheusMetrics},
     transaction_trace_xlayer::{get_global_tracer, TransactionProcessId},
@@ -46,6 +48,8 @@ use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, Transac
 use revm::context::{Block, BlockEnv};
 use std::{marker::PhantomData, sync::Arc, time::Instant};
 use tracing::{debug, trace, warn};
+
+// For X Layer inner tx
 use xlayer_db::{
     internal_transaction_inspector::TraceCollector,
     structs::{BlockTable, TxTable},
@@ -915,7 +919,7 @@ where
     }
 }
 
-/// Writes internal transactions to XLayer database for a payload builder execution.
+/// X Layer, for writing internal transactions to XLayer database for a payload builder execution.
 fn write_internal_transactions<N>(
     inspector: &mut TraceCollector,
     executed: &BuiltPayloadExecutedBlock<N>,

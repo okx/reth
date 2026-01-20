@@ -630,11 +630,11 @@ where
         // Otherwise, we recalculate the whole stage checkpoint including the amount of gas
         // already processed, if there's any.
         _ => {
-            // Start from genesis block which may be greater than 0
-            let range_start_block = provider.get_genesis_block_number();
-            let range_end_block = if start_block > range_start_block { start_block - 1 } else { 0 };
-            let processed =
-                calculate_gas_used_from_headers(provider, range_start_block..=range_end_block)?;
+            let genesis_block_number = provider.genesis_block_number();
+            let processed = calculate_gas_used_from_headers(
+                provider,
+                genesis_block_number..=max(start_block - 1, genesis_block_number),
+            )?;
 
             ExecutionCheckpoint {
                 block_range: CheckpointBlockRange { from: start_block, to: max_block },
@@ -1325,6 +1325,7 @@ mod tests {
     }
 }
 
+// X Layer, for innertx
 use alloy_consensus::{transaction::TxHashRef, TxReceipt};
 use alloy_rlp::encode;
 use reth_evm::{block::BlockExecutionError, execute::BlockExecutor};

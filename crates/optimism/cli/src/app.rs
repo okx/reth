@@ -92,6 +92,7 @@ where
                 runner.run_blocking_until_ctrl_c(command.execute::<OpNode>())
             }
             Commands::Import(command) => {
+                // X Layer, import blockchain data into op-reth
                 runner.run_blocking_until_ctrl_c(command.execute::<OpNode, _>(components))
             }
             Commands::ImportOp(command) => {

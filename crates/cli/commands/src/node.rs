@@ -111,7 +111,7 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "ERA")]
     pub era: EraArgs,
 
-    /// All transaction trace related arguments with --tx-trace prefix
+    /// X Layer, all transaction trace related arguments with --tx-trace prefix
     #[command(flatten)]
     pub tx_trace: TransactionTraceArgs,
 

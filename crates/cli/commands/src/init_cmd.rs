@@ -21,7 +21,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> InitComman
     pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec>>(self) -> eyre::Result<()> {
         info!(target: "reth::cli", "reth init starting");
 
-        // Check if using xlayer-mainnet or xlayer-testnet via --chain parameter - only genesis file
+        // X Layer, check if using xlayer-mainnet or xlayer-testnet via --chain parameter - only genesis file
         // is allowed
         let chain_id = self.env.chain.chain_id();
         let has_empty_alloc = self.env.chain.genesis().alloc.is_empty();
@@ -29,7 +29,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> InitComman
 
         let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RW)?;
 
-        // Get the actual genesis block number from the chain spec
+        // X Layer, get the actual genesis block number from the chain spec
         let genesis_block_number = provider_factory.chain_spec().genesis_header().number();
         let hash = provider_factory
             .block_hash(genesis_block_number)?
