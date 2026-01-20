@@ -34,13 +34,12 @@ use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
     BlockBodyIndicesProvider, BytecodeReader, DBProvider, DatabaseProviderFactory,
     HashedPostStateProvider, NodePrimitivesProvider, StageCheckpointReader, StateProofProvider,
-    StorageRootProvider, TrieReader,
+    StorageRootProvider,
 };
 use reth_storage_errors::provider::{ConsistentViewError, ProviderError, ProviderResult};
 use reth_trie::{
-    updates::{TrieUpdates, TrieUpdatesSorted},
-    AccountProof, HashedPostState, HashedStorage, MultiProof, MultiProofTargets, StorageMultiProof,
-    StorageProof, TrieInput,
+    updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
+    MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
 use std::{
     collections::BTreeMap,
@@ -118,7 +117,6 @@ impl<T: NodePrimitives, ChainSpec> MockEthProvider<T, ChainSpec> {
     /// Add multiple blocks to local block store
     pub fn extend_blocks(&self, iter: impl IntoIterator<Item = (B256, T::Block)>) {
         for (hash, block) in iter {
-            self.add_header(hash, block.header().clone());
             self.add_block(hash, block)
         }
     }
@@ -268,7 +266,7 @@ impl<T: NodePrimitives, ChainSpec: EthChainSpec + 'static> DBProvider
         self.tx
     }
 
-    fn commit(self) -> ProviderResult<bool> {
+    fn commit(self) -> ProviderResult<()> {
         Ok(self.tx.commit()?)
     }
 
@@ -399,18 +397,6 @@ impl<T: NodePrimitives, ChainSpec: EthChainSpec + 'static> TransactionsProvider
                     return Ok(Some((tx.clone(), meta)))
                 }
             }
-        }
-        Ok(None)
-    }
-
-    fn transaction_block(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
-        let lock = self.blocks.lock();
-        let mut current_tx_number: TxNumber = 0;
-        for block in lock.values() {
-            if current_tx_number + (block.body().transaction_count() as TxNumber) > id {
-                return Ok(Some(block.header().number()))
-            }
-            current_tx_number += block.body().transaction_count() as TxNumber;
         }
         Ok(None)
     }
@@ -990,6 +976,17 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync> ChangeSetReader for MockEthProvi
     ) -> ProviderResult<Option<AccountBeforeTx>> {
         Ok(None)
     }
+
+    fn account_changesets_range(
+        &self,
+        _range: impl core::ops::RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<(BlockNumber, AccountBeforeTx)>> {
+        Ok(Vec::default())
+    }
+
+    fn account_changeset_count(&self) -> ProviderResult<usize> {
+        Ok(0)
+    }
 }
 
 impl<T: NodePrimitives, ChainSpec: Send + Sync> StateReader for MockEthProvider<T, ChainSpec> {
@@ -1000,19 +997,6 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync> StateReader for MockEthProvider<
         _block: BlockNumber,
     ) -> ProviderResult<Option<ExecutionOutcome<Self::Receipt>>> {
         Ok(None)
-    }
-}
-
-impl<T: NodePrimitives, ChainSpec: Send + Sync> TrieReader for MockEthProvider<T, ChainSpec> {
-    fn trie_reverts(&self, _from: BlockNumber) -> ProviderResult<TrieUpdatesSorted> {
-        Ok(TrieUpdatesSorted::default())
-    }
-
-    fn get_block_trie_updates(
-        &self,
-        _block_number: BlockNumber,
-    ) -> ProviderResult<TrieUpdatesSorted> {
-        Ok(TrieUpdatesSorted::default())
     }
 }
 

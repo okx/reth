@@ -19,7 +19,7 @@ use alloy_serde::JsonStorageKey;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_primitives_traits::TxTy;
 use reth_rpc_convert::RpcTxReq;
-use reth_rpc_eth_types::FillTransactionResult;
+use reth_rpc_eth_types::FillTransaction;
 use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
 use tracing::trace;
 
@@ -243,7 +243,7 @@ pub trait EthApi<
 
     /// Fills the defaults on a given unsigned transaction.
     #[method(name = "fillTransaction")]
-    async fn fill_transaction(&self, request: TxReq) -> RpcResult<FillTransactionResult<RawTx>>;
+    async fn fill_transaction(&self, request: TxReq) -> RpcResult<FillTransaction<RawTx>>;
 
     /// Simulate arbitrary number of transactions at an arbitrary blockchain index, with the
     /// optionality of state overrides
@@ -603,8 +603,9 @@ where
             hash,
             EthTransactions::transaction_by_hash(self, hash)
                 .await?
-                .map(|tx| tx.into_transaction(self.tx_resp_builder()))
-                .transpose()?,
+                .map(|tx| tx.into_transaction(self.converter()))
+                .transpose()
+                .map_err(T::Error::from)?,
             self.legacy_rpc_client().unwrap().get_transaction_by_hash(hash)
         )
     }
@@ -855,7 +856,7 @@ where
     async fn fill_transaction(
         &self,
         request: RpcTxReq<T::NetworkTypes>,
-    ) -> RpcResult<FillTransactionResult<TxTy<T::Primitives>>> {
+    ) -> RpcResult<FillTransaction<TxTy<T::Primitives>>> {
         trace!(target: "rpc::eth", ?request, "Serving eth_fillTransaction");
         Ok(EthTransactions::fill_transaction(self, request).await?)
     }
@@ -998,7 +999,7 @@ where
     /// Handler for: `eth_sendTransaction`
     async fn send_transaction(&self, request: RpcTxReq<T::NetworkTypes>) -> RpcResult<B256> {
         trace!(target: "rpc::eth", ?request, "Serving eth_sendTransaction");
-        Ok(EthTransactions::send_transaction(self, request).await?)
+        Ok(EthTransactions::send_transaction_request(self, request).await?)
     }
 
     /// Handler for: `eth_sendRawTransaction`

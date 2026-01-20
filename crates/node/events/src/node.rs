@@ -5,9 +5,7 @@ use alloy_consensus::{constants::GWEI_TO_WEI, BlockHeader};
 use alloy_primitives::{BlockNumber, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use futures::Stream;
-use reth_engine_primitives::{
-    ConsensusEngineEvent, ConsensusEngineLiveSyncProgress, ForkchoiceStatus,
-};
+use reth_engine_primitives::{ConsensusEngineEvent, ForkchoiceStatus};
 use reth_network_api::PeersInfo;
 use reth_primitives_traits::{format_gas, format_gas_throughput, BlockBody, NodePrimitives};
 use reth_prune_types::PrunerEvent;
@@ -233,20 +231,6 @@ impl NodeState {
                 self.safe_block_hash = Some(safe_block_hash);
                 self.finalized_block_hash = Some(finalized_block_hash);
             }
-            ConsensusEngineEvent::LiveSyncProgress(live_sync_progress) => {
-                match live_sync_progress {
-                    ConsensusEngineLiveSyncProgress::DownloadingBlocks {
-                        remaining_blocks,
-                        target,
-                    } => {
-                        info!(
-                            remaining_blocks,
-                            target_block_hash=?target,
-                            "Live sync in progress, downloading blocks"
-                        );
-                    }
-                }
-            }
             ConsensusEngineEvent::CanonicalBlockAdded(executed, elapsed) => {
                 let block = executed.sealed_block();
                 let mut full = block.gas_used() as f64 * 100.0 / block.gas_limit() as f64;
@@ -279,7 +263,7 @@ impl NodeState {
                     "Block added to canonical chain"
                 );
 
-                // Clean up timing metrics after logging
+                // X Layer, clean up timing metrics after logging
                 remove_block_timing(&block.hash());
             }
             ConsensusEngineEvent::CanonicalChainCommitted(head, elapsed) => {

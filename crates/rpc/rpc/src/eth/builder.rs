@@ -15,7 +15,8 @@ use reth_rpc_eth_types::{
     FeeHistoryCacheConfig, ForwardConfig, GasCap, GasPriceOracle, GasPriceOracleConfig,
 };
 use reth_rpc_server_types::constants::{
-    DEFAULT_ETH_PROOF_WINDOW, DEFAULT_MAX_SIMULATE_BLOCKS, DEFAULT_PROOF_PERMITS,
+    DEFAULT_ETH_PROOF_WINDOW, DEFAULT_MAX_BLOCKING_IO_REQUEST, DEFAULT_MAX_SIMULATE_BLOCKS,
+    DEFAULT_PROOF_PERMITS,
 };
 use reth_tasks::{pool::BlockingTaskPool, TaskSpawner, TokioTaskExecutor};
 use std::{sync::Arc, time::Duration};
@@ -41,6 +42,7 @@ pub struct EthApiBuilder<N: RpcNodeCore, Rpc, NextEnv = ()> {
     task_spawner: Box<dyn TaskSpawner + 'static>,
     next_env: NextEnv,
     max_batch_size: usize,
+    max_blocking_io_requests: usize,
     pending_block_kind: PendingBlockKind,
     raw_tx_forwarder: ForwardConfig,
     legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
@@ -93,6 +95,7 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             task_spawner,
             next_env,
             max_batch_size,
+            max_blocking_io_requests,
             pending_block_kind,
             raw_tx_forwarder,
             legacy_rpc_config,
@@ -115,6 +118,7 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             task_spawner,
             next_env,
             max_batch_size,
+            max_blocking_io_requests,
             pending_block_kind,
             raw_tx_forwarder,
             legacy_rpc_config,
@@ -148,6 +152,7 @@ where
             eth_state_cache_config: Default::default(),
             next_env: Default::default(),
             max_batch_size: 1,
+            max_blocking_io_requests: DEFAULT_MAX_BLOCKING_IO_REQUEST,
             pending_block_kind: PendingBlockKind::Full,
             raw_tx_forwarder: ForwardConfig::default(),
             legacy_rpc_config: None,
@@ -197,6 +202,7 @@ where
             gas_oracle_config,
             next_env,
             max_batch_size,
+            max_blocking_io_requests,
             pending_block_kind,
             raw_tx_forwarder,
             legacy_rpc_config,
@@ -219,6 +225,7 @@ where
             gas_oracle_config,
             next_env,
             max_batch_size,
+            max_blocking_io_requests,
             pending_block_kind,
             raw_tx_forwarder,
             legacy_rpc_config,
@@ -248,6 +255,7 @@ where
             gas_oracle_config,
             next_env: _,
             max_batch_size,
+            max_blocking_io_requests,
             pending_block_kind,
             raw_tx_forwarder,
             legacy_rpc_config,
@@ -270,6 +278,7 @@ where
             gas_oracle_config,
             next_env,
             max_batch_size,
+            max_blocking_io_requests,
             pending_block_kind,
             raw_tx_forwarder,
             legacy_rpc_config,
@@ -349,6 +358,12 @@ where
     /// Sets the max batch size for batching transaction insertions.
     pub const fn max_batch_size(mut self, max_batch_size: usize) -> Self {
         self.max_batch_size = max_batch_size;
+        self
+    }
+
+    /// Sets the maximum number of concurrent blocking IO requests.
+    pub const fn max_blocking_io_requests(mut self, max_blocking_io_requests: usize) -> Self {
+        self.max_blocking_io_requests = max_blocking_io_requests;
         self
     }
 
@@ -499,6 +514,7 @@ where
             task_spawner,
             next_env,
             max_batch_size,
+            max_blocking_io_requests,
             pending_block_kind,
             raw_tx_forwarder,
             legacy_rpc_config,
@@ -541,6 +557,7 @@ where
             rpc_converter,
             next_env,
             max_batch_size,
+            max_blocking_io_requests,
             pending_block_kind,
             raw_tx_forwarder.forwarder_client(),
             legacy_rpc_config,

@@ -33,7 +33,7 @@ pub enum Commands<Spec: ChainSpecParser = OpChainSpecParser, Ext: clap::Args + f
     /// Initialize the database from a state dump file.
     #[command(name = "init-state")]
     InitState(init_state::InitStateCommandOp<Spec>),
-    /// This syncs RLP encoded blocks from a file.
+    /// X Layer, this syncs RLP encoded blocks from a file.
     #[command(name = "import")]
     Import(ImportCommand<Spec>),
     /// This syncs RLP encoded OP blocks below Bedrock from a file, without executing.

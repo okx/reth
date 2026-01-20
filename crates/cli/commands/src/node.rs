@@ -10,8 +10,8 @@ use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, MetricArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TransactionTraceArgs,
-        TxPoolArgs,
+        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs,
+        TransactionTraceArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -111,9 +111,13 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "ERA")]
     pub era: EraArgs,
 
-    /// All transaction trace related arguments with --tx-trace prefix
+    /// X Layer, all transaction trace related arguments with --tx-trace prefix
     #[command(flatten)]
     pub tx_trace: TransactionTraceArgs,
+
+    /// All static files related arguments
+    #[command(flatten, next_help_heading = "Static Files")]
+    pub static_files: StaticFilesArgs,
 
     /// Additional cli arguments
     #[command(flatten, next_help_heading = "Extension")]
@@ -150,7 +154,7 @@ where
     where
         L: Launcher<C, Ext>,
     {
-        tracing::info!(target: "reth::cli", version = ?version::version_metadata().short_version, "Starting reth");
+        tracing::info!(target: "reth::cli", version = ?version::version_metadata().short_version, "Starting {}",  version::version_metadata().name_client);
 
         let Self {
             datadir,
@@ -167,10 +171,11 @@ where
             db,
             dev,
             pruning,
-            ext,
             engine,
             era,
             tx_trace,
+            static_files,
+            ext,
         } = self;
 
         // XLayer: Auto-derive legacy cutoff block from genesis if legacy RPC is configured
@@ -210,6 +215,7 @@ where
             engine,
             era,
             tx_trace,
+            static_files,
         };
 
         let data_dir = node_config.datadir();
