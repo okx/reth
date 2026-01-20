@@ -494,11 +494,6 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
     pub const fn genesis_block_number(&self) -> u64 {
         self.genesis_block_number
     }
-
-    /// Get genesis block number
-    pub const fn get_genesis_block_number(&self) -> u64 {
-        self.genesis_block_number
-    }
 }
 
 impl<N: NodePrimitives> StaticFileProvider<N> {

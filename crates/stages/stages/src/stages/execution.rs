@@ -23,7 +23,7 @@ use reth_stages_api::{
 };
 use reth_static_file_types::StaticFileSegment;
 use std::{
-    cmp::{max, Ordering},
+    cmp::Ordering,
     collections::BTreeMap,
     ops::RangeInclusive,
     sync::Arc,
@@ -631,7 +631,7 @@ where
         // already processed, if there's any.
         _ => {
             // Start from genesis block which may be greater than 0
-            let range_start_block = provider.get_genesis_block_number();
+            let range_start_block = provider.genesis_block_number();
             let range_end_block = if start_block > range_start_block { start_block - 1 } else { 0 };
             let processed =
                 calculate_gas_used_from_headers(provider, range_start_block..=range_end_block)?;
