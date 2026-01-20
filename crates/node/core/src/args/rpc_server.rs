@@ -657,6 +657,13 @@ pub struct RpcServerArgs {
         value_parser = parse_duration_from_secs_or_ms,
     )]
     pub rpc_send_raw_transaction_sync_timeout: Duration,
+
+    /// Skip invalid transactions in `testing_buildBlockV1` instead of failing.
+    ///
+    /// When enabled, transactions that fail execution will be skipped, and all subsequent
+    /// transactions from the same sender will also be skipped.
+    #[arg(long = "testing.skip-invalid-transactions", default_value_t = false)]
+    pub testing_skip_invalid_transactions: bool,
 }
 
 impl RpcServerArgs {
@@ -872,6 +879,7 @@ impl Default for RpcServerArgs {
             legacy_rpc_url: None,
             legacy_rpc_timeout: None,
             legacy_cutoff_block: None,
+            testing_skip_invalid_transactions: false,
         }
     }
 }
@@ -1046,6 +1054,7 @@ mod tests {
                 default_suggested_fee: None,
             },
             rpc_send_raw_transaction_sync_timeout: std::time::Duration::from_secs(30),
+            testing_skip_invalid_transactions: true,
         };
 
         let parsed_args = CommandParser::<RpcServerArgs>::parse_from([
@@ -1134,6 +1143,7 @@ mod tests {
             "60",
             "--rpc.send-raw-transaction-sync-timeout",
             "30s",
+            "--testing.skip-invalid-transactions",
         ])
         .args;
 

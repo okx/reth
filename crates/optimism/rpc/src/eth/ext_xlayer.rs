@@ -230,7 +230,7 @@ pub trait PreExec: EthCall {
         at: BlockId,
     ) -> Vec<PreExecResult>
     where
-        DB: revm::Database<Error = ProviderError>
+        DB: revm::Database<Error = reth_revm::db::bal::EvmDatabaseError<ProviderError>>
             + DatabaseCommit
             + OverrideBlockHashes
             + revm::DatabaseRef

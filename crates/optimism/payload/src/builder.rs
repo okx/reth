@@ -19,11 +19,11 @@ use reth_evm::{
     op_revm::{constants::L1_BLOCK_CONTRACT, L1BlockInfo},
     ConfigureEvm, Database,
 };
-use reth_execution_types::ExecutionOutcome;
 use reth_node_metrics::{
     block_timing::{store_block_timing, BlockTimingContext, BlockTimingPrometheusMetrics},
     transaction_trace_xlayer::{get_global_tracer, TransactionProcessId},
 };
+use reth_execution_types::BlockExecutionOutput;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::{transaction::OpTransaction, L2_TO_L1_MESSAGE_PASSER_ADDRESS};
 use reth_optimism_txpool::{
@@ -454,12 +454,8 @@ impl<Txs> OpBuilder<'_, Txs> {
         let sealed_block = Arc::new(block.sealed_block().clone());
         debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
 
-        let execution_outcome = ExecutionOutcome::new(
-            db.take_bundle(),
-            vec![execution_result.receipts],
-            block.number(),
-            Vec::new(),
-        );
+        let execution_outcome =
+            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
 
         // create the executed block data
         let executed: BuiltPayloadExecutedBlock<N> = BuiltPayloadExecutedBlock {
@@ -746,7 +742,7 @@ where
             if sequencer_tx.value().is_eip4844() {
                 return Err(PayloadBuilderError::other(
                     OpPayloadBuilderError::BlobTransactionRejected,
-                ))
+                ));
             }
 
             // Convert the transaction to a [RecoveredTx]. This is
@@ -940,10 +936,10 @@ where
 
     let mut prev_cumulative_gas = 0u64;
     for (index, tx) in executed.recovered_block.transactions_recovered().enumerate() {
-        let success = executed.execution_output.receipts[0][index].status();
+        let success = executed.execution_output.receipts[index].status();
 
         let current_cumulative_gas =
-            executed.execution_output.receipts[0][index].cumulative_gas_used();
+            executed.execution_output.receipts[index].cumulative_gas_used();
         let tx_gas_used = current_cumulative_gas - prev_cumulative_gas;
         prev_cumulative_gas = current_cumulative_gas;
 

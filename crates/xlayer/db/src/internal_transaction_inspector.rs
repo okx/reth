@@ -412,7 +412,7 @@ where
         if !self.enabled {
             return None;
         }
-        let call_type = match inputs.scheme {
+        let call_type = match inputs.scheme() {
             reth_revm::interpreter::CreateScheme::Create => "create".to_string(),
             reth_revm::interpreter::CreateScheme::Create2 { salt: _ } => "create2".to_string(),
             reth_revm::interpreter::CreateScheme::Custom { address: _ } => "custom".to_string(),
@@ -420,11 +420,11 @@ where
 
         self.init_op(
             call_type,
-            inputs.caller.to_string(),
+            inputs.caller().to_string(),
             "".to_string(),
-            inputs.init_code.clone(),
-            inputs.value.to_string(),
-            inputs.gas_limit,
+            inputs.init_code().clone(),
+            inputs.value().to_string(),
+            inputs.gas_limit(),
             "".to_string(),
         );
 
