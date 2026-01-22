@@ -587,8 +587,10 @@ mod tests {
         }
 
         fn with_account(mut self, address: Address, balance: U256, nonce: u64) -> Self {
-            self.accounts
-                .insert(address, AccountInfo { balance, nonce, code_hash: B256::ZERO, code: None, account_id: None });
+            self.accounts.insert(
+                address,
+                AccountInfo { balance, nonce, code_hash: B256::ZERO, code: None, account_id: None },
+            );
             self
         }
     }
