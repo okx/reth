@@ -137,7 +137,7 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
         self.static_file_provider.set_genesis_block_number(genesis_block_number);
         self
     }
-    
+
     /// Sets the changeset cache for an existing [`ProviderFactory`].
     pub fn with_changeset_cache(mut self, changeset_cache: ChangesetCache) -> Self {
         self.changeset_cache = changeset_cache;

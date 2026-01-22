@@ -21,11 +21,11 @@ use reth_evm::{
 };
 
 // For X Layer block time
+use reth_execution_types::BlockExecutionOutput;
 use reth_node_metrics::{
     block_timing::{store_block_timing, BlockTimingContext, BlockTimingPrometheusMetrics},
     transaction_trace_xlayer::{get_global_tracer, TransactionProcessId},
 };
-use reth_execution_types::BlockExecutionOutput;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::{transaction::OpTransaction, L2_TO_L1_MESSAGE_PASSER_ADDRESS};
 use reth_optimism_txpool::{
