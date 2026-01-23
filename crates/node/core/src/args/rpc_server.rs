@@ -996,9 +996,6 @@ mod tests {
     #[test]
     fn test_rpc_server_args() {
         let args = RpcServerArgs {
-            legacy_rpc_url: None,
-            legacy_rpc_timeout: Some("30s".to_string()),
-            legacy_cutoff_block: None,
             http: true,
             http_addr: "127.0.0.1".parse().unwrap(),
             http_port: 8545,
@@ -1058,6 +1055,9 @@ mod tests {
             },
             rpc_send_raw_transaction_sync_timeout: std::time::Duration::from_secs(30),
             testing_skip_invalid_transactions: true,
+            legacy_rpc_url: None,
+            legacy_rpc_timeout: Some("30s".to_string()),
+            legacy_cutoff_block: None,
         };
 
         let parsed_args = CommandParser::<RpcServerArgs>::parse_from([
