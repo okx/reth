@@ -877,7 +877,7 @@ impl Default for RpcServerArgs {
             gas_price_oracle,
             rpc_send_raw_transaction_sync_timeout,
             legacy_rpc_url: None,
-            legacy_rpc_timeout: None,
+            legacy_rpc_timeout: Some("30s".to_string()),
             legacy_cutoff_block: None,
             testing_skip_invalid_transactions: false,
         }
@@ -1055,6 +1055,9 @@ mod tests {
             },
             rpc_send_raw_transaction_sync_timeout: std::time::Duration::from_secs(30),
             testing_skip_invalid_transactions: true,
+            legacy_rpc_url: None,
+            legacy_rpc_timeout: Some("30s".to_string()),
+            legacy_cutoff_block: None,
         };
 
         let parsed_args = CommandParser::<RpcServerArgs>::parse_from([
