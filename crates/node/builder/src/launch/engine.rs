@@ -126,6 +126,24 @@ impl EngineNodeLauncher {
             .with_genesis()?
             .inspect(|this: &LaunchContextWith<Attached<WithConfigs<<T::Types as NodeTypes>::ChainSpec>, _>>| {
                 info!(target: "reth::cli", "\n{}", this.chain_spec().display_hardforks());
+                
+                // Log storage settings after genesis initialization
+                match this.provider_factory().storage_settings() {
+                    Ok(settings) => {
+                        info!(
+                            target: "reth::cli",
+                            ?settings,
+                            "Storage settings (after genesis)"
+                        );
+                    },
+                    Err(err) => {
+                        warn!(
+                            target: "reth::cli",
+                            ?err,
+                            "Failed to get storage settings after genesis"
+                        );
+                    },
+                }
             })
             .with_metrics_task()
             // passing FullNodeTypes as type parameter here so that we can build
