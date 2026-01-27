@@ -56,22 +56,22 @@ impl RocksDBProvider {
         let mut unwind_target: Option<BlockNumber> = None;
 
         // Check TransactionHashNumbers if stored in RocksDB
-        if provider.cached_storage_settings().transaction_hash_numbers_in_rocksdb &&
-            let Some(target) = self.check_transaction_hash_numbers(provider)?
+        if provider.cached_storage_settings().transaction_hash_numbers_in_rocksdb
+            && let Some(target) = self.check_transaction_hash_numbers(provider)?
         {
             unwind_target = Some(unwind_target.map_or(target, |t| t.min(target)));
         }
 
         // Check StoragesHistory if stored in RocksDB
-        if provider.cached_storage_settings().storages_history_in_rocksdb &&
-            let Some(target) = self.check_storages_history(provider)?
+        if provider.cached_storage_settings().storages_history_in_rocksdb
+            && let Some(target) = self.check_storages_history(provider)?
         {
             unwind_target = Some(unwind_target.map_or(target, |t| t.min(target)));
         }
 
         // Check AccountsHistory if stored in RocksDB
-        if provider.cached_storage_settings().account_history_in_rocksdb &&
-            let Some(target) = self.check_accounts_history(provider)?
+        if provider.cached_storage_settings().account_history_in_rocksdb
+            && let Some(target) = self.check_accounts_history(provider)?
         {
             unwind_target = Some(unwind_target.map_or(target, |t| t.min(target)));
         }
@@ -99,7 +99,8 @@ impl RocksDBProvider {
         Provider: DBProvider
             + StageCheckpointReader
             + StaticFileProviderFactory
-            + TransactionsProvider<Transaction: Encodable2718>,
+            + TransactionsProvider<Transaction: Encodable2718>
+            + ChainSpecProvider,
     {
         // Get the TransactionLookup stage checkpoint
         let checkpoint = provider
@@ -167,12 +168,37 @@ impl RocksDBProvider {
                 // Both MDBX and static files are empty.
                 // If checkpoint says we should have data, that's an inconsistency.
                 if checkpoint > 0 {
-                    tracing::warn!(
-                        target: "reth::providers::rocksdb",
-                        checkpoint,
-                        "Checkpoint set but no transaction data exists, unwind needed"
-                    );
-                    return Ok(Some(0));
+                    // For nodes with custom genesis blocks, having empty data at genesis
+                    // checkpoint is normal. Only trigger unwind if checkpoint is beyond genesis.
+                    let genesis_block = provider.chain_spec().genesis().number.unwrap_or(0);
+
+                    if checkpoint > genesis_block {
+                        tracing::warn!(
+                            target: "reth::providers::rocksdb",
+                            checkpoint,
+                            genesis_block,
+                            "Checkpoint beyond genesis but no transaction data exists, unwind needed"
+                        );
+                        return Ok(Some(genesis_block));
+                    } else if checkpoint == genesis_block {
+                        // Checkpoint is at genesis with empty data - this is normal for custom genesis.
+                        // No unwind needed, RocksDB will start populating from genesis forward.
+                        tracing::info!(
+                            target: "reth::providers::rocksdb",
+                            genesis_block,
+                            "RocksDB checkpoint at custom genesis with empty data - normal state"
+                        );
+                        return Ok(None);
+                    } else {
+                        // Checkpoint < genesis_block - shouldn't happen but handle gracefully
+                        tracing::warn!(
+                            target: "reth::providers::rocksdb",
+                            checkpoint,
+                            genesis_block,
+                            "Checkpoint below genesis, unwind to genesis needed"
+                        );
+                        return Ok(Some(genesis_block));
+                    }
                 }
             }
         }
@@ -239,7 +265,7 @@ impl RocksDBProvider {
         provider: &Provider,
     ) -> ProviderResult<Option<BlockNumber>>
     where
-        Provider: DBProvider + StageCheckpointReader,
+        Provider: DBProvider + StageCheckpointReader + ChainSpecProvider,
     {
         // Get the IndexStorageHistory stage checkpoint
         let checkpoint = provider
@@ -298,8 +324,34 @@ impl RocksDBProvider {
             None => {
                 // Empty RocksDB table
                 if checkpoint > 0 {
-                    // Stage says we should have data but we don't
-                    return Ok(Some(0));
+                    // For nodes with custom genesis blocks, having empty data at genesis
+                    // checkpoint is normal. Only trigger unwind if checkpoint is beyond genesis.
+                    let genesis_block = provider.chain_spec().genesis().number.unwrap_or(0);
+
+                    if checkpoint > genesis_block {
+                        tracing::warn!(
+                            target: "reth::providers::rocksdb",
+                            checkpoint,
+                            genesis_block,
+                            "StoragesHistory checkpoint beyond genesis but no data exists, unwind needed"
+                        );
+                        return Ok(Some(genesis_block));
+                    } else if checkpoint == genesis_block {
+                        tracing::info!(
+                            target: "reth::providers::rocksdb",
+                            genesis_block,
+                            "StoragesHistory at custom genesis with empty data - normal state"
+                        );
+                        return Ok(None);
+                    } else {
+                        tracing::warn!(
+                            target: "reth::providers::rocksdb",
+                            checkpoint,
+                            genesis_block,
+                            "StoragesHistory checkpoint below genesis, unwind to genesis needed"
+                        );
+                        return Ok(Some(genesis_block));
+                    }
                 }
                 Ok(None)
             }
@@ -353,7 +405,7 @@ impl RocksDBProvider {
         provider: &Provider,
     ) -> ProviderResult<Option<BlockNumber>>
     where
-        Provider: DBProvider + StageCheckpointReader,
+        Provider: DBProvider + StageCheckpointReader + ChainSpecProvider,
     {
         // Get the IndexAccountHistory stage checkpoint
         let checkpoint = provider
@@ -415,8 +467,34 @@ impl RocksDBProvider {
             None => {
                 // Empty RocksDB table
                 if checkpoint > 0 {
-                    // Stage says we should have data but we don't
-                    return Ok(Some(0));
+                    // For nodes with custom genesis blocks, having empty data at genesis
+                    // checkpoint is normal. Only trigger unwind if checkpoint is beyond genesis.
+                    let genesis_block = provider.chain_spec().genesis().number.unwrap_or(0);
+
+                    if checkpoint > genesis_block {
+                        tracing::warn!(
+                            target: "reth::providers::rocksdb",
+                            checkpoint,
+                            genesis_block,
+                            "AccountsHistory checkpoint beyond genesis but no data exists, unwind needed"
+                        );
+                        return Ok(Some(genesis_block));
+                    } else if checkpoint == genesis_block {
+                        tracing::info!(
+                            target: "reth::providers::rocksdb",
+                            genesis_block,
+                            "AccountsHistory at custom genesis with empty data - normal state"
+                        );
+                        return Ok(None);
+                    } else {
+                        tracing::warn!(
+                            target: "reth::providers::rocksdb",
+                            checkpoint,
+                            genesis_block,
+                            "AccountsHistory checkpoint below genesis, unwind to genesis needed"
+                        );
+                        return Ok(Some(genesis_block));
+                    }
                 }
                 Ok(None)
             }

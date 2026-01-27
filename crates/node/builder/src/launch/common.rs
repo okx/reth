@@ -541,10 +541,16 @@ where
                 (None, Some(_)) => "static file",
                 (None, None) => unreachable!(),
             };
-            assert_ne!(
-                unwind_block, 0,
-                "A {} inconsistency was found that would trigger an unwind to block 0",
-                inconsistency_source
+            
+            let genesis_block = self.chain_spec().genesis().number.unwrap_or(0);
+            
+            assert!(
+                unwind_block >= genesis_block,
+                "A {} inconsistency was found that would trigger an unwind to block {} (genesis is {}). \
+                 This would cause data loss. Check RocksDB consistency logic for custom genesis support.",
+                inconsistency_source,
+                unwind_block,
+                genesis_block
             );
 
             let unwind_target = PipelineTarget::Unwind(unwind_block);
