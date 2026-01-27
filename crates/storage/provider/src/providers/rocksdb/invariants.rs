@@ -17,6 +17,7 @@ use reth_storage_api::{
     DBProvider, StageCheckpointReader, StorageSettingsCache, TransactionsProvider,
 };
 use reth_storage_errors::provider::ProviderResult;
+use reth_chainspec::ChainSpecProvider;
 
 impl RocksDBProvider {
     /// Checks consistency of `RocksDB` tables against MDBX stage checkpoints.
