@@ -17,7 +17,7 @@ use reth_storage_api::{
     DBProvider, StageCheckpointReader, StorageSettingsCache, TransactionsProvider,
 };
 use reth_storage_errors::provider::ProviderResult;
-use reth_chainspec::ChainSpecProvider;
+use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 
 impl RocksDBProvider {
     /// Checks consistency of `RocksDB` tables against MDBX stage checkpoints.
@@ -52,7 +52,8 @@ impl RocksDBProvider {
             + StageCheckpointReader
             + StorageSettingsCache
             + StaticFileProviderFactory
-            + TransactionsProvider<Transaction: Encodable2718>,
+            + TransactionsProvider<Transaction: Encodable2718>
+            + ChainSpecProvider,
     {
         let mut unwind_target: Option<BlockNumber> = None;
 
