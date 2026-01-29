@@ -299,7 +299,7 @@ impl PayloadTaskGuard {
     }
 }
 
-/// Settings for the [`BasicPayloadJobGenerator`].
+/// Configures the [`BasicPayloadJobGenerator`].
 #[derive(Debug, Clone)]
 pub struct BasicPayloadJobGeneratorConfig {
     /// The interval at which the job should build a new payload after the last.
@@ -310,6 +310,29 @@ pub struct BasicPayloadJobGeneratorConfig {
     deadline: Duration,
     /// Maximum number of tasks to spawn for building a payload.
     max_payload_tasks: usize,
+    /// Pre-warming configuration.
+    pub pre_warming: PreWarmingConfig,
+}
+
+/// Configuration for cache pre-warming.
+#[derive(Debug, Clone)]
+pub struct PreWarmingConfig {
+    /// Whether pre-warming is enabled.
+    pub enabled: bool,
+    /// Number of top transactions to pre-warm (sorted by gas price).
+    pub tx_count: usize,
+    /// Interval between pre-warming cycles (in seconds).
+    pub interval_secs: u64,
+}
+
+impl Default for PreWarmingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,  // Disabled by default (Phase 5 not implemented yet)
+            tx_count: 50,    // Conservative for X Layer (typical blocks: 1-50 tx)
+            interval_secs: 6, // Refresh every 6 seconds (15 blocks on X Layer)
+        }
+    }
 }
 
 // === impl BasicPayloadJobGeneratorConfig ===
@@ -337,6 +360,12 @@ impl BasicPayloadJobGeneratorConfig {
         self.max_payload_tasks = max_payload_tasks;
         self
     }
+
+    /// Sets the pre-warming configuration.
+    pub const fn pre_warming(mut self, pre_warming: PreWarmingConfig) -> Self {
+        self.pre_warming = pre_warming;
+        self
+    }
 }
 
 impl Default for BasicPayloadJobGeneratorConfig {
@@ -346,6 +375,7 @@ impl Default for BasicPayloadJobGeneratorConfig {
             // 12s slot time
             deadline: SLOT_DURATION,
             max_payload_tasks: 3,
+            pre_warming: PreWarmingConfig::default(),
         }
     }
 }
