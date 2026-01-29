@@ -132,10 +132,18 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
     /// Pre-warmed cache contains mempool transactions that are valid across blocks
     /// until the cache becomes stale. Staleness is based on time, not block number,
     /// since mempool transactions remain valid until included or replaced.
+    ///
+    /// Returns None if pre-warming is disabled or cache is stale.
     fn maybe_pre_warmed(&self, _parent: B256) -> Option<CachedReads> {
+        // Check if pre-warming is enabled
+        if !self.config.pre_warming.enabled {
+            return None;
+        }
+
         self.pre_warmed.as_ref().and_then(|pw| {
             // Only check staleness - mempool transactions are valid across blocks
-            let max_age_secs = self.config.pre_warming.interval_secs * 2;
+            let max_age_secs = self.config.pre_warming.interval_secs
+                * self.config.pre_warming.staleness_multiplier;
             let now = SystemTime::now();
             let age = now.duration_since(pw.created_at).ok()?;
             if age > Duration::from_secs(max_age_secs) {
@@ -153,10 +161,18 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
     ///
     /// Background job simply simulates top N transactions every cycle and calls this.
     /// No need to track which transactions were simulated - just merge the results.
+    ///
+    /// No-op if pre-warming is disabled.
     pub fn set_pre_warmed(&mut self, new_cache: PreWarmedCache) {
+        // Check if pre-warming is enabled
+        if !self.config.pre_warming.enabled {
+            return;
+        }
+
         if let Some(existing) = &mut self.pre_warmed {
             // Check if existing cache is still valid
-            let max_age_secs = self.config.pre_warming.interval_secs * 2;
+            let max_age_secs = self.config.pre_warming.interval_secs
+                * self.config.pre_warming.staleness_multiplier;
             let now = SystemTime::now();
             let age = now.duration_since(existing.created_at).ok();
 
@@ -344,14 +360,19 @@ pub struct PreWarmingConfig {
     pub tx_count: usize,
     /// Interval between pre-warming cycles (in seconds).
     pub interval_secs: u64,
+    /// Staleness multiplier for cache timeout.
+    /// Cache is invalidated after `interval_secs * staleness_multiplier` seconds.
+    /// Default: 2 (e.g., 6 second interval = 12 second cache lifetime)
+    pub staleness_multiplier: u64,
 }
 
 impl Default for PreWarmingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,  // Disabled by default (Phase 5 not implemented yet)
+            enabled: false,  // Disabled by default (background job not implemented yet)
             tx_count: 50,    // Conservative for X Layer (typical blocks: 1-50 tx)
-            interval_secs: 6, // Refresh every 6 seconds (15 blocks on X Layer)
+            interval_secs: 6, // Refresh every 6 seconds (15 blocks on X Layer @ 400ms)
+            staleness_multiplier: 2, // Cache valid for 2x interval (12 seconds)
         }
     }
 }
