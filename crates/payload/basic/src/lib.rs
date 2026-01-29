@@ -156,11 +156,11 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
 
     /// Updates the pre-warmed cache with new simulation results.
     ///
-    /// This merges new simulations with the existing cache. The cache accumulates
-    /// state across multiple simulation cycles until it becomes stale (time-based).
+    /// Always replaces the entire cache to avoid mixed state from different blocks.
+    /// This is safer for production than merging, which could create inconsistent
+    /// state with some accounts from block N and others from block N+1.
     ///
     /// Background job simply simulates top N transactions every cycle and calls this.
-    /// No need to track which transactions were simulated - just merge the results.
     ///
     /// No-op if pre-warming is disabled.
     pub fn set_pre_warmed(&mut self, new_cache: PreWarmedCache) {
@@ -169,25 +169,9 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
             return;
         }
 
-        if let Some(existing) = &mut self.pre_warmed {
-            // Check if existing cache is still valid
-            let max_age_secs = self.config.pre_warming.interval_secs
-                * self.config.pre_warming.staleness_multiplier;
-            let now = SystemTime::now();
-            let age = now.duration_since(existing.created_at).ok();
-
-            if age.map_or(false, |age| age <= Duration::from_secs(max_age_secs)) {
-                // Existing cache is still valid - merge
-                existing.cached.extend(new_cache.cached);
-                existing.created_at = now; // Update timestamp
-            } else {
-                // Existing cache is stale - replace
-                self.pre_warmed = Some(new_cache);
-            }
-        } else {
-            // No existing cache - set new
-            self.pre_warmed = Some(new_cache);
-        }
+        // Always replace cache with fresh simulation
+        // This prevents mixed state from different parent blocks
+        self.pre_warmed = Some(new_cache);
     }
 }
 
