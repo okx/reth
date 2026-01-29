@@ -38,9 +38,11 @@ use tracing::{debug, trace, warn};
 
 mod better_payload_emitter;
 mod metrics;
+mod simulator;
 mod stack;
 
 pub use better_payload_emitter::BetterPayloadEmitter;
+pub use simulator::{SimulationError, TransactionSimulator};
 pub use stack::PayloadBuilderStack;
 
 /// Helper to access [`NodePrimitives::BlockHeader`] from [`PayloadBuilder::BuiltPayload`].
@@ -63,6 +65,8 @@ pub struct BasicPayloadJobGenerator<Client, Tasks, Builder> {
     builder: Builder,
     /// Stored `cached_reads` for new payload jobs.
     pre_cached: Option<PrecachedState>,
+    /// Pre-warmed cache from mempool simulation.
+    pre_warmed: Option<PreWarmedCache>,
 }
 
 // === impl BasicPayloadJobGenerator ===
@@ -83,6 +87,7 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
             config,
             builder,
             pre_cached: None,
+            pre_warmed: None,
         }
     }
 
@@ -120,6 +125,35 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
     /// block.
     fn maybe_pre_cached(&self, parent: B256) -> Option<CachedReads> {
         self.pre_cached.as_ref().filter(|pc| pc.block == parent).map(|pc| pc.cached.clone())
+    }
+
+    /// Returns the pre-warmed cache for the given parent header if it matches and is still valid.
+    ///
+    /// Pre-warmed cache is only valid for a short time (typically 6-12 seconds) as mempool
+    /// changes rapidly. After this time, the cache is stale and should not be used.
+    fn maybe_pre_warmed(&self, parent: B256) -> Option<CachedReads> {
+        self.pre_warmed.as_ref().and_then(|pw| {
+            // Check parent block matches
+            if pw.parent_block != parent {
+                return None;
+            }
+
+            // Check cache freshness (12 seconds max age)
+            let now = SystemTime::now();
+            let age = now.duration_since(pw.created_at).ok()?;
+            if age > Duration::from_secs(12) {
+                return None;
+            }
+
+            Some(pw.cached.clone())
+        })
+    }
+
+    /// Updates the pre-warmed cache with new simulation results.
+    ///
+    /// This is called by the background task that simulates mempool transactions.
+    pub fn set_pre_warmed(&mut self, cache: PreWarmedCache) {
+        self.pre_warmed = Some(cache);
     }
 }
 
@@ -159,6 +193,17 @@ where
         };
 
         let cached_reads = self.maybe_pre_cached(parent_header.hash());
+        let pre_warmed = self.maybe_pre_warmed(parent_header.hash());
+
+        if let Some(ref cache) = pre_warmed {
+            debug!(
+                target: "payload_builder",
+                parent = ?parent_header.hash(),
+                cached_accounts = cache.accounts.len(),
+                cached_contracts = cache.contracts.len(),
+                "Pre-warmed cache available for new payload job"
+            );
+        }
 
         let config = PayloadConfig::new(Arc::new(parent_header), attributes);
 
@@ -174,6 +219,7 @@ where
             best_payload: PayloadState::Missing,
             pending_block: None,
             cached_reads,
+            pre_warmed,
             payload_task_guard: self.payload_task_guard.clone(),
             metrics: Default::default(),
             builder: self.builder.clone(),
@@ -214,6 +260,22 @@ pub struct PrecachedState {
     pub block: B256,
     /// Cached state for the block.
     pub cached: CachedReads,
+}
+
+/// Pre-warmed cache from mempool transaction simulation.
+///
+/// This cache is populated by simulating the top transactions from the mempool
+/// BEFORE block building starts, providing a "head start" on state access patterns.
+#[derive(Debug, Clone)]
+pub struct PreWarmedCache {
+    /// The parent block hash for which this cache is valid.
+    pub parent_block: B256,
+    /// Timestamp when this cache was created.
+    pub created_at: SystemTime,
+    /// Pre-warmed cached reads from mempool simulation.
+    pub cached: CachedReads,
+    /// Number of transactions that were simulated to create this cache.
+    pub simulated_tx_count: usize,
 }
 
 /// Restricts how many generator tasks can be executed at once.
@@ -322,6 +384,8 @@ where
     /// This is used to avoid reading the same state over and over again when new attempts are
     /// triggered, because during the building process we'll repeatedly execute the transactions.
     cached_reads: Option<CachedReads>,
+    /// Pre-warmed cache from simulating mempool transactions
+    pre_warmed: Option<CachedReads>,
     /// metrics for this type
     metrics: PayloadBuilderMetrics,
     /// The type responsible for building payloads.
@@ -344,16 +408,27 @@ where
         let cancel = CancelOnDrop::default();
         let _cancel = cancel.clone();
         let guard = self.payload_task_guard.clone();
-        let payload_config = self.config.clone();
-        let best_payload = self.best_payload.payload().cloned();
-        self.metrics.inc_initiated_payload_builds();
         let cached_reads = self.cached_reads.take().unwrap_or_default();
+        let pre_warmed = self.pre_warmed.take();
+        let best_payload = self.best_payload.payload().cloned();
+        let payload_config = self.config.clone();
         let builder = self.builder.clone();
+
+        if let Some(ref cache) = pre_warmed {
+            debug!(
+                target: "payload_builder",
+                parent = ?payload_config.parent_header.hash(),
+                cached_accounts = cache.accounts.len(),
+                cached_contracts = cache.contracts.len(),
+                "Using pre-warmed cache for payload building"
+            );
+        }
+
         self.executor.spawn_blocking(Box::pin(async move {
             // acquire the permit for executing the task
             let _permit = guard.acquire().await;
             let args =
-                BuildArguments { cached_reads, config: payload_config, cancel, best_payload };
+                BuildArguments { cached_reads, pre_warmed, config: payload_config, cancel, best_payload };
             let result = builder.try_build(args);
             let _ = tx.send(result);
         }));
@@ -477,6 +552,7 @@ where
 
             let args = BuildArguments {
                 cached_reads: self.cached_reads.take().unwrap_or_default(),
+                pre_warmed: self.pre_warmed.take(),
                 config: self.config.clone(),
                 cancel: CancelOnDrop::default(),
                 best_payload: None,
@@ -798,6 +874,8 @@ impl<Payload> BuildOutcomeKind<Payload> {
 pub struct BuildArguments<Attributes, Payload: BuiltPayload> {
     /// Previously cached disk reads
     pub cached_reads: CachedReads,
+    /// Pre-warmed cache from simulating mempool transactions
+    pub pre_warmed: Option<CachedReads>,
     /// How to configure the payload.
     pub config: PayloadConfig<Attributes, HeaderTy<Payload::Primitives>>,
     /// A marker that can be used to cancel the job.
@@ -810,11 +888,12 @@ impl<Attributes, Payload: BuiltPayload> BuildArguments<Attributes, Payload> {
     /// Create new build arguments.
     pub const fn new(
         cached_reads: CachedReads,
+        pre_warmed: Option<CachedReads>,
         config: PayloadConfig<Attributes, HeaderTy<Payload::Primitives>>,
         cancel: CancelOnDrop,
         best_payload: Option<Payload>,
     ) -> Self {
-        Self { cached_reads, config, cancel, best_payload }
+        Self { cached_reads, pre_warmed, config, cancel, best_payload }
     }
 }
 

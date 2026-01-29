@@ -194,6 +194,120 @@ impl<DB: DatabaseRef> DatabaseRef for CachedReadsDBRef<'_, DB> {
     }
 }
 
+/// A [Database] that implements three-level cache hierarchy for pre-warmed reads.
+///
+/// Cache lookup order:
+/// 1. Pre-warmed cache (from mempool simulation) - checked first
+/// 2. Base cache (from previous block execution) - fallback
+/// 3. Underlying database - final fallback
+///
+/// This provides optimal performance by checking the most likely cache (pre-warmed)
+/// before falling back to the base cache and database.
+#[derive(Debug)]
+pub struct PreWarmedCachedReadsDbMut<'a, DB> {
+    /// Pre-warmed cache from mempool transaction simulation.
+    pub pre_warmed: &'a CachedReads,
+    /// Base cache from previous block execution.
+    pub base_cached: &'a mut CachedReads,
+    /// The underlying database.
+    pub db: DB,
+}
+
+impl<'a, DB> PreWarmedCachedReadsDbMut<'a, DB> {
+    /// Creates a new three-level cache database.
+    pub const fn new(
+        pre_warmed: &'a CachedReads,
+        base_cached: &'a mut CachedReads,
+        db: DB,
+    ) -> Self {
+        Self { pre_warmed, base_cached, db }
+    }
+
+    /// Returns access to wrapped database.
+    pub const fn inner(&self) -> &DB {
+        &self.db
+    }
+}
+
+impl<DB: DatabaseRef> Database for PreWarmedCachedReadsDbMut<'_, DB> {
+    type Error = <DB as DatabaseRef>::Error;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        // Level 1: Check pre-warmed cache
+        if let Some(cached_account) = self.pre_warmed.accounts.get(&address) {
+            return Ok(cached_account.info.clone());
+        }
+
+        // Level 2: Check base cache, or fetch from DB and cache
+        let basic = match self.base_cached.accounts.entry(address) {
+            Entry::Occupied(entry) => entry.get().info.clone(),
+            Entry::Vacant(entry) => {
+                entry.insert(CachedAccount::new(self.db.basic_ref(address)?)).info.clone()
+            }
+        };
+        Ok(basic)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        // Level 1: Check pre-warmed cache
+        if let Some(code) = self.pre_warmed.contracts.get(&code_hash) {
+            return Ok(code.clone());
+        }
+
+        // Level 2: Check base cache, or fetch from DB and cache
+        let code = match self.base_cached.contracts.entry(code_hash) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => entry.insert(self.db.code_by_hash_ref(code_hash)?).clone(),
+        };
+        Ok(code)
+    }
+
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        // Level 1: Check pre-warmed cache for both account and storage
+        if let Some(cached_account) = self.pre_warmed.accounts.get(&address) {
+            if let Some(value) = cached_account.storage.get(&index) {
+                return Ok(*value);
+            }
+        }
+
+        // Level 2: Check base cache, or fetch from DB and cache
+        match self.base_cached.accounts.entry(address) {
+            Entry::Occupied(mut acc_entry) => match acc_entry.get_mut().storage.entry(index) {
+                Entry::Occupied(entry) => Ok(*entry.get()),
+                Entry::Vacant(entry) => Ok(*entry.insert(self.db.storage_ref(address, index)?)),
+            },
+            Entry::Vacant(acc_entry) => {
+                // Account needs to be loaded to access storage slots
+                let info = self.db.basic_ref(address)?;
+                let (account, value) = if info.is_some() {
+                    let value = self.db.storage_ref(address, index)?;
+                    let mut account = CachedAccount::new(info);
+                    account.storage.insert(index, value);
+                    (account, value)
+                } else {
+                    (CachedAccount::new(info), U256::ZERO)
+                };
+                acc_entry.insert(account);
+                Ok(value)
+            }
+        }
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        // Level 1: Check pre-warmed cache
+        if let Some(hash) = self.pre_warmed.block_hashes.get(&number) {
+            return Ok(*hash);
+        }
+
+        // Level 2: Check base cache, or fetch from DB and cache
+        let hash = match self.base_cached.block_hashes.entry(number) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => *entry.insert(self.db.block_hash_ref(number)?),
+        };
+        Ok(hash)
+    }
+}
+
 /// Cached account contains the account state with storage
 /// but lacks the account status.
 #[derive(Debug, Clone)]
@@ -262,4 +376,97 @@ mod tests {
             "All expected entries should be present"
         );
     }
+
+    #[test]
+    fn test_three_level_cache_lookup_order() {
+        // Test addresses
+        let addr_pre_warmed = Address::from_slice(&[1u8; 20]);
+        let addr_base = Address::from_slice(&[2u8; 20]);
+        let addr_storage_test = Address::from_slice(&[3u8; 20]);
+
+        // Create pre-warmed cache with one account
+        let pre_warmed = {
+            let mut cache = CachedReads::default();
+            let mut account_info = AccountInfo::default();
+            account_info.balance = U256::from(1000);
+            cache.insert_account(addr_pre_warmed, account_info, HashMap::default());
+            cache
+        };
+
+        // Create base cache with different account
+        let mut base_cached = {
+            let mut cache = CachedReads::default();
+            let mut account_info = AccountInfo::default();
+            account_info.balance = U256::from(2000);
+            cache.insert_account(addr_base, account_info, HashMap::default());
+
+            // Add account with storage for storage lookup test
+            let mut account_info_storage = AccountInfo::default();
+            account_info_storage.balance = U256::from(3000);
+            let mut storage = HashMap::default();
+            storage.insert(U256::from(1), U256::from(100));
+            cache.insert_account(addr_storage_test, account_info_storage, storage);
+            cache
+        };
+
+        // Mock database (returns None for everything)
+        struct MockDB;
+        impl DatabaseRef for MockDB {
+            type Error = core::convert::Infallible;
+            fn basic_ref(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+                Ok(None)
+            }
+            fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+                Ok(Bytecode::default())
+            }
+            fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+                Ok(U256::ZERO)
+            }
+            fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+                Ok(B256::ZERO)
+            }
+        }
+
+        let mut db = PreWarmedCachedReadsDbMut::new(&pre_warmed, &mut base_cached, MockDB);
+
+        // Test 1: Account in pre-warmed cache should be returned
+        let result = db.basic(addr_pre_warmed).unwrap();
+        assert!(result.is_some(), "Pre-warmed account should be found");
+        assert_eq!(result.unwrap().balance, U256::from(1000), "Should return pre-warmed balance");
+
+        // Test 2: Account in base cache should be returned
+        let result = db.basic(addr_base).unwrap();
+        assert!(result.is_some(), "Base cached account should be found");
+        assert_eq!(result.unwrap().balance, U256::from(2000), "Should return base cached balance");
+
+        // Test 3: Storage lookup from base cache
+        let result = db.storage(addr_storage_test, U256::from(1)).unwrap();
+        assert_eq!(result, U256::from(100), "Should return storage value from base cache");
+
+        // Test 4: Block hash lookup
+        // Add block hash to pre-warmed
+        let pre_warmed_with_hash = {
+            let mut cache = pre_warmed.clone();
+            cache.block_hashes.insert(1, B256::from_slice(&[0xAA; 32]));
+            cache
+        };
+        let mut db_with_hash =
+            PreWarmedCachedReadsDbMut::new(&pre_warmed_with_hash, &mut base_cached, MockDB);
+        let result = db_with_hash.block_hash(1).unwrap();
+        assert_eq!(result, B256::from_slice(&[0xAA; 32]), "Should return pre-warmed block hash");
+
+        // Test 5: Code lookup from pre-warmed cache
+        let code_hash = B256::from_slice(&[0xBB; 32]);
+        let pre_warmed_with_code = {
+            let mut cache = pre_warmed.clone();
+            cache.contracts.insert(code_hash, Bytecode::new_legacy([0x60, 0x00].into()));
+            cache
+        };
+        let mut db_with_code =
+            PreWarmedCachedReadsDbMut::new(&pre_warmed_with_code, &mut base_cached, MockDB);
+        let result = db_with_code.code_by_hash(code_hash).unwrap();
+        assert!(!result.is_empty(), "Should return code from pre-warmed cache");
+    }
 }
+
+

@@ -208,7 +208,7 @@ where
         Txs:
             PayloadTransactions<Transaction: PoolTransaction<Consensus = N::SignedTx> + OpPooledTx>,
     {
-        let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
+        let BuildArguments { mut cached_reads, pre_warmed, config, cancel, best_payload } = args;
 
         let ctx = OpPayloadBuilderCtx {
             evm_config: self.evm_config.clone(),
@@ -229,7 +229,23 @@ where
             builder.build(state, &state_provider, ctx)
         } else {
             // sequencer mode we can reuse cachedreads from previous runs
-            builder.build(cached_reads.as_db_mut(state), &state_provider, ctx)
+            // Check if we have a pre-warmed cache from mempool simulation
+            if let Some(pre_warmed) = pre_warmed {
+                debug!(
+                    target: "payload_builder",
+                    parent = ?ctx.parent().hash(),
+                    pre_warmed_accounts = pre_warmed.accounts.len(),
+                    base_cached_accounts = cached_reads.accounts.len(),
+                    "Using three-level cache: pre-warmed → base → database"
+                );
+                // Use three-level cache: pre-warmed → base → database
+                use reth_revm::cached::PreWarmedCachedReadsDbMut;
+                let db = PreWarmedCachedReadsDbMut::new(&pre_warmed, &mut cached_reads, state);
+                builder.build(db, &state_provider, ctx)
+            } else {
+                // Fallback to two-level cache: base → database
+                builder.build(cached_reads.as_db_mut(state), &state_provider, ctx)
+            }
         }
         .map(|out| out.with_cached_reads(cached_reads))
     }
@@ -307,6 +323,7 @@ where
         let args = BuildArguments {
             config,
             cached_reads: Default::default(),
+            pre_warmed: None,
             cancel: Default::default(),
             best_payload: None,
         };
