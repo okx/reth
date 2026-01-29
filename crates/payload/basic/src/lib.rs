@@ -127,21 +127,18 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
         self.pre_cached.as_ref().filter(|pc| pc.block == parent).map(|pc| pc.cached.clone())
     }
 
-    /// Returns the pre-warmed cache for the given parent header if it matches and is still valid.
+    /// Returns the pre-warmed cache if it is still valid (not stale).
     ///
-    /// Pre-warmed cache is only valid for a short time (typically 6-12 seconds) as mempool
-    /// changes rapidly. After this time, the cache is stale and should not be used.
-    fn maybe_pre_warmed(&self, parent: B256) -> Option<CachedReads> {
+    /// Pre-warmed cache contains mempool transactions that are valid across blocks
+    /// until the cache becomes stale. Staleness is based on time, not block number,
+    /// since mempool transactions remain valid until included or replaced.
+    fn maybe_pre_warmed(&self, _parent: B256) -> Option<CachedReads> {
         self.pre_warmed.as_ref().and_then(|pw| {
-            // Check parent block matches
-            if pw.parent_block != parent {
-                return None;
-            }
-
-            // Check cache freshness (12 seconds max age)
+            // Only check staleness - mempool transactions are valid across blocks
+            let max_age_secs = self.config.pre_warming.interval_secs * 2;
             let now = SystemTime::now();
             let age = now.duration_since(pw.created_at).ok()?;
-            if age > Duration::from_secs(12) {
+            if age > Duration::from_secs(max_age_secs) {
                 return None;
             }
 
@@ -151,9 +148,30 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
 
     /// Updates the pre-warmed cache with new simulation results.
     ///
-    /// This is called by the background task that simulates mempool transactions.
-    pub fn set_pre_warmed(&mut self, cache: PreWarmedCache) {
-        self.pre_warmed = Some(cache);
+    /// This merges new simulations with the existing cache. The cache accumulates
+    /// state across multiple simulation cycles until it becomes stale (time-based).
+    ///
+    /// Background job simply simulates top N transactions every cycle and calls this.
+    /// No need to track which transactions were simulated - just merge the results.
+    pub fn set_pre_warmed(&mut self, new_cache: PreWarmedCache) {
+        if let Some(existing) = &mut self.pre_warmed {
+            // Check if existing cache is still valid
+            let max_age_secs = self.config.pre_warming.interval_secs * 2;
+            let now = SystemTime::now();
+            let age = now.duration_since(existing.created_at).ok();
+
+            if age.map_or(false, |age| age <= Duration::from_secs(max_age_secs)) {
+                // Existing cache is still valid - merge
+                existing.cached.extend(new_cache.cached);
+                existing.created_at = now; // Update timestamp
+            } else {
+                // Existing cache is stale - replace
+                self.pre_warmed = Some(new_cache);
+            }
+        } else {
+            // No existing cache - set new
+            self.pre_warmed = Some(new_cache);
+        }
     }
 }
 
@@ -265,17 +283,20 @@ pub struct PrecachedState {
 /// Pre-warmed cache from mempool transaction simulation.
 ///
 /// This cache is populated by simulating the top transactions from the mempool
-/// BEFORE block building starts, providing a "head start" on state access patterns.
+/// BEFORE block building starts. Mempool transactions are valid across multiple
+/// blocks until they are included or the cache becomes stale.
+///
+/// The background job simply simulates the current top N transactions every cycle.
+/// No deduplication tracking is needed because:
+/// - Transactions that get included are automatically removed from mempool
+/// - Re-simulating the same transaction just overwrites with same data (cheap)
+/// - Simulation is fast (~3ms per transaction), so redundant work is negligible
 #[derive(Debug, Clone)]
 pub struct PreWarmedCache {
-    /// The parent block hash for which this cache is valid.
-    pub parent_block: B256,
-    /// Timestamp when this cache was created.
+    /// Timestamp when this cache was last updated.
     pub created_at: SystemTime,
     /// Pre-warmed cached reads from mempool simulation.
     pub cached: CachedReads,
-    /// Number of transactions that were simulated to create this cache.
-    pub simulated_tx_count: usize,
 }
 
 /// Restricts how many generator tasks can be executed at once.
