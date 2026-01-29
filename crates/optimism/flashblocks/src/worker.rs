@@ -107,7 +107,7 @@ where
         let hashed_state = state_provider.hashed_post_state(&bundle_state);
 
         let execution_outcome =
-            BlockExecutionOutput { state: state.take_bundle(), result: execution.execution_result };
+            BlockExecutionOutput { state: bundle_state, result: execution.execution_result };
 
         let pending_block = PendingBlock::with_executed_block(
             Instant::now() + Duration::from_secs(1),
