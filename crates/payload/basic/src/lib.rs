@@ -1063,3 +1063,23 @@ fn duration_until(unix_timestamp_secs: u64) -> Duration {
     let timestamp = Duration::from_secs(unix_timestamp_secs);
     timestamp.saturating_sub(unix_now)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pre_warming_disabled_by_default() {
+        let config = PreWarmingConfig::default();
+        assert!(!config.enabled, "Pre-warming should be disabled by default");
+    }
+
+    #[test]
+    fn test_pre_warming_config_values() {
+        let config = PreWarmingConfig::default();
+        assert_eq!(config.tx_count, 50, "Default tx_count should be 50");
+        assert_eq!(config.interval_secs, 6, "Default interval should be 6 seconds");
+        assert_eq!(config.staleness_multiplier, 2, "Default staleness multiplier should be 2");
+    }
+}
+
