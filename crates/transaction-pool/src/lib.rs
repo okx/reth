@@ -323,6 +323,10 @@ pub mod identifier;
 mod ordering;
 mod traits;
 
+#[cfg(feature = "pre-warming")]
+/// Pre-warming simulation for extracting transaction keys
+pub mod pre_warming;
+
 #[cfg(any(test, feature = "test-utils"))]
 /// Common test helpers for mocking a pool
 pub mod test_utils;
