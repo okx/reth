@@ -97,9 +97,19 @@ impl StaticFilesArgs {
 
     /// Converts the static files arguments into [`StorageSettings`].
     pub const fn to_settings(&self) -> StorageSettings {
-        StorageSettings::legacy()
+        let mut settings = StorageSettings::legacy()
             .with_receipts_in_static_files(self.receipts)
             .with_transaction_senders_in_static_files(self.transaction_senders)
-            .with_account_changesets_in_static_files(self.account_changesets)
+            .with_account_changesets_in_static_files(self.account_changesets);
+
+        #[cfg(all(unix, feature = "edge"))]
+        {
+            settings = StorageSettings::edge()
+                .with_account_history_in_rocksdb(true)
+                .with_storages_history_in_rocksdb(true)
+                .with_transaction_hash_numbers_in_rocksdb(true);
+        }
+
+        settings
     }
 }

@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 # reth
-reth-db-api.workspace = true
+reth-db-api = { workspace = true, features = ["edge"] }
 reth-fs-util.workspace = true
 reth-storage-errors.workspace = true
 reth-nippy-jar.workspace = true
