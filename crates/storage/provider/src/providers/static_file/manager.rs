@@ -38,8 +38,8 @@ use reth_primitives_traits::{
 };
 use reth_stages_types::{PipelineTarget, StageId};
 use reth_static_file_types::{
-    find_fixed_range, HighestStaticFiles, SegmentHeader, SegmentRangeInclusive, StaticFileMap,
-    StaticFileSegment, DEFAULT_BLOCKS_PER_STATIC_FILE,
+    find_fixed_range_with_genesis, HighestStaticFiles, SegmentHeader, SegmentRangeInclusive,
+    StaticFileMap, StaticFileSegment, DEFAULT_BLOCKS_PER_STATIC_FILE,
 };
 use reth_storage_api::{
     BlockBodyIndicesProvider, ChangeSetReader, DBProvider, StorageSettingsCache,
@@ -462,8 +462,8 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             }
         }
         // No block index is available, derive a new range using the fixed number of blocks,
-        // starting from the beginning.
-        find_fixed_range(block, blocks_per_file)
+        // starting from the genesis block.
+        find_fixed_range_with_genesis(block, blocks_per_file, self.genesis_block_number)
     }
 
     /// Each static file has a fixed number of blocks. This gives out the range where the requested
