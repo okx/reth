@@ -35,7 +35,7 @@ alloy-consensus = { workspace = true, features = ["kzg"] }
 futures-util.workspace = true
 parking_lot.workspace = true
 pin-project.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
 tokio-stream.workspace = true
 
 # metrics

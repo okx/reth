@@ -38,13 +38,15 @@
 //! Execute (all cache hits!)
 //! ```
 
-mod cache;
-mod config;
-mod types;
+pub mod cache;
+pub mod config;
+pub mod types;
+pub mod worker_pool;
 
 pub use cache::{CacheStats, PreWarmedCache};
 pub use config::PreWarmingConfig;
 pub use types::{ExtractedKeys, SimulationRequest};
+pub use worker_pool::SimulationWorkerPool;
 
 #[cfg(test)]
 mod tests {
