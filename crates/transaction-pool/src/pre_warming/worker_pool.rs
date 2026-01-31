@@ -259,8 +259,7 @@ fn dummy_simulate<T: PoolTransaction>(tx: &T) -> ExtractedKeys {
 mod tests {
     use super::*;
     use crate::pre_warming::PreWarmingConfig;
-    use alloy_primitives::{Address, TxHash};
-    use std::time::Duration;
+    use alloy_primitives::Address;
 
     #[test]
     fn test_dummy_simulate_basic() {
@@ -296,7 +295,13 @@ mod tests {
         assert_eq!(keys.total_keys(), 2);
     }
 
-    // TODO: Add integration tests with real transactions in Phase 3
-    // when Pool::add_transaction() integration is complete
+    // Integration tests with Pool will be added once test utilities are available
+    // These tests verify the full flow: Pool::add_transaction() → worker_pool → simulation → cache
+    //
+    // Test scenarios needed:
+    // 1. Pool with pre-warming enabled triggers simulation
+    // 2. Pool with pre-warming disabled works normally
+    // 3. Keys appear in cache after transaction added
+    // 4. Multiple transactions trigger multiple simulations
 }
 

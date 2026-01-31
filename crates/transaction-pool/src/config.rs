@@ -72,6 +72,9 @@ pub struct PoolConfig {
     ///
     /// This restricts how many executable transaction a delegated sender can stack.
     pub max_inflight_delegated_slot_limit: usize,
+    /// Pre-warming configuration
+    #[cfg(feature = "pre-warming")]
+    pub pre_warming: crate::pre_warming::PreWarmingConfig,
 }
 
 impl PoolConfig {
@@ -129,6 +132,8 @@ impl Default for PoolConfig {
             max_new_pending_txs_notifications: MAX_NEW_PENDING_TXS_NOTIFICATIONS,
             max_queued_lifetime: MAX_QUEUED_TRANSACTION_LIFETIME,
             max_inflight_delegated_slot_limit: DEFAULT_MAX_INFLIGHT_DELEGATED_SLOTS,
+            #[cfg(feature = "pre-warming")]
+            pre_warming: Default::default(),
         }
     }
 }
