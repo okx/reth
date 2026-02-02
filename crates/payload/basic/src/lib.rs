@@ -43,12 +43,36 @@ mod stack;
 pub use better_payload_emitter::BetterPayloadEmitter;
 pub use stack::PayloadBuilderStack;
 
+/// Trait for transaction pools that support pre-warming via simulation.
+///
+/// This trait is automatically implemented for pools that have the `get_prewarmed_keys()` method.
+#[cfg(feature = "pre-warming")]
+pub trait PreWarmingPool {
+    /// Get pre-warmed keys discovered by background simulation
+    fn get_prewarmed_keys(&self) -> Option<reth_transaction_pool::pre_warming::ExtractedKeys>;
+}
+
+/// Default implementation for unit type when no pool is provided
+#[cfg(feature = "pre-warming")]
+impl PreWarmingPool for () {
+    fn get_prewarmed_keys(&self) -> Option<reth_transaction_pool::pre_warming::ExtractedKeys> {
+        None
+    }
+}
+
+/// Blanket implementation when pre-warming feature is disabled
+#[cfg(not(feature = "pre-warming"))]
+pub trait PreWarmingPool {}
+
+#[cfg(not(feature = "pre-warming"))]
+impl<T> PreWarmingPool for T {}
+
 /// Helper to access [`NodePrimitives::BlockHeader`] from [`PayloadBuilder::BuiltPayload`].
 pub type HeaderForPayload<P> = <<P as BuiltPayload>::Primitives as NodePrimitives>::BlockHeader;
 
 /// The [`PayloadJobGenerator`] that creates [`BasicPayloadJob`]s.
 #[derive(Debug)]
-pub struct BasicPayloadJobGenerator<Client, Tasks, Builder> {
+pub struct BasicPayloadJobGenerator<Client, Tasks, Builder, Pool = ()> {
     /// The client that can interact with the chain.
     client: Client,
     /// The task executor to spawn payload building tasks on.
@@ -63,6 +87,15 @@ pub struct BasicPayloadJobGenerator<Client, Tasks, Builder> {
     builder: Builder,
     /// Stored `cached_reads` for new payload jobs.
     pre_cached: Option<PrecachedState>,
+    /// Optional transaction pool for pre-warming support.
+    ///
+    /// When provided, the payload builder will fetch pre-warmed keys from simulation
+    /// and prefetch state before execution for improved performance.
+    #[cfg(feature = "pre-warming")]
+    pool: Option<Pool>,
+    /// Marker for Pool type when feature is disabled
+    #[cfg(not(feature = "pre-warming"))]
+    _pool: std::marker::PhantomData<Pool>,
 }
 
 // === impl BasicPayloadJobGenerator ===
@@ -83,9 +116,36 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
             config,
             builder,
             pre_cached: None,
+            #[cfg(feature = "pre-warming")]
+            pool: None,
+            #[cfg(not(feature = "pre-warming"))]
+            _pool: std::marker::PhantomData,
         }
     }
 
+    /// Sets the transaction pool for pre-warming support.
+    ///
+    /// When a pool is provided, the payload builder will leverage pre-warmed keys
+    /// from transaction simulation to prefetch state before execution.
+    #[cfg(feature = "pre-warming")]
+    pub fn with_pool<Pool>(self, pool: Pool) -> BasicPayloadJobGenerator<Client, Tasks, Builder, Pool> {
+        BasicPayloadJobGenerator {
+            client: self.client,
+            executor: self.executor,
+            config: self.config,
+            payload_task_guard: self.payload_task_guard,
+            builder: self.builder,
+            pre_cached: self.pre_cached,
+            pool: Some(pool),
+            #[cfg(not(feature = "pre-warming"))]
+            _pool: std::marker::PhantomData,
+        }
+    }
+}
+
+// === impl BasicPayloadJobGenerator ===
+
+impl<Client, Tasks, Builder, Pool> BasicPayloadJobGenerator<Client, Tasks, Builder, Pool> {
     /// Returns the maximum duration a job should be allowed to run.
     ///
     /// This adheres to the following specification:
@@ -125,8 +185,8 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
 
 // === impl BasicPayloadJobGenerator ===
 
-impl<Client, Tasks, Builder> PayloadJobGenerator
-    for BasicPayloadJobGenerator<Client, Tasks, Builder>
+impl<Client, Tasks, Builder, Pool> PayloadJobGenerator
+    for BasicPayloadJobGenerator<Client, Tasks, Builder, Pool>
 where
     Client: StateProviderFactory
         + BlockReaderIdExt<Header = HeaderForPayload<Builder::BuiltPayload>>
@@ -137,6 +197,7 @@ where
     Builder: PayloadBuilder + Unpin + 'static,
     Builder::Attributes: Unpin + Clone,
     Builder::BuiltPayload: Unpin + Clone,
+    Pool: PreWarmingPool + Send + Sync + 'static,
 {
     type Job = BasicPayloadJob<Tasks, Builder>;
 
@@ -158,7 +219,39 @@ where
                 .ok_or_else(|| PayloadBuilderError::MissingParentHeader(attributes.parent()))?
         };
 
-        let cached_reads = self.maybe_pre_cached(parent_header.hash());
+        let mut cached_reads = self.maybe_pre_cached(parent_header.hash()).unwrap_or_default();
+
+        // Pre-warming: Prefetch state using keys discovered by simulation
+        #[cfg(feature = "pre-warming")]
+        if let Some(pool) = &self.pool {
+            // Import prefetch function
+            if let Some(keys) = pool.get_prewarmed_keys() {
+                // Get state provider for prefetching
+                if let Ok(state_provider) = self.client.state_by_block_hash(parent_header.hash()) {
+                    // Prefetch values in parallel and populate cache
+                    if let Err(err) = reth_transaction_pool::pre_warming::prefetch_and_populate(
+                        &mut cached_reads,
+                        &keys,
+                        &*state_provider,
+                    ) {
+                        // Log error but don't fail - execution can continue with partial cache
+                        tracing::warn!(
+                            target: "payload_builder",
+                            ?err,
+                            "Failed to prefetch pre-warmed state, continuing with partial cache"
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "payload_builder",
+                            accounts = keys.accounts.len(),
+                            storage_slots = keys.storage_slots.len(),
+                            contracts = keys.code_hashes.len(),
+                            "Pre-warmed cache populated from simulation"
+                        );
+                    }
+                }
+            }
+        }
 
         let config = PayloadConfig::new(Arc::new(parent_header), attributes);
 
@@ -173,7 +266,7 @@ where
             interval: tokio::time::interval(self.config.interval),
             best_payload: PayloadState::Missing,
             pending_block: None,
-            cached_reads,
+            cached_reads: Some(cached_reads),
             payload_task_guard: self.payload_task_guard.clone(),
             metrics: Default::default(),
             builder: self.builder.clone(),

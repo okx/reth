@@ -21,6 +21,7 @@ reth-tasks.workspace = true
 reth-revm.workspace = true
 reth-storage-api.workspace = true
 reth-chain-state.workspace = true
+reth-transaction-pool = { workspace = true, optional = true }
 
 # ethereum
 alloy-primitives.workspace = true
@@ -38,3 +39,8 @@ metrics.workspace = true
 
 # misc
 tracing.workspace = true
+
+[features]
+default = []
+pre-warming = ["reth-transaction-pool", "reth-transaction-pool/pre-warming"]
+

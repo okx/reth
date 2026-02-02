@@ -6,9 +6,9 @@
 //! ## Architecture
 //!
 //! ```text
-//! trigger_simulation(tx) ← Fire-and-forget! (< 1μs)
+//! trigger_simulation(tx) <- Fire-and-forget
 //!     ↓
-//! Send to mpsc channel
+//!Send to mpsc channel
 //!     ↓
 //!     ┌─────────────────────────────────┐
 //!     │   Multiple Workers Compete      │
@@ -27,13 +27,14 @@
 //! ## Non-Blocking Design
 //!
 //! Workers simulate transactions AFTER they've been added to the pool and the user
-//! has received their transaction hash. Zero impact on transaction acceptance latency.
+//! has received their transaction hash. No impact on transaction acceptance latency.
 
-use crate::pre_warming::{ExtractedKeys, PreWarmedCache, PreWarmingConfig, SimulationRequest};
+use crate::pre_warming::{ExtractedKeys, PreWarmedCache, PreWarmingConfig, SimulationRequest, Simulator, SnapshotState};
 use crate::PoolTransaction;
+use reth_chainspec::ChainSpec;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use std::thread::JoinHandle;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
 /// Worker pool for parallel transaction simulation
@@ -50,6 +51,12 @@ pub struct SimulationWorkerPool<T> {
     /// Shared cache for merging results
     cache: Arc<PreWarmedCache>,
 
+    /// Shared snapshot of blockchain state (with internal cache)
+    snapshot: Arc<SnapshotState>,
+
+    /// Chain specification (for EVM config)
+    chain_spec: Arc<ChainSpec>,
+
     /// Configuration
     config: PreWarmingConfig,
 }
@@ -61,7 +68,12 @@ where
     /// Create new worker pool and spawn N workers
     ///
     /// Workers start immediately and wait for jobs on the channel.
-    pub fn new(config: PreWarmingConfig, cache: Arc<PreWarmedCache>) -> Self {
+    pub fn new(
+        config: PreWarmingConfig,
+        cache: Arc<PreWarmedCache>,
+        snapshot: Arc<SnapshotState>,
+        chain_spec: Arc<ChainSpec>,
+    ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
 
         // Create shared receiver wrapped in Arc for worker threads
@@ -69,14 +81,16 @@ where
 
         let mut workers = Vec::with_capacity(config.num_workers);
 
-        // Spawn N workers
+        // Spawn N workers using tokio::spawn for async runtime integration
         for worker_id in 0..config.num_workers {
             let receiver = Arc::clone(&receiver);
             let cache = Arc::clone(&cache);
+            let snapshot = Arc::clone(&snapshot);
+            let chain_spec = Arc::clone(&chain_spec);
             let config = config.clone();
 
-            let handle = std::thread::spawn(move || {
-                worker_loop(worker_id, receiver, cache, config);
+            let handle = tokio::spawn(async move {
+                worker_loop(worker_id, receiver, cache, snapshot, chain_spec, config).await;
             });
 
             workers.push(handle);
@@ -85,15 +99,38 @@ where
         debug!(
             target: "txpool::pre_warming",
             num_workers = config.num_workers,
-            "Worker pool started"
+            chain_id = chain_spec.chain.id(),
+            "Worker pool started with real EVM simulator"
         );
 
         Self {
             sender,
             workers,
             cache,
+            snapshot,
+            chain_spec,
             config,
         }
+    }
+
+    /// Update snapshot with new state provider (called when new block arrives)
+    ///
+    /// This creates a new SnapshotState from the given state provider and updates
+    /// the internal reference. Workers will use the new snapshot for subsequent simulations.
+    ///
+    /// Note: This doesn't interrupt ongoing simulations - they continue with the old snapshot.
+    /// Only new simulations will use the updated snapshot.
+    pub fn update_snapshot(&mut self, new_snapshot: Arc<SnapshotState>) {
+        debug!(
+            target: "txpool::pre_warming",
+            "Updating snapshot for worker pool"
+        );
+        self.snapshot = new_snapshot;
+    }
+
+    /// Get reference to the current snapshot
+    pub fn snapshot(&self) -> &Arc<SnapshotState> {
+        &self.snapshot
     }
 
     /// Trigger simulation for a transaction (fire-and-forget!)
@@ -130,7 +167,7 @@ where
     ///
     /// Drops the sender (closing channel), then waits for all workers to finish
     /// their current jobs and exit.
-    pub fn shutdown(self) {
+    pub async fn shutdown(self) {
         debug!(
             target: "txpool::pre_warming",
             num_workers = self.workers.len(),
@@ -140,14 +177,14 @@ where
         // Drop sender to close channel
         drop(self.sender);
 
-        // Wait for all workers to finish
+        // Wait for all workers to finish using tokio join
         for (worker_id, handle) in self.workers.into_iter().enumerate() {
-            if let Err(err) = handle.join() {
+            if let Err(err) = handle.await {
                 error!(
                     target: "txpool::pre_warming",
                     worker_id,
                     ?err,
-                    "Worker panicked"
+                    "Worker task failed or panicked"
                 );
             }
         }
@@ -156,14 +193,16 @@ where
     }
 }
 
-/// Worker loop - runs in worker thread
+/// Worker loop - runs as tokio async task
 ///
 /// Continuously receives simulation requests from the channel, simulates them,
 /// and merges results into the cache.
-fn worker_loop<T>(
+async fn worker_loop<T>(
     worker_id: usize,
     receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SimulationRequest<T>>>>,
     cache: Arc<PreWarmedCache>,
+    snapshot: Arc<SnapshotState>,
+    chain_spec: Arc<ChainSpec>,
     _config: PreWarmingConfig,
 ) where
     T: PoolTransaction,
@@ -171,64 +210,98 @@ fn worker_loop<T>(
     debug!(
         target: "txpool::pre_warming",
         worker_id,
+        chain_id = chain_spec.chain.id(),
         "Worker started"
     );
 
-    // Create a tokio runtime for this worker thread
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create tokio runtime for worker");
+    // Create Simulator instance for this worker with snapshot and chain spec
+    let simulator = Simulator::new(Arc::clone(&snapshot), Arc::clone(&chain_spec));
 
-    rt.block_on(async {
-        loop {
-            // Receive next job from channel
-            let request = {
-                let mut rx = receiver.lock().await;
-                rx.recv().await
-            };
+    loop {
+        // Receive next job from channel
+        let request = {
+            let mut rx = receiver.lock().await;
+            rx.recv().await
+        };
 
-            match request {
-                Some(req) => {
-                    debug!(
-                        target: "txpool::pre_warming",
-                        worker_id,
-                        tx_hash = ?req.tx_hash,
-                        age_ms = req.age().as_millis(),
-                        "Processing simulation request"
-                    );
+        match request {
+            Some(req) => {
+                debug!(
+                    target: "txpool::pre_warming",
+                    worker_id,
+                    tx_hash = ?req.tx_hash,
+                    age_ms = req.age().as_millis(),
+                    "Processing simulation request"
+                );
 
-                    // Simulate transaction (dummy for now - Phase 4 will add real EVM)
-                    let keys = dummy_simulate(&req.transaction);
+                // Simulate transaction to extract keys
+                let keys = match simulate_transaction(&simulator, &req.transaction) {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        warn!(
+                            target: "txpool::pre_warming",
+                            worker_id,
+                            tx_hash = ?req.tx_hash,
+                            error = ?e,
+                            "Simulation failed, using fallback"
+                        );
+                        // Fallback to basic key extraction
+                        dummy_simulate(&req.transaction)
+                    }
+                };
 
-                    // Merge into cache (thread-safe)
-                    cache.merge_keys(keys);
+                // Store keys per transaction (thread-safe)
+                cache.store_tx_keys(req.tx_hash, keys);
 
-                    debug!(
-                        target: "txpool::pre_warming",
-                        worker_id,
-                        tx_hash = ?req.tx_hash,
-                        "Simulation complete"
-                    );
-                }
-                None => {
-                    // Channel closed, exit
-                    debug!(
-                        target: "txpool::pre_warming",
-                        worker_id,
-                        "Channel closed, worker exiting"
-                    );
-                    break;
-                }
+                debug!(
+                    target: "txpool::pre_warming",
+                    worker_id,
+                    tx_hash = ?req.tx_hash,
+                    "Simulation complete"
+                );
+            }
+            None => {
+                // Channel closed, exit
+                debug!(
+                    target: "txpool::pre_warming",
+                    worker_id,
+                    "Channel closed, worker exiting"
+                );
+                break;
             }
         }
-    });
+    }
 
     debug!(
         target: "txpool::pre_warming",
         worker_id,
         "Worker stopped"
     );
+}
+
+/// Simulate transaction and extract accessed keys
+///
+/// Uses the Simulator to extract keys that the transaction will access:
+/// - Sender and recipient accounts
+/// - Access list entries (EIP-2930)
+fn simulate_transaction<T: PoolTransaction>(
+    simulator: &Simulator,
+    tx: &T,
+) -> Result<ExtractedKeys, Box<dyn std::error::Error + Send + Sync>> {
+    // Get sender (already recovered in PoolTransaction)
+    let sender = tx.sender();
+
+    // Get the consensus transaction (implements alloy_consensus::Transaction)
+    let consensus_tx = tx.clone_into_consensus();
+    let (tx_inner, _signer) = consensus_tx.into_parts();
+
+    // Create default BlockEnv for simulation
+    // TODO: Get actual block context when available
+    let block_env = revm::context::BlockEnv::default();
+
+    // Simulate using the consensus transaction
+    simulator.simulate(&tx_inner, sender, block_env)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
 
 /// Dummy simulator - extracts sender and recipient as keys
@@ -247,11 +320,6 @@ fn dummy_simulate<T: PoolTransaction>(tx: &T) -> ExtractedKeys {
         keys.add_account(to);
     }
 
-    // TODO Phase 4: Replace with real EVM simulation
-    // - Execute transaction in read-only mode
-    // - Track all state access via CacheDB
-    // - Extract accounts, storage_slots, code_hashes, block_hashes
-
     keys
 }
 
@@ -259,27 +327,27 @@ fn dummy_simulate<T: PoolTransaction>(tx: &T) -> ExtractedKeys {
 mod tests {
     use super::*;
     use crate::pre_warming::PreWarmingConfig;
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, TxHash};
 
     #[test]
-    fn test_dummy_simulate_basic() {
-        // Test dummy_simulate with mock data
-        // Full integration tests will come in Phase 3
+    fn test_cache_store_and_retrieve() {
+        // Test cache store and retrieve with mock data
         let config = PreWarmingConfig::enabled().with_workers(1);
         let cache = Arc::new(PreWarmedCache::new(config.clone()));
 
         // Verify cache is empty initially
-        let keys = cache.get_all_keys();
-        assert!(keys.is_empty());
+        assert!(cache.is_empty());
 
-        // Manual merge test
+        // Create test keys and store them
+        let tx_hash = TxHash::random();
         let mut test_keys = ExtractedKeys::new();
         test_keys.add_account(Address::from([1; 20]));
         test_keys.add_account(Address::from([2; 20]));
 
-        cache.merge_keys(test_keys);
+        cache.store_tx_keys(tx_hash, test_keys);
 
-        let result = cache.get_all_keys();
+        // Retrieve keys for the transaction
+        let result = cache.get_keys_for_txs(&[tx_hash]);
         assert_eq!(result.accounts.len(), 2);
     }
 
@@ -304,4 +372,3 @@ mod tests {
     // 3. Keys appear in cache after transaction added
     // 4. Multiple transactions trigger multiple simulations
 }
-

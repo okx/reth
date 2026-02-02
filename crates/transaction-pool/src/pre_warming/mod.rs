@@ -42,11 +42,17 @@ pub mod cache;
 pub mod config;
 pub mod types;
 pub mod worker_pool;
+mod simulator;
+mod snapshot_state;
+pub mod bridge;
 
 pub use cache::{CacheStats, PreWarmedCache};
 pub use config::PreWarmingConfig;
 pub use types::{ExtractedKeys, SimulationRequest};
 pub use worker_pool::SimulationWorkerPool;
+pub use simulator::Simulator;
+pub use snapshot_state::SnapshotState;
+pub use bridge::{prefetch_and_populate, populate_cached_reads_from_keys, get_cache_stats};
 
 #[cfg(test)]
 mod tests {
@@ -64,25 +70,27 @@ mod tests {
     
     #[test]
     fn test_end_to_end_aggregated_flow() {
-        // Simulate complete flow: extract keys → merge → retrieve all
+        // Simulate complete flow: extract keys → store per TX → retrieve selected
         let config = PreWarmingConfig::enabled();
         let cache = PreWarmedCache::new(config);
         
         // Simulate extracting keys from multiple transactions
+        let tx1_hash = alloy_primitives::TxHash::random();
         let mut keys1 = ExtractedKeys::new();
         keys1.add_account(Address::random());
         keys1.add_account(Address::random());
         
+        let tx2_hash = alloy_primitives::TxHash::random();
         let mut keys2 = ExtractedKeys::new();
         keys2.add_account(Address::random());
         keys2.add_storage_slot(Address::random(), alloy_primitives::U256::from(5));
         
-        // Merge keys from both simulations
-        cache.merge_keys(keys1);
-        cache.merge_keys(keys2);
-        
-        // Retrieve all aggregated keys
-        let all_keys = cache.get_all_keys();
+        // Store keys per transaction
+        cache.store_tx_keys(tx1_hash, keys1);
+        cache.store_tx_keys(tx2_hash, keys2);
+
+        // Retrieve keys for both transactions (simulating block builder selecting them)
+        let all_keys = cache.get_keys_for_txs(&[tx1_hash, tx2_hash]);
         assert_eq!(all_keys.accounts.len(), 3);
         assert_eq!(all_keys.storage_slots.len(), 1);
     }

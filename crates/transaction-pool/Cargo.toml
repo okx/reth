@@ -25,6 +25,12 @@ reth-tasks.workspace = true
 revm-interpreter.workspace = true
 revm-primitives.workspace = true
 
+# Pre-warming specific dependencies (optional)
+reth-provider = { workspace = true, optional = true }
+reth-primitives = { workspace = true, optional = true }
+reth-revm = { workspace = true, optional = true }
+revm = { workspace = true, optional = true }
+
 # ethereum
 alloy-eips = { workspace = true, features = ["kzg"] }
 alloy-primitives.workspace = true
@@ -54,6 +60,7 @@ serde_json.workspace = true
 bitflags.workspace = true
 auto_impl.workspace = true
 smallvec.workspace = true
+rayon = { workspace = true, optional = true }
 
 # testing
 rand = { workspace = true, optional = true }
@@ -78,7 +85,13 @@ futures.workspace = true
 
 [features]
 default = []
-pre-warming = []  # Experimental: opt-in only for now
+pre-warming = [
+    "reth-provider",
+    "reth-primitives",
+    "reth-revm",
+    "revm",
+    "rayon",
+]  # Experimental: opt-in only for now
 serde = [
     "reth-execution-types/serde",
     "reth-eth-wire-types/serde",
