@@ -43,7 +43,8 @@ use tracing::{debug, error, warn};
 /// Workers simulate transactions, extract keys, and merge into PreWarmedCache.
 pub struct SimulationWorkerPool<T> {
     /// Sender for submitting simulation jobs (clone-able, cheap)
-    sender: mpsc::UnboundedSender<SimulationRequest<T>>,
+    /// Uses bounded channel to prevent unbounded memory growth
+    sender: mpsc::Sender<SimulationRequest<T>>,
 
     /// Worker thread handles
     workers: Vec<JoinHandle<()>>,
@@ -68,13 +69,17 @@ where
     /// Create new worker pool and spawn N workers
     ///
     /// Workers start immediately and wait for jobs on the channel.
+    /// Uses bounded channel with capacity = num_workers * 10 to prevent unbounded memory growth.
     pub fn new(
         config: PreWarmingConfig,
         cache: Arc<PreWarmedCache>,
         snapshot: Arc<SnapshotState>,
         chain_spec: Arc<ChainSpec>,
     ) -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        // Bounded channel: capacity = workers * 10
+        // This allows some buffering but prevents unbounded queue growth
+        let channel_capacity = config.num_workers * 10;
+        let (sender, receiver) = mpsc::channel(channel_capacity);
 
         // Create shared receiver wrapped in Arc for worker threads
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
@@ -99,8 +104,9 @@ where
         debug!(
             target: "txpool::pre_warming",
             num_workers = config.num_workers,
+            channel_capacity,
             chain_id = chain_spec.chain.id(),
-            "Worker pool started with real EVM simulator"
+            "Worker pool started with bounded channel"
         );
 
         Self {
@@ -142,14 +148,36 @@ where
     ///
     /// This is called AFTER the transaction is validated and added to the pool.
     /// The user has already received their transaction hash.
+    ///
+    /// ## Backpressure Handling
+    ///
+    /// If the channel is full (workers can't keep up), we log a warning and drop
+    /// the simulation request. This prevents blocking transaction acceptance.
+    /// The transaction will still be executed, just without pre-warming benefit.
     pub fn trigger_simulation(&self, request: SimulationRequest<T>) {
-        // Fire-and-forget: Just send to channel
-        if let Err(err) = self.sender.send(request) {
-            warn!(
-                target: "txpool::pre_warming",
-                ?err,
-                "Failed to send simulation request (channel closed)"
-            );
+        match self.sender.try_send(request) {
+            Ok(_) => {
+                // Successfully queued for simulation
+            }
+            Err(mpsc::error::TrySendError::Full(req)) => {
+                // Channel is full - workers can't keep up!
+                // Log warning and drop simulation (transaction still executes)
+                warn!(
+                    target: "txpool::pre_warming",
+                    tx_hash = ?req.tx_hash,
+                    "Simulation channel full - workers overloaded, dropping simulation request. \
+                     Consider increasing worker count or reducing transaction rate."
+                );
+                // TODO: Add metrics counter for dropped simulations
+                // metrics::counter!("txpool.pre_warming.simulations_dropped").increment(1);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Channel closed - worker pool shutdown
+                warn!(
+                    target: "txpool::pre_warming",
+                    "Simulation channel closed - worker pool shut down"
+                );
+            }
         }
     }
 
@@ -199,7 +227,7 @@ where
 /// and merges results into the cache.
 async fn worker_loop<T>(
     worker_id: usize,
-    receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SimulationRequest<T>>>>,
+    receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<SimulationRequest<T>>>>,
     cache: Arc<PreWarmedCache>,
     snapshot: Arc<SnapshotState>,
     chain_spec: Arc<ChainSpec>,
