@@ -21,7 +21,8 @@ impl Command {
     pub fn access_rights(&self) -> AccessRights {
         match self.command {
             Subcommands::Get => AccessRights::RO,
-            Subcommands::Set(_) => AccessRights::RW,
+            // Use RWMetadataOnly to skip genesis initialization which can fail on corrupted data
+            Subcommands::Set(_) => AccessRights::RWMetadataOnly,
         }
     }
 }
