@@ -592,18 +592,20 @@ where
         } = update;
         self.validator.on_new_head_block(new_tip);
 
+        // Notify pre-warming cache BEFORE passing mined_transactions to pool
+        // This avoids cloning mined_transactions
+        self.notify_txs_removed(&mined_transactions);
+
         let changed_senders = self.changed_senders(changed_accounts.into_iter());
 
-        // update the pool
+        // update the pool (takes ownership of mined_transactions)
         let outcome = self.pool.write().on_canonical_state_change(
             block_info,
-            mined_transactions.clone(),  // Clone for notification
+            mined_transactions,
             changed_senders,
             update_kind,
         );
 
-        // Notify pre-warming cache to remove mined transactions
-        self.notify_txs_removed(&mined_transactions);
 
         // This will discard outdated transactions based on the account's nonce
         self.delete_discarded_blobs(outcome.discarded.iter());
