@@ -31,11 +31,19 @@
 
 use crate::pre_warming::{ExtractedKeys, PreWarmedCache, PreWarmingConfig, SimulationRequest, Simulator, SnapshotState};
 use crate::PoolTransaction;
+use parking_lot::RwLock;
 use reth_chainspec::ChainSpec;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
+
+/// Shared snapshot holder that workers can read from
+/// Workers hold Arc to this, and can read the inner snapshot on each simulation
+///
+/// TODO: Wire up snapshot updates - call update_snapshot() from on_canonical_state_change()
+/// when new block arrives. Currently defined but not called.
+type SharedSnapshot = Arc<RwLock<Arc<SnapshotState>>>;
 
 /// Worker pool for parallel transaction simulation
 ///
@@ -52,8 +60,9 @@ pub struct SimulationWorkerPool<T> {
     /// Shared cache for merging results
     cache: Arc<PreWarmedCache>,
 
-    /// Shared snapshot of blockchain state (with internal cache)
-    snapshot: Arc<SnapshotState>,
+    /// Shared snapshot holder - workers read from this on each simulation
+    /// Wrapped in RwLock so update_snapshot() can swap the inner Arc
+    snapshot_holder: SharedSnapshot,
 
     /// Chain specification (for EVM config)
     chain_spec: Arc<ChainSpec>,
@@ -84,18 +93,21 @@ where
         // Create shared receiver wrapped in Arc for worker threads
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
 
+        // Wrap snapshot in RwLock so workers can see updates
+        let snapshot_holder: SharedSnapshot = Arc::new(RwLock::new(snapshot));
+
         let mut workers = Vec::with_capacity(config.num_workers);
 
         // Spawn N workers using tokio::spawn for async runtime integration
         for worker_id in 0..config.num_workers {
             let receiver = Arc::clone(&receiver);
             let cache = Arc::clone(&cache);
-            let snapshot = Arc::clone(&snapshot);
+            let snapshot_holder = Arc::clone(&snapshot_holder);
             let chain_spec = Arc::clone(&chain_spec);
             let config = config.clone();
 
             let handle = tokio::spawn(async move {
-                worker_loop(worker_id, receiver, cache, snapshot, chain_spec, config).await;
+                worker_loop(worker_id, receiver, cache, snapshot_holder, chain_spec, config).await;
             });
 
             workers.push(handle);
@@ -113,7 +125,7 @@ where
             sender,
             workers,
             cache,
-            snapshot,
+            snapshot_holder,
             chain_spec,
             config,
         }
@@ -121,22 +133,25 @@ where
 
     /// Update snapshot with new state provider (called when new block arrives)
     ///
-    /// This creates a new SnapshotState from the given state provider and updates
-    /// the internal reference. Workers will use the new snapshot for subsequent simulations.
+    /// Workers read from the shared snapshot_holder on each simulation,
+    /// so they will see this update on their next simulation.
     ///
-    /// Note: This doesn't interrupt ongoing simulations - they continue with the old snapshot.
-    /// Only new simulations will use the updated snapshot.
-    pub fn update_snapshot(&mut self, new_snapshot: Arc<SnapshotState>) {
+    /// TODO: Wire this up - should be called from on_canonical_state_change() in pool/mod.rs
+    /// when new block arrives. Caller needs to create SnapshotState from StateProvider.
+    pub fn update_snapshot(&self, new_snapshot: Arc<SnapshotState>) {
         debug!(
             target: "txpool::pre_warming",
             "Updating snapshot for worker pool"
         );
-        self.snapshot = new_snapshot;
+        *self.snapshot_holder.write() = new_snapshot;
     }
 
     /// Get reference to the current snapshot
-    pub fn snapshot(&self) -> &Arc<SnapshotState> {
-        &self.snapshot
+    ///
+    /// TODO: Used by worker_loop to get fresh snapshot on each simulation.
+    /// Returns clone of inner Arc (cheap - just ref count increment).
+    pub fn snapshot(&self) -> Arc<SnapshotState> {
+        self.snapshot_holder.read().clone()
     }
 
     /// Trigger simulation for a transaction (fire-and-forget!)
@@ -229,7 +244,7 @@ async fn worker_loop<T>(
     worker_id: usize,
     receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<SimulationRequest<T>>>>,
     cache: Arc<PreWarmedCache>,
-    snapshot: Arc<SnapshotState>,
+    snapshot_holder: SharedSnapshot,
     chain_spec: Arc<ChainSpec>,
     config: PreWarmingConfig,
 ) where
@@ -242,8 +257,6 @@ async fn worker_loop<T>(
         "Worker started"
     );
 
-    // Create Simulator instance for this worker with snapshot and chain spec
-    let simulator = Simulator::new(Arc::clone(&snapshot), Arc::clone(&chain_spec));
 
     // Track consecutive empty receives for adaptive sleep
     let mut consecutive_empty: u32 = 0;
@@ -286,12 +299,19 @@ async fn worker_loop<T>(
                     "Processing simulation request"
                 );
 
+                // Read fresh snapshot for this simulation
+                // This ensures we use the latest state after block updates
+                //
+                // TODO: Once update_snapshot() is wired to on_canonical_state_change(),
+                // this read will automatically get the fresh snapshot after new block.
+                let snapshot = snapshot_holder.read().clone();
+                let simulator = Simulator::new(snapshot, Arc::clone(&chain_spec));
+
                 // Simulate transaction with timeout to prevent hanging
                 let simulation_timeout = config.simulation_timeout;
                 let keys = match tokio::time::timeout(
                     simulation_timeout,
                     tokio::task::spawn_blocking({
-                        let simulator = simulator.clone();
                         let tx = req.transaction.clone();
                         move || simulate_transaction_sync(&simulator, &tx)
                     })

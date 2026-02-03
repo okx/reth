@@ -265,13 +265,16 @@ where
     ///
     /// This should be called whenever the chain state changes to ensure simulations
     /// are performed against current state.
+    ///
+    /// TODO: Wire this up - call from on_canonical_state_change() with fresh SnapshotState
+    /// created from StateProvider.
     #[cfg(feature = "pre-warming")]
     pub fn update_pre_warming_snapshot(
-        &mut self,
+        &self,
         snapshot: std::sync::Arc<crate::pre_warming::SnapshotState>,
     ) {
-        if let Some(wp) = &mut self.worker_pool {
-            std::sync::Arc::get_mut(wp).map(|wp| wp.update_snapshot(snapshot));
+        if let Some(wp) = &self.worker_pool {
+            wp.update_snapshot(snapshot);
         }
     }
 
