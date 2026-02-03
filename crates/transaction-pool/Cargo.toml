@@ -90,7 +90,6 @@ pre-warming = [
     "reth-primitives",
     "reth-revm",
     "revm",
-    "rayon",
 ]  # Experimental: opt-in only for now
 serde = [
     "reth-execution-types/serde",

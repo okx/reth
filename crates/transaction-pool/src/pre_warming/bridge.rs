@@ -2,21 +2,19 @@
 //!
 //! This module provides the PREFETCH logic that runs BEFORE execution:
 //! 1. Simulation discovers KEYS (which accounts/storage to access)
-//! 2. This module PREFETCHES VALUES from MDBX (PARALLEL when possible)
+//! 2. This module PREFETCHES VALUES from MDBX (can be parallel)
 //! 3. Populates CachedReads with prefetched data
-//! 4. Execution reads from CachedReads (95%+ cache hits!)
+//! 4. Execution reads from CachedReads (high cache hits!)
 
-use crate::pre_warming::{ExtractedKeys, SnapshotState};
+use crate::pre_warming::ExtractedKeys;
 use reth_provider::StateProvider;
 use reth_revm::cached::{CachedReads, CachedAccount};
-use alloy_primitives::{B256, map::HashMap};
-use rayon::prelude::*;
-use std::sync::Arc;
+use alloy_primitives::{Address, B256, U256, map::HashMap};
+use std::sync::Mutex;
 
-/// Prefetch and populate CachedReads from discovered keys (SEQUENTIAL version)
+/// Prefetch and populate CachedReads from discovered keys (SEQUENTIAL)
 ///
-/// Use this when you only have a `&dyn StateProvider` (not Sync).
-/// For parallel prefetching, use `prefetch_parallel` with `SnapshotState`.
+/// Use this for small key sets or when simplicity is preferred.
 pub fn prefetch_and_populate(
     cached_reads: &mut CachedReads,
     keys: &ExtractedKeys,
@@ -85,92 +83,118 @@ pub fn prefetch_and_populate(
     Ok(())
 }
 
-/// Prefetch and populate CachedReads using PARALLEL I/O (RECOMMENDED)
+/// Prefetch and populate CachedReads using PARALLEL threads (std::thread::scope)
 ///
-/// Uses rayon to fetch accounts, storage, and bytecode in parallel.
-/// This reduces prefetch time significantly (e.g., 2s → 200ms for 1000 keys).
+/// Uses scoped threads for parallel I/O without requiring Sync on StateProvider.
+/// Each thread gets its own reference to the state provider.
 ///
 /// # Arguments
-/// * `cached_reads` - The cache to populate
+/// * `cached_reads` - The cache to populate (protected by Mutex internally)
 /// * `keys` - Keys discovered by simulation
-/// * `snapshot` - Thread-safe snapshot state (wraps StateProvider with internal cache)
-///
-/// # Example
-/// ```ignore
-/// let snapshot = Arc::new(SnapshotState::new(state_provider));
-/// prefetch_parallel(&mut cached_reads, &keys, &snapshot)?;
-/// ```
-pub fn prefetch_parallel(
+/// * `state_provider` - State provider for MDBX queries (must be Send + Sync)
+/// * `num_threads` - Number of parallel threads (default: 4)
+pub fn prefetch_parallel<S>(
     cached_reads: &mut CachedReads,
     keys: &ExtractedKeys,
-    snapshot: &Arc<SnapshotState>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Collect addresses to fetch (excluding already cached)
-    let addresses_to_fetch: Vec<_> = keys.accounts
-        .iter()
-        .filter(|addr| !cached_reads.accounts.contains_key(*addr))
-        .copied()
-        .collect();
+    state_provider: &S,
+    num_threads: usize,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: StateProvider + Sync,
+{
+    let num_threads = num_threads.max(1);
 
-    // Step 1: Prefetch accounts in PARALLEL
-    let accounts: Vec<_> = addresses_to_fetch
-        .par_iter()
-        .filter_map(|&address| {
-            let info = snapshot.basic_account(address).ok()?;
-            Some((address, CachedAccount {
-                info,
-                storage: HashMap::default(),
-            }))
-        })
-        .collect();
+    // Collect keys to fetch
+    let accounts: Vec<Address> = keys.accounts.iter().copied().collect();
+    let storage_slots: Vec<(Address, U256)> = keys.storage_slots.iter().copied().collect();
+    let code_hashes: Vec<B256> = keys.code_hashes.iter().copied().collect();
 
-    // Insert fetched accounts
-    for (address, account) in accounts {
-        cached_reads.accounts.insert(address, account);
+    // Use Mutex to collect results from threads
+    let account_results: Mutex<Vec<(Address, CachedAccount)>> = Mutex::new(Vec::new());
+    let storage_results: Mutex<Vec<(Address, U256, U256)>> = Mutex::new(Vec::new());
+    let bytecode_results: Mutex<Vec<(B256, revm::bytecode::Bytecode)>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|s| {
+        // Partition accounts across threads
+        let chunk_size = (accounts.len() / num_threads).max(1);
+        for chunk in accounts.chunks(chunk_size) {
+            let account_results = &account_results;
+            s.spawn(move || {
+                let mut local_results = Vec::new();
+                for &address in chunk {
+                    if let Ok(account) = state_provider.basic_account(&address) {
+                        let info = account.map(|acc| revm::state::AccountInfo {
+                            balance: acc.balance,
+                            nonce: acc.nonce,
+                            code_hash: acc.bytecode_hash.unwrap_or_default(),
+                            code: None,
+                            account_id: None,
+                        });
+                        local_results.push((address, CachedAccount {
+                            info,
+                            storage: HashMap::default(),
+                        }));
+                    }
+                }
+                account_results.lock().unwrap().extend(local_results);
+            });
+        }
+
+        // Partition storage slots across threads
+        let chunk_size = (storage_slots.len() / num_threads).max(1);
+        for chunk in storage_slots.chunks(chunk_size) {
+            let storage_results = &storage_results;
+            s.spawn(move || {
+                let mut local_results = Vec::new();
+                for &(address, slot) in chunk {
+                    let slot_b256 = B256::from(slot);
+                    if let Ok(Some(value)) = state_provider.storage(address, slot_b256) {
+                        local_results.push((address, slot, value));
+                    }
+                }
+                storage_results.lock().unwrap().extend(local_results);
+            });
+        }
+
+        // Partition bytecode across threads
+        let chunk_size = (code_hashes.len() / num_threads).max(1);
+        for chunk in code_hashes.chunks(chunk_size) {
+            let bytecode_results = &bytecode_results;
+            s.spawn(move || {
+                let mut local_results = Vec::new();
+                for &code_hash in chunk {
+                    if code_hash.is_zero() {
+                        continue;
+                    }
+                    if let Ok(Some(bytecode_bytes)) = state_provider.bytecode_by_hash(&code_hash) {
+                        let bytecode = revm::bytecode::Bytecode::new_raw(
+                            bytecode_bytes.original_bytes().clone()
+                        );
+                        local_results.push((code_hash, bytecode));
+                    }
+                }
+                bytecode_results.lock().unwrap().extend(local_results);
+            });
+        }
+    });
+
+    // Merge results into cached_reads
+    for (address, account) in account_results.into_inner().unwrap() {
+        cached_reads.accounts.entry(address).or_insert(account);
     }
 
-    // Step 2: Prefetch storage slots in PARALLEL
-    let storage_values: Vec<_> = keys.storage_slots
-        .par_iter()
-        .filter_map(|&(address, slot)| {
-            let value = snapshot.storage(address, slot).ok()?;
-            Some((address, slot, value))
-        })
-        .collect();
-
-    // Insert storage values (ensure account exists)
-    for (address, slot, value) in storage_values {
+    for (address, slot, value) in storage_results.into_inner().unwrap() {
         let account = cached_reads.accounts.entry(address).or_insert_with(|| {
-            let info = snapshot.basic_account(address).ok().flatten();
             CachedAccount {
-                info,
+                info: None,
                 storage: HashMap::default(),
             }
         });
-        if account.info.is_some() {
-            account.storage.insert(slot, value);
-        }
+        account.storage.insert(slot, value);
     }
 
-    // Collect code hashes to fetch (excluding already cached and zero hashes)
-    let code_hashes_to_fetch: Vec<_> = keys.code_hashes
-        .iter()
-        .filter(|hash| !hash.is_zero() && !cached_reads.contracts.contains_key(*hash))
-        .copied()
-        .collect();
-
-    // Step 3: Prefetch bytecode in PARALLEL
-    let bytecodes: Vec<_> = code_hashes_to_fetch
-        .par_iter()
-        .filter_map(|&code_hash| {
-            let bytecode = snapshot.code_by_hash(code_hash).ok()?;
-            Some((code_hash, bytecode))
-        })
-        .collect();
-
-    // Insert bytecodes
-    for (code_hash, bytecode) in bytecodes {
-        cached_reads.contracts.insert(code_hash, bytecode);
+    for (code_hash, bytecode) in bytecode_results.into_inner().unwrap() {
+        cached_reads.contracts.entry(code_hash).or_insert(bytecode);
     }
 
     Ok(())
