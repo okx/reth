@@ -4,8 +4,7 @@
 //! to deduplicate MDBX queries across multiple worker simulations.
 
 use alloy_primitives::{Address, B256, U256};
-use reth_primitives_traits::Account;
-use reth_provider::{AccountReader, StateProvider, ProviderError, StateRootProvider};
+use reth_provider::{AccountReader, StateProvider, ProviderError};
 use revm::bytecode::Bytecode;
 use revm::state::AccountInfo;
 use std::collections::HashMap;

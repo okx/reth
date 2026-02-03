@@ -89,6 +89,10 @@ where
         pool: Pool,
         evm_config: EvmConfig,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
+        // Clone pool before passing to build_payload_builder if pre-warming is enabled
+        #[cfg(feature = "pre-warming")]
+        let pool_for_prewarming = pool.clone();
+
         let payload_builder = self.0.build_payload_builder(ctx, pool, evm_config).await?;
 
         let conf = ctx.config().builder.clone();
@@ -98,12 +102,24 @@ where
             .deadline(conf.deadline)
             .max_payload_tasks(conf.max_payload_tasks);
 
+        // Create payload generator and wire pool for pre-warming support
+        #[cfg(feature = "pre-warming")]
+        let payload_generator = BasicPayloadJobGenerator::with_builder(
+            ctx.provider().clone(),
+            ctx.task_executor().clone(),
+            payload_job_config,
+            payload_builder,
+        )
+        .with_pool(pool_for_prewarming);  // Wire pool for pre-warming prefetch
+
+        #[cfg(not(feature = "pre-warming"))]
         let payload_generator = BasicPayloadJobGenerator::with_builder(
             ctx.provider().clone(),
             ctx.task_executor().clone(),
             payload_job_config,
             payload_builder,
         );
+
         let (payload_service, payload_service_handle) =
             PayloadBuilderService::new(payload_generator, ctx.provider().canonical_state_stream());
 
