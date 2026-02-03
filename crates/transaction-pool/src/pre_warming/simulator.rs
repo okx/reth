@@ -24,6 +24,7 @@ use parking_lot::Mutex;
 ///
 /// Each worker thread creates its own Simulator instance.
 /// The Simulator uses a shared SnapshotState to query blockchain state.
+#[derive(Clone)]
 pub struct Simulator {
     /// Shared snapshot of block state (with internal cache)
     snapshot: Arc<SnapshotState>,

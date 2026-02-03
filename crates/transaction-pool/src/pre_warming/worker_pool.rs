@@ -231,7 +231,7 @@ async fn worker_loop<T>(
     cache: Arc<PreWarmedCache>,
     snapshot: Arc<SnapshotState>,
     chain_spec: Arc<ChainSpec>,
-    _config: PreWarmingConfig,
+    config: PreWarmingConfig,
 ) where
     T: PoolTransaction,
 {
@@ -245,27 +245,59 @@ async fn worker_loop<T>(
     // Create Simulator instance for this worker with snapshot and chain spec
     let simulator = Simulator::new(Arc::clone(&snapshot), Arc::clone(&chain_spec));
 
+    // Track consecutive empty receives for adaptive sleep
+    let mut consecutive_empty: u32 = 0;
+    const MAX_CONSECUTIVE_EMPTY: u32 = 100; // After 100 empty tries, sleep longer
+    const BASE_SLEEP_MICROS: u64 = 100;
+    const MAX_SLEEP_MICROS: u64 = 10_000; // Cap at 10ms
+
     loop {
-        // Receive next job from channel
+        // Try to receive from channel (non-blocking)
+        //
+        // CRITICAL: We must NOT hold the lock while waiting for items!
+        // Pattern: lock briefly → try_recv → unlock → process or sleep
         let request = {
             let mut rx = receiver.lock().await;
-            rx.recv().await
-        };
+            rx.try_recv()
+        }; // Lock released here!
 
         match request {
-            Some(req) => {
+            Ok(req) => {
+                // Reset empty counter on successful receive
+                consecutive_empty = 0;
+
+                // Log if request is old (but still process it!)
+                let age = req.age();
+                if age > config.simulation_timeout {
+                    debug!(
+                        target: "txpool::pre_warming",
+                        worker_id,
+                        tx_hash = ?req.tx_hash,
+                        age_ms = age.as_millis(),
+                        "Processing delayed simulation request"
+                    );
+                }
+
                 debug!(
                     target: "txpool::pre_warming",
                     worker_id,
                     tx_hash = ?req.tx_hash,
-                    age_ms = req.age().as_millis(),
+                    age_ms = age.as_millis(),
                     "Processing simulation request"
                 );
 
-                // Simulate transaction to extract keys
-                let keys = match simulate_transaction(&simulator, &req.transaction) {
-                    Ok(keys) => keys,
-                    Err(e) => {
+                // Simulate transaction with timeout to prevent hanging
+                let simulation_timeout = config.simulation_timeout;
+                let keys = match tokio::time::timeout(
+                    simulation_timeout,
+                    tokio::task::spawn_blocking({
+                        let simulator = simulator.clone();
+                        let tx = req.transaction.clone();
+                        move || simulate_transaction_sync(&simulator, &tx)
+                    })
+                ).await {
+                    Ok(Ok(Ok(keys))) => keys,
+                    Ok(Ok(Err(e))) => {
                         warn!(
                             target: "txpool::pre_warming",
                             worker_id,
@@ -273,7 +305,27 @@ async fn worker_loop<T>(
                             error = ?e,
                             "Simulation failed, using fallback"
                         );
-                        // Fallback to basic key extraction
+                        dummy_simulate(&req.transaction)
+                    }
+                    Ok(Err(join_err)) => {
+                        // spawn_blocking task panicked
+                        error!(
+                            target: "txpool::pre_warming",
+                            worker_id,
+                            tx_hash = ?req.tx_hash,
+                            error = ?join_err,
+                            "Simulation task panicked, using fallback"
+                        );
+                        dummy_simulate(&req.transaction)
+                    }
+                    Err(_timeout) => {
+                        warn!(
+                            target: "txpool::pre_warming",
+                            worker_id,
+                            tx_hash = ?req.tx_hash,
+                            timeout_ms = simulation_timeout.as_millis(),
+                            "Simulation timed out, using fallback"
+                        );
                         dummy_simulate(&req.transaction)
                     }
                 };
@@ -288,8 +340,22 @@ async fn worker_loop<T>(
                     "Simulation complete"
                 );
             }
-            None => {
-                // Channel closed, exit
+            Err(mpsc::error::TryRecvError::Empty) => {
+                // Channel empty - adaptive sleep to prevent busy spinning
+                consecutive_empty = consecutive_empty.saturating_add(1);
+
+                // Exponential backoff: sleep longer if channel stays empty
+                let sleep_micros = if consecutive_empty > MAX_CONSECUTIVE_EMPTY {
+                    MAX_SLEEP_MICROS
+                } else {
+                    BASE_SLEEP_MICROS.saturating_mul(1 + (consecutive_empty as u64 / 10))
+                        .min(MAX_SLEEP_MICROS)
+                };
+
+                tokio::time::sleep(tokio::time::Duration::from_micros(sleep_micros)).await;
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                // Channel closed, exit worker
                 debug!(
                     target: "txpool::pre_warming",
                     worker_id,
@@ -305,6 +371,14 @@ async fn worker_loop<T>(
         worker_id,
         "Worker stopped"
     );
+}
+
+/// Simulate transaction synchronously (for use in spawn_blocking)
+fn simulate_transaction_sync<T: PoolTransaction>(
+    simulator: &Simulator,
+    tx: &T,
+) -> Result<ExtractedKeys, Box<dyn std::error::Error + Send + Sync>> {
+    simulate_transaction(simulator, tx)
 }
 
 /// Simulate transaction and extract accessed keys
