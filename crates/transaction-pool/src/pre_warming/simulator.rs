@@ -33,6 +33,17 @@ pub struct Simulator {
     timeout: Duration,
 }
 
+// Manual Debug implementation since CfgEnv may not implement Debug
+impl std::fmt::Debug for Simulator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Simulator")
+            .field("snapshot", &self.snapshot)
+            .field("timeout", &self.timeout)
+            .field("cfg_env", &"<CfgEnv>")
+            .finish()
+    }
+}
+
 impl Simulator {
     /// Create a new simulator with the given snapshot and chain spec
     pub fn new(snapshot: Arc<SnapshotState>, chain_spec: Arc<ChainSpec>) -> Self {
