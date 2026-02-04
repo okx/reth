@@ -52,7 +52,7 @@ pub use types::{ExtractedKeys, SimulationRequest};
 pub use worker_pool::SimulationWorkerPool;
 pub use simulator::Simulator;
 pub use snapshot_state::SnapshotState;
-pub use bridge::{prefetch_and_populate, prefetch_parallel, populate_cached_reads_from_keys, get_cache_stats};
+pub use bridge::{prefetch_and_populate, prefetch_parallel, prefetch_with_snapshot, populate_cached_reads_from_keys, get_cache_stats};
 
 #[cfg(test)]
 mod tests {

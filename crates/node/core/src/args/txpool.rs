@@ -55,6 +55,12 @@ pub struct DefaultTxPoolValues {
     transactions_backup_path: Option<PathBuf>,
     disable_transactions_backup: bool,
     max_batch_size: usize,
+    // Pre-warming configuration
+    pre_warming_enabled: bool,
+    pre_warming_num_workers: usize,
+    pre_warming_simulation_timeout_ms: u64,
+    pre_warming_cache_ttl_secs: u64,
+    pre_warming_cache_max_entries: usize,
 }
 
 impl DefaultTxPoolValues {
@@ -247,6 +253,36 @@ impl DefaultTxPoolValues {
         self.max_batch_size = v;
         self
     }
+
+    /// Set whether pre-warming is enabled by default
+    pub const fn with_pre_warming_enabled(mut self, v: bool) -> Self {
+        self.pre_warming_enabled = v;
+        self
+    }
+
+    /// Set the default number of pre-warming workers
+    pub const fn with_pre_warming_num_workers(mut self, v: usize) -> Self {
+        self.pre_warming_num_workers = v;
+        self
+    }
+
+    /// Set the default pre-warming simulation timeout in milliseconds
+    pub const fn with_pre_warming_simulation_timeout_ms(mut self, v: u64) -> Self {
+        self.pre_warming_simulation_timeout_ms = v;
+        self
+    }
+
+    /// Set the default pre-warming cache TTL in seconds
+    pub const fn with_pre_warming_cache_ttl_secs(mut self, v: u64) -> Self {
+        self.pre_warming_cache_ttl_secs = v;
+        self
+    }
+
+    /// Set the default pre-warming cache max entries
+    pub const fn with_pre_warming_cache_max_entries(mut self, v: usize) -> Self {
+        self.pre_warming_cache_max_entries = v;
+        self
+    }
 }
 
 impl Default for DefaultTxPoolValues {
@@ -282,6 +318,12 @@ impl Default for DefaultTxPoolValues {
             transactions_backup_path: None,
             disable_transactions_backup: false,
             max_batch_size: 1,
+            // Pre-warming defaults (experimental, disabled by default)
+            pre_warming_enabled: false,
+            pre_warming_num_workers: 4,
+            pre_warming_simulation_timeout_ms: 100,
+            pre_warming_cache_ttl_secs: 60,
+            pre_warming_cache_max_entries: 10_000,
         }
     }
 }
@@ -411,6 +453,33 @@ pub struct TxPoolArgs {
     /// Max batch size for transaction pool insertions
     #[arg(long = "txpool.max-batch-size", default_value_t = DefaultTxPoolValues::get_global().max_batch_size)]
     pub max_batch_size: usize,
+
+    // Pre-warming configuration (experimental feature)
+    /// Enable pre-warming simulation for cache optimization.
+    /// When enabled, transactions are simulated in background to discover state keys
+    /// that will be accessed during execution, allowing parallel pre-fetching.
+    #[arg(long = "txpool.pre-warming", default_value_t = DefaultTxPoolValues::get_global().pre_warming_enabled)]
+    pub pre_warming_enabled: bool,
+
+    /// Number of pre-warming simulation workers.
+    /// More workers enable more parallel simulation but increase CPU/memory usage.
+    #[arg(long = "txpool.pre-warming-workers", default_value_t = DefaultTxPoolValues::get_global().pre_warming_num_workers)]
+    pub pre_warming_num_workers: usize,
+
+    /// Maximum simulation time in milliseconds before timeout.
+    /// Prevents hanging on pathological transactions.
+    #[arg(long = "txpool.pre-warming-timeout-ms", default_value_t = DefaultTxPoolValues::get_global().pre_warming_simulation_timeout_ms)]
+    pub pre_warming_simulation_timeout_ms: u64,
+
+    /// Cache TTL in seconds for pre-warmed keys.
+    /// Keys older than this are considered stale and evicted.
+    #[arg(long = "txpool.pre-warming-cache-ttl", default_value_t = DefaultTxPoolValues::get_global().pre_warming_cache_ttl_secs)]
+    pub pre_warming_cache_ttl_secs: u64,
+
+    /// Maximum number of entries in pre-warming cache.
+    /// Prevents unbounded memory growth. Each entry is ~500 bytes.
+    #[arg(long = "txpool.pre-warming-cache-max", default_value_t = DefaultTxPoolValues::get_global().pre_warming_cache_max_entries)]
+    pub pre_warming_cache_max_entries: usize,
 }
 
 impl TxPoolArgs {
@@ -464,6 +533,11 @@ impl Default for TxPoolArgs {
             transactions_backup_path,
             disable_transactions_backup,
             max_batch_size,
+            pre_warming_enabled,
+            pre_warming_num_workers,
+            pre_warming_simulation_timeout_ms,
+            pre_warming_cache_ttl_secs,
+            pre_warming_cache_max_entries,
         } = DefaultTxPoolValues::get_global().clone();
         Self {
             pending_max_count,
@@ -496,6 +570,11 @@ impl Default for TxPoolArgs {
             transactions_backup_path,
             disable_transactions_backup,
             max_batch_size,
+            pre_warming_enabled,
+            pre_warming_num_workers,
+            pre_warming_simulation_timeout_ms,
+            pre_warming_cache_ttl_secs,
+            pre_warming_cache_max_entries,
         }
     }
 }
@@ -540,6 +619,15 @@ impl RethTransactionPoolConfig for TxPoolArgs {
             max_new_pending_txs_notifications: self.max_new_pending_txs_notifications,
             max_queued_lifetime: self.max_queued_lifetime,
             max_inflight_delegated_slot_limit: default_config.max_inflight_delegated_slot_limit,
+            #[cfg(feature = "pre-warming")]
+            pre_warming: reth_transaction_pool::pre_warming::PreWarmingConfig {
+                enabled: self.pre_warming_enabled,
+                num_workers: self.pre_warming_num_workers,
+                simulation_timeout: std::time::Duration::from_millis(self.pre_warming_simulation_timeout_ms),
+                cache_ttl: std::time::Duration::from_secs(self.pre_warming_cache_ttl_secs),
+                cache_max_entries: self.pre_warming_cache_max_entries,
+                enable_metrics: true, // Always enable metrics when pre-warming is configured
+            },
         }
     }
 
@@ -625,6 +713,12 @@ mod tests {
             transactions_backup_path: Some(PathBuf::from("/tmp/txpool-backup")),
             disable_transactions_backup: false,
             max_batch_size: 10,
+            // Pre-warming with custom values (enabled via flag presence)
+            pre_warming_enabled: true,
+            pre_warming_num_workers: 8,
+            pre_warming_simulation_timeout_ms: 50,
+            pre_warming_cache_ttl_secs: 30,
+            pre_warming_cache_max_entries: 5000,
         };
 
         let parsed_args = CommandParser::<TxPoolArgs>::parse_from([
@@ -685,9 +779,280 @@ mod tests {
             "/tmp/txpool-backup",
             "--txpool.max-batch-size",
             "10",
+            // Pre-warming CLI arguments
+            "--txpool.pre-warming",
+            "--txpool.pre-warming-workers",
+            "8",
+            "--txpool.pre-warming-timeout-ms",
+            "50",
+            "--txpool.pre-warming-cache-ttl",
+            "30",
+            "--txpool.pre-warming-cache-max",
+            "5000",
         ])
         .args;
 
         assert_eq!(parsed_args, args);
+    }
+
+    #[test]
+    fn txpool_pre_warming_defaults() {
+        // Test that pre-warming defaults are correctly applied
+        let args = CommandParser::<TxPoolArgs>::parse_from(["reth"]).args;
+
+        assert!(!args.pre_warming_enabled, "Pre-warming should be disabled by default");
+        assert_eq!(args.pre_warming_num_workers, 4, "Default workers should be 4");
+        assert_eq!(args.pre_warming_simulation_timeout_ms, 100, "Default timeout should be 100ms");
+        assert_eq!(args.pre_warming_cache_ttl_secs, 60, "Default TTL should be 60 seconds");
+        assert_eq!(args.pre_warming_cache_max_entries, 10_000, "Default max entries should be 10000");
+    }
+
+    #[test]
+    fn txpool_pre_warming_enable_only() {
+        // Test enabling pre-warming without changing other defaults
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming",
+        ])
+        .args;
+
+        assert!(args.pre_warming_enabled);
+        // Other values should remain at defaults
+        assert_eq!(args.pre_warming_num_workers, 4);
+        assert_eq!(args.pre_warming_simulation_timeout_ms, 100);
+        assert_eq!(args.pre_warming_cache_ttl_secs, 60);
+        assert_eq!(args.pre_warming_cache_max_entries, 10_000);
+    }
+
+    #[test]
+    fn txpool_pre_warming_custom_workers() {
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming-workers",
+            "16",
+        ])
+        .args;
+
+        assert_eq!(args.pre_warming_num_workers, 16);
+    }
+
+    #[test]
+    fn txpool_pre_warming_custom_timeout() {
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming-timeout-ms",
+            "250",
+        ])
+        .args;
+
+        assert_eq!(args.pre_warming_simulation_timeout_ms, 250);
+    }
+
+    #[test]
+    fn txpool_pre_warming_custom_cache_ttl() {
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming-cache-ttl",
+            "120",
+        ])
+        .args;
+
+        assert_eq!(args.pre_warming_cache_ttl_secs, 120);
+    }
+
+    #[test]
+    fn txpool_pre_warming_custom_cache_max() {
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming-cache-max",
+            "50000",
+        ])
+        .args;
+
+        assert_eq!(args.pre_warming_cache_max_entries, 50000);
+    }
+
+    #[test]
+    fn txpool_pre_warming_all_custom() {
+        // Test setting all pre-warming options together
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming",
+            "--txpool.pre-warming-workers",
+            "12",
+            "--txpool.pre-warming-timeout-ms",
+            "75",
+            "--txpool.pre-warming-cache-ttl",
+            "45",
+            "--txpool.pre-warming-cache-max",
+            "20000",
+        ])
+        .args;
+
+        assert!(args.pre_warming_enabled);
+        assert_eq!(args.pre_warming_num_workers, 12);
+        assert_eq!(args.pre_warming_simulation_timeout_ms, 75);
+        assert_eq!(args.pre_warming_cache_ttl_secs, 45);
+        assert_eq!(args.pre_warming_cache_max_entries, 20000);
+    }
+
+    #[test]
+    fn txpool_pre_warming_edge_case_zero_workers() {
+        // Zero workers - should parse but may be handled specially by the pool
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming-workers",
+            "0",
+        ])
+        .args;
+
+        assert_eq!(args.pre_warming_num_workers, 0);
+    }
+
+    #[test]
+    fn txpool_pre_warming_edge_case_large_values() {
+        // Test with large values
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming-workers",
+            "128",
+            "--txpool.pre-warming-timeout-ms",
+            "10000",
+            "--txpool.pre-warming-cache-ttl",
+            "3600",
+            "--txpool.pre-warming-cache-max",
+            "1000000",
+        ])
+        .args;
+
+        assert_eq!(args.pre_warming_num_workers, 128);
+        assert_eq!(args.pre_warming_simulation_timeout_ms, 10000);
+        assert_eq!(args.pre_warming_cache_ttl_secs, 3600);
+        assert_eq!(args.pre_warming_cache_max_entries, 1000000);
+    }
+
+    #[test]
+    fn txpool_pre_warming_custom_values_without_enable_flag() {
+        // Custom values without enabling pre-warming (default disabled)
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming-workers",
+            "8",
+            "--txpool.pre-warming-cache-max",
+            "5000",
+        ])
+        .args;
+
+        assert!(!args.pre_warming_enabled);
+        assert_eq!(args.pre_warming_num_workers, 8);
+        assert_eq!(args.pre_warming_cache_max_entries, 5000);
+    }
+
+    #[test]
+    fn txpool_pre_warming_one_worker() {
+        // Minimum practical worker count
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming",
+            "--txpool.pre-warming-workers",
+            "1",
+        ])
+        .args;
+
+        assert!(args.pre_warming_enabled);
+        assert_eq!(args.pre_warming_num_workers, 1);
+    }
+
+    #[test]
+    fn txpool_pre_warming_small_timeout() {
+        // Very small timeout (1ms)
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming-timeout-ms",
+            "1",
+        ])
+        .args;
+
+        assert_eq!(args.pre_warming_simulation_timeout_ms, 1);
+    }
+
+    #[test]
+    fn txpool_pre_warming_small_cache() {
+        // Minimum cache size
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming-cache-max",
+            "1",
+        ])
+        .args;
+
+        assert_eq!(args.pre_warming_cache_max_entries, 1);
+    }
+
+    #[test]
+    fn txpool_pre_warming_zero_ttl() {
+        // Zero TTL (immediate eviction)
+        let args = CommandParser::<TxPoolArgs>::parse_from([
+            "reth",
+            "--txpool.pre-warming-cache-ttl",
+            "0",
+        ])
+        .args;
+
+        assert_eq!(args.pre_warming_cache_ttl_secs, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "pre-warming")]
+    fn txpool_pre_warming_pool_config_mapping() {
+        // Test that CLI args correctly map to PoolConfig
+        let args = TxPoolArgs {
+            pre_warming_enabled: true,
+            pre_warming_num_workers: 6,
+            pre_warming_simulation_timeout_ms: 150,
+            pre_warming_cache_ttl_secs: 90,
+            pre_warming_cache_max_entries: 15000,
+            ..Default::default()
+        };
+
+        let pool_config = args.pool_config();
+
+        assert!(pool_config.pre_warming.enabled);
+        assert_eq!(pool_config.pre_warming.num_workers, 6);
+        assert_eq!(pool_config.pre_warming.simulation_timeout, Duration::from_millis(150));
+        assert_eq!(pool_config.pre_warming.cache_ttl, Duration::from_secs(90));
+        assert_eq!(pool_config.pre_warming.cache_max_entries, 15000);
+        assert!(pool_config.pre_warming.enable_metrics); // Always true when configured
+    }
+
+    #[test]
+    #[cfg(feature = "pre-warming")]
+    fn txpool_pre_warming_pool_config_defaults() {
+        // Test default PoolConfig mapping
+        let args = TxPoolArgs::default();
+        let pool_config = args.pool_config();
+
+        assert!(!pool_config.pre_warming.enabled);
+        assert_eq!(pool_config.pre_warming.num_workers, 4);
+        assert_eq!(pool_config.pre_warming.simulation_timeout, Duration::from_millis(100));
+        assert_eq!(pool_config.pre_warming.cache_ttl, Duration::from_secs(60));
+        assert_eq!(pool_config.pre_warming.cache_max_entries, 10_000);
+    }
+
+    #[test]
+    #[cfg(feature = "pre-warming")]
+    fn txpool_pre_warming_pool_config_duration_conversion() {
+        // Test that duration conversions are correct
+        let args = TxPoolArgs {
+            pre_warming_simulation_timeout_ms: 500,
+            pre_warming_cache_ttl_secs: 120,
+            ..Default::default()
+        };
+
+        let pool_config = args.pool_config();
+
+        // Verify exact duration values
+        assert_eq!(pool_config.pre_warming.simulation_timeout.as_millis(), 500);
+        assert_eq!(pool_config.pre_warming.cache_ttl.as_secs(), 120);
     }
 }

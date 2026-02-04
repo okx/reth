@@ -221,18 +221,23 @@ where
 
         let mut cached_reads = self.maybe_pre_cached(parent_header.hash()).unwrap_or_default();
 
-        // Pre-warming: Prefetch state using keys discovered by simulation
+        // Pre-warming: Prefetch state using keys discovered by simulation (PARALLEL)
         #[cfg(feature = "pre-warming")]
         if let Some(pool) = &self.pool {
-            // Import prefetch function
             if let Some(keys) = pool.get_prewarmed_keys() {
                 // Get state provider for prefetching
                 if let Ok(state_provider) = self.client.state_by_block_hash(parent_header.hash()) {
-                    // Prefetch values in parallel and populate cache
-                    if let Err(err) = reth_transaction_pool::pre_warming::prefetch_and_populate(
+                    // Wrap in SnapshotState for parallel prefetch (provides Sync for Send-only providers)
+                    let snapshot = reth_transaction_pool::pre_warming::SnapshotState::new(state_provider);
+                    
+                    // Prefetch values in PARALLEL and populate cache
+                    // Default to 4 threads - can be made configurable
+                    let num_threads = 4;
+                    if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot(
                         &mut cached_reads,
                         &keys,
-                        &*state_provider,
+                        &snapshot,
+                        num_threads,
                     ) {
                         // Log error but don't fail - execution can continue with partial cache
                         tracing::warn!(
@@ -246,7 +251,8 @@ where
                             accounts = keys.accounts.len(),
                             storage_slots = keys.storage_slots.len(),
                             contracts = keys.code_hashes.len(),
-                            "Pre-warmed cache populated from simulation"
+                            threads = num_threads,
+                            "Pre-warmed cache populated from simulation (parallel)"
                         );
                     }
                 }
