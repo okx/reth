@@ -64,6 +64,8 @@ min-trace-logs = ["tracing/release_max_level_trace"]
 
 edge = ["reth-optimism-cli/edge"]
 
+pre-warming = ["reth-optimism-node/pre-warming"]
+
 [[bin]]
 name = "op-reth"
 path = "src/main.rs"
