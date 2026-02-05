@@ -1040,6 +1040,20 @@ where
         info!(target: "reth::cli", "Transaction pool initialized");
         debug!(target: "reth::cli", "Spawned txpool maintenance task");
 
+        // Initialize pre-warming if feature is enabled
+        #[cfg(feature = "pre-warming")]
+        {
+            use reth_provider::StateProviderFactory;
+            if let Ok(state_provider) = ctx.provider().latest() {
+                transaction_pool.initialize_pre_warming(
+                    state_provider,
+                    ctx.chain_spec().clone(),
+                );
+            } else {
+                tracing::warn!(target: "reth::cli", "Failed to get state provider for pre-warming initialization");
+            }
+        }
+
         // The Op txpool maintenance task is only spawned when interop is active
         if ctx.chain_spec().is_interop_active_at_timestamp(ctx.head().timestamp) {
             // spawn the Op txpool maintenance task
