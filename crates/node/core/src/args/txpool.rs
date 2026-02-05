@@ -458,7 +458,7 @@ pub struct TxPoolArgs {
     /// Enable pre-warming simulation for cache optimization.
     /// When enabled, transactions are simulated in background to discover state keys
     /// that will be accessed during execution, allowing parallel pre-fetching.
-    #[arg(long = "txpool.pre-warming", default_value_t = DefaultTxPoolValues::get_global().pre_warming_enabled)]
+    #[arg(long = "txpool.pre-warming", default_value_t = DefaultTxPoolValues::get_global().pre_warming_enabled, action = clap::ArgAction::Set)]
     pub pre_warming_enabled: bool,
 
     /// Number of pre-warming simulation workers.
