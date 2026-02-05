@@ -325,7 +325,7 @@ use reth_chainspec::ChainSpec;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Shared snapshot holder that workers can read from.
 ///
@@ -497,12 +497,13 @@ where
             workers.push(handle);
         }
 
-        debug!(
+        info!(
             target: "txpool::pre_warming",
             num_workers = config.num_workers,
             channel_capacity,
-            chain_id = chain_spec.chain.id(),
-            "Worker pool started with bounded channel"
+            simulation_timeout_ms = config.simulation_timeout.as_millis(),
+            cache_max_entries = config.cache_max_entries,
+            "Pre-warming ENABLED - Worker pool started"
         );
 
         Self {

@@ -298,9 +298,9 @@ where
         chain_spec: std::sync::Arc<reth_chainspec::ChainSpec>,
     ) {
         if !self.config.pre_warming.enabled {
-            tracing::debug!(
+            tracing::info!(
                 target: "txpool::pre_warming",
-                "Pre-warming disabled in config, skipping initialization"
+                "Pre-warming DISABLED in config (--txpool.pre-warming=false)"
             );
             return;
         }
@@ -336,8 +336,10 @@ where
 
         tracing::info!(
             target: "txpool::pre_warming",
-            workers = self.config.pre_warming.num_workers,
-            "Pre-warming worker pool initialized"
+            num_workers = self.config.pre_warming.num_workers,
+            simulation_timeout_ms = self.config.pre_warming.simulation_timeout.as_millis() as u64,
+            cache_max_entries = self.config.pre_warming.cache_max_entries,
+            "Pre-warming ENABLED - worker pool initialized successfully"
         );
     }
 
