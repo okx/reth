@@ -45,6 +45,7 @@ pub mod worker_pool;
 mod simulator;
 mod snapshot_state;
 pub mod bridge;
+pub mod metrics;
 
 #[cfg(test)]
 mod tests;
@@ -56,5 +57,6 @@ pub use worker_pool::SimulationWorkerPool;
 pub use simulator::Simulator;
 pub use snapshot_state::SnapshotState;
 pub use bridge::{prefetch_and_populate, prefetch_parallel, prefetch_with_snapshot, populate_cached_reads_from_keys, get_cache_stats};
+pub use metrics::PreWarmingMetrics;
 
 

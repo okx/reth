@@ -412,6 +412,76 @@ where
     pub fn blob_store(&self) -> &S {
         self.pool.blob_store()
     }
+
+    /// Returns whether the pre-warming worker pool is initialized and running.
+    ///
+    /// Returns `false` if pre-warming feature is disabled or worker pool not initialized.
+    pub fn is_pre_warming_active(&self) -> bool {
+        self.pool.is_pre_warming_active()
+    }
+
+    /// Returns pre-warmed keys for the specified transaction hashes.
+    ///
+    /// This is called by the payload builder with selected transaction hashes
+    /// to get the merged ExtractedKeys for prefetching.
+    ///
+    /// Returns `None` if pre-warming is disabled or not initialized.
+    ///
+    /// **Note:** This is a fallback that returns ALL cached keys.
+    /// Prefer `get_keys_for_txs()` when you know which transactions are selected.
+    #[cfg(feature = "pre-warming")]
+    pub fn get_prewarmed_keys(&self) -> Option<crate::pre_warming::ExtractedKeys> {
+        self.pool.get_all_prewarmed_keys()
+    }
+
+    /// Returns ALL pre-warmed keys for all cached transactions.
+    ///
+    /// Use this when you don't know which transactions will be selected.
+    #[cfg(feature = "pre-warming")]
+    pub fn get_all_prewarmed_keys(&self) -> Option<crate::pre_warming::ExtractedKeys> {
+        self.pool.get_all_prewarmed_keys()
+    }
+
+    /// Returns merged pre-warmed keys for selected transactions.
+    ///
+    /// This is the preferred method for payload builders - pass the hashes of
+    /// transactions selected for the block to get only the relevant keys.
+    #[cfg(feature = "pre-warming")]
+    pub fn get_keys_for_txs(&self, tx_hashes: &[alloy_primitives::TxHash]) -> Option<crate::pre_warming::ExtractedKeys> {
+        self.pool.get_keys_for_txs(tx_hashes)
+    }
+
+    /// Returns pre-warming cache statistics for monitoring.
+    #[cfg(feature = "pre-warming")]
+    pub fn pre_warming_stats(&self) -> Option<crate::pre_warming::CacheStats> {
+        self.pool.pre_warming_stats()
+    }
+
+    /// Returns the number of threads to use for parallel prefetch.
+    ///
+    /// This returns the configured `num_workers` from PreWarmingConfig,
+    /// which is suitable for parallel prefetch operations.
+    #[cfg(feature = "pre-warming")]
+    pub fn prefetch_threads(&self) -> usize {
+        self.pool.config().pre_warming.num_workers.max(1)
+    }
+
+    /// Initializes the pre-warming worker pool with a state provider.
+    ///
+    /// This must be called after pool creation when the state provider becomes available.
+    /// Without this call, pre-warming simulation will not run even if enabled in config.
+    ///
+    /// # Arguments
+    /// * `state_provider` - Boxed state provider for querying blockchain state
+    /// * `chain_spec` - Chain specification for EVM configuration
+    #[cfg(feature = "pre-warming")]
+    pub fn initialize_pre_warming(
+        &self,
+        state_provider: Box<dyn reth_provider::StateProvider + Send>,
+        chain_spec: std::sync::Arc<reth_chainspec::ChainSpec>,
+    ) {
+        self.pool.initialize_pre_warming(state_provider, chain_spec);
+    }
 }
 
 impl<Client, S> EthTransactionPool<Client, S>
@@ -807,6 +877,31 @@ where
 
     fn cleanup_blobs(&self) {
         self.pool.cleanup_blobs()
+    }
+
+    /// Updates the snapshot used for pre-warming simulation.
+    ///
+    /// Creates a new `SnapshotState` from the provided state provider and updates
+    /// the worker pool's snapshot. This ensures simulation workers use the latest
+    /// canonical state for key discovery.
+    ///
+    /// # Pre-Warming Flow
+    ///
+    /// 1. New block committed → `on_canonical_state_change()` called
+    /// 2. Mined TXs removed from cache via `notify_txs_removed()`
+    /// 3. This method called with fresh state provider
+    /// 4. Worker pool snapshot updated
+    /// 5. New simulations use latest state
+    ///
+    /// # No-op Conditions
+    ///
+    /// This method does nothing if:
+    /// - Pre-warming is not enabled in config
+    /// - Worker pool is not initialized (call `initialize_pre_warming()` first)
+    #[cfg(feature = "pre-warming")]
+    fn update_pre_warming_snapshot(&self, state_provider: Box<dyn reth_provider::StateProvider + Send>) {
+        let snapshot = std::sync::Arc::new(crate::pre_warming::SnapshotState::new(state_provider));
+        self.pool.update_pre_warming_snapshot(snapshot);
     }
 }
 

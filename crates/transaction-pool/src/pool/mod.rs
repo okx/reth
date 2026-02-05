@@ -162,9 +162,12 @@ where
     blob_transaction_sidecar_listener: Mutex<Vec<BlobTransactionSidecarListener>>,
     /// Metrics for the blob store
     blob_store_metrics: BlobStoreMetrics,
-    /// Worker pool for pre-warming simulations
+    /// Worker pool for pre-warming simulations.
+    ///
+    /// Wrapped in RwLock to allow late initialization after pool creation,
+    /// when StateProvider becomes available.
     #[cfg(feature = "pre-warming")]
-    worker_pool: Option<std::sync::Arc<crate::pre_warming::SimulationWorkerPool<T::Transaction>>>,
+    worker_pool: RwLock<Option<std::sync::Arc<crate::pre_warming::SimulationWorkerPool<T::Transaction>>>>,
 }
 
 // === impl PoolInner ===
@@ -177,17 +180,6 @@ where
 {
     /// Create a new transaction pool instance.
     pub fn new(validator: V, ordering: T, blob_store: S, config: PoolConfig) -> Self {
-        // Initialize worker pool if pre-warming is enabled
-        #[cfg(feature = "pre-warming")]
-        let worker_pool = if config.pre_warming.enabled {
-            // Worker pool will be initialized later when state provider becomes available
-            // For now, pre-warming is disabled at pool creation
-            // TODO: Add method to initialize worker pool with state provider
-            None
-        } else {
-            None
-        };
-
         Self {
             identifiers: Default::default(),
             validator,
@@ -201,7 +193,7 @@ where
             blob_store,
             blob_store_metrics: Default::default(),
             #[cfg(feature = "pre-warming")]
-            worker_pool,
+            worker_pool: RwLock::new(None),
         }
     }
 
@@ -220,7 +212,7 @@ where
     /// This method is primarily used for testing and monitoring.
     #[cfg(feature = "pre-warming")]
     pub fn pre_warming_stats(&self) -> Option<crate::pre_warming::CacheStats> {
-        self.worker_pool.as_ref().map(|wp| wp.cache().stats())
+        self.worker_pool.read().as_ref().map(|wp| wp.cache().stats())
     }
 
     /// Returns pre-warmed keys discovered by simulation if pre-warming is enabled.
@@ -236,13 +228,22 @@ where
         Some(crate::pre_warming::ExtractedKeys::new())
     }
 
+    /// Returns ALL pre-warmed keys for all cached transactions.
+    ///
+    /// This is a fallback when we don't know which transactions will be selected.
+    /// Prefer `get_keys_for_txs()` when you know the selected transaction hashes.
+    #[cfg(feature = "pre-warming")]
+    pub fn get_all_prewarmed_keys(&self) -> Option<crate::pre_warming::ExtractedKeys> {
+        self.worker_pool.read().as_ref().map(|wp| wp.cache().get_all_keys())
+    }
+
     /// Returns merged pre-warmed keys for selected transactions.
     ///
     /// This is called by the payload builder with the list of selected transaction hashes.
     /// Returns merged ExtractedKeys for only those transactions.
     #[cfg(feature = "pre-warming")]
     pub fn get_keys_for_txs(&self, tx_hashes: &[alloy_primitives::TxHash]) -> Option<crate::pre_warming::ExtractedKeys> {
-        self.worker_pool.as_ref().map(|wp| wp.cache().get_keys_for_txs(tx_hashes))
+        self.worker_pool.read().as_ref().map(|wp| wp.cache().get_keys_for_txs(tx_hashes))
     }
 
     /// Notify pre-warming cache that transactions have been removed.
@@ -251,7 +252,7 @@ where
     /// The cache will remove the keys for these transactions.
     #[cfg(feature = "pre-warming")]
     fn notify_txs_removed(&self, tx_hashes: &[alloy_primitives::TxHash]) {
-        if let Some(worker_pool) = &self.worker_pool {
+        if let Some(worker_pool) = self.worker_pool.read().as_ref() {
             worker_pool.cache().remove_txs(tx_hashes);
         }
     }
@@ -265,17 +266,91 @@ where
     ///
     /// This should be called whenever the chain state changes to ensure simulations
     /// are performed against current state.
-    ///
-    /// TODO: Wire this up - call from on_canonical_state_change() with fresh SnapshotState
-    /// created from StateProvider.
     #[cfg(feature = "pre-warming")]
     pub fn update_pre_warming_snapshot(
         &self,
         snapshot: std::sync::Arc<crate::pre_warming::SnapshotState>,
     ) {
-        if let Some(wp) = &self.worker_pool {
+        if let Some(wp) = self.worker_pool.read().as_ref() {
             wp.update_snapshot(snapshot);
         }
+    }
+
+    /// Initializes the pre-warming worker pool with a state provider.
+    ///
+    /// This must be called after pool creation when the state provider becomes available.
+    /// Without this call, pre-warming simulation will not run even if enabled in config.
+    ///
+    /// # Arguments
+    /// * `state_provider` - Boxed state provider for querying blockchain state
+    /// * `chain_spec` - Chain specification for EVM configuration
+    ///
+    /// # Example
+    /// ```ignore
+    /// // After pool creation, when state provider is available:
+    /// let state_provider = provider.latest()?;
+    /// pool.initialize_pre_warming(state_provider, chain_spec);
+    /// ```
+    #[cfg(feature = "pre-warming")]
+    pub fn initialize_pre_warming(
+        &self,
+        state_provider: Box<dyn reth_provider::StateProvider + Send>,
+        chain_spec: std::sync::Arc<reth_chainspec::ChainSpec>,
+    ) {
+        if !self.config.pre_warming.enabled {
+            tracing::debug!(
+                target: "txpool::pre_warming",
+                "Pre-warming disabled in config, skipping initialization"
+            );
+            return;
+        }
+
+        {
+            let guard = self.worker_pool.read();
+            if guard.is_some() {
+                tracing::warn!(
+                    target: "txpool::pre_warming",
+                    "Pre-warming worker pool already initialized, skipping"
+                );
+                return;
+            }
+        }
+
+        // Create snapshot from state provider
+        let snapshot = std::sync::Arc::new(crate::pre_warming::SnapshotState::new(state_provider));
+
+        // Create cache
+        let cache = std::sync::Arc::new(crate::pre_warming::PreWarmedCache::new(
+            self.config.pre_warming.clone()
+        ));
+
+        // Create worker pool
+        let worker_pool = crate::pre_warming::SimulationWorkerPool::new(
+            self.config.pre_warming.clone(),
+            cache,
+            snapshot,
+            chain_spec,
+        );
+
+        *self.worker_pool.write() = Some(std::sync::Arc::new(worker_pool));
+
+        tracing::info!(
+            target: "txpool::pre_warming",
+            workers = self.config.pre_warming.num_workers,
+            "Pre-warming worker pool initialized"
+        );
+    }
+
+    /// Returns whether the pre-warming worker pool is initialized and running.
+    #[cfg(feature = "pre-warming")]
+    pub fn is_pre_warming_active(&self) -> bool {
+        self.worker_pool.read().is_some()
+    }
+
+    /// Returns whether the pre-warming worker pool is initialized and running.
+    #[cfg(not(feature = "pre-warming"))]
+    pub fn is_pre_warming_active(&self) -> bool {
+        false
     }
 
     /// Returns the currently tracked block
@@ -785,7 +860,7 @@ where
     fn on_added_transaction(&self, meta: AddedTransactionMeta<T::Transaction>) {
         // Trigger pre-warming simulation (fire-and-forget, non-blocking)
         #[cfg(feature = "pre-warming")]
-        if let Some(worker_pool) = &self.worker_pool {
+        if let Some(worker_pool) = self.worker_pool.read().as_ref() {
             let tx_hash = *meta.added.hash();
             let transaction = match &meta.added {
                 AddedTransaction::Pending(tx) => tx.transaction.transaction.clone(),

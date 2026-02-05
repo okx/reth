@@ -45,11 +45,25 @@ pub use stack::PayloadBuilderStack;
 
 /// Trait for transaction pools that support pre-warming via simulation.
 ///
-/// This trait is automatically implemented for pools that have the `get_prewarmed_keys()` method.
+/// This trait provides access to pre-warmed keys discovered by background simulation.
+/// The keys can be used to prefetch state before block execution.
 #[cfg(feature = "pre-warming")]
 pub trait PreWarmingPool {
-    /// Get pre-warmed keys discovered by background simulation
+    /// Get pre-warmed keys discovered by background simulation.
+    ///
+    /// Returns merged ExtractedKeys for all cached transactions.
+    /// Returns `None` if pre-warming is not active.
     fn get_prewarmed_keys(&self) -> Option<reth_transaction_pool::pre_warming::ExtractedKeys>;
+
+    /// Check if pre-warming is active (worker pool initialized).
+    fn is_pre_warming_active(&self) -> bool;
+
+    /// Get the number of threads to use for parallel prefetch.
+    ///
+    /// Defaults to the number of simulation workers configured.
+    fn prefetch_threads(&self) -> usize {
+        4 // Default fallback
+    }
 }
 
 /// Default implementation for unit type when no pool is provided
@@ -57,6 +71,14 @@ pub trait PreWarmingPool {
 impl PreWarmingPool for () {
     fn get_prewarmed_keys(&self) -> Option<reth_transaction_pool::pre_warming::ExtractedKeys> {
         None
+    }
+
+    fn is_pre_warming_active(&self) -> bool {
+        false
+    }
+
+    fn prefetch_threads(&self) -> usize {
+        4
     }
 }
 
@@ -220,42 +242,55 @@ where
         };
 
         let mut cached_reads = self.maybe_pre_cached(parent_header.hash()).unwrap_or_default();
-
         // Pre-warming: Prefetch state using keys discovered by simulation (PARALLEL)
         #[cfg(feature = "pre-warming")]
         if let Some(pool) = &self.pool {
-            if let Some(keys) = pool.get_prewarmed_keys() {
-                // Get state provider for prefetching
-                if let Ok(state_provider) = self.client.state_by_block_hash(parent_header.hash()) {
-                    // Wrap in SnapshotState for parallel prefetch (provides Sync for Send-only providers)
-                    let snapshot = reth_transaction_pool::pre_warming::SnapshotState::new(state_provider);
-                    
-                    // Prefetch values in PARALLEL and populate cache
-                    // Default to 4 threads - can be made configurable
-                    let num_threads = 4;
-                    if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot(
-                        &mut cached_reads,
-                        &keys,
-                        &snapshot,
-                        num_threads,
-                    ) {
-                        // Log error but don't fail - execution can continue with partial cache
-                        tracing::warn!(
-                            target: "payload_builder",
-                            ?err,
-                            "Failed to prefetch pre-warmed state, continuing with partial cache"
-                        );
-                    } else {
+            // Check if pre-warming is active (worker pool initialized)
+            if pool.is_pre_warming_active() {
+                if let Some(keys) = pool.get_prewarmed_keys() {
+                    // Skip if no keys were discovered
+                    if keys.is_empty() {
                         tracing::debug!(
                             target: "payload_builder",
-                            accounts = keys.accounts.len(),
-                            storage_slots = keys.storage_slots.len(),
-                            contracts = keys.code_hashes.len(),
-                            threads = num_threads,
-                            "Pre-warmed cache populated from simulation (parallel)"
+                            "Pre-warming: No keys discovered by simulation"
                         );
+                    } else {
+                        // Get state provider for prefetching
+                        if let Ok(state_provider) = self.client.state_by_block_hash(parent_header.hash()) {
+                        // Wrap in SnapshotState for parallel prefetch
+                            let snapshot = reth_transaction_pool::pre_warming::SnapshotState::new(state_provider);
+
+                            // Use configured thread count from pool (defaults to num_workers)
+                            let num_threads = pool.prefetch_threads();
+                            if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot(
+                                &mut cached_reads,
+                                &keys,
+                                &snapshot,
+                                num_threads,
+                            ) {
+                                tracing::warn!(
+                                    target: "payload_builder",
+                                    ?err,
+                                    "Failed to prefetch pre-warmed state, continuing with partial cache"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    target: "payload_builder",
+                                    accounts = keys.accounts.len(),
+                                    storage_slots = keys.storage_slots.len(),
+                                    contracts = keys.code_hashes.len(),
+                                    threads = num_threads,
+                                    "Pre-warmed cache populated from simulation (parallel)"
+                                );
+                            }
+                        }
                     }
                 }
+            } else {
+                tracing::trace!(
+                    target: "payload_builder",
+                    "Pre-warming not active (worker pool not initialized)"
+                );
             }
         }
 

@@ -14,46 +14,6 @@
 //! 4. Keys are stored in the `PreWarmedCache` for later prefetching
 //!
 //! ---
-//!
-//! ## What Is the Worker Pool?
-//!
-//! Think of it like a **pizza restaurant kitchen**:
-//!
-//! ```text
-//! Customer orders pizza (Transaction arrives)
-//!       │
-//!       ▼
-//! Order ticket placed on queue (SimulationRequest sent to channel)
-//!       │
-//!       ▼
-//! ┌─────────────────────────────────────────────────┐
-//! │            Kitchen (Worker Pool)                │
-//! │                                                 │
-//! │   Chef 1    Chef 2    Chef 3    Chef 4         │
-//! │     │         │         │         │            │
-//! │     └────┬────┴────┬────┴────┬────┘            │
-//! │          │         │         │                  │
-//! │    Whoever is free grabs the next ticket!      │
-//! │                                                 │
-//! └─────────────────────────────────────────────────┘
-//!       │
-//!       ▼
-//! Pizza delivered (Keys stored in cache)
-//! ```
-//!
-//! ### In Code Terms
-//!
-//! | Restaurant | Worker Pool |
-//! |------------|-------------|
-//! | Kitchen | `SimulationWorkerPool` |
-//! | Chefs | Worker tasks (tokio::spawn) |
-//! | Order queue | Bounded mpsc channel |
-//! | Order ticket | `SimulationRequest<T>` |
-//! | Making pizza | Simulating transaction |
-//! | Delivered pizza | `ExtractedKeys` in cache |
-//!
-//! ---
-//!
 //! ## How Does the Worker Pool Work?
 //!
 //! ### Step-by-Step Flow
@@ -358,6 +318,7 @@
 //! | Channel capacity | Drops requests | Memory waste | workers × 10 |
 
 use crate::pre_warming::{ExtractedKeys, PreWarmedCache, PreWarmingConfig, SimulationRequest, Simulator, SnapshotState};
+use crate::pre_warming::metrics::PreWarmingMetrics;
 use crate::PoolTransaction;
 use parking_lot::RwLock;
 use reth_chainspec::ChainSpec;
@@ -440,6 +401,11 @@ pub struct SimulationWorkerPool<T> {
 
     /// Configuration for the worker pool.
     config: PreWarmingConfig,
+
+    /// Metrics for monitoring pre-warming performance.
+    ///
+    /// Tracks simulations triggered/completed/failed, cache stats, etc.
+    metrics: Arc<PreWarmingMetrics>,
 }
 
 // Manual Debug implementation since some fields don't implement Debug
@@ -510,6 +476,9 @@ where
         // Wrap snapshot in RwLock so workers can see updates
         let snapshot_holder: SharedSnapshot = Arc::new(RwLock::new(snapshot));
 
+        // Create metrics instance (registers with global Prometheus registry)
+        let metrics = Arc::new(PreWarmingMetrics::default());
+
         let mut workers = Vec::with_capacity(config.num_workers);
 
         // Spawn N workers using tokio::spawn for async runtime integration
@@ -519,9 +488,10 @@ where
             let snapshot_holder = Arc::clone(&snapshot_holder);
             let chain_spec = Arc::clone(&chain_spec);
             let config = config.clone();
+            let metrics = Arc::clone(&metrics);
 
             let handle = tokio::spawn(async move {
-                worker_loop(worker_id, receiver, cache, snapshot_holder, chain_spec, config).await;
+                worker_loop(worker_id, receiver, cache, snapshot_holder, chain_spec, config, metrics).await;
             });
 
             workers.push(handle);
@@ -542,6 +512,7 @@ where
             snapshot_holder,
             chain_spec,
             config,
+            metrics,
         }
     }
 
@@ -576,6 +547,9 @@ where
             "Updating snapshot for worker pool"
         );
         *self.snapshot_holder.write() = new_snapshot;
+
+        // Record snapshot update
+        self.metrics.snapshot_updates.increment(1);
     }
 
     /// Get a reference to the current snapshot.
@@ -614,12 +588,17 @@ where
     /// // Returns immediately! Don't await anything.
     /// ```
     pub fn trigger_simulation(&self, request: SimulationRequest<T>) {
+        // Record that a simulation was triggered
+        self.metrics.simulations_triggered.increment(1);
+
         match self.sender.try_send(request) {
             Ok(_) => {
                 // Successfully queued for simulation
             }
             Err(mpsc::error::TrySendError::Full(req)) => {
                 // Channel is full - workers can't keep up!
+                // Record the dropped simulation
+                self.metrics.simulations_dropped.increment(1);
                 warn!(
                     target: "txpool::pre_warming",
                     tx_hash = ?req.tx_hash,
@@ -629,6 +608,8 @@ where
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Channel closed - worker pool shutdown
+                // Record as dropped
+                self.metrics.simulations_dropped.increment(1);
                 warn!(
                     target: "txpool::pre_warming",
                     "Simulation channel closed - worker pool shut down"
@@ -752,6 +733,7 @@ async fn worker_loop<T>(
     snapshot_holder: SharedSnapshot,
     chain_spec: Arc<ChainSpec>,
     config: PreWarmingConfig,
+    metrics: Arc<PreWarmingMetrics>,
 ) where
     T: PoolTransaction,
 {
@@ -805,6 +787,9 @@ async fn worker_loop<T>(
                 let snapshot = snapshot_holder.read().clone();
                 let simulator = Simulator::new(snapshot, Arc::clone(&chain_spec));
 
+                // Start timing the simulation
+                let simulation_start = std::time::Instant::now();
+
                 // Simulate transaction with timeout
                 let simulation_timeout = config.simulation_timeout;
                 let keys = match tokio::time::timeout(
@@ -814,8 +799,14 @@ async fn worker_loop<T>(
                         move || simulate_transaction_sync(&simulator, &tx)
                     })
                 ).await {
-                    Ok(Ok(Ok(keys))) => keys,
+                    Ok(Ok(Ok(keys))) => {
+                        // Record successful simulation
+                        metrics.simulations_completed.increment(1);
+                        keys
+                    }
                     Ok(Ok(Err(e))) => {
+                        // Record failed simulation
+                        metrics.simulations_failed.increment(1);
                         warn!(
                             target: "txpool::pre_warming",
                             worker_id,
@@ -826,6 +817,8 @@ async fn worker_loop<T>(
                         dummy_simulate(&req.transaction)
                     }
                     Ok(Err(join_err)) => {
+                        // Record failed simulation (panic)
+                        metrics.simulations_failed.increment(1);
                         error!(
                             target: "txpool::pre_warming",
                             worker_id,
@@ -836,6 +829,8 @@ async fn worker_loop<T>(
                         dummy_simulate(&req.transaction)
                     }
                     Err(_timeout) => {
+                        // Record failed simulation (timeout)
+                        metrics.simulations_failed.increment(1);
                         warn!(
                             target: "txpool::pre_warming",
                             worker_id,
@@ -846,6 +841,10 @@ async fn worker_loop<T>(
                         dummy_simulate(&req.transaction)
                     }
                 };
+
+                // Record simulation duration
+                let simulation_duration = simulation_start.elapsed();
+                metrics.simulation_duration.record(simulation_duration.as_secs_f64());
 
                 // Store keys per transaction (thread-safe)
                 cache.store_tx_keys(req.tx_hash, keys);

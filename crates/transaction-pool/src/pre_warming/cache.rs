@@ -85,6 +85,24 @@ impl PreWarmedCache {
         merged
     }
 
+    /// Get ALL cached keys (all transactions currently in cache)
+    ///
+    /// This is a fallback method when we don't know which transactions will be selected.
+    /// It returns merged keys for ALL cached transactions.
+    ///
+    /// NOTE: This may return more keys than needed. Prefer `get_keys_for_txs()` when
+    /// you know which transactions will be selected.
+    pub fn get_all_keys(&self) -> ExtractedKeys {
+        let cache = self.per_tx_keys.read();
+        let mut merged = ExtractedKeys::new();
+
+        for keys in cache.values() {
+            merged.merge(keys.clone());
+        }
+
+        merged
+    }
+
     /// Remove keys for mined/dropped transactions (called from hook)
     ///
     /// This is called when transactions are removed from the pool (mined, dropped, etc.).
