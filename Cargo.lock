@@ -11470,7 +11470,6 @@ dependencies = [
  "reth-execution-types",
  "reth-fs-util",
  "reth-metrics",
- "reth-node-metrics",
  "reth-primitives",
  "reth-primitives-traits",
  "reth-provider",

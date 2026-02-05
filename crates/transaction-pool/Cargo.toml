@@ -22,11 +22,11 @@ reth-execution-types.workspace = true
 reth-fs-util.workspace = true
 reth-storage-api.workspace = true
 reth-tasks.workspace = true
+reth-provider.workspace = true
 revm-interpreter.workspace = true
 revm-primitives.workspace = true
 
 # Pre-warming specific dependencies (optional)
-reth-provider = { workspace = true, optional = true }
 reth-primitives = { workspace = true, optional = true }
 reth-revm = { workspace = true, optional = true }
 revm = { workspace = true, optional = true }
@@ -46,7 +46,6 @@ tokio-stream.workspace = true
 
 # metrics
 reth-metrics.workspace = true
-reth-node-metrics.workspace = true
 metrics.workspace = true
 
 # misc
@@ -86,7 +85,6 @@ futures.workspace = true
 [features]
 default = []
 pre-warming = [
-    "reth-provider",
     "reth-primitives",
     "reth-revm",
     "revm",
