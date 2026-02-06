@@ -62,7 +62,7 @@ use reth_rpc_api::{
     DebugApiServer, L2EthApiExtServer, XLayerEthApiExtServer,
 };
 use reth_rpc_server_types::RethRpcModule;
-use reth_tracing::tracing::{debug, info};
+use reth_tracing::tracing::{debug, info, warn};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, EthPoolTransaction, PoolPooledTx, PoolTransaction,
     TransactionPool, TransactionValidationTaskExecutor,
@@ -1046,16 +1046,16 @@ where
             use reth_provider::StateProviderFactory;
             use reth_chainspec::EthChainSpec;
             if let Ok(state_provider) = ctx.provider().latest() {
-                transaction_pool.initialize_pre_warming(
-                    state_provider,
-                    std::sync::Arc::new(reth_chainspec::ChainSpec::new(
-                        ctx.chain_spec().chain(),
-                        Default::default(),
-                        ctx.chain_spec().genesis().clone(),
-                    )),
+                // Create a basic ChainSpec from genesis for pre-warming
+                let chain_spec = std::sync::Arc::new(
+                    reth_chainspec::ChainSpec::builder()
+                        .chain(ctx.chain_spec().chain())
+                        .genesis(ctx.chain_spec().genesis().clone())
+                        .build()
                 );
+                transaction_pool.initialize_pre_warming(state_provider, chain_spec);
             } else {
-                tracing::warn!(target: "reth::cli", "Failed to get state provider for pre-warming initialization");
+                warn!(target: "reth::cli", "Failed to get state provider for pre-warming initialization");
             }
         }
 
