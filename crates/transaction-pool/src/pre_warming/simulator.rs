@@ -27,6 +27,7 @@ pub struct Simulator {
     snapshot: Arc<SnapshotState>,
 
     /// EVM configuration (spec ID, chain config, etc.)
+    #[allow(unused)]
     cfg_env: CfgEnv,
 
     /// Maximum simulation time (prevent infinite loops)

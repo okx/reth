@@ -8704,7 +8704,6 @@ dependencies = [
  "reth-chainspec",
  "reth-engine-primitives",
  "reth-ethereum-engine-primitives",
- "reth-optimism-chainspec",
  "reth-payload-builder",
  "reth-payload-primitives",
  "reth-primitives-traits",
@@ -9230,7 +9229,6 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-execution-types",
- "reth-node-metrics",
  "reth-primitives-traits",
  "reth-storage-errors",
  "reth-testing-utils",
@@ -10166,7 +10164,6 @@ dependencies = [
  "alloy-primitives",
  "once_cell",
  "reth-ethereum-forks",
- "tracing",
 ]
 
 [[package]]

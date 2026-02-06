@@ -85,7 +85,6 @@ futures.workspace = true
 [features]
 default = []
 pre-warming = [
-    "reth-primitives",
     "reth-revm",
     "revm",
 ]  # Experimental: opt-in only for now

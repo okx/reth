@@ -62,7 +62,7 @@ use reth_rpc_api::{
     DebugApiServer, L2EthApiExtServer, XLayerEthApiExtServer,
 };
 use reth_rpc_server_types::RethRpcModule;
-use reth_tracing::tracing::{debug, info, warn};
+use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, EthPoolTransaction, PoolPooledTx, PoolTransaction,
     TransactionPool, TransactionValidationTaskExecutor,
@@ -71,6 +71,9 @@ use reth_trie_common::KeccakKeyHasher;
 use serde::de::DeserializeOwned;
 use std::{marker::PhantomData, sync::Arc};
 use url::Url;
+
+#[cfg(feature = "pre-warming")]
+use reth_tracing::tracing::warn;
 
 /// Marker trait for Optimism node types with standard engine, chain spec, and primitives.
 pub trait OpNodeTypes:

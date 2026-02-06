@@ -171,6 +171,7 @@ pub fn remove_block_timing(block_hash: &B256) {
 ///     // ... do work ...
 /// } // Guard is dropped here and timing is automatically recorded
 /// ```
+#[derive(Debug)]
 pub struct TimingGuard<'a> {
     start: Option<Instant>,
     target: &'a mut Duration,
@@ -232,6 +233,7 @@ impl<'a> Drop for TimingGuard<'a> {
 /// building and insertion process. The context automatically stores metrics when dropped.
 ///
 /// Supports both logging (via IndexMap) and Prometheus metrics recording.
+#[derive(Debug)]
 pub struct BlockTimingContext {
     block_hash: B256,
     metrics: BlockTimingMetrics,

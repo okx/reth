@@ -20,7 +20,6 @@ reth-ethereum-primitives.workspace = true
 revm.workspace = true
 reth-evm.workspace = true
 reth-storage-errors.workspace = true
-reth-node-metrics.workspace = true
 
 # Alloy
 alloy-primitives.workspace = true

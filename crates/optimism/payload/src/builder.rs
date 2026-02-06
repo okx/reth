@@ -23,7 +23,7 @@ use reth_evm::{
 // For X Layer block time
 use reth_execution_types::BlockExecutionOutput;
 use reth_node_metrics::{
-    block_timing::{store_block_timing, BlockTimingContext, BlockTimingPrometheusMetrics},
+    block_timing::{BlockTimingContext, BlockTimingPrometheusMetrics},
     transaction_trace_xlayer::{get_global_tracer, TransactionProcessId},
 };
 use reth_optimism_forks::OpHardforks;
@@ -46,7 +46,7 @@ use reth_revm::{
 use reth_storage_api::{errors::ProviderError, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use revm::context::{Block, BlockEnv};
-use std::{marker::PhantomData, sync::Arc, time::Instant};
+use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, trace, warn};
 
 // For X Layer inner tx
@@ -403,7 +403,6 @@ impl<Txs> OpBuilder<'_, Txs> {
         // X Layer: Initialize timing context with RAII and Prometheus support
         // Note: We'll get the block hash after building, so we create an empty context first
         // and update it later. For now, we use a placeholder hash.
-        let build_start = Instant::now();
         let prom_metrics = BlockTimingPrometheusMetrics::default();
         let mut timing_ctx =
             BlockTimingContext::new_empty_with_prometheus(B256::ZERO, prom_metrics);

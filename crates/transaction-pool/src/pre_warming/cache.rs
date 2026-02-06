@@ -46,6 +46,7 @@ pub struct PreWarmedCache {
     per_tx_keys: RwLock<HashMap<TxHash, ExtractedKeys>>,
 
     /// Configuration
+    #[allow(unused)]
     config: PreWarmingConfig,
 }
 
