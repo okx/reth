@@ -1044,10 +1044,15 @@ where
         #[cfg(feature = "pre-warming")]
         {
             use reth_provider::StateProviderFactory;
+            use reth_chainspec::EthChainSpec;
             if let Ok(state_provider) = ctx.provider().latest() {
                 transaction_pool.initialize_pre_warming(
                     state_provider,
-                    ctx.chain_spec().clone(),
+                    std::sync::Arc::new(reth_chainspec::ChainSpec::new(
+                        ctx.chain_spec().chain(),
+                        Default::default(),
+                        ctx.chain_spec().genesis().clone(),
+                    )),
                 );
             } else {
                 tracing::warn!(target: "reth::cli", "Failed to get state provider for pre-warming initialization");
