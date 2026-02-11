@@ -40,7 +40,8 @@ use reth_storage_api::{errors::ProviderError, StateProvider, StateProviderFactor
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use revm::context::{Block, BlockEnv};
 use std::{marker::PhantomData, sync::Arc};
-use tracing::{debug, trace, warn};
+use std::time::Instant;
+use tracing::{debug, info, trace, warn};
 
 /// Optimism's payload builder
 #[derive(Debug)]
@@ -335,6 +336,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         Attrs: OpAttributes<Transaction = N::SignedTx>,
     {
         let Self { best } = self;
+        let build_start = Instant::now();
         debug!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
 
         let mut db = State::builder().with_database(db).with_bundle_update().build();
@@ -353,6 +355,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         })?;
 
         // 2. execute sequencer transactions
+        let exec_start = Instant::now();
         let mut info = ctx.execute_sequencer_transactions(&mut builder)?;
 
         // 3. if mem pool transactions are requested we execute them
@@ -368,12 +371,26 @@ impl<Txs> OpBuilder<'_, Txs> {
                 return Ok(BuildOutcomeKind::Aborted { fees: info.total_fees })
             }
         }
+        let exec_elapsed = exec_start.elapsed();
 
+        // 4. finish block building: compute state root and assemble block
+        let finish_start = Instant::now();
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(state_provider)?;
+        let finish_elapsed = finish_start.elapsed();
 
         let sealed_block = Arc::new(block.sealed_block().clone());
-        debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
+        let total_elapsed = build_start.elapsed();
+
+        info!(
+            target: "payload_builder",
+            id = %ctx.attributes().payload_id(),
+            gas_used = %sealed_block.gas_used(),
+            ?exec_elapsed,
+            ?finish_elapsed,
+            ?total_elapsed,
+            "payload built"
+        );
 
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
