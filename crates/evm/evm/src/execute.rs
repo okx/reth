@@ -363,6 +363,22 @@ pub trait BlockBuilder {
         state_provider: impl StateProvider,
     ) -> Result<BlockBuilderOutcome<Self::Primitives>, BlockExecutionError>;
 
+    /// Completes the block building process using a custom state root computation.
+    ///
+    /// This is similar to [`finish`](BlockBuilder::finish) but allows the caller to provide a
+    /// custom function for computing the state root and trie updates. This enables using
+    /// alternative (e.g. parallel) state root computation strategies.
+    ///
+    /// The `compute_root` closure receives the [`HashedPostState`] and should return the
+    /// computed state root hash and trie updates.
+    fn finish_with_state_root_closure(
+        self,
+        state_provider: impl StateProvider,
+        compute_root: impl FnOnce(
+            HashedPostState,
+        ) -> Result<(B256, TrieUpdates), BlockExecutionError>,
+    ) -> Result<BlockBuilderOutcome<Self::Primitives>, BlockExecutionError>;
+
     /// Provides mutable access to the inner [`BlockExecutor`].
     fn executor_mut(&mut self) -> &mut Self::Executor;
 
@@ -489,6 +505,44 @@ where
         let (state_root, trie_updates) = state
             .state_root_with_updates(hashed_state.clone())
             .map_err(BlockExecutionError::other)?;
+
+        let (transactions, senders) =
+            self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
+
+        let block = self.assembler.assemble_block(BlockAssemblerInput {
+            evm_env,
+            execution_ctx: self.ctx,
+            parent: self.parent,
+            transactions,
+            output: &result,
+            bundle_state: &db.bundle_state,
+            state_provider: &state,
+            state_root,
+        })?;
+
+        let block = RecoveredBlock::new_unhashed(block, senders);
+
+        Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
+    }
+
+    fn finish_with_state_root_closure(
+        self,
+        state: impl StateProvider,
+        compute_root: impl FnOnce(
+            HashedPostState,
+        ) -> Result<(B256, TrieUpdates), BlockExecutionError>,
+    ) -> Result<BlockBuilderOutcome<N>, BlockExecutionError> {
+        let (evm, result) = self.executor.finish()?;
+        let (db, evm_env) = evm.finish();
+
+        // merge all transitions into bundle state
+        db.merge_transitions(BundleRetention::Reverts);
+
+        // calculate the hashed post state
+        let hashed_state = state.hashed_post_state(&db.bundle_state);
+
+        // use the provided closure for state root computation
+        let (state_root, trie_updates) = compute_root(hashed_state.clone())?;
 
         let (transactions, senders) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();

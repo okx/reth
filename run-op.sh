@@ -29,7 +29,7 @@ DATA_DIR="./data-op"
 rm -rf $DATA_DIR
 
 # Start op-reth node in dev mode
-OP_DEV_EIP1559_DENOMINATOR=100000000 OP_DEV_GAS_LIMIT=1500000000 op-reth node \
+OP_DEV_EIP1559_DENOMINATOR=100000000 OP_DEV_GAS_LIMIT=3000000000 op-reth node \
     --datadir $DATA_DIR\
     --dev \
     --dev.block-time 1s \
