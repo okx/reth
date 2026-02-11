@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::time::Interval;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::error;
+use tracing::{debug, error};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -195,6 +195,11 @@ where
 
     /// Generates payload attributes for a new block, passes them to FCU and inserts built payload
     /// through newPayload.
+    ///
+    /// If the built payload includes execution data (e.g., from OP payload builder), the
+    /// pre-executed block is inserted into the engine tree first via [`InsertBuiltPayload`].
+    /// This allows the subsequent `new_payload` call to detect the block as already known,
+    /// skipping redundant EVM re-execution and effectively doubling throughput in dev mode.
     async fn advance(&mut self) -> eyre::Result<()> {
         let res = self
             .to_engine
@@ -218,6 +223,19 @@ where
         };
 
         let header = payload.block().sealed_header().clone();
+
+        // If the payload includes pre-executed block data, insert it into the engine tree
+        // before calling new_payload. The tree will then recognize the block as `AlreadySeen`
+        // and skip EVM re-execution, avoiding the double execution penalty in dev mode.
+        if let Some(executed_block) = payload.executed_block() {
+            debug!(
+                target: "engine::local",
+                block_hash = %header.hash(),
+                "inserting pre-executed block to skip re-execution"
+            );
+            self.to_engine.insert_built_payload(executed_block);
+        }
+
         let payload = T::block_to_payload(payload.block().clone());
         let res = self.to_engine.new_payload(payload).await?;
 

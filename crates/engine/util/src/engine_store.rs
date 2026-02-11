@@ -86,6 +86,9 @@ impl EngineMessageStore {
                     })?,
                 )?;
             }
+            BeaconEngineMessage::InsertBuiltPayload { .. } => {
+                // Not stored - this is a local dev-mode optimization message
+            }
         };
         Ok(())
     }

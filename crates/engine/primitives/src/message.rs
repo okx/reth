@@ -14,7 +14,9 @@ use core::{
 use futures::{future::Either, FutureExt, TryFutureExt};
 use reth_errors::RethResult;
 use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_payload_primitives::{EngineApiMessageVersion, PayloadTypes};
+use reth_payload_primitives::{
+    BuiltPayload, BuiltPayloadExecutedBlock, EngineApiMessageVersion, PayloadTypes,
+};
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
 /// Type alias for backwards compat
@@ -164,6 +166,21 @@ pub enum BeaconEngineMessage<Payload: PayloadTypes> {
         /// The sender for returning forkchoice updated result.
         tx: oneshot::Sender<RethResult<OnForkChoiceUpdated>>,
     },
+    /// Insert a pre-executed block from the local payload builder.
+    ///
+    /// This allows the engine tree to skip re-execution when the same block arrives via
+    /// [`BeaconEngineMessage::NewPayload`]. The block is inserted into the tree state directly,
+    /// so subsequent `new_payload` calls for the same block hash will return `AlreadySeen`
+    /// without EVM execution.
+    ///
+    /// This is primarily used in dev mode where the same node builds and validates blocks,
+    /// avoiding redundant double execution.
+    InsertBuiltPayload {
+        /// The pre-executed block from the payload builder.
+        block: BuiltPayloadExecutedBlock<
+            <Payload::BuiltPayload as BuiltPayload>::Primitives,
+        >,
+    },
 }
 
 impl<Payload: PayloadTypes> Display for BeaconEngineMessage<Payload> {
@@ -185,6 +202,13 @@ impl<Payload: PayloadTypes> Display for BeaconEngineMessage<Payload> {
                     f,
                     "ForkchoiceUpdated {{ state: {state:?}, has_payload_attributes: {} }}",
                     payload_attrs.is_some()
+                )
+            }
+            Self::InsertBuiltPayload { block } => {
+                write!(
+                    f,
+                    "InsertBuiltPayload(hash: {})",
+                    block.recovered_block.hash()
                 )
             }
         }
@@ -238,6 +262,19 @@ where
             .await?
             .map_err(BeaconForkChoiceUpdateError::internal)?
             .await?)
+    }
+
+    /// Sends a pre-executed block to the engine tree for insertion without re-execution.
+    ///
+    /// This should be called before [`Self::new_payload`] when the payload was built locally,
+    /// so that `new_payload` can skip EVM execution by detecting the block as `AlreadySeen`.
+    pub fn insert_built_payload(
+        &self,
+        block: BuiltPayloadExecutedBlock<
+            <Payload::BuiltPayload as BuiltPayload>::Primitives,
+        >,
+    ) {
+        let _ = self.to_engine.send(BeaconEngineMessage::InsertBuiltPayload { block });
     }
 
     /// Sends a forkchoice update message to the beacon consensus engine and returns the receiver to

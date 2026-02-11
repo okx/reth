@@ -1572,6 +1572,31 @@ where
                                 // handle the event if any
                                 self.on_maybe_tree_event(maybe_event)?;
                             }
+                            BeaconEngineMessage::InsertBuiltPayload { block } => {
+                                // Insert a locally-built payload directly into the tree
+                                // without re-execution. This allows the subsequent
+                                // `new_payload` call to detect the block as `AlreadySeen`.
+                                let block_num_hash = block.recovered_block.num_hash();
+                                debug!(target: "engine::tree", block=?block_num_hash, "inserting locally built payload");
+                                let now = Instant::now();
+
+                                let executed = block.into_executed_payload();
+
+                                if block_num_hash.number > self.state.tree_state.canonical_block_number() {
+                                    if self.state.tree_state.canonical_block_hash() ==
+                                        executed.recovered_block().parent_hash()
+                                    {
+                                        self.canonical_in_memory_state.set_pending_block(executed.clone());
+                                    }
+
+                                    self.state.tree_state.insert_executed(executed.clone());
+                                    self.payload_validator.on_inserted_executed_block(executed.clone());
+                                    self.metrics.engine.inserted_already_executed_blocks.increment(1);
+                                    self.emit_event(EngineApiEvent::BeaconConsensus(
+                                        ConsensusEngineEvent::CanonicalBlockAdded(executed, now.elapsed()),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
