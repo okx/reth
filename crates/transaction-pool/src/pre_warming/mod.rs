@@ -46,6 +46,7 @@ mod simulator;
 mod snapshot_state;
 pub mod bridge;
 pub mod metrics;
+pub mod registry;
 
 #[cfg(test)]
 mod tests;
@@ -58,5 +59,43 @@ pub use simulator::Simulator;
 pub use snapshot_state::SnapshotState;
 pub use bridge::{prefetch_and_populate, prefetch_parallel, prefetch_with_snapshot, populate_cached_reads_from_keys, get_cache_stats};
 pub use metrics::PreWarmingMetrics;
+pub use registry::{set_global_cache, get_global_cache, is_pre_warming_active, clear_global_cache};
+
+/// Trait for transaction pools that support pre-warming via simulation.
+///
+/// This trait provides access to pre-warmed keys discovered by background simulation.
+/// The keys can be used to prefetch state before block execution.
+pub trait PreWarmingPool {
+    /// Get ALL pre-warmed keys discovered by background simulation.
+    ///
+    /// Returns merged ExtractedKeys for all cached transactions.
+    /// Returns `None` if pre-warming is not active.
+    fn get_all_prewarmed_keys(&self) -> Option<ExtractedKeys>;
+
+    /// Check if pre-warming is active (worker pool initialized).
+    fn is_pre_warming_active(&self) -> bool;
+
+    /// Get the number of threads to use for parallel prefetch.
+    ///
+    /// Defaults to the number of simulation workers configured.
+    fn prefetch_threads(&self) -> usize {
+        4 // Default fallback
+    }
+}
+
+/// Default implementation for unit type when no pool is provided.
+impl PreWarmingPool for () {
+    fn get_all_prewarmed_keys(&self) -> Option<ExtractedKeys> {
+        None
+    }
+
+    fn is_pre_warming_active(&self) -> bool {
+        false
+    }
+
+    fn prefetch_threads(&self) -> usize {
+        4
+    }
+}
 
 

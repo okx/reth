@@ -129,4 +129,9 @@ op = [
     "reth-evm/op",
     "reth-primitives-traits/op",
 ]
-pre-warming = []
+
+pre-warming = [
+    "reth-basic-payload-builder/pre-warming",
+    "reth-transaction-pool/pre-warming",
+    "reth-node-core/pre-warming",
+]

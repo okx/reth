@@ -506,6 +506,9 @@ where
             "Pre-warming ENABLED - Worker pool started"
         );
 
+        // Register cache globally so payload builder can access it
+        crate::pre_warming::registry::set_global_cache(Arc::clone(&cache));
+
         Self {
             sender,
             workers,

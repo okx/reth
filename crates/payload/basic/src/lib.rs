@@ -43,44 +43,10 @@ mod stack;
 pub use better_payload_emitter::BetterPayloadEmitter;
 pub use stack::PayloadBuilderStack;
 
-/// Trait for transaction pools that support pre-warming via simulation.
-///
+/// Re-export the PreWarmingPool trait from transaction-pool.
 /// This trait provides access to pre-warmed keys discovered by background simulation.
-/// The keys can be used to prefetch state before block execution.
 #[cfg(feature = "pre-warming")]
-pub trait PreWarmingPool {
-    /// Get pre-warmed keys discovered by background simulation.
-    ///
-    /// Returns merged ExtractedKeys for all cached transactions.
-    /// Returns `None` if pre-warming is not active.
-    fn get_prewarmed_keys(&self) -> Option<reth_transaction_pool::pre_warming::ExtractedKeys>;
-
-    /// Check if pre-warming is active (worker pool initialized).
-    fn is_pre_warming_active(&self) -> bool;
-
-    /// Get the number of threads to use for parallel prefetch.
-    ///
-    /// Defaults to the number of simulation workers configured.
-    fn prefetch_threads(&self) -> usize {
-        4 // Default fallback
-    }
-}
-
-/// Default implementation for unit type when no pool is provided
-#[cfg(feature = "pre-warming")]
-impl PreWarmingPool for () {
-    fn get_prewarmed_keys(&self) -> Option<reth_transaction_pool::pre_warming::ExtractedKeys> {
-        None
-    }
-
-    fn is_pre_warming_active(&self) -> bool {
-        false
-    }
-
-    fn prefetch_threads(&self) -> usize {
-        4
-    }
-}
+pub use reth_transaction_pool::pre_warming::PreWarmingPool;
 
 /// Blanket implementation when pre-warming feature is disabled
 #[cfg(not(feature = "pre-warming"))]
@@ -94,7 +60,7 @@ pub type HeaderForPayload<P> = <<P as BuiltPayload>::Primitives as NodePrimitive
 
 /// The [`PayloadJobGenerator`] that creates [`BasicPayloadJob`]s.
 #[derive(Debug)]
-pub struct BasicPayloadJobGenerator<Client, Tasks, Builder, Pool = ()> {
+pub struct BasicPayloadJobGenerator<Client, Tasks, Builder> {
     /// The client that can interact with the chain.
     client: Client,
     /// The task executor to spawn payload building tasks on.
@@ -109,15 +75,6 @@ pub struct BasicPayloadJobGenerator<Client, Tasks, Builder, Pool = ()> {
     builder: Builder,
     /// Stored `cached_reads` for new payload jobs.
     pre_cached: Option<PrecachedState>,
-    /// Optional transaction pool for pre-warming support.
-    ///
-    /// When provided, the payload builder will fetch pre-warmed keys from simulation
-    /// and prefetch state before execution for improved performance.
-    #[cfg(feature = "pre-warming")]
-    pool: Option<Pool>,
-    /// Marker for Pool type when feature is disabled
-    #[cfg(not(feature = "pre-warming"))]
-    _pool: std::marker::PhantomData<Pool>,
 }
 
 // === impl BasicPayloadJobGenerator ===
@@ -138,36 +95,13 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
             config,
             builder,
             pre_cached: None,
-            #[cfg(feature = "pre-warming")]
-            pool: None,
-            #[cfg(not(feature = "pre-warming"))]
-            _pool: std::marker::PhantomData,
-        }
-    }
-
-    /// Sets the transaction pool for pre-warming support.
-    ///
-    /// When a pool is provided, the payload builder will leverage pre-warmed keys
-    /// from transaction simulation to prefetch state before execution.
-    #[cfg(feature = "pre-warming")]
-    pub fn with_pool<Pool>(self, pool: Pool) -> BasicPayloadJobGenerator<Client, Tasks, Builder, Pool> {
-        BasicPayloadJobGenerator {
-            client: self.client,
-            executor: self.executor,
-            config: self.config,
-            payload_task_guard: self.payload_task_guard,
-            builder: self.builder,
-            pre_cached: self.pre_cached,
-            pool: Some(pool),
-            #[cfg(not(feature = "pre-warming"))]
-            _pool: std::marker::PhantomData,
         }
     }
 }
 
 // === impl BasicPayloadJobGenerator ===
 
-impl<Client, Tasks, Builder, Pool> BasicPayloadJobGenerator<Client, Tasks, Builder, Pool> {
+impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
     /// Returns the maximum duration a job should be allowed to run.
     ///
     /// This adheres to the following specification:
@@ -207,8 +141,8 @@ impl<Client, Tasks, Builder, Pool> BasicPayloadJobGenerator<Client, Tasks, Build
 
 // === impl BasicPayloadJobGenerator ===
 
-impl<Client, Tasks, Builder, Pool> PayloadJobGenerator
-    for BasicPayloadJobGenerator<Client, Tasks, Builder, Pool>
+impl<Client, Tasks, Builder> PayloadJobGenerator
+    for BasicPayloadJobGenerator<Client, Tasks, Builder>
 where
     Client: StateProviderFactory
         + BlockReaderIdExt<Header = HeaderForPayload<Builder::BuiltPayload>>
@@ -219,7 +153,6 @@ where
     Builder: PayloadBuilder + Unpin + 'static,
     Builder::Attributes: Unpin + Clone,
     Builder::BuiltPayload: Unpin + Clone,
-    Pool: PreWarmingPool + Send + Sync + 'static,
 {
     type Job = BasicPayloadJob<Tasks, Builder>;
 
@@ -243,53 +176,52 @@ where
 
         let cached_reads = self.maybe_pre_cached(parent_header.hash()).unwrap_or_default();
         // Pre-warming: Prefetch state using keys discovered by simulation (PARALLEL)
+        // Uses global registry to access pre-warmed cache without complex trait bounds
         #[cfg(feature = "pre-warming")]
-        if let Some(pool) = &self.pool {
-            // Check if pre-warming is active (worker pool initialized)
-            if pool.is_pre_warming_active() {
-                if let Some(keys) = pool.get_prewarmed_keys() {
-                    // Skip if no keys were discovered
-                    if keys.is_empty() {
-                        tracing::debug!(
-                            target: "payload_builder",
-                            "Pre-warming: No keys discovered by simulation"
-                        );
-                    } else {
-                        // Get state provider for prefetching
-                        if let Ok(state_provider) = self.client.state_by_block_hash(parent_header.hash()) {
+        {
+            if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
+                let keys = cache.get_all_keys();
+                // Skip if no keys were discovered
+                if keys.is_empty() {
+                    tracing::debug!(
+                        target: "payload_builder",
+                        "Pre-warming: No keys discovered by simulation"
+                    );
+                } else {
+                    // Get state provider for prefetching
+                    if let Ok(state_provider) = self.client.state_by_block_hash(parent_header.hash()) {
                         // Wrap in SnapshotState for parallel prefetch
-                            let snapshot = reth_transaction_pool::pre_warming::SnapshotState::new(state_provider);
+                        let snapshot = reth_transaction_pool::pre_warming::SnapshotState::new(state_provider);
 
-                            // Use configured thread count from pool (defaults to num_workers)
-                            let num_threads = pool.prefetch_threads();
-                            if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot(
-                                &mut cached_reads,
-                                &keys,
-                                &snapshot,
-                                num_threads,
-                            ) {
-                                tracing::warn!(
-                                    target: "payload_builder",
-                                    ?err,
-                                    "Failed to prefetch pre-warmed state, continuing with partial cache"
-                                );
-                            } else {
-                                tracing::debug!(
-                                    target: "payload_builder",
-                                    accounts = keys.accounts.len(),
-                                    storage_slots = keys.storage_slots.len(),
-                                    contracts = keys.code_hashes.len(),
-                                    threads = num_threads,
-                                    "Pre-warmed cache populated from simulation (parallel)"
-                                );
-                            }
+                        // Default to 4 threads for parallel prefetch
+                        let num_threads = 4;
+                        if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot(
+                            &mut cached_reads,
+                            &keys,
+                            &snapshot,
+                            num_threads,
+                        ) {
+                            tracing::warn!(
+                                target: "payload_builder",
+                                ?err,
+                                "Failed to prefetch pre-warmed state, continuing with partial cache"
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "payload_builder",
+                                accounts = keys.accounts.len(),
+                                storage_slots = keys.storage_slots.len(),
+                                contracts = keys.code_hashes.len(),
+                                threads = num_threads,
+                                "Pre-warmed cache populated from simulation (parallel)"
+                            );
                         }
                     }
                 }
             } else {
                 tracing::trace!(
                     target: "payload_builder",
-                    "Pre-warming not active (worker pool not initialized)"
+                    "Pre-warming not active (global cache not registered)"
                 );
             }
         }

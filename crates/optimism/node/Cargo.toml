@@ -132,7 +132,11 @@ test-utils = [
 ]
 reth-codec = ["reth-optimism-primitives/reth-codec"]
 
-pre-warming = ["reth-transaction-pool/pre-warming", "reth-node-core/pre-warming"]
+pre-warming = [
+    "reth-transaction-pool/pre-warming",
+    "reth-node-core/pre-warming",
+    "reth-node-builder/pre-warming",
+]
 
 [[test]]
 name = "e2e_testsuite"

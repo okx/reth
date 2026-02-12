@@ -484,6 +484,29 @@ where
     }
 }
 
+/// Implementation of PreWarmingPool for Pool when pre-warming feature is enabled.
+///
+/// This allows the payload builder to access pre-warmed keys for prefetching.
+#[cfg(feature = "pre-warming")]
+impl<V, T, S> crate::pre_warming::PreWarmingPool for Pool<V, T, S>
+where
+    V: TransactionValidator,
+    T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
+    S: BlobStore,
+{
+    fn get_all_prewarmed_keys(&self) -> Option<crate::pre_warming::ExtractedKeys> {
+        self.pool.get_all_prewarmed_keys()
+    }
+
+    fn is_pre_warming_active(&self) -> bool {
+        self.pool.is_pre_warming_active()
+    }
+
+    fn prefetch_threads(&self) -> usize {
+        self.pool.config().pre_warming.num_workers.max(1)
+    }
+}
+
 impl<Client, S> EthTransactionPool<Client, S>
 where
     Client:
