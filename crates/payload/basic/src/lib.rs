@@ -174,7 +174,7 @@ where
                 .ok_or_else(|| PayloadBuilderError::MissingParentHeader(attributes.parent()))?
         };
 
-        let cached_reads = self.maybe_pre_cached(parent_header.hash()).unwrap_or_default();
+        let mut cached_reads = self.maybe_pre_cached(parent_header.hash()).unwrap_or_default();
         // Pre-warming: Prefetch state using keys discovered by simulation (PARALLEL)
         // Uses global registry to access pre-warmed cache without complex trait bounds
         #[cfg(feature = "pre-warming")]
