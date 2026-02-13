@@ -210,6 +210,53 @@ where
     {
         let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
 
+        // Pre-warming: Prefetch state using keys discovered by simulation
+        #[cfg(feature = "pre-warming")]
+        {
+            tracing::debug!(
+                target: "payload_builder",
+                "OpPayloadBuilder: Checking pre-warming cache"
+            );
+            if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
+                let keys = cache.get_all_keys();
+                if !keys.is_empty() {
+                    tracing::info!(
+                        target: "payload_builder",
+                        accounts = keys.accounts.len(),
+                        storage_slots = keys.storage_slots.len(),
+                        "OpPayloadBuilder: Prefetching pre-warmed keys"
+                    );
+                    // Get state provider for prefetching
+                    if let Ok(state_provider) = self.client.state_by_block_hash(config.parent_header.hash()) {
+                        let snapshot = reth_transaction_pool::pre_warming::SnapshotState::new(state_provider);
+                        let num_threads = 4;
+                        if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot(
+                            &mut cached_reads,
+                            &keys,
+                            &snapshot,
+                            num_threads,
+                        ) {
+                            tracing::warn!(
+                                target: "payload_builder",
+                                ?err,
+                                "OpPayloadBuilder: Prefetch failed, continuing with partial cache"
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "payload_builder",
+                                "OpPayloadBuilder: Prefetch complete"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::trace!(
+                        target: "payload_builder",
+                        "OpPayloadBuilder: No pre-warmed keys available"
+                    );
+                }
+            }
+        }
+
         let ctx = OpPayloadBuilderCtx {
             evm_config: self.evm_config.clone(),
             builder_config: self.config.clone(),

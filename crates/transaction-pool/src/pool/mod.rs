@@ -228,14 +228,6 @@ where
         Some(crate::pre_warming::ExtractedKeys::new())
     }
 
-    /// Returns ALL pre-warmed keys for all cached transactions.
-    ///
-    /// This is a fallback when we don't know which transactions will be selected.
-    /// Prefer `get_keys_for_txs()` when you know the selected transaction hashes.
-    #[cfg(feature = "pre-warming")]
-    pub fn get_all_prewarmed_keys(&self) -> Option<crate::pre_warming::ExtractedKeys> {
-        self.worker_pool.read().as_ref().map(|wp| wp.cache().get_all_keys())
-    }
 
     /// Returns merged pre-warmed keys for selected transactions.
     ///
@@ -253,6 +245,11 @@ where
     #[cfg(feature = "pre-warming")]
     fn notify_txs_removed(&self, tx_hashes: &[alloy_primitives::TxHash]) {
         if let Some(worker_pool) = self.worker_pool.read().as_ref() {
+            tracing::debug!(
+                target: "txpool::pre_warming",
+                tx_count = tx_hashes.len(),
+                "Removing mined transactions from pre-warming cache"
+            );
             worker_pool.cache().remove_txs(tx_hashes);
         }
     }
@@ -353,6 +350,21 @@ where
     #[cfg(not(feature = "pre-warming"))]
     pub fn is_pre_warming_active(&self) -> bool {
         false
+    }
+
+    /// Get all pre-warmed keys from the cache.
+    ///
+    /// Returns merged ExtractedKeys from all cached transactions,
+    /// or None if pre-warming is not active.
+    #[cfg(feature = "pre-warming")]
+    pub fn get_all_prewarmed_keys(&self) -> Option<crate::pre_warming::ExtractedKeys> {
+        self.worker_pool.read().as_ref().map(|wp| wp.cache().get_all_keys())
+    }
+
+    /// Get all pre-warmed keys - no-op when feature disabled.
+    #[cfg(not(feature = "pre-warming"))]
+    pub fn get_all_prewarmed_keys(&self) -> Option<()> {
+        None
     }
 
     /// Returns the currently tracked block

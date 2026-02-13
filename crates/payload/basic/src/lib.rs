@@ -160,6 +160,10 @@ where
         &self,
         attributes: <Self::Job as PayloadJob>::PayloadAttributes,
     ) -> Result<Self::Job, PayloadBuilderError> {
+        tracing::info!(
+            target: "payload_builder",
+            "new_payload_job called - starting payload job creation"
+        );
         let parent_header = if attributes.parent().is_zero() {
             // Use latest header for genesis block case
             self.client
@@ -179,15 +183,32 @@ where
         // Uses global registry to access pre-warmed cache without complex trait bounds
         #[cfg(feature = "pre-warming")]
         {
+            tracing::debug!(
+                target: "payload_builder",
+                "Pre-warming: Checking global cache for keys"
+            );
             if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
                 let keys = cache.get_all_keys();
+                let cache_stats = cache.stats();
+                tracing::debug!(
+                    target: "payload_builder",
+                    cache_entries = cache_stats.total_transactions,
+                    total_keys = cache_stats.total_accounts + cache_stats.total_storage_slots,
+                    "Pre-warming: Got cache with stats"
+                );
                 // Skip if no keys were discovered
                 if keys.is_empty() {
                     tracing::debug!(
                         target: "payload_builder",
-                        "Pre-warming: No keys discovered by simulation"
+                        "Pre-warming: No keys discovered by simulation (cache empty)"
                     );
                 } else {
+                    tracing::info!(
+                        target: "payload_builder",
+                        accounts = keys.accounts.len(),
+                        storage_slots = keys.storage_slots.len(),
+                        "Pre-warming: Found keys, starting prefetch"
+                    );
                     // Get state provider for prefetching
                     if let Ok(state_provider) = self.client.state_by_block_hash(parent_header.hash()) {
                         // Wrap in SnapshotState for parallel prefetch
