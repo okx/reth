@@ -294,10 +294,17 @@ where
         state_provider: Box<dyn reth_provider::StateProvider + Send>,
         chain_spec: std::sync::Arc<reth_chainspec::ChainSpec>,
     ) {
+        tracing::warn!(
+            target: "txpool::pre_warming",
+            enabled = self.config.pre_warming.enabled,
+            num_workers = self.config.pre_warming.num_workers,
+            ">>> initialize_pre_warming called with config"
+        );
+
         if !self.config.pre_warming.enabled {
-            tracing::info!(
+            tracing::warn!(
                 target: "txpool::pre_warming",
-                "Pre-warming DISABLED in config (--txpool.pre-warming=false)"
+                ">>> Pre-warming DISABLED in config (config.pre_warming.enabled=false)"
             );
             return;
         }

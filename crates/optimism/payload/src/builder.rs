@@ -228,12 +228,17 @@ where
                     );
                     // Get state provider for prefetching
                     if let Ok(state_provider) = self.client.state_by_block_hash(config.parent_header.hash()) {
-                        let snapshot = reth_transaction_pool::pre_warming::SnapshotState::new(state_provider);
+                        // Wrap in Arc<SnapshotState> for parallel prefetch
+                        let snapshot = std::sync::Arc::new(
+                            reth_transaction_pool::pre_warming::SnapshotState::new(state_provider)
+                        );
                         let num_threads = 4;
-                        if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot(
+
+                        // Use sync version (uses std::thread::scope internally)
+                        if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot_sync(
                             &mut cached_reads,
                             &keys,
-                            &snapshot,
+                            snapshot,
                             num_threads,
                         ) {
                             tracing::warn!(

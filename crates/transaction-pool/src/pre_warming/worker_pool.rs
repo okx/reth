@@ -852,18 +852,21 @@ async fn worker_loop<T>(
 
                 // Store keys per transaction (thread-safe)
                 let keys_count = keys.accounts.len() + keys.storage_slots.len() + keys.code_hashes.len() + keys.block_hashes.len();
+                let cache_ptr = std::sync::Arc::as_ptr(&cache);
                 cache.store_tx_keys(req.tx_hash, keys);
 
                 // Update cache metrics
                 metrics.cache_entries.increment(1);
                 metrics.cache_keys_total.increment(keys_count as f64);
 
-                debug!(
+                tracing::warn!(
                     target: "txpool::pre_warming",
                     worker_id,
                     tx_hash = ?req.tx_hash,
                     keys_count,
-                    "Simulation complete, keys cached"
+                    cache_ptr = ?cache_ptr,
+                    cache_len = cache.len(),
+                    ">>> Simulation complete, keys stored in cache"
                 );
             }
             Err(mpsc::error::TryRecvError::Empty) => {

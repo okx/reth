@@ -2,203 +2,182 @@
 //!
 //! This module provides the PREFETCH logic that runs BEFORE execution:
 //! 1. Simulation discovers KEYS (which accounts/storage to access)
-//! 2. This module PREFETCHES VALUES from MDBX
+//! 2. This module PREFETCHES VALUES from MDBX using parallel workers
 //! 3. Populates CachedReads with prefetched data
 //! 4. Execution reads from CachedReads (high cache hits!)
 //!
-//! ## Two Functions Available
+//! ## Functions Available
 //!
-//! | Function | Use When | Performance |
-//! |----------|----------|-------------|
-//! | `prefetch_and_populate` | Have `&dyn StateProvider` (e.g., `StateProviderBox`) | Sequential |
-//! | `prefetch_parallel` | Have `S: StateProvider + Sync` (e.g., via `SnapshotState`) | Parallel |
+//! | Function | Context | Threading |
+//! |----------|---------|-----------|
+//! | `prefetch_with_snapshot` | Async | `tokio::spawn` |
+//! | `prefetch_with_snapshot_sync` | Sync | `std::thread::scope` |
+//!
+//! ## Why Tokio for async version (not Rayon)?
+//!
+//! | Aspect | Tokio | Rayon |
+//! |--------|-------|-------|
+//! | Runtime | Already used throughout codebase | Would add separate thread pool |
+//! | Task overhead | ~100ns per task | ~100ns per task |
+//! | Work stealing | Yes (tokio scheduler) | Yes (rayon scheduler) |
+//! | Trait requirements | `Send + 'static` | `Send + Sync` on captured data |
+//! | Integration | Native async/await | Requires `block_on` in async context |
+//!
+//! **Decision:** Tokio is preferred because:
+//! 1. Codebase already runs on tokio runtime - no additional thread pool overhead
+//! 2. Payload builder is async - native `.await` integration
+//! 3. `SnapshotState` is `Send + Sync` via `unsafe impl` - works with both, but tokio is simpler
+//! 4. Team convention - all async work uses tokio
+//!
+//! ## Why sync version exists?
+//!
+//! The payload builder's `new_payload_job()` is synchronous. To avoid complex
+//! `block_on` wrappers, we provide `prefetch_with_snapshot_sync` which uses
+//! `std::thread::scope` internally - still parallel, just not async.
+//!
+//! ## Usage
+//!
+//! ```ignore
+//! // Async context (if available)
+//! let snapshot = Arc::new(SnapshotState::new(state_provider_box));
+//! prefetch_with_snapshot(&mut cached_reads, &keys, snapshot, 4).await?;
+//!
+//! // Sync context (e.g., payload builder)
+//! let snapshot = Arc::new(SnapshotState::new(state_provider_box));
+//! prefetch_with_snapshot_sync(&mut cached_reads, &keys, snapshot, 4)?;
+//! ```
 
 use crate::pre_warming::ExtractedKeys;
-use reth_provider::StateProvider;
 use reth_revm::cached::{CachedReads, CachedAccount};
 use alloy_primitives::{Address, B256, U256, map::HashMap};
-use std::sync::Mutex;
 
-/// Prefetch and populate CachedReads from discovered keys (SEQUENTIAL)
+
+/// Prefetch and populate CachedReads using SnapshotState (PARALLEL - TOKIO)
 ///
-/// Fetches values from MDBX for all keys in ExtractedKeys and populates CachedReads.
-/// This runs BEFORE execution so that execution sees a warm cache.
+/// Uses `tokio::spawn` for parallel async I/O. This is the only prefetch function
+/// needed since the entire codebase runs on tokio.
 ///
-/// # Note
-/// Uses sequential I/O because StateProviderBox is not Sync.
-/// For parallel I/O, use `prefetch_parallel` with a Sync state provider.
-pub fn prefetch_and_populate(
-    cached_reads: &mut CachedReads,
-    keys: &ExtractedKeys,
-    state_provider: &dyn StateProvider,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Step 1: Prefetch accounts
-    for &address in &keys.accounts {
-        if cached_reads.accounts.contains_key(&address) {
-            continue;
-        }
-
-        if let Ok(account) = state_provider.basic_account(&address) {
-            let info = account.map(|acc| revm::state::AccountInfo {
-                balance: acc.balance,
-                nonce: acc.nonce,
-                code_hash: acc.bytecode_hash.unwrap_or_default(),
-                code: None,
-                account_id: None,
-            });
-
-            cached_reads.accounts.insert(address, CachedAccount {
-                info,
-                storage: HashMap::default(),
-            });
-        }
-    }
-
-    // Step 2: Prefetch storage slots
-    for &(address, slot) in &keys.storage_slots {
-        let account = cached_reads.accounts.entry(address).or_insert_with(|| {
-            let info = state_provider.basic_account(&address).ok().flatten().map(|acc| {
-                revm::state::AccountInfo {
-                    balance: acc.balance,
-                    nonce: acc.nonce,
-                    code_hash: acc.bytecode_hash.unwrap_or_default(),
-                    code: None,
-                    account_id: None,
-                }
-            });
-            CachedAccount {
-                info,
-                storage: HashMap::default(),
-            }
-        });
-
-        if account.info.is_some() {
-            let slot_b256 = B256::from(slot);
-            if let Ok(Some(value)) = state_provider.storage(address, slot_b256) {
-                account.storage.insert(slot, value);
-            }
-        }
-    }
-
-    // Step 3: Prefetch bytecode
-    for &code_hash in &keys.code_hashes {
-        if code_hash.is_zero() || cached_reads.contracts.contains_key(&code_hash) {
-            continue;
-        }
-
-        if let Ok(Some(bytecode_bytes)) = state_provider.bytecode_by_hash(&code_hash) {
-            let bytecode = revm::bytecode::Bytecode::new_raw(bytecode_bytes.original_bytes().clone());
-            cached_reads.contracts.insert(code_hash, bytecode);
-        }
-    }
-
-    Ok(())
-}
-
-/// Prefetch and populate CachedReads using PARALLEL threads (std::thread::scope)
+/// ## Why Tokio instead of Rayon?
 ///
-/// Uses scoped threads for parallel I/O. Requires a Sync state provider.
+/// - **No extra thread pool:** Reuses existing tokio runtime
+/// - **Async-native:** Integrates with async payload builder via `.await`
+/// - **Work stealing:** Tokio scheduler automatically load-balances tasks
+/// - **Team convention:** All async work in reth uses tokio
+///
+/// ## Why not `std::thread::scope`?
+///
+/// - Creates N new threads per call (~10-50μs overhead each)
+/// - Tokio reuses existing worker threads (~100ns task spawn)
+/// - `std::thread` doesn't integrate with async context
 ///
 /// # Arguments
 /// * `cached_reads` - The cache to populate
 /// * `keys` - Keys discovered by simulation
-/// * `state_provider` - State provider for MDBX queries (must be Sync)
-/// * `num_threads` - Number of parallel threads
+/// * `snapshot` - Arc-wrapped SnapshotState for sharing across tasks
+/// * `num_tasks` - Number of parallel tasks (default: 4)
 ///
-/// # When to Use
-/// Use this when you have a Sync state provider (e.g., SnapshotState).
-/// For StateProviderBox (not Sync), use `prefetch_and_populate` instead.
-pub fn prefetch_parallel<S>(
+/// # Example
+/// ```ignore
+/// let snapshot = Arc::new(SnapshotState::new(state_provider_box));
+/// prefetch_with_snapshot(&mut cached_reads, &keys, snapshot, 4).await?;
+/// ```
+pub async fn prefetch_with_snapshot(
     cached_reads: &mut CachedReads,
     keys: &ExtractedKeys,
-    state_provider: &S,
-    num_threads: usize,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    S: StateProvider + Sync,
-{
-    let num_threads = num_threads.max(1);
+    snapshot: std::sync::Arc<crate::pre_warming::SnapshotState>,
+    num_tasks: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::sync::Mutex as TokioMutex;
+    use std::sync::Arc;
+
+    let num_tasks = num_tasks.max(1);
 
     // Collect keys to fetch
     let accounts: Vec<Address> = keys.accounts.iter().copied().collect();
     let storage_slots: Vec<(Address, U256)> = keys.storage_slots.iter().copied().collect();
     let code_hashes: Vec<B256> = keys.code_hashes.iter().copied().collect();
 
-    // Use Mutex to collect results from threads
-    let account_results: Mutex<Vec<(Address, CachedAccount)>> = Mutex::new(Vec::new());
-    let storage_results: Mutex<Vec<(Address, U256, U256)>> = Mutex::new(Vec::new());
-    let bytecode_results: Mutex<Vec<(B256, revm::bytecode::Bytecode)>> = Mutex::new(Vec::new());
+    // Use Arc<TokioMutex> to collect results from async tasks
+    let account_results: Arc<TokioMutex<Vec<(Address, CachedAccount)>>> =
+        Arc::new(TokioMutex::new(Vec::new()));
+    let storage_results: Arc<TokioMutex<Vec<(Address, U256, U256)>>> =
+        Arc::new(TokioMutex::new(Vec::new()));
+    let bytecode_results: Arc<TokioMutex<Vec<(B256, revm::bytecode::Bytecode)>>> =
+        Arc::new(TokioMutex::new(Vec::new()));
 
-    std::thread::scope(|s| {
-        // Partition accounts across threads
-        let chunk_size = (accounts.len() / num_threads).max(1);
-        for chunk in accounts.chunks(chunk_size) {
-            let account_results = &account_results;
-            s.spawn(move || {
-                let mut local_results = Vec::new();
-                for &address in chunk {
-                    if let Ok(account) = state_provider.basic_account(&address) {
-                        let info = account.map(|acc| revm::state::AccountInfo {
-                            balance: acc.balance,
-                            nonce: acc.nonce,
-                            code_hash: acc.bytecode_hash.unwrap_or_default(),
-                            code: None,
-                            account_id: None,
-                        });
-                        local_results.push((address, CachedAccount {
-                            info,
-                            storage: HashMap::default(),
-                        }));
-                    }
-                }
-                account_results.lock().unwrap().extend(local_results);
-            });
-        }
+    let mut handles = Vec::new();
 
-        // Partition storage slots across threads
-        let chunk_size = (storage_slots.len() / num_threads).max(1);
-        for chunk in storage_slots.chunks(chunk_size) {
-            let storage_results = &storage_results;
-            s.spawn(move || {
-                let mut local_results = Vec::new();
-                for &(address, slot) in chunk {
-                    let slot_b256 = B256::from(slot);
-                    if let Ok(Some(value)) = state_provider.storage(address, slot_b256) {
-                        local_results.push((address, slot, value));
-                    }
-                }
-                storage_results.lock().unwrap().extend(local_results);
-            });
-        }
+    // Spawn account prefetch tasks
+    let chunk_size = (accounts.len() / num_tasks).max(1);
+    for chunk in accounts.chunks(chunk_size) {
+        let chunk = chunk.to_vec();
+        let snapshot = Arc::clone(&snapshot);
+        let results = Arc::clone(&account_results);
 
-        // Partition bytecode across threads
-        let chunk_size = (code_hashes.len() / num_threads).max(1);
-        for chunk in code_hashes.chunks(chunk_size) {
-            let bytecode_results = &bytecode_results;
-            s.spawn(move || {
-                let mut local_results = Vec::new();
-                for &code_hash in chunk {
-                    if code_hash.is_zero() {
-                        continue;
-                    }
-                    if let Ok(Some(bytecode_bytes)) = state_provider.bytecode_by_hash(&code_hash) {
-                        let bytecode = revm::bytecode::Bytecode::new_raw(
-                            bytecode_bytes.original_bytes().clone()
-                        );
-                        local_results.push((code_hash, bytecode));
-                    }
+        handles.push(tokio::spawn(async move {
+            let mut local_results = Vec::new();
+            for address in chunk {
+                if let Ok(info) = snapshot.basic_account(address) {
+                    local_results.push((address, CachedAccount {
+                        info,
+                        storage: HashMap::default(),
+                    }));
                 }
-                bytecode_results.lock().unwrap().extend(local_results);
-            });
-        }
-    });
+            }
+            results.lock().await.extend(local_results);
+        }));
+    }
+
+    // Spawn storage prefetch tasks
+    let chunk_size = (storage_slots.len() / num_tasks).max(1);
+    for chunk in storage_slots.chunks(chunk_size) {
+        let chunk = chunk.to_vec();
+        let snapshot = Arc::clone(&snapshot);
+        let results = Arc::clone(&storage_results);
+
+        handles.push(tokio::spawn(async move {
+            let mut local_results = Vec::new();
+            for (address, slot) in chunk {
+                if let Ok(value) = snapshot.storage(address, slot) {
+                    local_results.push((address, slot, value));
+                }
+            }
+            results.lock().await.extend(local_results);
+        }));
+    }
+
+    // Spawn bytecode prefetch tasks
+    let chunk_size = (code_hashes.len() / num_tasks).max(1);
+    for chunk in code_hashes.chunks(chunk_size) {
+        let chunk = chunk.to_vec();
+        let snapshot = Arc::clone(&snapshot);
+        let results = Arc::clone(&bytecode_results);
+
+        handles.push(tokio::spawn(async move {
+            let mut local_results = Vec::new();
+            for code_hash in chunk {
+                if code_hash.is_zero() {
+                    continue;
+                }
+                if let Ok(bytecode) = snapshot.code_by_hash(code_hash) {
+                    local_results.push((code_hash, bytecode));
+                }
+            }
+            results.lock().await.extend(local_results);
+        }));
+    }
+
+    // Wait for all tasks to complete
+    for handle in handles {
+        handle.await.map_err(|e| format!("Task join error: {}", e))?;
+    }
 
     // Merge results into cached_reads
-    for (address, account) in account_results.into_inner().unwrap() {
+    for (address, account) in account_results.lock().await.drain(..) {
         cached_reads.accounts.entry(address).or_insert(account);
     }
 
-    for (address, slot, value) in storage_results.into_inner().unwrap() {
+    for (address, slot, value) in storage_results.lock().await.drain(..) {
         let account = cached_reads.accounts.entry(address).or_insert_with(|| {
             CachedAccount {
                 info: None,
@@ -208,35 +187,31 @@ where
         account.storage.insert(slot, value);
     }
 
-    for (code_hash, bytecode) in bytecode_results.into_inner().unwrap() {
+    for (code_hash, bytecode) in bytecode_results.lock().await.drain(..) {
         cached_reads.contracts.entry(code_hash).or_insert(bytecode);
     }
 
     Ok(())
 }
 
-/// Prefetch and populate CachedReads using SnapshotState (PARALLEL)
+/// Sync version of prefetch for callers not in async context
 ///
-/// This is the recommended function for parallel prefetch as it works with
-/// Send-only providers wrapped in SnapshotState (which provides Sync).
+/// Uses `std::thread::scope` internally for parallel prefetch.
+/// Prefer `prefetch_with_snapshot` (async) when in async context.
 ///
 /// # Arguments
 /// * `cached_reads` - The cache to populate
 /// * `keys` - Keys discovered by simulation
-/// * `snapshot` - SnapshotState wrapping a Send-only StateProvider
+/// * `snapshot` - Arc-wrapped SnapshotState for sharing across threads
 /// * `num_threads` - Number of parallel threads (default: 4)
-///
-/// # Example
-/// ```ignore
-/// let snapshot = SnapshotState::new(state_provider_box);
-/// prefetch_with_snapshot(&mut cached_reads, &keys, &snapshot, 4)?;
-/// ```
-pub fn prefetch_with_snapshot(
+pub fn prefetch_with_snapshot_sync(
     cached_reads: &mut CachedReads,
     keys: &ExtractedKeys,
-    snapshot: &crate::pre_warming::SnapshotState,
+    snapshot: std::sync::Arc<crate::pre_warming::SnapshotState>,
     num_threads: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::sync::Mutex;
+
     let num_threads = num_threads.max(1);
 
     // Collect keys to fetch
@@ -254,6 +229,7 @@ pub fn prefetch_with_snapshot(
         let chunk_size = (accounts.len() / num_threads).max(1);
         for chunk in accounts.chunks(chunk_size) {
             let account_results = &account_results;
+            let snapshot = &snapshot;
             s.spawn(move || {
                 let mut local_results = Vec::new();
                 for &address in chunk {
@@ -272,6 +248,7 @@ pub fn prefetch_with_snapshot(
         let chunk_size = (storage_slots.len() / num_threads).max(1);
         for chunk in storage_slots.chunks(chunk_size) {
             let storage_results = &storage_results;
+            let snapshot = &snapshot;
             s.spawn(move || {
                 let mut local_results = Vec::new();
                 for &(address, slot) in chunk {
@@ -287,6 +264,7 @@ pub fn prefetch_with_snapshot(
         let chunk_size = (code_hashes.len() / num_threads).max(1);
         for chunk in code_hashes.chunks(chunk_size) {
             let bytecode_results = &bytecode_results;
+            let snapshot = &snapshot;
             s.spawn(move || {
                 let mut local_results = Vec::new();
                 for &code_hash in chunk {
@@ -324,14 +302,6 @@ pub fn prefetch_with_snapshot(
     Ok(())
 }
 
-/// Alternative name for backward compatibility
-pub fn populate_cached_reads_from_keys(
-    cached_reads: &mut CachedReads,
-    keys: &ExtractedKeys,
-    state_provider: &dyn StateProvider,
-) -> Result<(), Box<dyn std::error::Error>> {
-    prefetch_and_populate(cached_reads, keys, state_provider)
-}
 
 /// Helper to get cache statistics after population
 pub fn get_cache_stats(cached_reads: &CachedReads) -> CacheStats {

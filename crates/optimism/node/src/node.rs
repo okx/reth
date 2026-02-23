@@ -1046,9 +1046,11 @@ where
         // Initialize pre-warming if feature is enabled
         #[cfg(feature = "pre-warming")]
         {
+            warn!(target: "reth::cli", ">>> PRE-WARMING FEATURE BLOCK REACHED");
             use reth_provider::StateProviderFactory;
             use reth_chainspec::EthChainSpec;
             if let Ok(state_provider) = ctx.provider().latest() {
+                warn!(target: "reth::cli", ">>> State provider obtained, initializing pre-warming");
                 // Create a basic ChainSpec from genesis for pre-warming
                 let chain_spec = std::sync::Arc::new(
                     reth_chainspec::ChainSpec::builder()
@@ -1057,9 +1059,15 @@ where
                         .build()
                 );
                 transaction_pool.initialize_pre_warming(state_provider, chain_spec);
+                warn!(target: "reth::cli", ">>> Pre-warming initialization completed");
             } else {
-                warn!(target: "reth::cli", "Failed to get state provider for pre-warming initialization");
+                warn!(target: "reth::cli", ">>> FAILED to get state provider for pre-warming initialization");
             }
+        }
+
+        #[cfg(not(feature = "pre-warming"))]
+        {
+            warn!(target: "reth::cli", ">>> PRE-WARMING FEATURE NOT COMPILED IN");
         }
 
         // The Op txpool maintenance task is only spawned when interop is active

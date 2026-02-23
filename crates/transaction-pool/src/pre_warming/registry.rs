@@ -31,10 +31,12 @@ static GLOBAL_CACHE: RwLock<Option<Arc<PreWarmedCache>>> = RwLock::new(None);
 ///
 /// Called by the transaction pool when the worker pool is initialized.
 pub fn set_global_cache(cache: Arc<PreWarmedCache>) {
+    let ptr = Arc::as_ptr(&cache);
     *GLOBAL_CACHE.write() = Some(cache);
-    tracing::debug!(
+    tracing::warn!(
         target: "txpool::pre_warming",
-        "Global pre-warming cache registered"
+        cache_ptr = ?ptr,
+        ">>> set_global_cache called"
     );
 }
 
@@ -42,7 +44,24 @@ pub fn set_global_cache(cache: Arc<PreWarmedCache>) {
 ///
 /// Returns None if pre-warming is not initialized.
 pub fn get_global_cache() -> Option<Arc<PreWarmedCache>> {
-    GLOBAL_CACHE.read().clone()
+    let cache = GLOBAL_CACHE.read().clone();
+    if let Some(ref c) = cache {
+        let ptr = Arc::as_ptr(c);
+        let stats = c.stats();
+        tracing::warn!(
+            target: "txpool::pre_warming",
+            cache_ptr = ?ptr,
+            total_transactions = stats.total_transactions,
+            total_keys = stats.total_keys,
+            ">>> get_global_cache returning Some(cache)"
+        );
+    } else {
+        tracing::warn!(
+            target: "txpool::pre_warming",
+            ">>> get_global_cache returning None"
+        );
+    }
+    cache
 }
 
 /// Check if pre-warming is active (cache registered)

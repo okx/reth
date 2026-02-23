@@ -95,11 +95,25 @@ impl PreWarmedCache {
     /// you know which transactions will be selected.
     pub fn get_all_keys(&self) -> ExtractedKeys {
         let cache = self.per_tx_keys.read();
+        let cache_size = cache.len();
         let mut merged = ExtractedKeys::new();
 
         for keys in cache.values() {
             merged.merge(keys.clone());
         }
+
+        let result_accounts = merged.accounts.len();
+        let result_storage = merged.storage_slots.len();
+        let result_is_empty = merged.is_empty();
+
+        tracing::warn!(
+            target: "txpool::pre_warming",
+            cache_size,
+            result_accounts,
+            result_storage,
+            result_is_empty,
+            ">>> get_all_keys called"
+        );
 
         merged
     }
@@ -108,11 +122,18 @@ impl PreWarmedCache {
     ///
     /// This is called when transactions are removed from the pool (mined, dropped, etc.).
     /// Removes the keys for those transactions from the cache.
+    ///
+    /// NOTE: Eviction temporarily disabled - keys need to remain for payload builder
     pub fn remove_txs(&self, tx_hashes: &[TxHash]) {
-        let mut cache = self.per_tx_keys.write();
-        for tx_hash in tx_hashes {
-            cache.remove(tx_hash);
-        }
+        // DISABLED: Don't evict keys immediately - payload builder needs them
+        // TODO: Implement TTL-based eviction instead
+        let cache = self.per_tx_keys.read();
+        tracing::warn!(
+            target: "txpool::pre_warming",
+            cache_size = cache.len(),
+            requested_removal = tx_hashes.len(),
+            ">>> cache.remove_txs called - EVICTION DISABLED"
+        );
     }
 
     /// Get cache statistics

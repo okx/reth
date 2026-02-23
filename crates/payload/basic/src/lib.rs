@@ -190,17 +190,25 @@ where
             if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
                 let keys = cache.get_all_keys();
                 let cache_stats = cache.stats();
-                tracing::debug!(
+                tracing::info!(
                     target: "payload_builder",
                     cache_entries = cache_stats.total_transactions,
-                    total_keys = cache_stats.total_accounts + cache_stats.total_storage_slots,
-                    "Pre-warming: Got cache with stats"
+                    total_accounts = cache_stats.total_accounts,
+                    total_storage_slots = cache_stats.total_storage_slots,
+                    total_code_hashes = cache_stats.total_code_hashes,
+                    total_keys = cache_stats.total_keys,
+                    accounts_in_keys = keys.accounts.len(),
+                    storage_in_keys = keys.storage_slots.len(),
+                    code_hashes_in_keys = keys.code_hashes.len(),
+                    is_empty = keys.is_empty(),
+                    "Pre-warming: Got cache with stats and keys"
                 );
                 // Skip if no keys were discovered
                 if keys.is_empty() {
-                    tracing::debug!(
+                    tracing::warn!(
                         target: "payload_builder",
-                        "Pre-warming: No keys discovered by simulation (cache empty)"
+                        "Pre-warming: No keys discovered by simulation (cache reports {} entries but is_empty=true)",
+                        cache_stats.total_transactions
                     );
                 } else {
                     tracing::info!(
@@ -211,15 +219,19 @@ where
                     );
                     // Get state provider for prefetching
                     if let Ok(state_provider) = self.client.state_by_block_hash(parent_header.hash()) {
-                        // Wrap in SnapshotState for parallel prefetch
-                        let snapshot = reth_transaction_pool::pre_warming::SnapshotState::new(state_provider);
+                        // Wrap in Arc<SnapshotState> for parallel prefetch
+                        let snapshot = std::sync::Arc::new(
+                            reth_transaction_pool::pre_warming::SnapshotState::new(state_provider)
+                        );
 
                         // Default to 4 threads for parallel prefetch
                         let num_threads = 4;
-                        if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot(
+
+                        // Use sync version (uses std::thread::scope internally)
+                        if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot_sync(
                             &mut cached_reads,
                             &keys,
-                            &snapshot,
+                            snapshot,
                             num_threads,
                         ) {
                             tracing::warn!(

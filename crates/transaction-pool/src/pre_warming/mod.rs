@@ -57,7 +57,7 @@ pub use types::{ExtractedKeys, SimulationRequest};
 pub use worker_pool::SimulationWorkerPool;
 pub use simulator::Simulator;
 pub use snapshot_state::SnapshotState;
-pub use bridge::{prefetch_and_populate, prefetch_parallel, prefetch_with_snapshot, populate_cached_reads_from_keys, get_cache_stats};
+pub use bridge::{prefetch_with_snapshot, prefetch_with_snapshot_sync, get_cache_stats};
 pub use metrics::PreWarmingMetrics;
 pub use registry::{set_global_cache, get_global_cache, is_pre_warming_active, clear_global_cache};
 
