@@ -509,6 +509,9 @@ where
         // Register cache globally so payload builder can access it
         crate::pre_warming::registry::set_global_cache(Arc::clone(&cache));
 
+        // Register metrics globally so prefetch can update them
+        crate::pre_warming::registry::set_global_metrics(Arc::clone(&metrics));
+
         Self {
             sender,
             workers,
@@ -625,6 +628,11 @@ where
     /// Get reference to the cache.
     pub fn cache(&self) -> &Arc<PreWarmedCache> {
         &self.cache
+    }
+
+    /// Get reference to the metrics.
+    pub fn metrics(&self) -> &Arc<PreWarmingMetrics> {
+        &self.metrics
     }
 
     /// Get the configuration.

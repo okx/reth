@@ -204,11 +204,13 @@ pub async fn prefetch_with_snapshot(
 /// * `keys` - Keys discovered by simulation
 /// * `snapshot` - Arc-wrapped SnapshotState for sharing across threads
 /// * `num_threads` - Number of parallel threads (default: 4)
+/// * `metrics` - Optional metrics instance to update counters
 pub fn prefetch_with_snapshot_sync(
     cached_reads: &mut CachedReads,
     keys: &ExtractedKeys,
     snapshot: std::sync::Arc<crate::pre_warming::SnapshotState>,
     num_threads: usize,
+    metrics: Option<&crate::pre_warming::PreWarmingMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::sync::Mutex;
 
@@ -343,7 +345,20 @@ pub fn prefetch_with_snapshot_sync(
     let final_accounts = cached_reads.accounts.len();
     let final_contracts = cached_reads.contracts.len();
     let final_storage: usize = cached_reads.accounts.values().map(|a| a.storage.len()).sum();
-    
+
+    // Update metrics if provided
+    if let Some(metrics) = metrics {
+        metrics.prefetch_operations.increment(1);
+        metrics.prefetch_accounts.increment(accounts.len() as u64);
+        metrics.prefetch_storage_slots.increment(storage_slots.len() as u64);
+        metrics.prefetch_contracts.increment(code_hashes.len() as u64);
+
+        tracing::warn!(
+            target: "txpool::pre_warming",
+            ">>> PREFETCH_SYNC: Metrics updated successfully"
+        );
+    }
+
     tracing::warn!(
         target: "txpool::pre_warming",
         final_accounts,
@@ -351,6 +366,7 @@ pub fn prefetch_with_snapshot_sync(
         final_contracts,
         ">>> PREFETCH_SYNC: Results merged into cached_reads - COMPLETE ✅"
     );
+
 
     Ok(())
 }

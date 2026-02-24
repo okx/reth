@@ -268,12 +268,17 @@ where
                                 ">>> PREFETCH Step 7: Calling prefetch_with_snapshot_sync"
                             );
 
+                            // Get global metrics to pass to prefetch
+                            let metrics = reth_transaction_pool::pre_warming::get_global_metrics();
+                            let metrics_ref = metrics.as_ref().map(|m| m.as_ref());
+
                             // Use sync version (uses std::thread::scope internally)
                             match reth_transaction_pool::pre_warming::prefetch_with_snapshot_sync(
                                 &mut cached_reads,
                                 &keys,
                                 snapshot,
                                 num_threads,
+                                metrics_ref,
                             ) {
                                 Ok(()) => {
                                     tracing::warn!(

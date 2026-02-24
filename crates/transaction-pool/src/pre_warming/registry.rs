@@ -21,11 +21,15 @@
 //! ```
 
 use crate::pre_warming::PreWarmedCache;
+use crate::pre_warming::PreWarmingMetrics;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
 /// Global cache holder
 static GLOBAL_CACHE: RwLock<Option<Arc<PreWarmedCache>>> = RwLock::new(None);
+
+/// Global metrics holder
+static GLOBAL_METRICS: RwLock<Option<Arc<PreWarmingMetrics>>> = RwLock::new(None);
 
 /// Set the global pre-warmed cache
 ///
@@ -37,6 +41,17 @@ pub fn set_global_cache(cache: Arc<PreWarmedCache>) {
         target: "txpool::pre_warming",
         cache_ptr = ?ptr,
         ">>> set_global_cache called"
+    );
+}
+
+/// Set the global pre-warming metrics
+///
+/// Called by the transaction pool when the worker pool is initialized.
+pub fn set_global_metrics(metrics: Arc<PreWarmingMetrics>) {
+    *GLOBAL_METRICS.write() = Some(metrics);
+    tracing::warn!(
+        target: "txpool::pre_warming",
+        ">>> set_global_metrics called"
     );
 }
 
@@ -64,6 +79,12 @@ pub fn get_global_cache() -> Option<Arc<PreWarmedCache>> {
     cache
 }
 
+/// Get the global pre-warming metrics (if registered)
+///
+/// Returns None if pre-warming is not initialized.
+pub fn get_global_metrics() -> Option<Arc<PreWarmingMetrics>> {
+    GLOBAL_METRICS.read().clone()
+}
 /// Check if pre-warming is active (cache registered)
 pub fn is_pre_warming_active() -> bool {
     GLOBAL_CACHE.read().is_some()

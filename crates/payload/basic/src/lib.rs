@@ -233,6 +233,7 @@ where
                             &keys,
                             snapshot,
                             num_threads,
+                            None,  // No metrics for basic payload builder
                         ) {
                             tracing::warn!(
                                 target: "payload_builder",
