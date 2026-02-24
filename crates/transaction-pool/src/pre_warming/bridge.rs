@@ -212,12 +212,29 @@ pub fn prefetch_with_snapshot_sync(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::sync::Mutex;
 
+    tracing::warn!(
+        target: "txpool::pre_warming",
+        num_threads,
+        accounts = keys.accounts.len(),
+        storage_slots = keys.storage_slots.len(),
+        code_hashes = keys.code_hashes.len(),
+        ">>> PREFETCH_SYNC: Starting parallel prefetch"
+    );
+
     let num_threads = num_threads.max(1);
 
     // Collect keys to fetch
     let accounts: Vec<Address> = keys.accounts.iter().copied().collect();
     let storage_slots: Vec<(Address, U256)> = keys.storage_slots.iter().copied().collect();
     let code_hashes: Vec<B256> = keys.code_hashes.iter().copied().collect();
+
+    tracing::warn!(
+        target: "txpool::pre_warming",
+        accounts_count = accounts.len(),
+        storage_count = storage_slots.len(),
+        code_count = code_hashes.len(),
+        ">>> PREFETCH_SYNC: Keys collected for parallel fetch"
+    );
 
     // Use Mutex to collect results from threads
     let account_results: Mutex<Vec<(Address, CachedAccount)>> = Mutex::new(Vec::new());
@@ -227,6 +244,13 @@ pub fn prefetch_with_snapshot_sync(
     std::thread::scope(|s| {
         // Partition accounts across threads
         let chunk_size = (accounts.len() / num_threads).max(1);
+        tracing::warn!(
+            target: "txpool::pre_warming",
+            chunk_size,
+            num_chunks = accounts.chunks(chunk_size).len(),
+            ">>> PREFETCH_SYNC: Spawning account fetch threads"
+        );
+
         for chunk in accounts.chunks(chunk_size) {
             let account_results = &account_results;
             let snapshot = &snapshot;
@@ -280,12 +304,29 @@ pub fn prefetch_with_snapshot_sync(
         }
     });
 
+    tracing::warn!(
+        target: "txpool::pre_warming",
+        ">>> PREFETCH_SYNC: All threads completed, merging results"
+    );
+
     // Merge results into cached_reads
-    for (address, account) in account_results.into_inner().unwrap() {
+    let account_results_vec = account_results.into_inner().unwrap();
+    let storage_results_vec = storage_results.into_inner().unwrap();
+    let bytecode_results_vec = bytecode_results.into_inner().unwrap();
+
+    tracing::warn!(
+        target: "txpool::pre_warming",
+        accounts_fetched = account_results_vec.len(),
+        storage_fetched = storage_results_vec.len(),
+        bytecode_fetched = bytecode_results_vec.len(),
+        ">>> PREFETCH_SYNC: Fetched results from MDBX"
+    );
+
+    for (address, account) in account_results_vec {
         cached_reads.accounts.entry(address).or_insert(account);
     }
 
-    for (address, slot, value) in storage_results.into_inner().unwrap() {
+    for (address, slot, value) in storage_results_vec {
         let account = cached_reads.accounts.entry(address).or_insert_with(|| {
             CachedAccount {
                 info: None,
@@ -295,9 +336,21 @@ pub fn prefetch_with_snapshot_sync(
         account.storage.insert(slot, value);
     }
 
-    for (code_hash, bytecode) in bytecode_results.into_inner().unwrap() {
+    for (code_hash, bytecode) in bytecode_results_vec {
         cached_reads.contracts.entry(code_hash).or_insert(bytecode);
     }
+
+    let final_accounts = cached_reads.accounts.len();
+    let final_contracts = cached_reads.contracts.len();
+    let final_storage: usize = cached_reads.accounts.values().map(|a| a.storage.len()).sum();
+    
+    tracing::warn!(
+        target: "txpool::pre_warming",
+        final_accounts,
+        final_storage,
+        final_contracts,
+        ">>> PREFETCH_SYNC: Results merged into cached_reads - COMPLETE ✅"
+    );
 
     Ok(())
 }

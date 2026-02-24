@@ -64,7 +64,25 @@ impl PreWarmedCache {
     /// This is called by simulation workers after extracting keys from a transaction.
     /// Each transaction's keys are stored separately.
     pub fn store_tx_keys(&self, tx_hash: TxHash, keys: ExtractedKeys) {
+        let keys_count = keys.total_keys();
+        let accounts = keys.accounts.len();
+        let storage = keys.storage_slots.len();
+        let code_hashes = keys.code_hashes.len();
+
         self.per_tx_keys.write().insert(tx_hash, keys);
+
+        let cache_size = self.per_tx_keys.read().len();
+
+        tracing::warn!(
+            target: "txpool::pre_warming",
+            tx_hash = ?tx_hash,
+            keys_count,
+            accounts,
+            storage,
+            code_hashes,
+            cache_size,
+            ">>> CACHE: store_tx_keys - Keys stored for transaction"
+        );
     }
 
     /// Get merged keys for selected transactions (called during block building)

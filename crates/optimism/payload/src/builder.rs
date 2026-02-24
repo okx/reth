@@ -213,53 +213,112 @@ where
         // Pre-warming: Prefetch state using keys discovered by simulation
         #[cfg(feature = "pre-warming")]
         {
-            tracing::debug!(
+            tracing::warn!(
                 target: "payload_builder",
-                "OpPayloadBuilder: Checking pre-warming cache"
+                ">>> PREFETCH Step 1: pre-warming feature COMPILED IN"
             );
-            if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
-                let keys = cache.get_all_keys();
-                if !keys.is_empty() {
-                    tracing::info!(
-                        target: "payload_builder",
-                        accounts = keys.accounts.len(),
-                        storage_slots = keys.storage_slots.len(),
-                        "OpPayloadBuilder: Prefetching pre-warmed keys"
-                    );
-                    // Get state provider for prefetching
-                    if let Ok(state_provider) = self.client.state_by_block_hash(config.parent_header.hash()) {
-                        // Wrap in Arc<SnapshotState> for parallel prefetch
-                        let snapshot = std::sync::Arc::new(
-                            reth_transaction_pool::pre_warming::SnapshotState::new(state_provider)
-                        );
-                        let num_threads = 4;
 
-                        // Use sync version (uses std::thread::scope internally)
-                        if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot_sync(
-                            &mut cached_reads,
-                            &keys,
-                            snapshot,
-                            num_threads,
-                        ) {
+            tracing::warn!(
+                target: "payload_builder",
+                ">>> PREFETCH Step 2: Checking global cache"
+            );
+
+            if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
+                tracing::warn!(
+                    target: "payload_builder",
+                    ">>> PREFETCH Step 3: Got cache from global registry"
+                );
+
+                let keys = cache.get_all_keys();
+
+                tracing::warn!(
+                    target: "payload_builder",
+                    accounts = keys.accounts.len(),
+                    storage_slots = keys.storage_slots.len(),
+                    code_hashes = keys.code_hashes.len(),
+                    block_hashes = keys.block_hashes.len(),
+                    is_empty = keys.is_empty(),
+                    ">>> PREFETCH Step 4: Retrieved keys from cache"
+                );
+
+                if !keys.is_empty() {
+                    tracing::warn!(
+                        target: "payload_builder",
+                        ">>> PREFETCH Step 5: Keys NOT empty, proceeding with prefetch"
+                    );
+
+                    // Get state provider for prefetching
+                    match self.client.state_by_block_hash(config.parent_header.hash()) {
+                        Ok(state_provider) => {
+                            tracing::warn!(
+                                target: "payload_builder",
+                                parent_hash = ?config.parent_header.hash(),
+                                ">>> PREFETCH Step 6: Got state provider"
+                            );
+
+                            // Wrap in Arc<SnapshotState> for parallel prefetch
+                            let snapshot = std::sync::Arc::new(
+                                reth_transaction_pool::pre_warming::SnapshotState::new(state_provider)
+                            );
+                            let num_threads = 4;
+
+                            tracing::warn!(
+                                target: "payload_builder",
+                                num_threads,
+                                ">>> PREFETCH Step 7: Calling prefetch_with_snapshot_sync"
+                            );
+
+                            // Use sync version (uses std::thread::scope internally)
+                            match reth_transaction_pool::pre_warming::prefetch_with_snapshot_sync(
+                                &mut cached_reads,
+                                &keys,
+                                snapshot,
+                                num_threads,
+                            ) {
+                                Ok(()) => {
+                                    tracing::warn!(
+                                        target: "payload_builder",
+                                        ">>> PREFETCH Step 8: Prefetch SUCCESS ✅"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        target: "payload_builder",
+                                        ?err,
+                                        ">>> PREFETCH Step 8: Prefetch FAILED ❌"
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
                             tracing::warn!(
                                 target: "payload_builder",
                                 ?err,
-                                "OpPayloadBuilder: Prefetch failed, continuing with partial cache"
-                            );
-                        } else {
-                            tracing::debug!(
-                                target: "payload_builder",
-                                "OpPayloadBuilder: Prefetch complete"
+                                parent_hash = ?config.parent_header.hash(),
+                                ">>> PREFETCH Step 6: FAILED to get state provider ❌"
                             );
                         }
                     }
                 } else {
-                    tracing::trace!(
+                    tracing::warn!(
                         target: "payload_builder",
-                        "OpPayloadBuilder: No pre-warmed keys available"
+                        ">>> PREFETCH Step 5: Keys ARE empty, skipping prefetch"
                     );
                 }
+            } else {
+                tracing::warn!(
+                    target: "payload_builder",
+                    ">>> PREFETCH Step 3: Global cache is None ❌"
+                );
             }
+        }
+
+        #[cfg(not(feature = "pre-warming"))]
+        {
+            tracing::warn!(
+                target: "payload_builder",
+                ">>> PREFETCH: pre-warming feature NOT COMPILED ❌"
+            );
         }
 
         let ctx = OpPayloadBuilderCtx {
