@@ -223,6 +223,31 @@ where
                 ">>> PREFETCH Step 2: Checking global cache"
             );
 
+            // Get metrics and set callbacks on cached_reads for tracking hits/misses
+            if let Some(metrics) = reth_transaction_pool::pre_warming::get_global_metrics() {
+                let metrics_clone_hit = metrics.clone();
+                let metrics_clone_miss = metrics.clone();
+                
+                let on_hit = std::sync::Arc::new(move || {
+                    metrics_clone_hit.cache_hits.increment(1);
+                });
+                
+                let on_miss = std::sync::Arc::new(move || {
+                    metrics_clone_miss.cache_misses.increment(1);
+                });
+                
+                cached_reads.set_metrics_callbacks(on_hit, on_miss);
+                tracing::warn!(
+                    target: "payload_builder",
+                    ">>> PREFETCH: Metrics callbacks set on cached_reads for hit/miss tracking ✅"
+                );
+            } else {
+                tracing::warn!(
+                    target: "payload_builder",
+                    ">>> PREFETCH: No global metrics found ❌"
+                );
+            }
+
             if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
                 tracing::warn!(
                     target: "payload_builder",

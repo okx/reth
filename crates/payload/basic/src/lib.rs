@@ -187,6 +187,23 @@ where
                 target: "payload_builder",
                 "Pre-warming: Checking global cache for keys"
             );
+
+            // Set metrics callbacks for hit/miss tracking during EVM execution
+            if let Some(metrics) = reth_transaction_pool::pre_warming::get_global_metrics() {
+                let metrics_clone_hit = metrics.clone();
+                let metrics_clone_miss = metrics.clone();
+
+                let on_hit = std::sync::Arc::new(move || {
+                    metrics_clone_hit.cache_hits.increment(1);
+                });
+
+                let on_miss = std::sync::Arc::new(move || {
+                    metrics_clone_miss.cache_misses.increment(1);
+                });
+
+                cached_reads.set_metrics_callbacks(on_hit, on_miss);
+            }
+
             if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
                 let keys = cache.get_all_keys();
                 let cache_stats = cache.stats();
