@@ -83,7 +83,7 @@ pub struct RollupArgs {
     /// When enabled, the flashblock consensus client will process flashblock sequences and submit
     /// them to the engine API to advance the chain.
     /// Requires at least one `flashblocks-url` to be set.
-    #[arg(long, default_value_t = false, requires = "flashblocks_url")]
+    #[arg(long, default_value_t = false, requires = "flashblocks_urls")]
     pub flashblock_consensus: bool,
 }
 
