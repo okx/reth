@@ -2,6 +2,7 @@
 
 pub use reth_primitives_traits::header::HeaderMut;
 
+use alloy_consensus::BlockHeader as AlloyBlockHeader;
 use alloy_primitives::B256;
 use clap::Parser;
 use reth_chainspec::EthChainSpec;
@@ -118,7 +119,7 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         }
 
         info!(target: "reth::cli", ?db_path, ?sf_path, "Opening storage");
-        let genesis_block_number = self.chain.genesis().number.unwrap_or_default();
+        let genesis_block_number = AlloyBlockHeader::number(self.chain.genesis_header());
         let (db, sfp) = match access {
             AccessRights::RW => (
                 init_db(db_path, self.db.database_args())?,

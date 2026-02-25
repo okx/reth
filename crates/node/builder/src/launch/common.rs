@@ -54,7 +54,7 @@ use reth_node_core::{
     args::DefaultEraHost,
     dirs::{ChainPath, DataDirPath},
     node_config::NodeConfig,
-    primitives::BlockHeader,
+    primitives::{AlloyBlockHeader, BlockHeader},
     version::version_metadata,
 };
 use reth_node_metrics::{
@@ -488,7 +488,9 @@ where
             StaticFileProviderBuilder::read_write(self.data_dir().static_files())
                 .with_metrics()
                 .with_blocks_per_file_for_segments(&static_files_config.as_blocks_per_file_map())
-                .with_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default())
+                .with_genesis_block_number(AlloyBlockHeader::number(
+                    self.chain_spec().genesis_header(),
+                ))
                 .build()?;
 
         // Initialize RocksDB provider with metrics, statistics, and default tables
