@@ -1,7 +1,7 @@
 use super::{
     manager::StaticFileProviderInner, metrics::StaticFileProviderMetrics, StaticFileProvider,
 };
-use crate::{StaticFileWriter, providers::static_file::metrics::StaticFileProviderOperation};
+use crate::{providers::static_file::metrics::StaticFileProviderOperation};
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockHash, BlockNumber, TxNumber, U256};
 use parking_lot::{lock_api::RwLockWriteGuard, RawRwLock, RwLock};
@@ -283,15 +283,6 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             }
             Err(err) => return Err(err),
         };
-
-        // // For new files where the range start is below genesis, adjust expected_block_start
-        // let genesis = static_file_provider.genesis_block_number();
-        // if block_range.start() < genesis {
-        //     static_file_provider
-        //         .get_writer(genesis, segment)?
-        //         .user_header_mut()
-        //         .set_expected_block_start(genesis);
-        // }
 
         let result = match NippyJarWriter::new(jar) {
             Ok(writer) => Ok((writer, path)),
