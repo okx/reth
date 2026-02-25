@@ -133,12 +133,6 @@ where
                         Entry::Vacant(entry) => {
                             // First arrival
                             entry.insert(flashblock.diff.block_hash);
-                            let source_label = state.index.to_string();
-                            metrics::counter!(
-                                "flashblock_multi_source_wins",
-                                "source" => source_label
-                            )
-                            .increment(1);
                             return Poll::Ready(Some(Ok(flashblock)));
                         }
                         Entry::Occupied(entry) => {
