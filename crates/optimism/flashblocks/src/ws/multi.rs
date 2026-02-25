@@ -84,8 +84,6 @@ where
         let start = this.poll_offset;
         this.poll_offset = (this.poll_offset + 1) % num_sources;
 
-        let mut any_pending = false;
-
         for i in 0..num_sources {
             let idx = (start + i) % num_sources;
             let (stream, state) = &mut this.sources[idx];
@@ -100,7 +98,6 @@ where
                         state.backoff = None;
                     }
                     Poll::Pending => {
-                        any_pending = true;
                         continue;
                     }
                 }
@@ -140,8 +137,6 @@ where
                                 );
                                 this.metrics.mismatch_total.increment(1);
                             }
-                            // Continue polling other sources
-                            any_pending = true;
                         }
                     }
                 }
@@ -157,22 +152,19 @@ where
                     if let Some(backoff) = &mut state.backoff {
                         let _ = backoff.as_mut().poll(cx);
                     }
-                    any_pending = true;
                 }
                 Poll::Ready(None) => {
                     state.terminated = true;
                     this.update_active_sources_metric();
                 }
-                Poll::Pending => {
-                    any_pending = true;
-                }
+                Poll::Pending => {}
             }
         }
 
-        if any_pending {
-            Poll::Pending
-        } else {
+        if this.sources.iter().all(|(_, s)| s.terminated) {
             Poll::Ready(None)
+        } else {
+            Poll::Pending
         }
     }
 }
