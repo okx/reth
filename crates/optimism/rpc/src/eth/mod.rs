@@ -29,7 +29,7 @@ use reth_node_builder::rpc::{EthApiBuilder, EthApiCtx};
 use reth_optimism_flashblocks::{
     FlashBlockBuildInfo, FlashBlockCompleteSequence, FlashBlockCompleteSequenceRx,
     FlashBlockConsensusClient, FlashBlockRx, FlashBlockService, FlashblocksListeners,
-    PendingBlockRx, PendingFlashBlock, WsFlashBlockStream,
+    MultiSourceFlashBlockStream, PendingBlockRx, PendingFlashBlock, WsFlashBlockStream,
 };
 use reth_primitives_traits::NodePrimitives;
 use reth_rpc::eth::core::EthApiInner;
@@ -158,7 +158,7 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
                         let Some((block_number, timestamp)) = *state else {
                             // we haven't received a new flashblock sequence yet, so we can skip
                             // until we receive the first index 0 (base)
-                            return futures::future::ready(Some(Vec::new()))
+                            return futures::future::ready(Some(Vec::new()));
                         };
 
                         let receipts =
@@ -199,7 +199,7 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
         parent_hash: B256,
     ) -> eyre::Result<Option<PendingBlock<N::Primitives>>> {
         let Some(rx) = self.inner.flashblocks.as_ref().map(|f| &f.pending_block_rx) else {
-            return Ok(None)
+            return Ok(None);
         };
 
         // Check if a flashblock is being built
@@ -455,10 +455,10 @@ pub struct OpEthApiBuilder<NetworkT = Optimism> {
     sequencer_headers: Vec<String>,
     /// Minimum suggested priority fee (tip)
     min_suggested_priority_fee: u64,
-    /// A URL pointing to a secure websocket connection (wss) that streams out [flashblocks].
+    /// URL(s) pointing to secure websocket connections that stream out [flashblocks].
     ///
     /// [flashblocks]: reth_optimism_flashblocks
-    flashblocks_url: Option<Url>,
+    flashblocks_urls: Vec<Url>,
     /// Enable flashblock consensus client to drive the chain forward.
     ///
     /// When enabled, flashblock sequences are submitted to the engine API via
@@ -475,7 +475,7 @@ impl<NetworkT> Default for OpEthApiBuilder<NetworkT> {
             sequencer_url: None,
             sequencer_headers: Vec::new(),
             min_suggested_priority_fee: 1_000_000,
-            flashblocks_url: None,
+            flashblocks_urls: Vec::new(),
             flashblock_consensus: false,
             _nt: PhantomData,
         }
@@ -489,7 +489,7 @@ impl<NetworkT> OpEthApiBuilder<NetworkT> {
             sequencer_url: None,
             sequencer_headers: Vec::new(),
             min_suggested_priority_fee: 1_000_000,
-            flashblocks_url: None,
+            flashblocks_urls: Vec::new(),
             flashblock_consensus: false,
             _nt: PhantomData,
         }
@@ -513,9 +513,9 @@ impl<NetworkT> OpEthApiBuilder<NetworkT> {
         self
     }
 
-    /// With a subscription to flashblocks secure websocket connection.
-    pub fn with_flashblocks(mut self, flashblocks_url: Option<Url>) -> Self {
-        self.flashblocks_url = flashblocks_url;
+    /// With subscription(s) to flashblocks secure websocket connection(s).
+    pub fn with_flashblocks(mut self, flashblocks_urls: Vec<Url>) -> Self {
+        self.flashblocks_urls = flashblocks_urls;
         self
     }
 
@@ -558,7 +558,7 @@ where
             sequencer_url,
             sequencer_headers,
             min_suggested_priority_fee,
-            flashblocks_url,
+            flashblocks_urls,
             flashblock_consensus,
             ..
         } = self;
@@ -576,11 +576,15 @@ where
             None
         };
 
-        let flashblocks = if let Some(ws_url) = flashblocks_url {
-            info!(target: "reth:cli", %ws_url, "Launching flashblocks service");
+        let flashblocks = if flashblocks_urls.is_empty() {
+            None
+        } else {
+            info!(target: "reth:cli", ?flashblocks_urls, "Launching flashblocks service");
 
             let (tx, pending_rx) = watch::channel(None);
-            let stream = WsFlashBlockStream::new(ws_url);
+            let streams: Vec<_> =
+                flashblocks_urls.into_iter().map(WsFlashBlockStream::new).collect();
+            let stream = MultiSourceFlashBlockStream::new(streams);
             let service = FlashBlockService::new(
                 stream,
                 ctx.components.evm_config().clone(),
@@ -609,8 +613,6 @@ where
                 in_progress_rx,
                 received_flashblocks,
             ))
-        } else {
-            None
         };
 
         let eth_api = ctx.eth_api_builder().with_rpc_converter(rpc_converter).build_inner();
