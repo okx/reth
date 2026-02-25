@@ -244,6 +244,16 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             synced: false,
         };
 
+        // For new files where expected_block_start < genesis, adjust to genesis.
+        // This happens for non-zero genesis chains where find_fixed_range computes
+        // a segment boundary below the genesis block number.
+        let genesis = writer.reader().genesis_block_number();
+        if writer.writer.user_header().block_range().is_none() &&
+            writer.writer.user_header().expected_block_start() < genesis
+        {
+            writer.writer.user_header_mut().set_expected_block_start(genesis);
+        }
+
         writer.ensure_end_range_consistency()?;
 
         Ok(writer)
