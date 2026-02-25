@@ -221,13 +221,13 @@ where
             static_file_provider
                 .get_writer(genesis_block_number, StaticFileSegment::AccountChangeSets)?
                 .user_header_mut()
-                .set_expected_block_start(genesis_block_number);
+                .set_block_range(genesis_block_number, genesis_block_number);
         }
         if genesis_storage_settings.storage_changesets_in_static_files {
             static_file_provider
                 .get_writer(genesis_block_number, StaticFileSegment::StorageChangeSets)?
                 .user_header_mut()
-                .set_expected_block_start(genesis_block_number);
+                .set_block_range(genesis_block_number, genesis_block_number);
         }
     }
 
