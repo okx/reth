@@ -14,7 +14,6 @@ use tokio::time::Sleep;
 use tracing::warn;
 
 /// Backoff duration applied per-source when a stream error occurs.
-/// Kept short so that a reconnected source can resume serving flashblocks quickly.
 const PER_SOURCE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Dedup key: uniquely identifies a flashblock within a block.
@@ -23,11 +22,8 @@ type DedupKey = (PayloadId, u64);
 /// Per-source state tracker.
 #[derive(Debug)]
 struct SourceState {
-    /// Index of this source (for logging and metrics).
     index: usize,
-    /// Whether the source stream has terminated (returned `None`).
-    done: bool,
-    /// Active backoff timer set after a source error.
+    terminated: bool,
     backoff: Option<Pin<Box<Sleep>>>,
 }
 
@@ -35,23 +31,16 @@ struct SourceState {
 ///
 /// Deduplicates flashblocks by `(payload_id, index)`. The first-arriving
 /// flashblock for each key wins. Subsequent duplicates are cross-validated:
-/// if their `diff.block_hash` differs from the accepted one, a warning is
-/// logged and a mismatch metric incremented.
 ///
 /// Each source has independent error backoff. When a source errors, it backs
 /// off for [`PER_SOURCE_BACKOFF`] before being polled again. Other sources
 /// continue serving flashblocks during this time.
 #[derive(Debug)]
 pub struct MultiSourceFlashBlockStream<S> {
-    /// Inner streams paired with their per-source state.
     sources: Vec<(S, SourceState)>,
-    /// Seen flashblocks in the current block: maps `(payload_id, index)` to block hash.
     seen: HashMap<DedupKey, B256>,
-    /// The current `payload_id` being tracked (to detect new blocks and reset state).
     current_payload_id: Option<PayloadId>,
-    /// Round-robin offset for fair source polling.
     poll_offset: usize,
-    /// Multi-source metrics.
     metrics: MultiSourceMetrics,
 }
 
@@ -62,7 +51,7 @@ impl<S> MultiSourceFlashBlockStream<S> {
         let sources = streams
             .into_iter()
             .enumerate()
-            .map(|(i, s)| (s, SourceState { index: i, done: false, backoff: None }))
+            .map(|(i, s)| (s, SourceState { index: i, terminated: false, backoff: None }))
             .collect();
         let metrics = MultiSourceMetrics::default();
         metrics.total_sources.set(len as f64);
@@ -72,7 +61,7 @@ impl<S> MultiSourceFlashBlockStream<S> {
 
     /// Updates the active sources gauge metric.
     fn update_active_sources_metric(&self) {
-        let active = self.sources.iter().filter(|(_, s)| !s.done).count();
+        let active = self.sources.iter().filter(|(_, s)| !s.terminated).count();
         self.metrics.active_sources.set(active as f64);
     }
 }
@@ -101,7 +90,7 @@ where
             let idx = (start + i) % num_sources;
             let (stream, state) = &mut this.sources[idx];
 
-            if state.done {
+            if state.terminated {
                 continue;
             }
 
@@ -171,7 +160,7 @@ where
                     any_pending = true;
                 }
                 Poll::Ready(None) => {
-                    state.done = true;
+                    state.terminated = true;
                     this.update_active_sources_metric();
                 }
                 Poll::Pending => {

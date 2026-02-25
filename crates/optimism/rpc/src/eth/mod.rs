@@ -463,7 +463,7 @@ pub struct OpEthApiBuilder<NetworkT = Optimism> {
     ///
     /// When enabled, flashblock sequences are submitted to the engine API via
     /// `newPayload` and `forkchoiceUpdated` calls, advancing the canonical chain state.
-    /// Requires `flashblocks_url` to be set.
+    /// Requires `flashblocks_urls` to be set.
     flashblock_consensus: bool,
     /// Marker for network types.
     _nt: PhantomData<NetworkT>,
