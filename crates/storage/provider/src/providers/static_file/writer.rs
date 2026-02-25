@@ -244,16 +244,6 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             synced: false,
         };
 
-        // For new files where expected_block_start < genesis, adjust to genesis.
-        // This happens for non-zero genesis chains where find_fixed_range computes
-        // a segment boundary below the genesis block number.
-        let genesis = writer.reader().genesis_block_number();
-        if writer.writer.user_header().block_range().is_none() &&
-            writer.writer.user_header().expected_block_start() < genesis
-        {
-            writer.writer.user_header_mut().set_expected_block_start(genesis);
-        }
-
         writer.ensure_end_range_consistency()?;
 
         Ok(writer)
@@ -270,9 +260,21 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         let static_file_provider = Self::upgrade_provider_to_strong_reference(&reader);
 
         let block_range = static_file_provider.find_fixed_range(segment, block);
+
+        // For non-zero genesis chains where the genesis block falls in the middle of a fixed
+        // range, new files should start at the genesis block rather than the range boundary.
+        // This ensures the filename on disk is consistent with the expected_block_range stored
+        // in the .conf, so the file can be found by the in-memory index on subsequent starts.
+        let genesis_block = static_file_provider.genesis_block_number();
+        let effective_range = if genesis_block > block_range.start() && block == genesis_block {
+            SegmentRangeInclusive::new(genesis_block, block_range.end())
+        } else {
+            block_range
+        };
+
         let (jar, path) = match static_file_provider.get_segment_provider_for_block(
             segment,
-            block_range.start(),
+            effective_range.start(),
             None,
         ) {
             Ok(provider) => (
@@ -280,8 +282,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 provider.data_path().into(),
             ),
             Err(ProviderError::MissingStaticFileBlock(_, _)) => {
-                let path = static_file_provider.directory().join(segment.filename(&block_range));
-                (create_jar(segment, &path, block_range), path)
+                let path =
+                    static_file_provider.directory().join(segment.filename(&effective_range));
+                (create_jar(segment, &path, effective_range), path)
             }
             Err(err) => return Err(err),
         };
