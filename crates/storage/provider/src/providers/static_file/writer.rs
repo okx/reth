@@ -1,7 +1,7 @@
 use super::{
     manager::StaticFileProviderInner, metrics::StaticFileProviderMetrics, StaticFileProvider,
 };
-use crate::providers::static_file::metrics::StaticFileProviderOperation;
+use crate::{StaticFileWriter, providers::static_file::metrics::StaticFileProviderOperation};
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockHash, BlockNumber, TxNumber, U256};
 use parking_lot::{lock_api::RwLockWriteGuard, RawRwLock, RwLock};
@@ -233,6 +233,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         reader: Weak<StaticFileProviderInner<N>>,
         metrics: Option<Arc<StaticFileProviderMetrics>>,
     ) -> ProviderResult<Self> {
+        // You should create the file with genesis
         let (writer, data_path) = Self::open(segment, block, reader.clone(), metrics.clone())?;
         let mut writer = Self {
             writer,
@@ -259,7 +260,14 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
         let static_file_provider = Self::upgrade_provider_to_strong_reference(&reader);
 
-        let block_range = static_file_provider.find_fixed_range(segment, block);
+        let mut block_range = static_file_provider.find_fixed_range(segment, block);
+
+        // Adjust the first static file containing custom genesis block_number.
+        let genesis = static_file_provider.genesis_block_number();
+        if block_range.start() < genesis {
+            block_range = SegmentRangeInclusive::new(genesis, block_range.end());
+        }
+
         let (jar, path) = match static_file_provider.get_segment_provider_for_block(
             segment,
             block_range.start(),
@@ -275,6 +283,15 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             }
             Err(err) => return Err(err),
         };
+
+        // // For new files where the range start is below genesis, adjust expected_block_start
+        // let genesis = static_file_provider.genesis_block_number();
+        // if block_range.start() < genesis {
+        //     static_file_provider
+        //         .get_writer(genesis, segment)?
+        //         .user_header_mut()
+        //         .set_expected_block_start(genesis);
+        // }
 
         let result = match NippyJarWriter::new(jar) {
             Ok(writer) => Ok((writer, path)),
@@ -512,6 +529,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             0
         };
 
+        // current_block_number == genesis?
+        // expected block 185000000
         match current_block.cmp(&advance_to) {
             Ordering::Less => {
                 for block in current_block + 1..=advance_to {
