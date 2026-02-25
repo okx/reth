@@ -80,7 +80,7 @@ where
             return Poll::Ready(None);
         }
 
-        // Rotate start index each poll for fairness.
+        // Rotate start index
         let start = this.poll_offset;
         this.poll_offset = (this.poll_offset + 1) % num_sources;
 
