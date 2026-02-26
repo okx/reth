@@ -155,6 +155,7 @@ where
                 }
                 Poll::Ready(None) => {
                     state.terminated = true;
+                    warn!(target: "flashblocks", source = state.index, "Source terminated");
                     this.update_active_sources_metric();
                 }
                 Poll::Pending => {}
@@ -162,6 +163,7 @@ where
         }
 
         if this.sources.iter().all(|(_, s)| s.terminated) {
+            warn!(target: "flashblocks", "All sources terminated, returning None");
             Poll::Ready(None)
         } else {
             Poll::Pending
