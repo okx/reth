@@ -233,7 +233,6 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         reader: Weak<StaticFileProviderInner<N>>,
         metrics: Option<Arc<StaticFileProviderMetrics>>,
     ) -> ProviderResult<Self> {
-        // You should create the file with genesis
         let (writer, data_path) = Self::open(segment, block, reader.clone(), metrics.clone())?;
         let mut writer = Self {
             writer,
@@ -522,8 +521,6 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             0
         };
 
-        // current_block_number == genesis?
-        // expected block 185000000
         match current_block.cmp(&advance_to) {
             Ordering::Less => {
                 for block in current_block + 1..=advance_to {
