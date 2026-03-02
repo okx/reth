@@ -15,7 +15,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RETH_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DATADIR="$RETH_DIR/.benchmark-contract-test"
+# Use timestamp for fresh datadir to avoid EOA issue
+DATADIR="$RETH_DIR/.benchmark-contract-test-$(date +%s)"
 REPORT_FILE="$RETH_DIR/BENCHMARK_REPORT.md"
 
 # Colors
@@ -35,6 +36,7 @@ cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
     pkill -9 op-reth 2>/dev/null || true
     sleep 2
+    rm -rf "$RETH_DIR/.benchmark-contract-test-"* 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -43,7 +45,7 @@ pkill -9 op-reth 2>/dev/null || true
 sleep 2
 
 # Remove old data
-rm -rf "$DATADIR"
+rm -rf "$RETH_DIR/.benchmark-contract-test-"* 2>/dev/null || true
 
 echo -e "${BLUE}Step 1: Starting op-reth node with pre-warming enabled...${NC}"
 "$RETH_DIR/target/release/op-reth" node \

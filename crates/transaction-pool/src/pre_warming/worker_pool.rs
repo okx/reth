@@ -371,7 +371,16 @@ type SharedSnapshot = Arc<RwLock<Arc<SnapshotState>>>;
 /// 2. `trigger_simulation()` - Sends requests (fire-and-forget)
 /// 3. Workers process requests in parallel
 /// 4. `shutdown()` - Closes channel, waits for workers to finish
-pub struct SimulationWorkerPool<T> {
+///
+/// # Generic Parameters
+///
+/// - `T`: Transaction type (must implement `PoolTransaction`)
+/// - `E`: EVM configuration type (optional, defaults to `()`)
+///
+/// When `E` implements `ConfigureEvm`, workers can perform full EVM simulation
+/// to discover all state keys including storage slots. When `E = ()`, workers
+/// use heuristic-based key extraction.
+pub struct SimulationWorkerPool<T, E = ()> {
     /// Sender for submitting simulation jobs.
     ///
     /// Clone-able and cheap (just an Arc increment).
@@ -406,23 +415,31 @@ pub struct SimulationWorkerPool<T> {
     ///
     /// Tracks simulations triggered/completed/failed, cache stats, etc.
     metrics: Arc<PreWarmingMetrics>,
+
+    /// EVM configuration for full simulation (optional).
+    ///
+    /// When provided, enables full EVM execution to discover all state accesses.
+    /// When None, falls back to heuristic-based key extraction.
+    evm_config: Option<Arc<E>>,
 }
 
 // Manual Debug implementation since some fields don't implement Debug
-impl<T> std::fmt::Debug for SimulationWorkerPool<T> {
+impl<T, E> std::fmt::Debug for SimulationWorkerPool<T, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimulationWorkerPool")
             .field("num_workers", &self.workers.len())
             .field("cache_size", &self.cache.len())
             .field("config", &self.config)
             .field("chain_id", &self.chain_spec.chain.id())
+            .field("has_evm_config", &self.evm_config.is_some())
             .finish()
     }
 }
 
-impl<T> SimulationWorkerPool<T>
+impl<T, E> SimulationWorkerPool<T, E>
 where
     T: PoolTransaction + Send + 'static,
+    E: Send + Sync + 'static,
 {
     /// Create a new worker pool and spawn N worker tasks.
     ///
@@ -520,7 +537,44 @@ where
             chain_spec,
             config,
             metrics,
+            evm_config: None,
         }
+    }
+
+    /// Create a new worker pool with EVM config for full simulation.
+    ///
+    /// When `evm_config` is provided, workers can perform full EVM execution
+    /// to discover all state keys including storage slots accessed during
+    /// contract execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Pre-warming configuration
+    /// * `cache` - Shared cache for storing extracted keys
+    /// * `snapshot` - Initial state snapshot
+    /// * `chain_spec` - Chain specification
+    /// * `evm_config` - EVM configuration for full simulation
+    pub fn new_with_evm(
+        config: PreWarmingConfig,
+        cache: Arc<PreWarmedCache>,
+        snapshot: Arc<SnapshotState>,
+        chain_spec: Arc<ChainSpec>,
+        evm_config: E,
+    ) -> Self {
+        let mut pool = Self::new(config, cache, snapshot, chain_spec);
+        pool.evm_config = Some(Arc::new(evm_config));
+
+        info!(
+            target: "txpool::pre_warming",
+            "Full EVM simulation ENABLED for pre-warming"
+        );
+
+        pool
+    }
+
+    /// Returns true if full EVM simulation is enabled.
+    pub fn has_evm_config(&self) -> bool {
+        self.evm_config.is_some()
     }
 
     /// Update the snapshot with new state (called when new block arrives).

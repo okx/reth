@@ -19,8 +19,8 @@ cd "$RETH_ROOT"
 echo "Working directory: $RETH_ROOT"
 echo ""
 
-# Configuration
-DATADIR=".test-validation"
+# Configuration - use timestamp for fresh datadir to avoid EOA issue
+DATADIR=".test-validation-$(date +%s)"
 CHAIN_LOG="validation_chain.log"
 TEST_OUTPUT="validation_results.txt"
 
@@ -35,6 +35,7 @@ cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
     pkill -9 op-reth 2>/dev/null || true
     sleep 2
+    rm -rf "$RETH_ROOT/.test-validation-"* 2>/dev/null || true
 }
 
 # Trap to cleanup on exit
@@ -44,6 +45,7 @@ trap cleanup EXIT
 echo -e "${YELLOW}Step 1: Killing any existing op-reth processes...${NC}"
 pkill -9 op-reth 2>/dev/null || true
 sleep 2
+rm -rf "$RETH_ROOT/.test-validation-"* 2>/dev/null || true
 
 # Step 2: Build (if needed)
 echo -e "${YELLOW}Step 2: Building op-reth with pre-warming feature...${NC}"

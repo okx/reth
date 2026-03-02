@@ -299,7 +299,7 @@
 //! | **When MDBX queried?** | On cache miss, then cached for future |
 //! | **What data cached?** | MDBX data (accounts, storage, bytecode) |
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, KECCAK256_EMPTY};
 use reth_provider::{AccountReader, StateProvider, ProviderError};
 use revm::bytecode::Bytecode;
 use revm::state::AccountInfo;
@@ -401,10 +401,13 @@ impl SnapshotState {
         };
 
         // Convert Account to AccountInfo for REVM compatibility
+        // IMPORTANT: Use KECCAK_EMPTY for accounts with no bytecode, not B256::default()!
+        // B256::default() (all zeros) is NOT considered "empty" by REVM's is_empty_code_hash(),
+        // which would cause accounts to be incorrectly flagged as having bytecode.
         let info = account.map(|acc| AccountInfo {
             balance: acc.balance,
             nonce: acc.nonce,
-            code_hash: acc.bytecode_hash.unwrap_or_default(),
+            code_hash: acc.bytecode_hash.unwrap_or(KECCAK256_EMPTY),
             code: None,  // Code loaded separately via code_by_hash
             account_id: None,  // Not needed for simulation
         });
