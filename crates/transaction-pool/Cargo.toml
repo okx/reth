@@ -29,6 +29,8 @@ revm-primitives.workspace = true
 # Pre-warming specific dependencies (optional)
 reth-primitives = { workspace = true, optional = true }
 reth-revm = { workspace = true, optional = true }
+reth-evm = { workspace = true, optional = true }
+alloy-evm = { workspace = true, optional = true }
 revm = { workspace = true, optional = true }
 
 # ethereum
@@ -86,6 +88,8 @@ futures.workspace = true
 default = []
 pre-warming = [
     "reth-revm",
+    "reth-evm",
+    "alloy-evm",
     "revm",
 ]  # Experimental: opt-in only for now
 serde = [

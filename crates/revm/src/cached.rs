@@ -1,10 +1,10 @@
 //! Database adapters for payload building.
+use alloc::sync::Arc;
 use alloy_primitives::{
     map::{Entry, HashMap},
     Address, B256, U256,
 };
 use core::cell::RefCell;
-use std::sync::Arc;
 use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseRef};
 
 /// A container type that caches reads from an underlying [`DatabaseRef`].
