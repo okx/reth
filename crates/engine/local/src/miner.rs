@@ -1,5 +1,6 @@
 //! Contains the implementation of the mining mode for the local engine.
 
+use alloy_consensus::BlockHeader;
 use alloy_primitives::{TxHash, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use eyre::OptionExt;
@@ -18,11 +19,11 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::time::Interval;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::error;
+use tracing::{error, info};
 
 /// A mining mode for the local dev engine.
 pub enum MiningMode<Pool: TransactionPool + Unpin> {
@@ -143,6 +144,8 @@ pub struct LocalMiner<T: PayloadTypes, B, Pool: TransactionPool + Unpin> {
     last_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
     /// Stores latest mined blocks.
     last_block_hashes: VecDeque<B256>,
+    /// Timestamp of the last successfully added block.
+    last_block_added_at: Instant,
 }
 
 impl<T, B, Pool> LocalMiner<T, B, Pool>
@@ -172,6 +175,7 @@ where
             payload_builder,
             last_block_hashes: VecDeque::from([last_header.hash()]),
             last_header,
+            last_block_added_at: Instant::now(),
         }
     }
 
@@ -229,6 +233,8 @@ where
     /// Generates payload attributes for a new block, passes them to FCU and inserts built payload
     /// through newPayload.
     async fn advance(&mut self) -> eyre::Result<()> {
+        let idle_ms = self.last_block_added_at.elapsed().as_secs_f64() * 1000.0;
+        let advance_start = Instant::now();
         let res = self
             .to_engine
             .fork_choice_updated(
@@ -237,29 +243,55 @@ where
                 EngineApiMessageVersion::default(),
             )
             .await?;
+        let fcu_elapsed = advance_start.elapsed();
 
         if !res.is_valid() {
             eyre::bail!("Invalid payload status")
         }
 
         let payload_id = res.payload_id.ok_or_eyre("No payload id")?;
+        let resolve_start = Instant::now();
 
         let Some(Ok(payload)) =
             self.payload_builder.resolve_kind(payload_id, PayloadKind::WaitForPending).await
         else {
             eyre::bail!("No payload")
         };
+        let resolve_elapsed = resolve_start.elapsed();
 
         let header = payload.block().sealed_header().clone();
         let payload = T::block_to_payload(payload.block().clone());
+        // Yield to let the engine loop process the built_payloads stream first,
+        // so InsertExecutedBlock reaches the tree before new_payload.
+        tokio::task::yield_now().await;
+        let new_payload_start = Instant::now();
         let res = self.to_engine.new_payload(payload).await?;
+        let new_payload_elapsed = new_payload_start.elapsed();
 
         if !res.is_valid() {
             eyre::bail!("Invalid payload")
         }
 
+        let advance_ms = advance_start.elapsed().as_secs_f64() * 1000.0;
+        let cycle_ms = idle_ms + advance_ms;
+
+        info!(
+            target: "engine::local",
+            ?payload_id,
+            block_number = header.number(),
+            block_hash = ?header.hash(),
+            cycle_ms,
+            idle_ms,
+            advance_ms,
+            fcu_ms = fcu_elapsed.as_secs_f64() * 1000.0,
+            resolve_ms = resolve_elapsed.as_secs_f64() * 1000.0,
+            new_payload_ms = new_payload_elapsed.as_secs_f64() * 1000.0,
+            "miner advance timing"
+        );
+
         self.last_block_hashes.push_back(header.hash());
         self.last_header = header;
+        self.last_block_added_at = Instant::now();
         // ensure we keep at most 64 blocks
         if self.last_block_hashes.len() > 64 {
             self.last_block_hashes.pop_front();

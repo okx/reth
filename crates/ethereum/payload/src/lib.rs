@@ -27,7 +27,7 @@ use reth_evm::{
 use reth_evm_ethereum::EthEvmConfig;
 use reth_payload_builder::{BlobSidecars, EthBuiltPayload, EthPayloadBuilderAttributes};
 use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_payload_primitives::PayloadBuilderAttributes;
+use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderAttributes};
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::StateProviderFactory;
@@ -36,9 +36,14 @@ use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
     ValidPoolTransaction,
 };
+use either::Either;
+use reth_execution_types::BlockExecutionOutput;
 use revm::context_interface::Block as _;
-use std::sync::Arc;
-use tracing::{debug, trace, warn};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tracing::{debug, info, trace, warn};
 
 mod config;
 pub use config::*;
@@ -149,6 +154,7 @@ where
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
 {
+    let payload_build_start = Instant::now();
     let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
     let PayloadConfig { parent_header, attributes } = config;
 
@@ -185,6 +191,10 @@ where
         builder.evm_mut().block().blob_gasprice().map(|gasprice| gasprice as u64),
     ));
     let mut total_fees = U256::ZERO;
+    let mut txpool_next_total = Duration::ZERO;
+    let mut execute_total = Duration::ZERO;
+    let mut txs_considered = 0usize;
+    let mut txs_executed = 0usize;
 
     builder.apply_pre_execution_changes().map_err(|err| {
         warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
@@ -213,7 +223,12 @@ where
 
     let withdrawals_rlp_length = attributes.withdrawals().length();
 
-    while let Some(pool_tx) = best_txs.next() {
+    loop {
+        let next_start = Instant::now();
+        let maybe_pool_tx = best_txs.next();
+        txpool_next_total += next_start.elapsed();
+        let Some(pool_tx) = maybe_pool_tx else { break };
+        txs_considered += 1;
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
             // we can't fit this transaction into the block, so we need to mark it as invalid
@@ -303,11 +318,16 @@ where
             };
         }
 
+        let exec_start = Instant::now();
         let gas_used = match builder.execute_transaction(tx.clone()) {
-            Ok(gas_used) => gas_used,
+            Ok(gas_used) => {
+                execute_total += exec_start.elapsed();
+                gas_used
+            }
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                 error, ..
             })) => {
+                execute_total += exec_start.elapsed();
                 if error.is_nonce_too_low() {
                     // if the nonce is too low, we can skip this transaction
                     trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
@@ -325,8 +345,12 @@ where
                 continue
             }
             // this is an error that we should treat as fatal for this attempt
-            Err(err) => return Err(PayloadBuilderError::evm(err)),
+            Err(err) => {
+                execute_total += exec_start.elapsed();
+                return Err(PayloadBuilderError::evm(err))
+            }
         };
+        txs_executed += 1;
 
         // add to the total blob gas used if the transaction successfully executed
         if let Some(blob_hashes) = tx.blob_versioned_hashes() {
@@ -360,12 +384,19 @@ where
         return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
     }
 
-    let BlockBuilderOutcome { execution_result, block, .. } =
+    let finish_start = Instant::now();
+    let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
         builder.finish(state_provider.as_ref())?;
+    let finish_total = finish_start.elapsed();
+
+    // After finish(), the builder's borrow on db is released.
+    // db.bundle_state was populated by merge_transitions() inside finish().
+    let bundle_state = std::mem::take(&mut db.bundle_state);
+    drop(db);
 
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
-        .then_some(execution_result.requests);
+        .then(|| execution_result.requests.clone());
 
     let sealed_block = Arc::new(block.sealed_block().clone());
     debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");
@@ -377,9 +408,31 @@ where
         }));
     }
 
+    let executed = BuiltPayloadExecutedBlock {
+        recovered_block: Arc::new(block),
+        execution_output: Arc::new(BlockExecutionOutput {
+            result: execution_result,
+            state: bundle_state,
+        }),
+        hashed_state: Either::Left(Arc::new(hashed_state)),
+        trie_updates: Either::Left(Arc::new(trie_updates)),
+    };
+
     let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
-        // add blob sidecars from the executed txs
-        .with_sidecars(blob_sidecars);
+        .with_sidecars(blob_sidecars)
+        .with_executed_block(executed);
+
+    info!(
+        target: "payload_builder",
+        id = %attributes.id,
+        txs_considered,
+        txs_executed,
+        txpool_next_ms = txpool_next_total.as_secs_f64() * 1000.0,
+        tx_execute_ms = execute_total.as_secs_f64() * 1000.0,
+        finish_ms = finish_total.as_secs_f64() * 1000.0,
+        payload_build_total_ms = payload_build_start.elapsed().as_secs_f64() * 1000.0,
+        "payload build stage timing"
+    );
 
     Ok(BuildOutcome::Better { payload, cached_reads })
 }

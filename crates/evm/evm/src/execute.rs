@@ -484,12 +484,14 @@ where
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
-        // calculate the state root
+        let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
         let (state_root, trie_updates) = state
             .state_root_with_updates(hashed_state.clone())
             .map_err(BlockExecutionError::other)?;
+        let state_root_ms = state_root_start.elapsed().as_secs_f64() * 1000.0;
 
+        let assemble_start = std::time::Instant::now();
         let (transactions, senders) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 
@@ -505,6 +507,14 @@ where
         })?;
 
         let block = RecoveredBlock::new_unhashed(block, senders);
+        let assemble_ms = assemble_start.elapsed().as_secs_f64() * 1000.0;
+
+        tracing::info!(
+            target: "evm::block_builder",
+            state_root_ms,
+            assemble_ms,
+            "block builder finish timing"
+        );
 
         Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
     }
