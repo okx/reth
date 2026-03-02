@@ -1,0 +1,56 @@
+[package]
+name = "xlayer-salt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+description = "Bridge between SALT (megaETH state tree) and reth for performance comparison"
+
+[dependencies]
+# salt
+salt.workspace = true
+
+# reth
+reth-primitives-traits.workspace = true
+reth-storage-errors.workspace = true
+reth-trie-common.workspace = true
+reth-libmdbx.workspace = true
+
+# alloy
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+
+# revm
+revm-database.workspace = true
+revm-state.workspace = true
+
+# misc
+tracing.workspace = true
+thiserror.workspace = true
+page_size.workspace = true
+rocksdb.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+rayon.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-trie = { workspace = true }
+reth-trie-db.workspace = true
+proptest.workspace = true
+proptest-arbitrary-interop.workspace = true
+
+[[bench]]
+name = "mpt_vs_salt"
+harness = false
+
+[[bench]]
+name = "block_io"
+harness = false
+
+[lints]
+workspace = true

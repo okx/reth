@@ -181,6 +181,7 @@ members = [
     "crates/tracing-otlp",
     "crates/xlayer/db",
     "crates/xlayer/rpc",
+    "crates/xlayer/salt",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]
@@ -754,11 +755,23 @@ vergen-git2 = "9.1.0"
 # xlayer
 xlayer-db = { path = "crates/xlayer/db" }
 xlayer-rpc = { path = "crates/xlayer/rpc" }
+xlayer-salt = { path = "crates/xlayer/salt" }
+
+# salt (megaETH state tree)
+salt = { path = "../salt/salt" }
+banderwagon = { path = "../salt/banderwagon" }
+ipa-multipoint = { path = "../salt/ipa-multipoint" }
 
 # networking
 ipnet = "2.11"
 
 [patch.crates-io]
+# salt/banderwagon requires patched ark-* crates
+ark-ed-on-bls12-381-bandersnatch = { git = "https://github.com/megaeth-labs/algebra.git", rev = "80ca69c37f79d5d00750edc1602af81b5f456695" }
+ark-ff = { git = "https://github.com/megaeth-labs/algebra.git", rev = "80ca69c37f79d5d00750edc1602af81b5f456695" }
+ark-ec = { git = "https://github.com/megaeth-labs/algebra.git", rev = "80ca69c37f79d5d00750edc1602af81b5f456695" }
+ark-serialize = { git = "https://github.com/megaeth-labs/algebra.git", rev = "80ca69c37f79d5d00750edc1602af81b5f456695" }
+
 # alloy-consensus = { git = "https://github.com/alloy-rs/alloy", rev = "3049f232fbb44d1909883e154eb38ec5962f53a3" }
 # alloy-contract = { git = "https://github.com/alloy-rs/alloy", rev = "3049f232fbb44d1909883e154eb38ec5962f53a3" }
 # alloy-eips = { git = "https://github.com/alloy-rs/alloy", rev = "3049f232fbb44d1909883e154eb38ec5962f53a3" }
