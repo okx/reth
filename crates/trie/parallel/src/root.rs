@@ -83,15 +83,13 @@ where
         retain_updates: bool,
     ) -> Result<(B256, TrieUpdates), ParallelStateRootError> {
         let mut tracker = ParallelTrieTracker::default();
-        let storage_root_targets = StorageRootTargets::new(
-            self.prefix_sets
-                .account_prefix_set
-                .iter()
-                .map(|nibbles| B256::from_slice(&nibbles.pack())),
-            self.prefix_sets.storage_prefix_sets,
-        );
+        // Only create targets for accounts that actually have storage changes,
+        // not all changed accounts. Accounts with only balance changes don't
+        // need storage root recomputation.
+        let storage_root_targets =
+            StorageRootTargets::new(std::iter::empty(), self.prefix_sets.storage_prefix_sets);
 
-        // Pre-calculate storage roots in parallel for accounts which were changed.
+        // Pre-calculate storage roots in parallel for accounts with storage changes.
         tracker.set_precomputed_storage_roots(storage_root_targets.len() as u64);
         debug!(target: "trie::parallel_state_root", len = storage_root_targets.len(), "pre-calculating storage roots");
         let mut storage_roots = HashMap::with_capacity(storage_root_targets.len());
@@ -107,7 +105,6 @@ where
 
             let (tx, rx) = mpsc::sync_channel(1);
 
-            // Spawn a blocking task to calculate account's storage root from database I/O
             drop(handle.spawn_blocking(move || {
                 let result = (|| -> Result<_, ParallelStateRootError> {
                     let provider = factory.database_provider_ro()?;
@@ -266,6 +263,61 @@ impl From<StateProofError> for ParallelStateRootError {
                 Self::Provider(ProviderError::TrieWitnessError(msg))
             }
         }
+    }
+}
+
+/// [`StateRootStrategy`](reth_evm::execute::StateRootStrategy) implementation that uses
+/// [`ParallelStateRoot`] for parallel storage root computation.
+#[derive(Debug)]
+pub struct ParallelStrategy<F> {
+    overlay_factory: reth_provider::providers::OverlayStateProviderFactory<F>,
+    runtime: Runtime,
+}
+
+impl<F> ParallelStrategy<F> {
+    /// Creates a new parallel strategy with the given overlay factory and runtime.
+    pub fn new(
+        overlay_factory: reth_provider::providers::OverlayStateProviderFactory<F>,
+        runtime: Runtime,
+    ) -> Self {
+        Self { overlay_factory, runtime }
+    }
+}
+
+impl<F> reth_evm::execute::StateRootStrategy for ParallelStrategy<F>
+where
+    F: reth_provider::DatabaseProviderFactory + Clone + Send + 'static,
+    F::Provider: reth_provider::StageCheckpointReader
+        + reth_provider::PruneCheckpointReader
+        + reth_provider::BlockNumReader
+        + reth_provider::ChangeSetReader
+        + reth_provider::StorageChangeSetReader
+        + reth_provider::StorageSettingsCache,
+{
+    fn compute_root(
+        self,
+        hashed_state: &reth_trie::HashedPostState,
+        state_provider: &dyn reth_storage_api::StateProvider,
+    ) -> Result<
+        (alloy_primitives::B256, reth_trie::updates::TrieUpdates),
+        reth_execution_errors::BlockExecutionError,
+    > {
+        if !std::env::var("RETH_PARALLEL_STATE_ROOT")
+            .is_ok_and(|v| v == "1" || v == "true")
+        {
+            return state_provider
+                .state_root_with_updates(hashed_state.clone())
+                .map_err(reth_execution_errors::BlockExecutionError::other);
+        }
+
+        let prefix_sets = hashed_state.construct_prefix_sets().freeze();
+        let overlay = self
+            .overlay_factory
+            .with_extended_hashed_state_overlay(hashed_state.clone_into_sorted());
+
+        ParallelStateRoot::new(overlay, prefix_sets, self.runtime)
+            .incremental_root_with_updates()
+            .map_err(reth_execution_errors::BlockExecutionError::other)
     }
 }
 

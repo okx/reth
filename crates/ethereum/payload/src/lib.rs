@@ -56,7 +56,7 @@ type BestTransactionsIter<Pool> = Box<
 >;
 
 /// Ethereum payload builder
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EthereumPayloadBuilder<Pool, Client, EvmConfig = EthEvmConfig> {
     /// Client providing access to node state.
     client: Client,
@@ -66,17 +66,34 @@ pub struct EthereumPayloadBuilder<Pool, Client, EvmConfig = EthEvmConfig> {
     evm_config: EvmConfig,
     /// Payload builder configuration.
     builder_config: EthereumBuilderConfig,
+    /// Runtime for spawning parallel state root tasks.
+    runtime: reth_tasks::Runtime,
 }
 
 impl<Pool, Client, EvmConfig> EthereumPayloadBuilder<Pool, Client, EvmConfig> {
     /// `EthereumPayloadBuilder` constructor.
-    pub const fn new(
+    pub fn new(
         client: Client,
         pool: Pool,
         evm_config: EvmConfig,
         builder_config: EthereumBuilderConfig,
+        runtime: reth_tasks::Runtime,
     ) -> Self {
-        Self { client, pool, evm_config, builder_config }
+        Self { client, pool, evm_config, builder_config, runtime }
+    }
+}
+
+impl<Pool, Client: Clone, EvmConfig> EthereumPayloadBuilder<Pool, Client, EvmConfig> {
+    fn state_root_strategy(
+        &self,
+    ) -> reth_trie_parallel::root::ParallelStrategy<Client> {
+        reth_trie_parallel::root::ParallelStrategy::new(
+            reth_provider::providers::OverlayStateProviderFactory::new(
+                self.client.clone(),
+                Default::default(),
+            ),
+            self.runtime.clone(),
+        )
     }
 }
 
@@ -84,7 +101,18 @@ impl<Pool, Client, EvmConfig> EthereumPayloadBuilder<Pool, Client, EvmConfig> {
 impl<Pool, Client, EvmConfig> PayloadBuilder for EthereumPayloadBuilder<Pool, Client, EvmConfig>
 where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
-    Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
+    Client: StateProviderFactory
+        + ChainSpecProvider<ChainSpec: EthereumHardforks>
+        + reth_provider::DatabaseProviderFactory<
+            Provider: reth_provider::StageCheckpointReader
+                + reth_provider::PruneCheckpointReader
+                + reth_provider::BlockNumReader
+                + reth_provider::ChangeSetReader
+                + reth_provider::StorageChangeSetReader
+                + reth_provider::StorageSettingsCache,
+        > + Clone
+        + Send
+        + 'static,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
 {
     type Attributes = EthPayloadBuilderAttributes;
@@ -101,6 +129,7 @@ where
             self.builder_config.clone(),
             args,
             |attributes| self.pool.best_transactions_with_attributes(attributes),
+            self.state_root_strategy(),
         )
     }
 
@@ -128,6 +157,7 @@ where
             self.builder_config.clone(),
             args,
             |attributes| self.pool.best_transactions_with_attributes(attributes),
+            self.state_root_strategy(),
         )?
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
@@ -140,19 +170,21 @@ where
 /// and configuration, this function creates a transaction payload. Returns
 /// a result indicating success with the payload or an error in case of failure.
 #[inline]
-pub fn default_ethereum_payload<EvmConfig, Client, Pool, F>(
+pub fn default_ethereum_payload<EvmConfig, Client, Pool, F, S>(
     evm_config: EvmConfig,
     client: Client,
     pool: Pool,
     builder_config: EthereumBuilderConfig,
     args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
     best_txs: F,
+    state_root_strategy: S,
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
 where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
+    S: reth_evm::execute::StateRootStrategy,
 {
     let payload_build_start = Instant::now();
     let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
@@ -386,7 +418,7 @@ where
 
     let finish_start = Instant::now();
     let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-        builder.finish(state_provider.as_ref())?;
+        builder.finish_with_strategy(state_provider.as_ref(), state_root_strategy)?;
     let finish_total = finish_start.elapsed();
 
     // After finish(), the builder's borrow on db is released.

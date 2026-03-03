@@ -306,6 +306,48 @@ pub struct BlockBuilderOutcome<N: NodePrimitives> {
     pub block: RecoveredBlock<N::Block>,
 }
 
+/// Strategy for computing state root during block building.
+///
+/// The lifecycle spans the entire block building process:
+/// 1. [`state_hook`](Self::state_hook) — called before execution to optionally set up
+///    incremental state tracking (needed by StateRootTask strategy)
+/// 2. Transaction execution — hook receives state changes if provided
+/// 3. [`compute_root`](Self::compute_root) — called after execution to get the final state root
+pub trait StateRootStrategy: Send {
+    /// Returns a state hook for incremental state tracking during execution.
+    ///
+    /// Returns `None` for post-execution strategies (Synchronous, Parallel).
+    /// Returns `Some` for StateRootTask which computes incrementally during execution.
+    fn state_hook(&mut self) -> Option<Box<dyn OnStateHook>> {
+        None
+    }
+
+    /// Computes the state root from the post-execution hashed state.
+    fn compute_root(
+        self,
+        hashed_state: &HashedPostState,
+        state_provider: &dyn StateProvider,
+    ) -> Result<(B256, TrieUpdates), BlockExecutionError>;
+}
+
+/// Default synchronous state root strategy.
+///
+/// Delegates to [`StateRootProvider::state_root_with_updates`] on the state provider.
+#[derive(Debug)]
+pub struct SyncStateRoot;
+
+impl StateRootStrategy for SyncStateRoot {
+    fn compute_root(
+        self,
+        hashed_state: &HashedPostState,
+        state_provider: &dyn StateProvider,
+    ) -> Result<(B256, TrieUpdates), BlockExecutionError> {
+        state_provider
+            .state_root_with_updates(hashed_state.clone())
+            .map_err(BlockExecutionError::other)
+    }
+}
+
 /// A type that knows how to execute and build a block.
 ///
 /// It wraps an inner [`BlockExecutor`] and provides a way to execute transactions and
@@ -357,10 +399,22 @@ pub trait BlockBuilder {
         self.execute_transaction_with_result_closure(tx, |_| ())
     }
 
-    /// Completes the block building process and returns the [`BlockBuilderOutcome`].
+    /// Completes the block building process using the default synchronous state root.
     fn finish(
         self,
         state_provider: impl StateProvider,
+    ) -> Result<BlockBuilderOutcome<Self::Primitives>, BlockExecutionError>
+    where
+        Self: Sized,
+    {
+        self.finish_with_strategy(state_provider, SyncStateRoot)
+    }
+
+    /// Completes the block building process using the given [`StateRootStrategy`].
+    fn finish_with_strategy(
+        self,
+        state_provider: impl StateProvider,
+        strategy: impl StateRootStrategy,
     ) -> Result<BlockBuilderOutcome<Self::Primitives>, BlockExecutionError>;
 
     /// Provides mutable access to the inner [`BlockExecutor`].
@@ -474,9 +528,10 @@ where
         }
     }
 
-    fn finish(
+    fn finish_with_strategy(
         self,
         state: impl StateProvider,
+        strategy: impl StateRootStrategy,
     ) -> Result<BlockBuilderOutcome<N>, BlockExecutionError> {
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
@@ -486,9 +541,7 @@ where
 
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
-        let (state_root, trie_updates) = state
-            .state_root_with_updates(hashed_state.clone())
-            .map_err(BlockExecutionError::other)?;
+        let (state_root, trie_updates) = strategy.compute_root(&hashed_state, &state)?;
         let state_root_ms = state_root_start.elapsed().as_secs_f64() * 1000.0;
 
         let assemble_start = std::time::Instant::now();
