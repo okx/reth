@@ -319,10 +319,10 @@ impl Default for DefaultTxPoolValues {
             disable_transactions_backup: false,
             max_batch_size: 1,
             // Pre-warming defaults (experimental, disabled by default)
-            // Workers default to half of available CPUs (min 4) to avoid overwhelming the system
+            // Workers default to available CPUs for maximum parallelism
             pre_warming_enabled: false,
             pre_warming_num_workers: std::thread::available_parallelism()
-                .map(|p| (p.get() / 2).max(4))
+                .map(|p| p.get())
                 .unwrap_or(4),
             pre_warming_simulation_timeout_ms: 100,
             pre_warming_cache_ttl_secs: 60,
@@ -805,11 +805,11 @@ mod tests {
 
         // Calculate expected default workers (same logic as in DefaultTxPoolValues::default())
         let expected_workers = std::thread::available_parallelism()
-            .map(|p| (p.get() / 2).max(4))
+            .map(|p| p.get())
             .unwrap_or(4);
 
         assert!(!args.pre_warming_enabled, "Pre-warming should be disabled by default");
-        assert_eq!(args.pre_warming_num_workers, expected_workers, "Default workers should be half of CPUs (min 4)");
+        assert_eq!(args.pre_warming_num_workers, expected_workers, "Default workers should be all CPUs");
         assert_eq!(args.pre_warming_simulation_timeout_ms, 100, "Default timeout should be 100ms");
         assert_eq!(args.pre_warming_cache_ttl_secs, 60, "Default TTL should be 60 seconds");
         assert_eq!(args.pre_warming_cache_max_entries, 10_000, "Default max entries should be 10000");
@@ -826,7 +826,7 @@ mod tests {
 
         // Calculate expected default workers
         let expected_workers = std::thread::available_parallelism()
-            .map(|p| (p.get() / 2).max(4))
+            .map(|p| p.get())
             .unwrap_or(4);
 
         assert!(args.pre_warming_enabled);
@@ -1047,7 +1047,7 @@ mod tests {
 
         // Calculate expected default workers
         let expected_workers = std::thread::available_parallelism()
-            .map(|p| (p.get() / 2).max(4))
+            .map(|p| p.get())
             .unwrap_or(4);
 
         assert!(!pool_config.pre_warming.enabled);
