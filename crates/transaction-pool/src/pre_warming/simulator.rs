@@ -159,22 +159,75 @@ impl Simulator {
         Ok(keys)
     }
 
-    /// Check if selector is a known ERC20 function
+    /// Check if selector is a known ERC20/ERC721/DeFi function
     fn is_known_erc20_selector(selector: &[u8]) -> bool {
-        const TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
-        const TRANSFER_FROM: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd];
-        const APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
-        const BALANCE_OF: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
-        const ALLOWANCE: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];
+        // ERC20 Core
+        const TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];           // transfer(address,uint256)
+        const TRANSFER_FROM: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd];      // transferFrom(address,address,uint256)
+        const APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];            // approve(address,uint256)
+        const BALANCE_OF: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];         // balanceOf(address)
+        const ALLOWANCE: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];          // allowance(address,address)
+
+        // ERC20 Extensions (mint/burn)
+        const MINT: [u8; 4] = [0x40, 0xc1, 0x0f, 0x19];               // mint(address,uint256)
+        const BURN: [u8; 4] = [0x42, 0x96, 0x6c, 0x68];               // burn(uint256)
+        const BURN_FROM: [u8; 4] = [0x79, 0xcc, 0x67, 0x90];          // burnFrom(address,uint256)
+        const INCREASE_ALLOWANCE: [u8; 4] = [0x39, 0x50, 0x93, 0x51]; // increaseAllowance(address,uint256)
+        const DECREASE_ALLOWANCE: [u8; 4] = [0xa4, 0x57, 0xc2, 0xd7]; // decreaseAllowance(address,uint256)
+
+        // ERC721 Core
+        const SAFE_TRANSFER_FROM: [u8; 4] = [0x42, 0x84, 0x2e, 0x0e]; // safeTransferFrom(address,address,uint256)
+        const SAFE_TRANSFER_FROM_DATA: [u8; 4] = [0xb8, 0x8d, 0x4f, 0xde]; // safeTransferFrom(address,address,uint256,bytes)
+        const SET_APPROVAL_FOR_ALL: [u8; 4] = [0xa2, 0x2c, 0xb4, 0x65]; // setApprovalForAll(address,bool)
+        const GET_APPROVED: [u8; 4] = [0x08, 0x18, 0x12, 0xfc];       // getApproved(uint256)
+        const IS_APPROVED_FOR_ALL: [u8; 4] = [0xe9, 0x85, 0xe9, 0xc5]; // isApprovedForAll(address,address)
+        const OWNER_OF: [u8; 4] = [0x63, 0x52, 0x21, 0x1e];           // ownerOf(uint256)
+
+        // ERC1155
+        const SAFE_TRANSFER_FROM_1155: [u8; 4] = [0xf2, 0x42, 0x43, 0x2a]; // safeTransferFrom(address,address,uint256,uint256,bytes)
+        const SAFE_BATCH_TRANSFER: [u8; 4] = [0x2e, 0xb2, 0xc2, 0xd6]; // safeBatchTransferFrom(...)
+        const BALANCE_OF_BATCH: [u8; 4] = [0x4e, 0x12, 0x73, 0xf4];   // balanceOfBatch(address[],uint256[])
+
+        // Uniswap V2
+        const SWAP: [u8; 4] = [0x02, 0x2c, 0x0d, 0x9f];               // swap(uint256,uint256,address,bytes)
+        const SYNC: [u8; 4] = [0xff, 0xf6, 0xca, 0xe9];               // sync()
+        const MINT_LP: [u8; 4] = [0x6a, 0x62, 0x78, 0x42];            // mint(address)
+        const BURN_LP: [u8; 4] = [0x89, 0xaf, 0xcb, 0x44];            // burn(address)
+        const GET_RESERVES: [u8; 4] = [0x09, 0x02, 0xf1, 0xac];       // getReserves()
+
+        // Uniswap V3 / Router
+        const EXACT_INPUT_SINGLE: [u8; 4] = [0x41, 0x4b, 0xf3, 0x89]; // exactInputSingle(...)
+        const EXACT_OUTPUT_SINGLE: [u8; 4] = [0xdb, 0x3e, 0x21, 0x98]; // exactOutputSingle(...)
+        const MULTICALL: [u8; 4] = [0xac, 0x96, 0x50, 0xd8];          // multicall(bytes[])
+
+        // WETH
+        const DEPOSIT: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];            // deposit()
+        const WITHDRAW: [u8; 4] = [0x2e, 0x1a, 0x7d, 0x4d];           // withdraw(uint256)
 
         matches!(
             selector,
             s if s == TRANSFER || s == TRANSFER_FROM || s == APPROVE ||
-                 s == BALANCE_OF || s == ALLOWANCE
+                 s == BALANCE_OF || s == ALLOWANCE ||
+                 // ERC20 Extensions
+                 s == MINT || s == BURN || s == BURN_FROM ||
+                 s == INCREASE_ALLOWANCE || s == DECREASE_ALLOWANCE ||
+                 // ERC721
+                 s == SAFE_TRANSFER_FROM || s == SAFE_TRANSFER_FROM_DATA ||
+                 s == SET_APPROVAL_FOR_ALL || s == GET_APPROVED ||
+                 s == IS_APPROVED_FOR_ALL || s == OWNER_OF ||
+                 // ERC1155
+                 s == SAFE_TRANSFER_FROM_1155 || s == SAFE_BATCH_TRANSFER ||
+                 s == BALANCE_OF_BATCH ||
+                 // Uniswap V2
+                 s == SWAP || s == SYNC || s == MINT_LP || s == BURN_LP || s == GET_RESERVES ||
+                 // Uniswap V3
+                 s == EXACT_INPUT_SINGLE || s == EXACT_OUTPUT_SINGLE || s == MULTICALL ||
+                 // WETH
+                 s == DEPOSIT || s == WITHDRAW
         )
     }
 
-    /// Predict storage slots from ERC20/DeFi calldata patterns
+    /// Predict storage slots from ERC20/ERC721/DeFi calldata patterns
     /// This is called before any database access for maximum speed
     fn predict_storage_from_calldata(
         keys: &mut ExtractedKeys,
@@ -188,22 +241,80 @@ impl Simulator {
 
         let selector = &input[0..4];
 
-        // ERC20 function selectors
+        // ═══════════════════════════════════════════════════════════════════
+        // ERC20 Selectors
+        // ═══════════════════════════════════════════════════════════════════
         const TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
         const TRANSFER_FROM: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd];
         const APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
         const BALANCE_OF: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
+        const MINT: [u8; 4] = [0x40, 0xc1, 0x0f, 0x19];
+        const BURN: [u8; 4] = [0x42, 0x96, 0x6c, 0x68];
+        const BURN_FROM: [u8; 4] = [0x79, 0xcc, 0x67, 0x90];
+        const INCREASE_ALLOWANCE: [u8; 4] = [0x39, 0x50, 0x93, 0x51];
+        const DECREASE_ALLOWANCE: [u8; 4] = [0xa4, 0x57, 0xc2, 0xd7];
 
-        // Common ERC20 storage slots
+        // ═══════════════════════════════════════════════════════════════════
+        // ERC721 Selectors
+        // ═══════════════════════════════════════════════════════════════════
+        const SAFE_TRANSFER_FROM: [u8; 4] = [0x42, 0x84, 0x2e, 0x0e];
+        const SAFE_TRANSFER_FROM_DATA: [u8; 4] = [0xb8, 0x8d, 0x4f, 0xde];
+        const SET_APPROVAL_FOR_ALL: [u8; 4] = [0xa2, 0x2c, 0xb4, 0x65];
+        const GET_APPROVED: [u8; 4] = [0x08, 0x18, 0x12, 0xfc];
+        const IS_APPROVED_FOR_ALL: [u8; 4] = [0xe9, 0x85, 0xe9, 0xc5];
+        const OWNER_OF: [u8; 4] = [0x63, 0x52, 0x21, 0x1e];
+
+        // ═══════════════════════════════════════════════════════════════════
+        // ERC1155 Selectors
+        // ═══════════════════════════════════════════════════════════════════
+        const SAFE_TRANSFER_FROM_1155: [u8; 4] = [0xf2, 0x42, 0x43, 0x2a];
+        const SAFE_BATCH_TRANSFER: [u8; 4] = [0x2e, 0xb2, 0xc2, 0xd6];
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Uniswap V2 Selectors
+        // ═══════════════════════════════════════════════════════════════════
+        const SWAP: [u8; 4] = [0x02, 0x2c, 0x0d, 0x9f];
+        const SYNC: [u8; 4] = [0xff, 0xf6, 0xca, 0xe9];
+        const MINT_LP: [u8; 4] = [0x6a, 0x62, 0x78, 0x42];
+        const BURN_LP: [u8; 4] = [0x89, 0xaf, 0xcb, 0x44];
+        const GET_RESERVES: [u8; 4] = [0x09, 0x02, 0xf1, 0xac];
+
+        // ═══════════════════════════════════════════════════════════════════
+        // WETH Selectors
+        // ═══════════════════════════════════════════════════════════════════
+        const DEPOSIT: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
+        const WITHDRAW: [u8; 4] = [0x2e, 0x1a, 0x7d, 0x4d];
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Common Storage Slots
+        // ═══════════════════════════════════════════════════════════════════
+        // ERC20: slot 0 = balances, slot 1 = allowances, slot 2 = totalSupply
         const BALANCES_SLOT: U256 = U256::ZERO;
         const ALLOWANCES_SLOT: U256 = U256::from_limbs([1, 0, 0, 0]);
+        const TOTAL_SUPPLY_SLOT: U256 = U256::from_limbs([2, 0, 0, 0]);
+
+        // ERC721: slot 0 = owners, slot 1 = balances, slot 2 = approvals, slot 3 = operatorApprovals
+        const ERC721_OWNERS_SLOT: U256 = U256::ZERO;
+        const ERC721_BALANCES_SLOT: U256 = U256::from_limbs([1, 0, 0, 0]);
+        const ERC721_TOKEN_APPROVALS_SLOT: U256 = U256::from_limbs([2, 0, 0, 0]);
+        const ERC721_OPERATOR_APPROVALS_SLOT: U256 = U256::from_limbs([3, 0, 0, 0]);
+
+        // ERC1155: slot 0 = balances (id => owner => amount), slot 1 = operatorApprovals
+        const ERC1155_BALANCES_SLOT: U256 = U256::ZERO;
+        const ERC1155_OPERATOR_APPROVALS_SLOT: U256 = U256::from_limbs([1, 0, 0, 0]);
+
+        // Uniswap V2 Pair: reserves at slots 6-8
+        const RESERVE0_SLOT: U256 = U256::from_limbs([8, 0, 0, 0]);
+        const RESERVE1_SLOT: U256 = U256::from_limbs([9, 0, 0, 0]);
+        const KLAST_SLOT: U256 = U256::from_limbs([10, 0, 0, 0]);
 
         match selector {
+            // ═══════════════════════════════════════════════════════════════
+            // ERC20 Handlers
+            // ═══════════════════════════════════════════════════════════════
             s if s == TRANSFER => {
                 if input.len() >= 36 {
                     let to = Address::from_slice(&input[16..36]);
-
-                    // Pre-warm sender and recipient balance slots
                     keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, sender));
                     keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, to));
                     keys.add_account(to);
@@ -213,8 +324,6 @@ impl Simulator {
                 if input.len() >= 68 {
                     let from = Address::from_slice(&input[16..36]);
                     let to = Address::from_slice(&input[48..68]);
-
-                    // Pre-warm from/to balance slots and allowance
                     keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, from));
                     keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, to));
                     keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, from, sender));
@@ -222,7 +331,7 @@ impl Simulator {
                     keys.add_account(to);
                 }
             }
-            s if s == APPROVE => {
+            s if s == APPROVE || s == INCREASE_ALLOWANCE || s == DECREASE_ALLOWANCE => {
                 if input.len() >= 36 {
                     let spender = Address::from_slice(&input[16..36]);
                     keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, sender, spender));
@@ -235,6 +344,157 @@ impl Simulator {
                     keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, account));
                 }
             }
+            s if s == MINT => {
+                if input.len() >= 36 {
+                    let to = Address::from_slice(&input[16..36]);
+                    keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, to));
+                    keys.add_storage_slot(contract, TOTAL_SUPPLY_SLOT);
+                    keys.add_account(to);
+                }
+            }
+            s if s == BURN => {
+                keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, sender));
+                keys.add_storage_slot(contract, TOTAL_SUPPLY_SLOT);
+            }
+            s if s == BURN_FROM => {
+                if input.len() >= 36 {
+                    let from = Address::from_slice(&input[16..36]);
+                    keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, from));
+                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, from, sender));
+                    keys.add_storage_slot(contract, TOTAL_SUPPLY_SLOT);
+                    keys.add_account(from);
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // ERC721 Handlers
+            // ═══════════════════════════════════════════════════════════════
+            s if s == SAFE_TRANSFER_FROM || s == SAFE_TRANSFER_FROM_DATA => {
+                if input.len() >= 68 {
+                    let from = Address::from_slice(&input[16..36]);
+                    let to = Address::from_slice(&input[48..68]);
+                    // tokenId is in bytes 68-100
+                    if input.len() >= 100 {
+                        let token_id = U256::from_be_slice(&input[68..100]);
+                        keys.add_storage_slot(contract, Self::compute_mapping_slot_u256(ERC721_OWNERS_SLOT, token_id));
+                        keys.add_storage_slot(contract, Self::compute_mapping_slot_u256(ERC721_TOKEN_APPROVALS_SLOT, token_id));
+                    }
+                    keys.add_storage_slot(contract, Self::compute_mapping_slot(ERC721_BALANCES_SLOT, from));
+                    keys.add_storage_slot(contract, Self::compute_mapping_slot(ERC721_BALANCES_SLOT, to));
+                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ERC721_OPERATOR_APPROVALS_SLOT, from, sender));
+                    keys.add_account(from);
+                    keys.add_account(to);
+                }
+            }
+            s if s == SET_APPROVAL_FOR_ALL => {
+                if input.len() >= 36 {
+                    let operator = Address::from_slice(&input[16..36]);
+                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ERC721_OPERATOR_APPROVALS_SLOT, sender, operator));
+                    keys.add_account(operator);
+                }
+            }
+            s if s == GET_APPROVED => {
+                if input.len() >= 36 {
+                    let token_id = U256::from_be_slice(&input[4..36]);
+                    keys.add_storage_slot(contract, Self::compute_mapping_slot_u256(ERC721_TOKEN_APPROVALS_SLOT, token_id));
+                }
+            }
+            s if s == IS_APPROVED_FOR_ALL => {
+                if input.len() >= 68 {
+                    let owner = Address::from_slice(&input[16..36]);
+                    let operator = Address::from_slice(&input[48..68]);
+                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ERC721_OPERATOR_APPROVALS_SLOT, owner, operator));
+                }
+            }
+            s if s == OWNER_OF => {
+                if input.len() >= 36 {
+                    let token_id = U256::from_be_slice(&input[4..36]);
+                    keys.add_storage_slot(contract, Self::compute_mapping_slot_u256(ERC721_OWNERS_SLOT, token_id));
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // ERC1155 Handlers
+            // ═══════════════════════════════════════════════════════════════
+            s if s == SAFE_TRANSFER_FROM_1155 => {
+                if input.len() >= 100 {
+                    let from = Address::from_slice(&input[16..36]);
+                    let to = Address::from_slice(&input[48..68]);
+                    let token_id = U256::from_be_slice(&input[68..100]);
+                    // ERC1155 balances: mapping(uint256 => mapping(address => uint256))
+                    keys.add_storage_slot(contract, Self::compute_erc1155_balance_slot(ERC1155_BALANCES_SLOT, token_id, from));
+                    keys.add_storage_slot(contract, Self::compute_erc1155_balance_slot(ERC1155_BALANCES_SLOT, token_id, to));
+                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ERC1155_OPERATOR_APPROVALS_SLOT, from, sender));
+                    keys.add_account(from);
+                    keys.add_account(to);
+                }
+            }
+            s if s == SAFE_BATCH_TRANSFER => {
+                // Extract from and to addresses, process first few token IDs
+                if input.len() >= 68 {
+                    let from = Address::from_slice(&input[16..36]);
+                    let to = Address::from_slice(&input[48..68]);
+                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ERC1155_OPERATOR_APPROVALS_SLOT, from, sender));
+                    keys.add_account(from);
+                    keys.add_account(to);
+                    // Note: Full batch parsing would require dynamic array decoding
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // Uniswap V2 Handlers
+            // ═══════════════════════════════════════════════════════════════
+            s if s == SWAP => {
+                // swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)
+                keys.add_storage_slot(contract, RESERVE0_SLOT);
+                keys.add_storage_slot(contract, RESERVE1_SLOT);
+                keys.add_storage_slot(contract, KLAST_SLOT);
+                // Token balances in pair contract
+                keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, contract));
+                if input.len() >= 100 {
+                    let to = Address::from_slice(&input[80..100]);
+                    keys.add_account(to);
+                }
+            }
+            s if s == SYNC || s == GET_RESERVES => {
+                keys.add_storage_slot(contract, RESERVE0_SLOT);
+                keys.add_storage_slot(contract, RESERVE1_SLOT);
+            }
+            s if s == MINT_LP => {
+                keys.add_storage_slot(contract, RESERVE0_SLOT);
+                keys.add_storage_slot(contract, RESERVE1_SLOT);
+                keys.add_storage_slot(contract, KLAST_SLOT);
+                keys.add_storage_slot(contract, TOTAL_SUPPLY_SLOT);
+                if input.len() >= 36 {
+                    let to = Address::from_slice(&input[16..36]);
+                    keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, to));
+                    keys.add_account(to);
+                }
+            }
+            s if s == BURN_LP => {
+                keys.add_storage_slot(contract, RESERVE0_SLOT);
+                keys.add_storage_slot(contract, RESERVE1_SLOT);
+                keys.add_storage_slot(contract, KLAST_SLOT);
+                keys.add_storage_slot(contract, TOTAL_SUPPLY_SLOT);
+                keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, sender));
+                if input.len() >= 36 {
+                    let to = Address::from_slice(&input[16..36]);
+                    keys.add_account(to);
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // WETH Handlers
+            // ═══════════════════════════════════════════════════════════════
+            s if s == DEPOSIT => {
+                keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, sender));
+                keys.add_storage_slot(contract, TOTAL_SUPPLY_SLOT);
+            }
+            s if s == WITHDRAW => {
+                keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, sender));
+                keys.add_storage_slot(contract, TOTAL_SUPPLY_SLOT);
+            }
+
             _ => {
                 // Unknown function - extract addresses from calldata
                 Self::extract_addresses_from_calldata(keys, contract, input, sender);
@@ -526,11 +786,31 @@ impl Simulator {
         U256::from_be_bytes(hash.0)
     }
 
+    /// Compute mapping slot with U256 key: keccak256(abi.encode(key, slot))
+    /// Used for ERC721 tokenId mappings
+    fn compute_mapping_slot_u256(base_slot: U256, key: U256) -> U256 {
+        use alloy_primitives::keccak256;
+
+        let mut data = [0u8; 64];
+        data[0..32].copy_from_slice(&key.to_be_bytes::<32>());
+        data[32..64].copy_from_slice(&base_slot.to_be_bytes::<32>());
+
+        let hash = keccak256(&data);
+        U256::from_be_bytes(hash.0)
+    }
+
     /// Compute nested mapping slot: keccak256(abi.encode(key2, keccak256(abi.encode(key1, slot))))
     /// Used for allowances[owner][spender]
     fn compute_nested_mapping_slot(base_slot: U256, key1: Address, key2: Address) -> U256 {
         let inner_slot = Self::compute_mapping_slot(base_slot, key1);
         Self::compute_mapping_slot(inner_slot, key2)
+    }
+
+    /// Compute ERC1155 balance slot: mapping(uint256 => mapping(address => uint256))
+    /// slot = keccak256(abi.encode(account, keccak256(abi.encode(tokenId, baseSlot))))
+    fn compute_erc1155_balance_slot(base_slot: U256, token_id: U256, account: Address) -> U256 {
+        let inner_slot = Self::compute_mapping_slot_u256(base_slot, token_id);
+        Self::compute_mapping_slot(inner_slot, account)
     }
 
     /// Fallback: Basic key extraction from transaction structure only
