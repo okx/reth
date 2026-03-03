@@ -125,6 +125,7 @@ start_node() {
             --metrics 0.0.0.0:9001 \
             --txpool.pre-warming true \
             --txpool.pre-warming-workers "$PREWARM_WORKERS" \
+            --txpool.pre-fetch-workers "$PREFETCH_WORKERS" \
             --log.stdout.filter error > /dev/null 2>&1 &
     else
         "$RETH_DIR/target/release/op-reth" node \
@@ -370,8 +371,10 @@ NUM_CPUS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo "8")
 # Use max workers if flag set, otherwise half of CPUs (min 4)
 if [ "$MAX_WORKERS" = true ]; then
     PREWARM_WORKERS=$NUM_CPUS
+    PREFETCH_WORKERS=$NUM_CPUS
 else
     PREWARM_WORKERS=$(( (NUM_CPUS / 2) > 4 ? (NUM_CPUS / 2) : 4 ))
+    PREFETCH_WORKERS=$(( (NUM_CPUS / 2) > 4 ? (NUM_CPUS / 2) : 4 ))
 fi
 
 clear
@@ -387,7 +390,7 @@ elif [ "$FULL_LOAD" = true ]; then
     echo -e "  ${BOLD}MODE: FULL LOAD (~28K transactions)${NC}"
 fi
 echo -e "  Normal Load: ${NORMAL_LOAD} txs | Peak Load: ${PEAK_LOAD} txs"
-echo -e "  CPUs: ${NUM_CPUS} | Pre-warming Workers: ${PREWARM_WORKERS}"
+echo -e "  CPUs: ${NUM_CPUS} | Pre-warming Workers: ${PREWARM_WORKERS} | Prefetch Workers: ${PREFETCH_WORKERS}"
 TOTAL_TXS=$((NORMAL_LOAD * 4 + PEAK_LOAD * 4))  # 4 tests each
 echo -e "  Total Transactions: ~${TOTAL_TXS} (across all tests)"
 echo ""
@@ -551,6 +554,7 @@ report = f"""# Pre-Warming Benchmark Report
 | Normal Load | ${NORMAL_LOAD} transactions |
 | Peak Load | ${PEAK_LOAD} transactions |
 | Pre-warming Workers | ${PREWARM_WORKERS} |
+| Prefetch Workers | ${PREFETCH_WORKERS} |
 | Total Transactions | ~${TOTAL_TXS_ACTUAL} |
 | Block Time | 1 second |
 
@@ -656,8 +660,9 @@ echo -e "   Copy the content for your Lark doc!"
 echo ""
 
 # Show error summary if any errors occurred
-ERROR_COUNT=$(grep -c "\[ERROR\]" "$ERROR_LOG" 2>/dev/null || echo "0")
-if [ "$ERROR_COUNT" -gt 0 ]; then
+ERROR_COUNT=$(grep -c "\[ERROR\]" "$ERROR_LOG" 2>/dev/null | tr -d '[:space:]' || echo "0")
+ERROR_COUNT=${ERROR_COUNT:-0}
+if [ "$ERROR_COUNT" -gt 0 ] 2>/dev/null; then
     echo -e "${YELLOW}⚠️  $ERROR_COUNT error(s) logged. Check: $ERROR_LOG${NC}"
     echo ""
 fi

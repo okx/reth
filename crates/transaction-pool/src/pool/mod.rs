@@ -341,6 +341,7 @@ where
         tracing::info!(
             target: "txpool::pre_warming",
             num_workers = self.config.pre_warming.num_workers,
+            prefetch_workers = self.config.pre_warming.prefetch_num_workers,
             simulation_timeout_ms = self.config.pre_warming.simulation_timeout.as_millis() as u64,
             cache_max_entries = self.config.pre_warming.cache_max_entries,
             "Pre-warming ENABLED - worker pool initialized successfully"

@@ -58,6 +58,7 @@ pub struct DefaultTxPoolValues {
     // Pre-warming configuration
     pre_warming_enabled: bool,
     pre_warming_num_workers: usize,
+    pre_fetch_num_workers: usize,
     pre_warming_simulation_timeout_ms: u64,
     pre_warming_cache_ttl_secs: u64,
     pre_warming_cache_max_entries: usize,
@@ -266,6 +267,12 @@ impl DefaultTxPoolValues {
         self
     }
 
+    /// Set the default number of pre-fetch workers
+    pub const fn with_pre_fetch_num_workers(mut self, v: usize) -> Self {
+        self.pre_fetch_num_workers = v;
+        self
+    }
+
     /// Set the default pre-warming simulation timeout in milliseconds
     pub const fn with_pre_warming_simulation_timeout_ms(mut self, v: u64) -> Self {
         self.pre_warming_simulation_timeout_ms = v;
@@ -322,6 +329,9 @@ impl Default for DefaultTxPoolValues {
             // Workers default to available CPUs for maximum parallelism
             pre_warming_enabled: false,
             pre_warming_num_workers: std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4),
+            pre_fetch_num_workers: std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(4),
             pre_warming_simulation_timeout_ms: 100,
@@ -469,6 +479,11 @@ pub struct TxPoolArgs {
     #[arg(long = "txpool.pre-warming-workers", default_value_t = DefaultTxPoolValues::get_global().pre_warming_num_workers)]
     pub pre_warming_num_workers: usize,
 
+    /// Number of pre-fetch workers for loading data from MDBX.
+    /// More workers enable more parallel database reads but increase I/O pressure.
+    #[arg(long = "txpool.pre-fetch-workers", default_value_t = DefaultTxPoolValues::get_global().pre_fetch_num_workers)]
+    pub pre_fetch_num_workers: usize,
+
     /// Maximum simulation time in milliseconds before timeout.
     /// Prevents hanging on pathological transactions.
     #[arg(long = "txpool.pre-warming-timeout-ms", default_value_t = DefaultTxPoolValues::get_global().pre_warming_simulation_timeout_ms)]
@@ -538,6 +553,7 @@ impl Default for TxPoolArgs {
             max_batch_size,
             pre_warming_enabled,
             pre_warming_num_workers,
+            pre_fetch_num_workers,
             pre_warming_simulation_timeout_ms,
             pre_warming_cache_ttl_secs,
             pre_warming_cache_max_entries,
@@ -575,6 +591,7 @@ impl Default for TxPoolArgs {
             max_batch_size,
             pre_warming_enabled,
             pre_warming_num_workers,
+            pre_fetch_num_workers,
             pre_warming_simulation_timeout_ms,
             pre_warming_cache_ttl_secs,
             pre_warming_cache_max_entries,
@@ -626,6 +643,7 @@ impl RethTransactionPoolConfig for TxPoolArgs {
             pre_warming: reth_transaction_pool::pre_warming::PreWarmingConfig {
                 enabled: self.pre_warming_enabled,
                 num_workers: self.pre_warming_num_workers,
+                prefetch_num_workers: self.pre_fetch_num_workers,
                 simulation_timeout: std::time::Duration::from_millis(self.pre_warming_simulation_timeout_ms),
                 cache_ttl: std::time::Duration::from_secs(self.pre_warming_cache_ttl_secs),
                 cache_max_entries: self.pre_warming_cache_max_entries,
@@ -719,6 +737,7 @@ mod tests {
             // Pre-warming with custom values (enabled via flag presence)
             pre_warming_enabled: true,
             pre_warming_num_workers: 8,
+            pre_fetch_num_workers: 8,
             pre_warming_simulation_timeout_ms: 50,
             pre_warming_cache_ttl_secs: 30,
             pre_warming_cache_max_entries: 5000,
@@ -784,7 +803,10 @@ mod tests {
             "10",
             // Pre-warming CLI arguments
             "--txpool.pre-warming",
+            "true",
             "--txpool.pre-warming-workers",
+            "8",
+            "--txpool.pre-fetch-workers",
             "8",
             "--txpool.pre-warming-timeout-ms",
             "50",
@@ -821,6 +843,7 @@ mod tests {
         let args = CommandParser::<TxPoolArgs>::parse_from([
             "reth",
             "--txpool.pre-warming",
+            "true",
         ])
         .args;
 
@@ -832,6 +855,7 @@ mod tests {
         assert!(args.pre_warming_enabled);
         // Other values should remain at defaults
         assert_eq!(args.pre_warming_num_workers, expected_workers);
+        assert_eq!(args.pre_fetch_num_workers, expected_workers);
         assert_eq!(args.pre_warming_simulation_timeout_ms, 100);
         assert_eq!(args.pre_warming_cache_ttl_secs, 60);
         assert_eq!(args.pre_warming_cache_max_entries, 10_000);
@@ -891,8 +915,11 @@ mod tests {
         let args = CommandParser::<TxPoolArgs>::parse_from([
             "reth",
             "--txpool.pre-warming",
+            "true",
             "--txpool.pre-warming-workers",
             "12",
+            "--txpool.pre-fetch-workers",
+            "10",
             "--txpool.pre-warming-timeout-ms",
             "75",
             "--txpool.pre-warming-cache-ttl",
@@ -904,6 +931,7 @@ mod tests {
 
         assert!(args.pre_warming_enabled);
         assert_eq!(args.pre_warming_num_workers, 12);
+        assert_eq!(args.pre_fetch_num_workers, 10);
         assert_eq!(args.pre_warming_simulation_timeout_ms, 75);
         assert_eq!(args.pre_warming_cache_ttl_secs, 45);
         assert_eq!(args.pre_warming_cache_max_entries, 20000);
@@ -967,6 +995,7 @@ mod tests {
         let args = CommandParser::<TxPoolArgs>::parse_from([
             "reth",
             "--txpool.pre-warming",
+            "true",
             "--txpool.pre-warming-workers",
             "1",
         ])
@@ -1022,6 +1051,7 @@ mod tests {
         let args = TxPoolArgs {
             pre_warming_enabled: true,
             pre_warming_num_workers: 6,
+            pre_fetch_num_workers: 8,
             pre_warming_simulation_timeout_ms: 150,
             pre_warming_cache_ttl_secs: 90,
             pre_warming_cache_max_entries: 15000,
@@ -1032,6 +1062,7 @@ mod tests {
 
         assert!(pool_config.pre_warming.enabled);
         assert_eq!(pool_config.pre_warming.num_workers, 6);
+        assert_eq!(pool_config.pre_warming.prefetch_num_workers, 8);
         assert_eq!(pool_config.pre_warming.simulation_timeout, Duration::from_millis(150));
         assert_eq!(pool_config.pre_warming.cache_ttl, Duration::from_secs(90));
         assert_eq!(pool_config.pre_warming.cache_max_entries, 15000);
@@ -1052,6 +1083,7 @@ mod tests {
 
         assert!(!pool_config.pre_warming.enabled);
         assert_eq!(pool_config.pre_warming.num_workers, expected_workers);
+        assert_eq!(pool_config.pre_warming.prefetch_num_workers, expected_workers);
         assert_eq!(pool_config.pre_warming.simulation_timeout, Duration::from_millis(100));
         assert_eq!(pool_config.pre_warming.cache_ttl, Duration::from_secs(60));
         assert_eq!(pool_config.pre_warming.cache_max_entries, 10_000);

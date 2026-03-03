@@ -517,6 +517,7 @@ where
         info!(
             target: "txpool::pre_warming",
             num_workers = config.num_workers,
+            prefetch_workers = config.prefetch_num_workers,
             channel_capacity,
             simulation_timeout_ms = config.simulation_timeout.as_millis(),
             cache_max_entries = config.cache_max_entries,
@@ -530,7 +531,7 @@ where
         crate::pre_warming::registry::set_global_metrics(Arc::clone(&metrics));
 
         // Register prefetch threads count globally so payload builder can use it
-        crate::pre_warming::registry::set_global_prefetch_threads(config.num_workers);
+        crate::pre_warming::registry::set_global_prefetch_threads(config.prefetch_num_workers);
 
         Self {
             sender,

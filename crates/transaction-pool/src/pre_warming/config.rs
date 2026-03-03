@@ -20,6 +20,14 @@ pub struct PreWarmingConfig {
     /// X Layer (400ms block time): 4-8 workers recommended
     pub num_workers: usize,
 
+    /// Number of pre-fetch workers for loading data from MDBX
+    ///
+    /// Each worker can fetch data from database in parallel.
+    /// More workers = more parallel I/O, but also more database contention.
+    ///
+    /// Recommended: 4-8 workers for most systems
+    pub prefetch_num_workers: usize,
+
     /// Maximum simulation time before timeout
     ///
     /// If a simulation takes longer than this, it's cancelled.
@@ -60,6 +68,9 @@ impl Default for PreWarmingConfig {
             // 4 workers for parallel simulation
             num_workers: 4,
 
+            // 4 workers for parallel prefetch from database
+            prefetch_num_workers: 4,
+
             // 100ms max per simulation (well below typical block times)
             simulation_timeout: Duration::from_millis(100),
 
@@ -95,6 +106,12 @@ impl PreWarmingConfig {
     /// Set number of workers
     pub fn with_workers(mut self, num_workers: usize) -> Self {
         self.num_workers = num_workers.max(1);  // At least 1 worker
+        self
+    }
+
+    /// Set number of prefetch workers
+    pub fn with_prefetch_workers(mut self, num_workers: usize) -> Self {
+        self.prefetch_num_workers = num_workers.max(1);  // At least 1 worker
         self
     }
 
