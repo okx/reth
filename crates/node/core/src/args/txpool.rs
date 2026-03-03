@@ -319,8 +319,11 @@ impl Default for DefaultTxPoolValues {
             disable_transactions_backup: false,
             max_batch_size: 1,
             // Pre-warming defaults (experimental, disabled by default)
+            // Workers default to half of available CPUs (min 4) to avoid overwhelming the system
             pre_warming_enabled: false,
-            pre_warming_num_workers: 4,
+            pre_warming_num_workers: std::thread::available_parallelism()
+                .map(|p| (p.get() / 2).max(4))
+                .unwrap_or(4),
             pre_warming_simulation_timeout_ms: 100,
             pre_warming_cache_ttl_secs: 60,
             pre_warming_cache_max_entries: 10_000,
@@ -800,8 +803,13 @@ mod tests {
         // Test that pre-warming defaults are correctly applied
         let args = CommandParser::<TxPoolArgs>::parse_from(["reth"]).args;
 
+        // Calculate expected default workers (same logic as in DefaultTxPoolValues::default())
+        let expected_workers = std::thread::available_parallelism()
+            .map(|p| (p.get() / 2).max(4))
+            .unwrap_or(4);
+
         assert!(!args.pre_warming_enabled, "Pre-warming should be disabled by default");
-        assert_eq!(args.pre_warming_num_workers, 4, "Default workers should be 4");
+        assert_eq!(args.pre_warming_num_workers, expected_workers, "Default workers should be half of CPUs (min 4)");
         assert_eq!(args.pre_warming_simulation_timeout_ms, 100, "Default timeout should be 100ms");
         assert_eq!(args.pre_warming_cache_ttl_secs, 60, "Default TTL should be 60 seconds");
         assert_eq!(args.pre_warming_cache_max_entries, 10_000, "Default max entries should be 10000");
@@ -816,9 +824,14 @@ mod tests {
         ])
         .args;
 
+        // Calculate expected default workers
+        let expected_workers = std::thread::available_parallelism()
+            .map(|p| (p.get() / 2).max(4))
+            .unwrap_or(4);
+
         assert!(args.pre_warming_enabled);
         // Other values should remain at defaults
-        assert_eq!(args.pre_warming_num_workers, 4);
+        assert_eq!(args.pre_warming_num_workers, expected_workers);
         assert_eq!(args.pre_warming_simulation_timeout_ms, 100);
         assert_eq!(args.pre_warming_cache_ttl_secs, 60);
         assert_eq!(args.pre_warming_cache_max_entries, 10_000);
@@ -1032,8 +1045,13 @@ mod tests {
         let args = TxPoolArgs::default();
         let pool_config = args.pool_config();
 
+        // Calculate expected default workers
+        let expected_workers = std::thread::available_parallelism()
+            .map(|p| (p.get() / 2).max(4))
+            .unwrap_or(4);
+
         assert!(!pool_config.pre_warming.enabled);
-        assert_eq!(pool_config.pre_warming.num_workers, 4);
+        assert_eq!(pool_config.pre_warming.num_workers, expected_workers);
         assert_eq!(pool_config.pre_warming.simulation_timeout, Duration::from_millis(100));
         assert_eq!(pool_config.pre_warming.cache_ttl, Duration::from_secs(60));
         assert_eq!(pool_config.pre_warming.cache_max_entries, 10_000);
