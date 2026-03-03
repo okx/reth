@@ -981,6 +981,8 @@ fn simulate_transaction_sync<T: PoolTransaction>(
 /// - Sender and recipient accounts
 /// - Access list entries (EIP-2930)
 /// - Storage slots accessed during execution
+///
+/// Uses enhanced simulation for comprehensive state discovery.
 fn simulate_transaction<T: PoolTransaction>(
     simulator: &Simulator,
     tx: &T,
@@ -990,7 +992,9 @@ fn simulate_transaction<T: PoolTransaction>(
     let (tx_inner, _signer) = consensus_tx.into_parts();
     let block_env = revm::context::BlockEnv::default();
 
-    simulator.simulate(&tx_inner, sender, block_env)
+    // Use enhanced simulation for better coverage
+    // This method queries more storage slots and handles more contract patterns
+    simulator.simulate_with_full_evm(&tx_inner, sender, block_env)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
 
