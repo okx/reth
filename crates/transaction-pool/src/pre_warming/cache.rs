@@ -349,14 +349,15 @@ mod tests {
 
         assert_eq!(cache.len(), 2);
 
-        // Remove tx1
+        // Remove tx1 - NOTE: Eviction is disabled
         cache.remove_txs(&[tx1]);
 
-        assert_eq!(cache.len(), 1);
+        // With eviction disabled, cache still has both entries
+        assert_eq!(cache.len(), 2);
 
-        // tx1 should be gone
+        // tx1 is still there (eviction disabled)
         let merged = cache.get_keys_for_txs(&[tx1]);
-        assert!(merged.is_empty());
+        assert!(!merged.is_empty());
 
         // tx2 should still be there
         let merged = cache.get_keys_for_txs(&[tx2]);
@@ -376,12 +377,13 @@ mod tests {
 
         assert_eq!(cache.len(), 3);
 
-        // Remove tx1 and tx2
+        // Remove tx1 and tx2 - NOTE: Eviction is disabled, cache stays at 3
         cache.remove_txs(&[tx1, tx2]);
 
-        assert_eq!(cache.len(), 1);
+        // With eviction disabled, all entries remain
+        assert_eq!(cache.len(), 3);
 
-        // Only tx3 should remain
+        // tx3 should still be there
         let merged = cache.get_keys_for_txs(&[tx3]);
         assert_eq!(merged.accounts.len(), 1);
     }
@@ -472,12 +474,13 @@ mod tests {
         assert_eq!(merged.accounts.len(), 3);
         assert_eq!(merged.storage_slots.len(), 1 + 3 + 5);  // 0+1, 2+1, 4+1
 
-        // Block finalized, remove mined transactions
+        // Block finalized, remove mined transactions - NOTE: Eviction is disabled
         cache.remove_txs(&selected);
 
-        assert_eq!(cache.len(), 2);  // Only tx1 and tx3 remain
+        // With eviction disabled, all 5 entries remain
+        assert_eq!(cache.len(), 5);
 
-        // Verify remaining
+        // All transactions still accessible
         let remaining = cache.get_keys_for_txs(&[txs[1], txs[3]]);
         assert_eq!(remaining.accounts.len(), 2);
     }

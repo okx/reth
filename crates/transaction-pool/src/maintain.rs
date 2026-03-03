@@ -932,7 +932,7 @@ mod tests {
         let blob_store = InMemoryBlobStore::default();
         let validator = EthTransactionValidatorBuilder::new(provider).build(blob_store.clone());
 
-        let txpool = Pool::new(
+        let txpool: Pool<_, _, _, ()> = Pool::new(
             validator,
             CoinbaseTipOrdering::default(),
             blob_store.clone(),

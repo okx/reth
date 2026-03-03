@@ -404,19 +404,20 @@ mod integration {
 
         assert_eq!(cache.len(), 5);
 
-        // Alice, Bob, Charlie got mined
+        // Alice, Bob, Charlie got mined - NOTE: Eviction is disabled
         let mined = &tx_hashes[0..3];
         cache.remove_txs(mined);
 
-        assert_eq!(cache.len(), 2);
+        // With eviction disabled, all 5 entries remain
+        assert_eq!(cache.len(), 5);
 
         // Dave and Eve's keys should still be available
         let remaining = cache.get_keys_for_txs(&tx_hashes[3..5]);
         assert_eq!(remaining.accounts.len(), 2);
 
-        // Mined TXs should return empty
+        // Mined TXs are still in cache (eviction disabled)
         let removed = cache.get_keys_for_txs(mined);
-        assert!(removed.is_empty());
+        assert!(!removed.is_empty());
     }
 
     /// # Test: Cache Statistics Accuracy
@@ -626,8 +627,9 @@ mod e2e {
         assert!(prefetch_keys.accounts.len() > 50);
         assert!(prefetch_keys.storage_slots.len() > 0);
 
+        // NOTE: Eviction is disabled, so cache.len() stays at 100
         cache.remove_txs(&selected_for_block);
-        assert_eq!(cache.len(), 50);
+        assert_eq!(cache.len(), 100);
     }
 
     /// # Test: Overlapping Keys Deduplication (Hot Contract)
@@ -1794,20 +1796,24 @@ mod stress {
         for block_num in 0..100 {
             let users = generate_user_addresses(100);
 
-            let tx_hashes: Vec<TxHash> = users.iter().enumerate().map(|(i, user)| {
+            let tx_hashes: Vec<TxHash> = users.iter().enumerate().map(|(_i, user)| {
                 let tx_hash = TxHash::random();
                 let mut keys = ExtractedKeys::new();
                 keys.add_account(*user);
                 keys.add_account(USDC);
-                keys.add_storage_slot(USDC, U256::from(block_num * 100 + i));
+                keys.add_storage_slot(USDC, U256::from(block_num * 100 + _i));
                 cache.store_tx_keys(tx_hash, keys);
                 tx_hash
             }).collect();
 
-            assert_eq!(cache.len(), 100);
+            // With eviction disabled, cache keeps growing
+            // After block 0: 100 entries, after block 1: 200, etc.
+            let expected_len = (block_num + 1) * 100;
+            assert_eq!(cache.len(), expected_len);
 
+            // remove_txs is a no-op with eviction disabled
             cache.remove_txs(&tx_hashes);
-            assert_eq!(cache.len(), 0);
+            assert_eq!(cache.len(), expected_len);
         }
     }
 

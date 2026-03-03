@@ -1348,7 +1348,7 @@ mod tests {
 
         assert!(outcome.is_valid());
 
-        let pool =
+        let pool: Pool<_, _, _, ()> =
             Pool::new(validator, CoinbaseTipOrdering::default(), blob_store, Default::default());
 
         let res = pool.add_external_transaction(transaction.clone()).await;
@@ -1377,7 +1377,7 @@ mod tests {
 
         assert!(outcome.is_invalid());
 
-        let pool =
+        let pool: Pool<_, _, _, ()> =
             Pool::new(validator, CoinbaseTipOrdering::default(), blob_store, Default::default());
 
         let res = pool.add_external_transaction(transaction.clone()).await;
@@ -1417,7 +1417,7 @@ mod tests {
             ));
         }
 
-        let pool =
+        let pool: Pool<_, _, _, ()> =
             Pool::new(validator, CoinbaseTipOrdering::default(), blob_store, Default::default());
         let res = pool.add_transaction(TransactionOrigin::Local, transaction.clone()).await;
         assert!(res.is_err());
@@ -1482,7 +1482,7 @@ mod tests {
         let outcome = validator.validate_one(TransactionOrigin::External, transaction.clone());
         assert!(outcome.is_invalid());
 
-        let pool =
+        let pool: Pool<_, _, _, ()> =
             Pool::new(validator, CoinbaseTipOrdering::default(), blob_store, Default::default());
 
         let res = pool.add_external_transaction(transaction.clone()).await;
@@ -1589,7 +1589,7 @@ mod tests {
 
         // Test pool integration
         let blob_store = InMemoryBlobStore::default();
-        let pool =
+        let pool: Pool<_, _, _, ()> =
             Pool::new(validator, CoinbaseTipOrdering::default(), blob_store, Default::default());
 
         let res = pool.add_external_transaction(transaction.clone()).await;

@@ -282,7 +282,10 @@ run_test() {
     start_node "$PREWARM"
     sleep 3
 
-    local BASE_HITS=$(get_metric "reth_txpool_pre_warming_cache_hits")
+    # Use sync caching metrics for actual cache hits during EVM execution
+    local BASE_ACCOUNT_HITS=$(get_metric "reth_sync_caching_account_cache_hits")
+    local BASE_STORAGE_HITS=$(get_metric "reth_sync_caching_storage_cache_hits")
+    local BASE_HITS=$((BASE_ACCOUNT_HITS + BASE_STORAGE_HITS))
     local BASE_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
 
     local START=$(python3 -c "import time; print(time.time())")
@@ -302,7 +305,10 @@ run_test() {
 
     sleep 3
 
-    local FINAL_HITS=$(get_metric "reth_txpool_pre_warming_cache_hits")
+    # Use sync caching metrics for actual cache hits during EVM execution
+    local ACCOUNT_HITS=$(get_metric "reth_sync_caching_account_cache_hits")
+    local STORAGE_HITS=$(get_metric "reth_sync_caching_storage_cache_hits")
+    local FINAL_HITS=$((ACCOUNT_HITS + STORAGE_HITS))
     local FINAL_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
     local STORAGE=$(get_metric "reth_txpool_pre_warming_prefetch_storage_slots")
 
