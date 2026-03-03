@@ -122,17 +122,26 @@ mod tests {
         num_accounts: usize,
         slots_per_account: usize,
     ) -> revm_database::BundleState {
+        make_test_bundle_offset(num_accounts, slots_per_account, 0)
+    }
+
+    fn make_test_bundle_offset(
+        num_accounts: usize,
+        slots_per_account: usize,
+        offset: usize,
+    ) -> revm_database::BundleState {
         let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
             PrimitivesHashMap::default();
 
         for i in 0..num_accounts {
+            let idx = offset + i;
             let mut addr_bytes = [0u8; 20];
-            addr_bytes[0..8].copy_from_slice(&(i as u64).to_be_bytes());
+            addr_bytes[0..8].copy_from_slice(&(idx as u64).to_be_bytes());
             let addr = Address::from(addr_bytes);
 
             let info = AccountInfo {
-                nonce: i as u64,
-                balance: U256::from(1000 * (i + 1)),
+                nonce: idx as u64,
+                balance: U256::from(1000 * (idx + 1)),
                 code_hash: KECCAK_EMPTY,
                 account_id: None,
                 code: None,
@@ -204,7 +213,8 @@ mod tests {
         store.update_state(outcome1.state_updates);
         store.update_trie(outcome1.trie_updates);
 
-        let bundle2 = make_test_bundle(3, 1);
+        // Use a non-overlapping offset so bundle2 contains different accounts/values.
+        let bundle2 = make_test_bundle_offset(3, 1, 100);
         let outcome2 = compute_salt_state_root(&store, &mut salt_root, &bundle2).unwrap();
 
         assert_ne!(outcome2.state_root, B256::ZERO);

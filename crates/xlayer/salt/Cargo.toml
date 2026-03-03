@@ -52,5 +52,9 @@ harness = false
 name = "block_io"
 harness = false
 
+[[bench]]
+name = "store_compare"
+harness = false
+
 [lints]
 workspace = true

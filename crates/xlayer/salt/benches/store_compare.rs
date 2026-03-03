@@ -1,0 +1,460 @@
+//! Lightweight benchmark: compare SALT backends (MdbxSaltStore, FlatFileStore, RocksSaltStore).
+//!
+//! Same workload as block_io.rs Random scenario but runs faster (fewer criterion samples).
+
+#![allow(missing_docs, unreachable_pub)]
+
+use alloy_consensus::constants::KECCAK_EMPTY;
+use alloy_primitives::{map::HashMap as PrimitivesHashMap, Address, B256, U256};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
+use revm_database::{states::StorageSlot, AccountStatus, StorageWithOriginalValues};
+use revm_state::AccountInfo;
+use std::{
+    io::Write,
+    time::{Duration, Instant},
+};
+
+use rayon::ThreadPoolBuilder;
+use salt::{EphemeralSaltState, StateRoot as SaltStateRoot};
+use xlayer_salt::{
+    convert::bundle_state_to_plain_kv, flat_store::FlatFileStore, mdbx_store::MdbxSaltStore,
+    rocks_store::RocksSaltStore,
+};
+
+const PRE_POP_ACCOUNTS: usize = 200_000;
+const NUM_BLOCKS: usize = 10;
+const ACCOUNTS_PER_BLOCK: usize = 2000;
+const SLOTS_PER_ACCOUNT: usize = 10;
+const SALT_NUM_THREADS: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Data generation (same as block_io.rs)
+// ---------------------------------------------------------------------------
+
+fn generate_bundle_state_random(
+    num_accounts: usize,
+    slots_per_account: usize,
+    rng: &mut StdRng,
+) -> revm_database::BundleState {
+    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+        PrimitivesHashMap::default();
+    let mut addr_buf = [0u8; 20];
+
+    for i in 0..num_accounts {
+        rng.fill_bytes(&mut addr_buf);
+        let addr = Address::from(addr_buf);
+        let info = AccountInfo {
+            nonce: i as u64,
+            balance: U256::from(1_000_000 * (i + 1)),
+            code_hash: KECCAK_EMPTY,
+            account_id: None,
+            code: None,
+        };
+        let mut storage = StorageWithOriginalValues::default();
+        for j in 0..slots_per_account {
+            let mut slot_bytes = [0u8; 32];
+            slot_bytes[24..32].copy_from_slice(&(j as u64).to_be_bytes());
+            let slot_key = B256::from(slot_bytes);
+            storage
+                .insert(slot_key.into(), StorageSlot::new_changed(U256::ZERO, U256::from(j + 1)));
+        }
+        state.insert(
+            addr,
+            revm_database::BundleAccount {
+                info: Some(info),
+                original_info: None,
+                status: AccountStatus::Changed,
+                storage,
+            },
+        );
+    }
+
+    revm_database::BundleState {
+        state,
+        contracts: Default::default(),
+        reverts: Default::default(),
+        state_size: 0,
+        reverts_size: 0,
+    }
+}
+
+fn generate_block_updates_from_addresses(
+    addresses: &[Address],
+    slots_per_account: usize,
+    block_index: usize,
+    rng: &mut StdRng,
+) -> revm_database::BundleState {
+    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+        PrimitivesHashMap::default();
+    let indices: Vec<usize> =
+        (0..ACCOUNTS_PER_BLOCK).map(|_| rng.random_range(0..addresses.len())).collect();
+
+    for (i, &idx) in indices.iter().enumerate() {
+        let addr = addresses[idx];
+        let nonce = (block_index * ACCOUNTS_PER_BLOCK + i) as u64;
+        let balance = U256::from(1_000_000 * (block_index * ACCOUNTS_PER_BLOCK + i + 1));
+        let info =
+            AccountInfo { nonce, balance, code_hash: KECCAK_EMPTY, account_id: None, code: None };
+        let mut storage = StorageWithOriginalValues::default();
+        for j in 0..slots_per_account {
+            let mut slot_bytes = [0u8; 32];
+            slot_bytes[24..32].copy_from_slice(&(j as u64).to_be_bytes());
+            let slot_key = B256::from(slot_bytes);
+            storage.insert(
+                slot_key.into(),
+                StorageSlot::new_changed(U256::ZERO, U256::from((block_index + j) as u128 + 1)),
+            );
+        }
+        state.insert(
+            addr,
+            revm_database::BundleAccount {
+                info: Some(info),
+                original_info: None,
+                status: AccountStatus::Changed,
+                storage,
+            },
+        );
+    }
+
+    revm_database::BundleState {
+        state,
+        contracts: Default::default(),
+        reverts: Default::default(),
+        state_size: 0,
+        reverts_size: 0,
+    }
+}
+
+fn bundle_state_changes(bundle: &revm_database::BundleState) -> usize {
+    bundle.state().iter().map(|(_, a)| 1 + a.storage.len()).sum()
+}
+
+// ---------------------------------------------------------------------------
+// Per-block stats (simplified)
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct BlockStats {
+    wall_time: Duration,
+    state_prep_time: Duration,
+    state_delta_time: Duration,
+    root_compute_time: Duration,
+    disk_io_time: Duration,
+    state_entries: usize,
+    trie_entries: usize,
+}
+
+fn print_stats(label: &str, stats: &[BlockStats]) {
+    let n = stats.len();
+    if n == 0 {
+        return;
+    }
+    let avg = |f: fn(&BlockStats) -> Duration| -> Duration {
+        stats.iter().map(f).sum::<Duration>() / n as u32
+    };
+    let avg_usize = |f: fn(&BlockStats) -> usize| -> f64 {
+        stats.iter().map(f).sum::<usize>() as f64 / n as f64
+    };
+    eprintln!("─── {} ───", label);
+    eprintln!(
+        "  {} blocks avg: {:.2?}  (prep {:.2?}  delta {:.2?}  root {:.2?}  io {:.2?})",
+        n,
+        avg(|s| s.wall_time),
+        avg(|s| s.state_prep_time),
+        avg(|s| s.state_delta_time),
+        avg(|s| s.root_compute_time),
+        avg(|s| s.disk_io_time),
+    );
+    eprintln!(
+        "  writes/blk: state {:.0}, trie {:.0}",
+        avg_usize(|s| s.state_entries),
+        avg_usize(|s| s.trie_entries),
+    );
+    eprintln!();
+}
+
+// ---------------------------------------------------------------------------
+// MDBX backend
+// ---------------------------------------------------------------------------
+
+fn reset_mdbx_pre_pop(
+    store: &MdbxSaltStore,
+    pre_pop: &revm_database::BundleState,
+    pool: &rayon::ThreadPool,
+) {
+    let kvs = bundle_state_to_plain_kv(pre_pop);
+    let mut eph = EphemeralSaltState::new(store);
+    let state_updates = eph.update_fin(&kvs).unwrap();
+    let mut root = SaltStateRoot::new(store).with_min_par_batch_size(4).with_deferred_levels(2);
+    let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
+    store.update_state(state_updates).unwrap();
+    store.update_trie(trie_updates).unwrap();
+}
+
+fn run_mdbx_blocks(
+    store: &MdbxSaltStore,
+    root: &mut SaltStateRoot<'_, MdbxSaltStore>,
+    pool: &rayon::ThreadPool,
+    block_bundles: &[revm_database::BundleState],
+) -> (Duration, Vec<BlockStats>) {
+    let mut block_stats = Vec::with_capacity(block_bundles.len());
+    let total_start = Instant::now();
+    for bundle in block_bundles {
+        let block_start = Instant::now();
+        let prep_start = Instant::now();
+        let kvs = bundle_state_to_plain_kv(bundle);
+        let prep_time = prep_start.elapsed();
+
+        let delta_start = Instant::now();
+        let mut eph = EphemeralSaltState::new(store);
+        let state_updates = eph.update_fin(&kvs).unwrap();
+        let delta_time = delta_start.elapsed();
+
+        let root_start = Instant::now();
+        let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
+        let root_time = root_start.elapsed();
+
+        let io_start = Instant::now();
+        let state_entries = state_updates.data.len();
+        let trie_entries = trie_updates.len();
+        store.update_state(state_updates).unwrap();
+        store.update_trie(trie_updates).unwrap();
+        let io_time = io_start.elapsed();
+
+        block_stats.push(BlockStats {
+            wall_time: block_start.elapsed(),
+            state_prep_time: prep_time,
+            state_delta_time: delta_time,
+            root_compute_time: root_time,
+            disk_io_time: io_time,
+            state_entries,
+            trie_entries,
+        });
+    }
+    (total_start.elapsed(), block_stats)
+}
+
+// ---------------------------------------------------------------------------
+// FlatFile backend
+// ---------------------------------------------------------------------------
+
+fn reset_flat_pre_pop(
+    store: &FlatFileStore,
+    pre_pop: &revm_database::BundleState,
+    pool: &rayon::ThreadPool,
+) {
+    let kvs = bundle_state_to_plain_kv(pre_pop);
+    let mut eph = EphemeralSaltState::new(store);
+    let state_updates = eph.update_fin(&kvs).unwrap();
+    let mut root = SaltStateRoot::new(store).with_min_par_batch_size(4).with_deferred_levels(2);
+    let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
+    store.update_state(state_updates).unwrap();
+    store.update_trie(trie_updates).unwrap();
+}
+
+fn run_flat_blocks(
+    store: &FlatFileStore,
+    root: &mut SaltStateRoot<'_, FlatFileStore>,
+    pool: &rayon::ThreadPool,
+    block_bundles: &[revm_database::BundleState],
+) -> (Duration, Vec<BlockStats>) {
+    let mut block_stats = Vec::with_capacity(block_bundles.len());
+    let total_start = Instant::now();
+    for bundle in block_bundles {
+        let block_start = Instant::now();
+        let prep_start = Instant::now();
+        let kvs = bundle_state_to_plain_kv(bundle);
+        let prep_time = prep_start.elapsed();
+
+        let delta_start = Instant::now();
+        let mut eph = EphemeralSaltState::new(store);
+        let state_updates = eph.update_fin(&kvs).unwrap();
+        let delta_time = delta_start.elapsed();
+
+        let root_start = Instant::now();
+        let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
+        let root_time = root_start.elapsed();
+
+        let io_start = Instant::now();
+        let state_entries = state_updates.data.len();
+        let trie_entries = trie_updates.len();
+        store.update_state(state_updates).unwrap();
+        store.update_trie(trie_updates).unwrap();
+        let io_time = io_start.elapsed();
+
+        block_stats.push(BlockStats {
+            wall_time: block_start.elapsed(),
+            state_prep_time: prep_time,
+            state_delta_time: delta_time,
+            root_compute_time: root_time,
+            disk_io_time: io_time,
+            state_entries,
+            trie_entries,
+        });
+    }
+    (total_start.elapsed(), block_stats)
+}
+
+// ---------------------------------------------------------------------------
+// RocksDB backend (for comparison baseline)
+// ---------------------------------------------------------------------------
+
+fn reset_rocks_pre_pop(
+    store: &RocksSaltStore,
+    pre_pop: &revm_database::BundleState,
+    pool: &rayon::ThreadPool,
+) {
+    let kvs = bundle_state_to_plain_kv(pre_pop);
+    let mut eph = EphemeralSaltState::new(store);
+    let state_updates = eph.update_fin(&kvs).unwrap();
+    let mut root = SaltStateRoot::new(store).with_min_par_batch_size(4).with_deferred_levels(2);
+    let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
+    store.update_state_and_trie(state_updates, trie_updates).unwrap();
+}
+
+fn run_rocks_blocks(
+    store: &RocksSaltStore,
+    root: &mut SaltStateRoot<'_, RocksSaltStore>,
+    pool: &rayon::ThreadPool,
+    block_bundles: &[revm_database::BundleState],
+) -> (Duration, Vec<BlockStats>) {
+    let mut block_stats = Vec::with_capacity(block_bundles.len());
+    let total_start = Instant::now();
+    for bundle in block_bundles {
+        let block_start = Instant::now();
+        let prep_start = Instant::now();
+        let kvs = bundle_state_to_plain_kv(bundle);
+        let prep_time = prep_start.elapsed();
+
+        let delta_start = Instant::now();
+        let mut eph = EphemeralSaltState::new(store);
+        let state_updates = eph.update_fin(&kvs).unwrap();
+        let delta_time = delta_start.elapsed();
+
+        let root_start = Instant::now();
+        let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
+        let root_time = root_start.elapsed();
+
+        let io_start = Instant::now();
+        let state_entries = state_updates.data.len();
+        let trie_entries = trie_updates.len();
+        store.update_state_and_trie(state_updates, trie_updates).unwrap();
+        let io_time = io_start.elapsed();
+
+        block_stats.push(BlockStats {
+            wall_time: block_start.elapsed(),
+            state_prep_time: prep_time,
+            state_delta_time: delta_time,
+            root_compute_time: root_time,
+            disk_io_time: io_time,
+            state_entries,
+            trie_entries,
+        });
+    }
+    (total_start.elapsed(), block_stats)
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark
+// ---------------------------------------------------------------------------
+
+fn bench_store_compare(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Store comparison");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    let pool = ThreadPoolBuilder::new().num_threads(SALT_NUM_THREADS).build().unwrap();
+
+    let label = format!("pre{PRE_POP_ACCOUNTS}_{NUM_BLOCKS}blk_{ACCOUNTS_PER_BLOCK}accts");
+    let state_changes_per_block = ACCOUNTS_PER_BLOCK * (1 + SLOTS_PER_ACCOUNT);
+
+    let mut rng = StdRng::seed_from_u64(42);
+    let pre_pop = generate_bundle_state_random(PRE_POP_ACCOUNTS, SLOTS_PER_ACCOUNT, &mut rng);
+    let pre_pop_addresses: Vec<Address> = pre_pop.state().keys().copied().collect();
+
+    let mut rng_blocks = StdRng::seed_from_u64(43);
+    let block_bundles: Vec<_> = (0..NUM_BLOCKS)
+        .map(|i| {
+            generate_block_updates_from_addresses(
+                &pre_pop_addresses,
+                SLOTS_PER_ACCOUNT,
+                i,
+                &mut rng_blocks,
+            )
+        })
+        .collect();
+
+    eprintln!(
+        "Setup: {} accounts, {} state changes/block",
+        PRE_POP_ACCOUNTS, state_changes_per_block
+    );
+
+    // ---- MDBX ----
+    group.bench_function(BenchmarkId::new("mdbx", &label), |b| {
+        b.iter_custom(|iters| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = MdbxSaltStore::new(dir.path()).unwrap();
+            reset_mdbx_pre_pop(&store, &pre_pop, &pool);
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                reset_mdbx_pre_pop(&store, &pre_pop, &pool);
+                let mut root =
+                    SaltStateRoot::new(&store).with_min_par_batch_size(4).with_deferred_levels(2);
+                let (elapsed, stats) = run_mdbx_blocks(&store, &mut root, &pool, &block_bundles);
+                total += elapsed;
+                if i == 0 {
+                    print_stats(&format!("MDBX({SALT_NUM_THREADS}t)"), &stats);
+                }
+            }
+            total
+        })
+    });
+
+    // ---- FlatFile ----
+    group.bench_function(BenchmarkId::new("flat", &label), |b| {
+        b.iter_custom(|iters| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = FlatFileStore::new(dir.path()).unwrap();
+            reset_flat_pre_pop(&store, &pre_pop, &pool);
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                reset_flat_pre_pop(&store, &pre_pop, &pool);
+                let mut root =
+                    SaltStateRoot::new(&store).with_min_par_batch_size(4).with_deferred_levels(2);
+                let (elapsed, stats) = run_flat_blocks(&store, &mut root, &pool, &block_bundles);
+                total += elapsed;
+                if i == 0 {
+                    print_stats(&format!("FlatFile({SALT_NUM_THREADS}t)"), &stats);
+                }
+            }
+            total
+        })
+    });
+
+    // ---- RocksDB (baseline) ----
+    group.bench_function(BenchmarkId::new("rocksdb", &label), |b| {
+        b.iter_custom(|iters| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = RocksSaltStore::new(dir.path()).unwrap();
+            reset_rocks_pre_pop(&store, &pre_pop, &pool);
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                reset_rocks_pre_pop(&store, &pre_pop, &pool);
+                let mut root =
+                    SaltStateRoot::new(&store).with_min_par_batch_size(4).with_deferred_levels(2);
+                let (elapsed, stats) = run_rocks_blocks(&store, &mut root, &pool, &block_bundles);
+                total += elapsed;
+                if i == 0 {
+                    print_stats(&format!("RocksDB({SALT_NUM_THREADS}t)"), &stats);
+                }
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_store_compare);
+criterion_main!(benches);

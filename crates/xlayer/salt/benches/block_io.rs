@@ -25,8 +25,8 @@ use std::{
 };
 
 use rayon::ThreadPoolBuilder;
-use salt::{EphemeralSaltState, StateRoot as SaltStateRoot};
-use xlayer_salt::{convert::bundle_state_to_plain_kv, rocks_store::RocksSaltStore};
+use salt::{EphemeralSaltState, MemStore, StateRoot as SaltStateRoot};
+use xlayer_salt::{convert::bundle_state_to_plain_kv, flat_store::FlatFileStore};
 
 use reth_provider::{
     test_utils::{create_test_provider_factory, MockNodeTypesWithDB},
@@ -46,7 +46,7 @@ const ACCOUNTS_PER_BLOCK: usize = 2000;
 /// Storage slots per account.
 const SLOTS_PER_ACCOUNT: usize = 10;
 /// SALT IPA thread count.
-const SALT_NUM_THREADS: usize = 8;
+const SALT_NUM_THREADS: usize = 32;
 
 /// Fixed ERC20 contract address for the benchmark (deployed once).
 fn erc20_contract() -> Address {
@@ -426,23 +426,24 @@ fn run_mpt_blocks_only(
 // ---------------------------------------------------------------------------
 
 fn reset_salt_to_pre_pop(
-    store: &RocksSaltStore,
+    store: &FlatFileStore,
     pre_pop: &revm_database::BundleState,
     pool: &rayon::ThreadPool,
 ) {
     let kvs = bundle_state_to_plain_kv(pre_pop);
     let mut eph = EphemeralSaltState::new(store);
     let state_updates = eph.update_fin(&kvs).unwrap();
-    let mut root = SaltStateRoot::new(store).with_deferred_levels(3).with_min_par_batch_size(16);
+    // deferred_levels=2: skip persisting Level 0+1 (257 nodes), recompute from children.
+    let mut root = SaltStateRoot::new(store).with_min_par_batch_size(4).with_deferred_levels(2);
     let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
-    store.update_state(state_updates).unwrap();
-    store.update_trie(trie_updates).unwrap();
+    // Write state + trie in one batch (single fsync) to match MDBX commit semantics.
+    store.update_state_and_trie(state_updates, trie_updates).unwrap();
 }
 
 /// Run N blocks only (store must already be at pre-pop state; root fresh after reset).
 fn run_salt_blocks_only(
-    store: &RocksSaltStore,
-    root: &mut SaltStateRoot<'_, RocksSaltStore>,
+    store: &FlatFileStore,
+    root: &mut SaltStateRoot<'_, FlatFileStore>,
     pool: &rayon::ThreadPool,
     block_bundles: &[revm_database::BundleState],
 ) -> (Duration, Vec<BlockStats>) {
@@ -461,13 +462,81 @@ fn run_salt_blocks_only(
         let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
         let root_time = root_start.elapsed();
         let io_start = Instant::now();
-        let ws = store.update_state(state_updates).unwrap();
-        let trie_entries = store.update_trie(trie_updates).unwrap();
+        // Combined write: single WriteBatch + single WAL flush (no double fsync).
+        let (ws, trie_entries) = store.update_state_and_trie(state_updates, trie_updates).unwrap();
         let io_time = io_start.elapsed();
         block_stats.push(BlockStats {
             wall_time: block_start.elapsed(),
             disk_write_ops: ws.entries + trie_entries,
             state_write_ops: ws.entries,
+            trie_node_disk_writes: trie_entries,
+            account_trie_writes: 0,
+            storage_trie_writes: 0,
+            state_prep_time: prep_time,
+            state_delta_time: delta_time,
+            root_compute_time: root_time,
+            disk_io_time: io_time,
+        });
+    }
+    (total_start.elapsed(), block_stats)
+}
+
+// ---------------------------------------------------------------------------
+// SALT (MemStore): megaETH-style fully in-memory backend (no disk I/O).
+//
+// This is the intended use case from megaETH's official benchmark: the state
+// and trie stay entirely in RAM.  deferred_levels=3 matches megaETH's bench.
+// ---------------------------------------------------------------------------
+
+fn reset_salt_mem_to_pre_pop(
+    store: &MemStore,
+    pre_pop: &revm_database::BundleState,
+    pool: &rayon::ThreadPool,
+) {
+    let kvs = bundle_state_to_plain_kv(pre_pop);
+    let mut eph = EphemeralSaltState::new(store);
+    let state_updates = eph.update_fin(&kvs).unwrap();
+    // deferred_levels=3 matches megaETH's official salt_trie benchmark.
+    let mut root = SaltStateRoot::new(store).with_min_par_batch_size(4).with_deferred_levels(3);
+    let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
+    store.update_state(state_updates);
+    store.update_trie(trie_updates);
+}
+
+/// Run N blocks with a fully in-memory MemStore (megaETH reference design).
+///
+/// No disk I/O: all state and trie reads/writes stay in RAM.
+fn run_salt_mem_blocks_only(
+    store: &MemStore,
+    root: &mut SaltStateRoot<'_, MemStore>,
+    pool: &rayon::ThreadPool,
+    block_bundles: &[revm_database::BundleState],
+) -> (Duration, Vec<BlockStats>) {
+    let mut block_stats = Vec::with_capacity(block_bundles.len());
+    let total_start = Instant::now();
+    for bundle in block_bundles {
+        let block_start = Instant::now();
+        let prep_start = Instant::now();
+        let kvs = bundle_state_to_plain_kv(bundle);
+        let prep_time = prep_start.elapsed();
+        let delta_start = Instant::now();
+        let mut eph = EphemeralSaltState::new(store);
+        let state_updates = eph.update_fin(&kvs).unwrap();
+        let delta_time = delta_start.elapsed();
+        let root_start = Instant::now();
+        let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
+        let root_time = root_start.elapsed();
+        // In-memory update (no disk): count entries for write-amp stats.
+        let io_start = Instant::now();
+        let state_entries = state_updates.data.len();
+        let trie_entries = trie_updates.len();
+        store.update_state(state_updates);
+        store.update_trie(trie_updates);
+        let io_time = io_start.elapsed();
+        block_stats.push(BlockStats {
+            wall_time: block_start.elapsed(),
+            disk_write_ops: 0, // in-memory: no disk writes
+            state_write_ops: state_entries,
             trie_node_disk_writes: trie_entries,
             account_trie_writes: 0,
             storage_trie_writes: 0,
@@ -547,7 +616,7 @@ fn print_blocks_stats(
 fn bench_mpt_vs_salt(c: &mut Criterion) {
     let mut group = c.benchmark_group("Block processing");
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(60));
+    group.measurement_time(Duration::from_secs(30));
 
     // Shared thread pool for SALT (avoid spawn/teardown per criterion iteration)
     let pool = ThreadPoolBuilder::new().num_threads(SALT_NUM_THREADS).build().unwrap();
@@ -607,27 +676,20 @@ fn bench_mpt_vs_salt(c: &mut Criterion) {
     });
 
     group.bench_function(
-        BenchmarkId::new(&format!("salt_{SALT_NUM_THREADS}t"), &label_erc20),
+        BenchmarkId::new(&format!("salt_flat_{SALT_NUM_THREADS}t"), &label_erc20),
         |b| {
             b.iter_custom(|iters| {
                 let dir = tempfile::TempDir::new().unwrap();
-                let store = RocksSaltStore::new(dir.path()).unwrap();
+                let store = FlatFileStore::new(dir.path()).unwrap();
                 reset_salt_to_pre_pop(&store, &erc20_pre_pop, &pool);
-                store.log_bucket_load_stats();
-                if iters > 0 {
-                    let mut root = SaltStateRoot::new(&store)
-                        .with_deferred_levels(3)
-                        .with_min_par_batch_size(16);
-                    let _ = run_salt_blocks_only(&store, &mut root, &pool, &erc20_block_bundles);
-                    reset_salt_to_pre_pop(&store, &erc20_pre_pop, &pool);
-                }
+                let snap = store.snapshot();
                 let mut total = Duration::ZERO;
                 let mut first_stats: Option<Vec<BlockStats>> = None;
                 for i in 0..iters {
-                    reset_salt_to_pre_pop(&store, &erc20_pre_pop, &pool);
+                    store.restore(&snap);
                     let mut root = SaltStateRoot::new(&store)
-                        .with_deferred_levels(3)
-                        .with_min_par_batch_size(16);
+                        .with_min_par_batch_size(4)
+                        .with_deferred_levels(2);
                     let (elapsed, stats) =
                         run_salt_blocks_only(&store, &mut root, &pool, &erc20_block_bundles);
                     total += elapsed;
@@ -638,7 +700,42 @@ fn bench_mpt_vs_salt(c: &mut Criterion) {
                 if let Some(stats) = first_stats {
                     print_blocks_stats(
                         &label_erc20,
-                        &format!("SALT({SALT_NUM_THREADS}t)"),
+                        &format!("SALT-flat({SALT_NUM_THREADS}t)"),
+                        &stats,
+                        erc20_state_changes_per_block,
+                    );
+                }
+                total
+            })
+        },
+    );
+
+    // ERC20: SALT (MemStore, megaETH-style, fully in-memory)
+    group.bench_function(
+        BenchmarkId::new(&format!("salt_mem_{SALT_NUM_THREADS}t"), &label_erc20),
+        |b| {
+            b.iter_custom(|iters| {
+                let store = MemStore::new();
+                reset_salt_mem_to_pre_pop(&store, &erc20_pre_pop, &pool);
+                let base_store = store.clone();
+                let mut total = Duration::ZERO;
+                let mut first_stats: Option<Vec<BlockStats>> = None;
+                for i in 0..iters {
+                    let store = base_store.clone();
+                    let mut root = SaltStateRoot::new(&store)
+                        .with_min_par_batch_size(4)
+                        .with_deferred_levels(3);
+                    let (elapsed, stats) =
+                        run_salt_mem_blocks_only(&store, &mut root, &pool, &erc20_block_bundles);
+                    total += elapsed;
+                    if i == 0 {
+                        first_stats = Some(stats);
+                    }
+                }
+                if let Some(stats) = first_stats {
+                    print_blocks_stats(
+                        &label_erc20,
+                        &format!("SALT-mem({SALT_NUM_THREADS}t)"),
                         &stats,
                         erc20_state_changes_per_block,
                     );
@@ -711,27 +808,20 @@ fn bench_mpt_vs_salt(c: &mut Criterion) {
     });
 
     group.bench_function(
-        BenchmarkId::new(&format!("salt_{SALT_NUM_THREADS}t"), &label_random),
+        BenchmarkId::new(&format!("salt_flat_{SALT_NUM_THREADS}t"), &label_random),
         |b| {
             b.iter_custom(|iters| {
                 let dir = tempfile::TempDir::new().unwrap();
-                let store = RocksSaltStore::new(dir.path()).unwrap();
+                let store = FlatFileStore::new(dir.path()).unwrap();
                 reset_salt_to_pre_pop(&store, &pre_pop, &pool);
-                store.log_bucket_load_stats();
-                if iters > 0 {
-                    let mut root = SaltStateRoot::new(&store)
-                        .with_deferred_levels(3)
-                        .with_min_par_batch_size(16);
-                    let _ = run_salt_blocks_only(&store, &mut root, &pool, &block_bundles);
-                    reset_salt_to_pre_pop(&store, &pre_pop, &pool);
-                }
+                let snap = store.snapshot();
                 let mut total = Duration::ZERO;
                 let mut first_stats: Option<Vec<BlockStats>> = None;
                 for i in 0..iters {
-                    reset_salt_to_pre_pop(&store, &pre_pop, &pool);
+                    store.restore(&snap);
                     let mut root = SaltStateRoot::new(&store)
-                        .with_deferred_levels(3)
-                        .with_min_par_batch_size(16);
+                        .with_min_par_batch_size(4)
+                        .with_deferred_levels(2);
                     let (elapsed, stats) =
                         run_salt_blocks_only(&store, &mut root, &pool, &block_bundles);
                     total += elapsed;
@@ -742,7 +832,42 @@ fn bench_mpt_vs_salt(c: &mut Criterion) {
                 if let Some(stats) = first_stats {
                     print_blocks_stats(
                         &label_random,
-                        &format!("SALT({SALT_NUM_THREADS}t)"),
+                        &format!("SALT-flat({SALT_NUM_THREADS}t)"),
+                        &stats,
+                        state_changes_per_block,
+                    );
+                }
+                total
+            })
+        },
+    );
+
+    // Random: SALT (MemStore, megaETH-style, fully in-memory)
+    group.bench_function(
+        BenchmarkId::new(&format!("salt_mem_{SALT_NUM_THREADS}t"), &label_random),
+        |b| {
+            b.iter_custom(|iters| {
+                let store = MemStore::new();
+                reset_salt_mem_to_pre_pop(&store, &pre_pop, &pool);
+                let base_store = store.clone();
+                let mut total = Duration::ZERO;
+                let mut first_stats: Option<Vec<BlockStats>> = None;
+                for i in 0..iters {
+                    let store = base_store.clone();
+                    let mut root = SaltStateRoot::new(&store)
+                        .with_min_par_batch_size(4)
+                        .with_deferred_levels(3);
+                    let (elapsed, stats) =
+                        run_salt_mem_blocks_only(&store, &mut root, &pool, &block_bundles);
+                    total += elapsed;
+                    if i == 0 {
+                        first_stats = Some(stats);
+                    }
+                }
+                if let Some(stats) = first_stats {
+                    print_blocks_stats(
+                        &label_random,
+                        &format!("SALT-mem({SALT_NUM_THREADS}t)"),
                         &stats,
                         state_changes_per_block,
                     );

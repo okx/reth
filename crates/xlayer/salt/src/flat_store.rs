@@ -46,12 +46,21 @@ pub struct FlatFileStore {
     state: RwLock<StateStore>,
     trie: RwLock<BTreeMap<NodeId, CommitmentBytes>>,
     state_path: PathBuf,
+    trie_path: PathBuf,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 struct StateStore {
     kvs: BTreeMap<SaltKey, SaltValue>,
     used_slots: HashMap<BucketId, u64>,
+}
+
+/// Opaque snapshot of a [`FlatFileStore`]'s in-memory state, used for fast reset
+/// in benchmarks (clone BTreeMaps instead of re-computing the full trie).
+#[derive(Debug)]
+pub struct FlatFileSnapshot {
+    state: StateStore,
+    trie: BTreeMap<NodeId, CommitmentBytes>,
 }
 
 impl std::fmt::Debug for FlatFileStore {
@@ -65,13 +74,29 @@ impl FlatFileStore {
     pub fn new(dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let state_path = dir.join("salt_flat_state.bin");
-        // Create/truncate the state file
+        let trie_path = dir.join("salt_flat_trie.bin");
         File::create(&state_path)?;
+        File::create(&trie_path)?;
         Ok(Self {
             state: RwLock::new(StateStore::default()),
             trie: RwLock::new(BTreeMap::new()),
             state_path,
+            trie_path,
         })
+    }
+
+    /// Captures a snapshot of the in-memory state + trie for fast restore.
+    pub fn snapshot(&self) -> FlatFileSnapshot {
+        FlatFileSnapshot {
+            state: self.state.read().unwrap().clone(),
+            trie: self.trie.read().unwrap().clone(),
+        }
+    }
+
+    /// Restores from a snapshot (clone BTreeMaps, skip expensive trie recomputation).
+    pub fn restore(&self, snap: &FlatFileSnapshot) {
+        *self.state.write().unwrap() = snap.state.clone();
+        *self.trie.write().unwrap() = snap.trie.clone();
     }
 
     /// Applies state updates: updates in-memory cache, then writes to disk with fsync.
@@ -126,12 +151,98 @@ impl FlatFileStore {
         Ok(WriteStats { entries: num_entries, bytes_written, persist_duration })
     }
 
-    /// Applies trie updates to memory only (trie lives in memory per SALT design).
-    pub fn update_trie(&self, updates: TrieUpdates) {
-        let mut trie = self.trie.write().unwrap();
+    /// Applies trie updates: persists to disk with fsync, then updates in-memory cache.
+    pub fn update_trie(&self, updates: TrieUpdates) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(updates.len() * 72);
+        let mut entries = Vec::with_capacity(updates.len());
         for (node_id, (_, new_val)) in updates {
-            trie.insert(node_id, new_val);
+            buf.extend_from_slice(&node_id.to_be_bytes());
+            buf.extend_from_slice(&new_val);
+            entries.push((node_id, new_val));
         }
+
+        let mut file = OpenOptions::new().write(true).truncate(true).open(&self.trie_path)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+
+        let mut trie = self.trie.write().unwrap();
+        for (id, val) in entries {
+            trie.insert(id, val);
+        }
+        Ok(())
+    }
+
+    /// Applies state and trie updates in a single sequential write + single fsync.
+    ///
+    /// Matches RocksDB's `update_state_and_trie` semantics: all changes go into one
+    /// contiguous buffer, written once, fsynced once.
+    pub fn update_state_and_trie(
+        &self,
+        state_updates: StateUpdates,
+        trie_updates: TrieUpdates,
+    ) -> std::io::Result<(WriteStats, usize)> {
+        let state_count = state_updates.data.len();
+        let trie_count = trie_updates.len();
+        let t0 = Instant::now();
+
+        let mut buf = Vec::with_capacity(state_count * 100 + trie_count * 72);
+
+        // Serialize state delta
+        for (key, (_, new_val)) in &state_updates.data {
+            buf.extend_from_slice(&key.0.to_be_bytes());
+            match new_val {
+                Some(val) => {
+                    let data_len = val.data_len();
+                    buf.push(data_len as u8);
+                    buf.extend_from_slice(&val.data[..data_len]);
+                }
+                None => buf.push(0),
+            }
+        }
+
+        // Serialize trie delta
+        let mut trie_entries = Vec::with_capacity(trie_count);
+        for (node_id, (_, new_val)) in trie_updates {
+            buf.extend_from_slice(&node_id.to_be_bytes());
+            buf.extend_from_slice(&new_val);
+            trie_entries.push((node_id, new_val));
+        }
+
+        // Single write + fsync
+        let mut file = OpenOptions::new().write(true).truncate(true).open(&self.state_path)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+
+        let bytes_written = buf.len();
+        let persist_duration = t0.elapsed();
+
+        // Update in-memory state
+        let mut state = self.state.write().unwrap();
+        for (key, (old_value, new_value)) in state_updates.data {
+            if !key.is_in_meta_bucket() {
+                let delta: i64 = match (old_value.is_some(), new_value.is_some()) {
+                    (false, true) => 1,
+                    (true, false) => -1,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    let count = state.used_slots.entry(key.bucket_id()).or_insert(0);
+                    *count = (*count as i64 + delta).max(0) as u64;
+                }
+            }
+            match new_value {
+                Some(val) => state.kvs.insert(key, val),
+                None => state.kvs.remove(&key),
+            };
+        }
+
+        // Update in-memory trie
+        let mut trie = self.trie.write().unwrap();
+        for (id, val) in trie_entries {
+            trie.insert(id, val);
+        }
+
+        Ok((WriteStats { entries: state_count, bytes_written, persist_duration }, trie_count))
     }
 }
 

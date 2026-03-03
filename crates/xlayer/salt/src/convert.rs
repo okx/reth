@@ -93,7 +93,8 @@ mod tests {
         for (addr, status, info, slots) in accounts {
             let mut storage = StorageWithOriginalValues::default();
             for (slot_key, value) in slots {
-                storage.insert(slot_key.into(), StorageSlot::new_changed(U256::ZERO, value));
+                // Use non-zero original so is_changed() == true even when present value is zero.
+                storage.insert(slot_key.into(), StorageSlot::new_changed(U256::ONE, value));
             }
             state.insert(
                 addr,
