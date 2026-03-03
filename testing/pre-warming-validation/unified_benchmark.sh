@@ -9,11 +9,12 @@
 #  Generates a unified report showing TPS and Cache performance
 #
 #  Usage:
-#    ./unified_benchmark.sh                      # Quick test (1K/10K txs)
+#    ./unified_benchmark.sh                      # Quick test (~10K txs, ~6 min)
 #    ./unified_benchmark.sh --rebuild            # Rebuild binary first
 #    ./unified_benchmark.sh --max-workers        # Use all CPUs as workers
-#    ./unified_benchmark.sh --full-load          # Full 500K+ transaction test
-#    ./unified_benchmark.sh --rebuild --max-workers --full-load  # All options
+#    ./unified_benchmark.sh --full-load          # Medium load (~28K txs, ~20 min)
+#    ./unified_benchmark.sh --high-load          # High load (~100K txs, ~60-90 min)
+#    ./unified_benchmark.sh --rebuild --max-workers --high-load  # All options
 #===============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -141,18 +142,16 @@ send_transactions() {
     local COUNT=$2
     local ERROR_LOG_FILE="$3"
 
-    # For high loads, use Python with parallel requests
+    # Use sequential sending to avoid nonce collisions
+    # Parallel sending causes "already known" and "replacement underpriced" errors
     python3 << PYEOF
 import subprocess
 import json
 import time
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 import sys
 
 TX_TYPE = "$TX_TYPE"
 COUNT = $COUNT
-BURST_SIZE = $BURST_SIZE
 SENDER = "$SENDER"
 CONTRACT_ADDR = "$CONTRACT_ADDR"
 ERC20_TRANSFER = "$ERC20_TRANSFER"
@@ -170,12 +169,9 @@ RECIPIENTS = [
     "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f",
 ]
 
-errors = []
 error_counts = {}
 
 def log_error(msg):
-    """Log error to both file and stderr"""
-    errors.append(msg)
     with open(ERROR_LOG, "a") as f:
         f.write(f"{msg}\n")
 
@@ -246,28 +242,24 @@ def send_single_tx(i):
     except Exception as e:
         return (0, str(e))
 
-# Use thread pool for parallel sending
+# Sequential sending to avoid nonce collisions
 success = 0
 failed = 0
-num_workers = min(32, COUNT // 10 + 1)  # Scale workers with load
 
-with ThreadPoolExecutor(max_workers=num_workers) as executor:
-    futures = [executor.submit(send_single_tx, i) for i in range(COUNT)]
-    for future in concurrent.futures.as_completed(futures):
-        result, error = future.result()
-        if result == 1:
-            success += 1
-        else:
-            failed += 1
-            if error:
-                error_counts[error] = error_counts.get(error, 0) + 1
+for i in range(COUNT):
+    result, error = send_single_tx(i)
+    if result == 1:
+        success += 1
+    else:
+        failed += 1
+        if error:
+            error_counts[error] = error_counts.get(error, 0) + 1
 
 # Log error summary
 if error_counts:
     log_error(f"\n[{TX_TYPE}] Error Summary ({failed} failed out of {COUNT}):")
     for err, count in sorted(error_counts.items(), key=lambda x: -x[1])[:5]:
         log_error(f"  - {err}: {count} times")
-        # Also print to stderr for console visibility
         print(f"  [ERROR] {err}: {count}x", file=sys.stderr)
 
 print(success)
@@ -351,10 +343,19 @@ BURST_DELAY=0.1         # 100ms between bursts
 
 # For higher load test, use --full-load flag (~20-30 minutes)
 FULL_LOAD=false
+HIGH_LOAD=false
+
 if [ "$1" = "--full-load" ] || [ "$2" = "--full-load" ] || [ "$3" = "--full-load" ]; then
     FULL_LOAD=true
     NORMAL_LOAD=2000    # 2K for normal
     PEAK_LOAD=5000      # 5K for peak (total ~28K across all tests)
+fi
+
+# For 100K+ transactions, use --high-load flag (~60-90 minutes)
+if [ "$1" = "--high-load" ] || [ "$2" = "--high-load" ] || [ "$3" = "--high-load" ] || [ "$4" = "--high-load" ]; then
+    HIGH_LOAD=true
+    NORMAL_LOAD=10000   # 10K for normal
+    PEAK_LOAD=15000     # 15K for peak (total ~100K across all tests)
 fi
 
 # Get number of CPU cores for optimal worker count
@@ -374,7 +375,9 @@ echo -e "${BOLD}${MAGENTA}║       UNIFIED PRE-WARMING BENCHMARK SUITE         
 echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  Date: $(date '+%Y-%m-%d %H:%M:%S')"
-if [ "$FULL_LOAD" = true ]; then
+if [ "$HIGH_LOAD" = true ]; then
+    echo -e "  ${BOLD}${RED}MODE: HIGH LOAD (~100K transactions) - Est. 60-90 minutes${NC}"
+elif [ "$FULL_LOAD" = true ]; then
     echo -e "  ${BOLD}MODE: FULL LOAD (~28K transactions)${NC}"
 fi
 echo -e "  Normal Load: ${NORMAL_LOAD} txs | Peak Load: ${PEAK_LOAD} txs"
@@ -657,4 +660,3 @@ fi
 rm -rf "$LOG_DIR"
 
 echo -e "${BOLD}${GREEN}Benchmark complete!${NC}"
-
