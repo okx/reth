@@ -64,14 +64,10 @@ min-trace-logs = ["tracing/release_max_level_trace"]
 
 edge = ["reth-optimism-cli/edge"]
 
-<<<<<<< Updated upstream
-pre-warming = ["reth-optimism-node/pre-warming"]
-=======
 pre-warming = [
     "reth-optimism-cli/pre-warming",
     "reth-optimism-node/pre-warming",
 ]
->>>>>>> Stashed changes
 
 [[bin]]
 name = "op-reth"

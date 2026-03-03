@@ -285,7 +285,7 @@ where
                             let snapshot = std::sync::Arc::new(
                                 reth_transaction_pool::pre_warming::SnapshotState::new(state_provider)
                             );
-                            let num_threads = 4;
+                            let num_threads = reth_transaction_pool::pre_warming::get_global_prefetch_threads();
 
                             tracing::warn!(
                                 target: "payload_builder",

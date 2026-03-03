@@ -24,12 +24,16 @@ use crate::pre_warming::PreWarmedCache;
 use crate::pre_warming::PreWarmingMetrics;
 use parking_lot::RwLock;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Global cache holder
 static GLOBAL_CACHE: RwLock<Option<Arc<PreWarmedCache>>> = RwLock::new(None);
 
 /// Global metrics holder
 static GLOBAL_METRICS: RwLock<Option<Arc<PreWarmingMetrics>>> = RwLock::new(None);
+
+/// Global prefetch threads count (defaults to available CPUs)
+static GLOBAL_PREFETCH_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 /// Set the global pre-warmed cache
 ///
@@ -85,6 +89,34 @@ pub fn get_global_cache() -> Option<Arc<PreWarmedCache>> {
 pub fn get_global_metrics() -> Option<Arc<PreWarmingMetrics>> {
     GLOBAL_METRICS.read().clone()
 }
+
+/// Set the global prefetch threads count
+///
+/// Called by the transaction pool when the worker pool is initialized.
+pub fn set_global_prefetch_threads(num_threads: usize) {
+    GLOBAL_PREFETCH_THREADS.store(num_threads, Ordering::Relaxed);
+    tracing::warn!(
+        target: "txpool::pre_warming",
+        num_threads,
+        ">>> set_global_prefetch_threads called"
+    );
+}
+
+/// Get the global prefetch threads count
+///
+/// Returns the configured number of prefetch threads, or defaults to available CPUs.
+pub fn get_global_prefetch_threads() -> usize {
+    let stored = GLOBAL_PREFETCH_THREADS.load(Ordering::Relaxed);
+    if stored == 0 {
+        // Default to available CPUs if not set
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+    } else {
+        stored
+    }
+}
+
 /// Check if pre-warming is active (cache registered)
 pub fn is_pre_warming_active() -> bool {
     GLOBAL_CACHE.read().is_some()

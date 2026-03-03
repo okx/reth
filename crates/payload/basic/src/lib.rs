@@ -241,8 +241,8 @@ where
                             reth_transaction_pool::pre_warming::SnapshotState::new(state_provider)
                         );
 
-                        // Default to 4 threads for parallel prefetch
-                        let num_threads = 4;
+                        // Use globally configured prefetch threads (from --txpool.pre-warming-workers)
+                        let num_threads = reth_transaction_pool::pre_warming::get_global_prefetch_threads();
 
                         // Use sync version (uses std::thread::scope internally)
                         if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot_sync(

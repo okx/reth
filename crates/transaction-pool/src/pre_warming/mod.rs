@@ -59,7 +59,7 @@ pub use simulator::Simulator;
 pub use snapshot_state::SnapshotState;
 pub use bridge::{prefetch_with_snapshot, prefetch_with_snapshot_sync, get_cache_stats};
 pub use metrics::PreWarmingMetrics;
-pub use registry::{set_global_cache, get_global_cache, set_global_metrics, get_global_metrics, is_pre_warming_active, clear_global_cache};
+pub use registry::{set_global_cache, get_global_cache, set_global_metrics, get_global_metrics, is_pre_warming_active, clear_global_cache, set_global_prefetch_threads, get_global_prefetch_threads};
 
 /// Trait for transaction pools that support pre-warming via simulation.
 ///

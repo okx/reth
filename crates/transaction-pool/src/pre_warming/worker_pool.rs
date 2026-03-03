@@ -529,6 +529,9 @@ where
         // Register metrics globally so prefetch can update them
         crate::pre_warming::registry::set_global_metrics(Arc::clone(&metrics));
 
+        // Register prefetch threads count globally so payload builder can use it
+        crate::pre_warming::registry::set_global_prefetch_threads(config.num_workers);
+
         Self {
             sender,
             workers,
