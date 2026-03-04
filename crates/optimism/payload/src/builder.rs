@@ -237,61 +237,33 @@ where
                 });
                 
                 cached_reads.set_metrics_callbacks(on_hit, on_miss);
-                tracing::warn!(
-                    target: "payload_builder",
-                    ">>> PREFETCH: Metrics callbacks set on cached_reads for hit/miss tracking ✅"
-                );
-            } else {
-                tracing::warn!(
-                    target: "payload_builder",
-                    ">>> PREFETCH: No global metrics found ❌"
-                );
             }
 
             if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
-                tracing::warn!(
-                    target: "payload_builder",
-                    ">>> PREFETCH Step 3: Got cache from global registry"
-                );
-
                 let keys = cache.get_all_keys();
 
-                tracing::warn!(
+                tracing::debug!(
                     target: "payload_builder",
                     accounts = keys.accounts.len(),
                     storage_slots = keys.storage_slots.len(),
                     code_hashes = keys.code_hashes.len(),
-                    block_hashes = keys.block_hashes.len(),
-                    is_empty = keys.is_empty(),
-                    ">>> PREFETCH Step 4: Retrieved keys from cache"
+                    "PREFETCH: Retrieved keys from cache"
                 );
 
                 if !keys.is_empty() {
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "payload_builder",
-                        ">>> PREFETCH Step 5: Keys NOT empty, proceeding with prefetch"
+                        "PREFETCH: Keys found, proceeding with prefetch"
                     );
 
                     // Get state provider for prefetching
                     match self.client.state_by_block_hash(config.parent_header.hash()) {
                         Ok(state_provider) => {
-                            tracing::warn!(
-                                target: "payload_builder",
-                                parent_hash = ?config.parent_header.hash(),
-                                ">>> PREFETCH Step 6: Got state provider"
-                            );
-
                             // Wrap in Arc<SnapshotState> for parallel prefetch
                             let snapshot = std::sync::Arc::new(
                                 reth_transaction_pool::pre_warming::SnapshotState::new(state_provider)
                             );
                             let num_threads = reth_transaction_pool::pre_warming::get_global_prefetch_threads();
-
-                            tracing::warn!(
-                                target: "payload_builder",
-                                num_threads,
-                                ">>> PREFETCH Step 7: Calling prefetch_with_snapshot_sync"
-                            );
 
                             // Get global metrics to pass to prefetch
                             let metrics = reth_transaction_pool::pre_warming::get_global_metrics();
@@ -306,16 +278,18 @@ where
                                 metrics_ref,
                             ) {
                                 Ok(()) => {
-                                    tracing::warn!(
+                                    tracing::debug!(
                                         target: "payload_builder",
-                                        ">>> PREFETCH Step 8: Prefetch SUCCESS ✅"
+                                        accounts = keys.accounts.len(),
+                                        storage = keys.storage_slots.len(),
+                                        "PREFETCH: Success"
                                     );
                                 }
                                 Err(err) => {
                                     tracing::warn!(
                                         target: "payload_builder",
                                         ?err,
-                                        ">>> PREFETCH Step 8: Prefetch FAILED ❌"
+                                        "PREFETCH: Failed"
                                     );
                                 }
                             }
@@ -324,8 +298,7 @@ where
                             tracing::warn!(
                                 target: "payload_builder",
                                 ?err,
-                                parent_hash = ?config.parent_header.hash(),
-                                ">>> PREFETCH Step 6: FAILED to get state provider ❌"
+                                "PREFETCH: Failed to get state provider"
                             );
                         }
                     }

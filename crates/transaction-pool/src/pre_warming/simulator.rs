@@ -201,6 +201,8 @@ impl Simulator {
     /// - Balance/allowance mappings for all addresses in calldata
     /// - ERC721/ERC1155 specific patterns
     /// - Uniswap/DEX patterns
+    ///
+    /// OPTIMIZED: Only queries essential slots based on calldata analysis
     fn simulate_comprehensive_storage_access(
         db: &mut TrackingDatabaseMut,
         contract: Address,
@@ -209,14 +211,14 @@ impl Simulator {
     ) {
         use revm::Database;
 
-        // Query common state variable slots (covers most contracts)
-        // Slots 0-15 cover: owner, balances, allowances, totalSupply, name, symbol, decimals, etc.
-        for slot in 0u64..16 {
+        // OPTIMIZATION: Only query slots 0-3 (most common state vars)
+        // instead of 0-15 which was too aggressive
+        for slot in 0u64..4 {
             let _ = db.storage(contract, U256::from(slot));
         }
 
-        // Extract all addresses from calldata and query their balance slots
-        let addresses = Self::extract_all_addresses_from_calldata(input, sender);
+        // Extract addresses from calldata (limit to first 5 to avoid overhead)
+        let addresses = Self::extract_all_addresses_from_calldata_limited(input, sender, 5);
 
         // Common ERC20 storage layout slots
         const BALANCES_SLOT: U256 = U256::ZERO;
@@ -230,47 +232,43 @@ impl Simulator {
             let balance_slot = Self::compute_mapping_slot(BALANCES_SLOT, *addr);
             let _ = db.storage(contract, balance_slot);
 
-            // Query allowance mapping slots (addr as owner, sender as spender and vice versa)
-            let allowance_slot1 = Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, *addr, sender);
-            let allowance_slot2 = Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, sender, *addr);
-            let _ = db.storage(contract, allowance_slot1);
-            let _ = db.storage(contract, allowance_slot2);
+            // OPTIMIZATION: Only query allowance if sender != addr
+            if *addr != sender {
+                let allowance_slot = Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, *addr, sender);
+                let _ = db.storage(contract, allowance_slot);
+            }
         }
 
-        // Query Uniswap V2 specific slots if this might be a pair contract
-        // Reserves are typically at slots 8-10
-        for slot in 8u64..12 {
-            let _ = db.storage(contract, U256::from(slot));
+        // OPTIMIZATION: Only query Uniswap slots if calldata looks like a swap
+        // (has specific length patterns for swap calls)
+        if input.len() >= 100 && input.len() <= 200 {
+            // Likely a swap - query reserves
+            for slot in 8u64..11 {
+                let _ = db.storage(contract, U256::from(slot));
+            }
         }
 
-        // Query ERC721 specific slots for token IDs in calldata
-        if input.len() >= 68 {
-            // Try to extract tokenId from common positions
-            for offset in [4usize, 36, 68].iter() {
-                if input.len() >= offset + 32 {
-                    let potential_token_id = U256::from_be_slice(&input[*offset..*offset + 32]);
-                    if potential_token_id < U256::from(1_000_000_000u64) {
-                        // Likely a token ID, not a large number
-                        // ERC721 owners mapping (slot 0 typically)
-                        let owner_slot = Self::compute_mapping_slot_u256(U256::ZERO, potential_token_id);
-                        let _ = db.storage(contract, owner_slot);
-
-                        // ERC721 token approvals mapping (slot 2 typically)
-                        let approval_slot = Self::compute_mapping_slot_u256(U256::from(2), potential_token_id);
-                        let _ = db.storage(contract, approval_slot);
-                    }
+        // OPTIMIZATION: Only check ERC721 if calldata has tokenId-sized params
+        if input.len() >= 68 && input.len() <= 140 {
+            // Try to extract tokenId from position 68 (common for safeTransferFrom)
+            if input.len() >= 100 {
+                let potential_token_id = U256::from_be_slice(&input[68..100]);
+                if potential_token_id < U256::from(1_000_000u64) {
+                    // Likely a token ID
+                    let owner_slot = Self::compute_mapping_slot_u256(U256::ZERO, potential_token_id);
+                    let _ = db.storage(contract, owner_slot);
                 }
             }
         }
     }
 
-    /// Extract all potential addresses from calldata
-    fn extract_all_addresses_from_calldata(input: &[u8], sender: Address) -> Vec<Address> {
+    /// Extract addresses from calldata with a limit to avoid overhead
+    fn extract_all_addresses_from_calldata_limited(input: &[u8], sender: Address, max_addresses: usize) -> Vec<Address> {
         let mut addresses = vec![sender];
 
         // Skip selector (first 4 bytes)
         let mut offset = 4;
-        while offset + 32 <= input.len() {
+        while offset + 32 <= input.len() && addresses.len() < max_addresses {
             let chunk = &input[offset..offset + 32];
             // Check if this looks like an address (first 12 bytes are zeros)
             if chunk[0..12].iter().all(|&b| b == 0) {
@@ -283,6 +281,11 @@ impl Simulator {
         }
 
         addresses
+    }
+
+    /// Extract all potential addresses from calldata (unlimited version)
+    fn extract_all_addresses_from_calldata(input: &[u8], sender: Address) -> Vec<Address> {
+        Self::extract_all_addresses_from_calldata_limited(input, sender, usize::MAX)
     }
 
     /// Simulate a transaction and extract ALL accessed keys

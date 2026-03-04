@@ -214,13 +214,14 @@ pub fn prefetch_with_snapshot_sync(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::sync::Mutex;
 
-    tracing::warn!(
+    // Use trace level for hot path logging to avoid overhead
+    tracing::trace!(
         target: "txpool::pre_warming",
         num_threads,
         accounts = keys.accounts.len(),
         storage_slots = keys.storage_slots.len(),
         code_hashes = keys.code_hashes.len(),
-        ">>> PREFETCH_SYNC: Starting parallel prefetch"
+        "PREFETCH_SYNC: Starting parallel prefetch"
     );
 
     let num_threads = num_threads.max(1);
@@ -230,34 +231,25 @@ pub fn prefetch_with_snapshot_sync(
     let storage_slots: Vec<(Address, U256)> = keys.storage_slots.iter().copied().collect();
     let code_hashes: Vec<B256> = keys.code_hashes.iter().copied().collect();
 
-    tracing::warn!(
-        target: "txpool::pre_warming",
-        accounts_count = accounts.len(),
-        storage_count = storage_slots.len(),
-        code_count = code_hashes.len(),
-        ">>> PREFETCH_SYNC: Keys collected for parallel fetch"
-    );
+    // Skip if nothing to prefetch
+    if accounts.is_empty() && storage_slots.is_empty() && code_hashes.is_empty() {
+        return Ok(());
+    }
 
     // Use Mutex to collect results from threads
-    let account_results: Mutex<Vec<(Address, CachedAccount)>> = Mutex::new(Vec::new());
-    let storage_results: Mutex<Vec<(Address, U256, U256)>> = Mutex::new(Vec::new());
-    let bytecode_results: Mutex<Vec<(B256, revm::bytecode::Bytecode)>> = Mutex::new(Vec::new());
+    let account_results: Mutex<Vec<(Address, CachedAccount)>> = Mutex::new(Vec::with_capacity(accounts.len()));
+    let storage_results: Mutex<Vec<(Address, U256, U256)>> = Mutex::new(Vec::with_capacity(storage_slots.len()));
+    let bytecode_results: Mutex<Vec<(B256, revm::bytecode::Bytecode)>> = Mutex::new(Vec::with_capacity(code_hashes.len()));
 
     std::thread::scope(|s| {
         // Partition accounts across threads
         let chunk_size = (accounts.len() / num_threads).max(1);
-        tracing::warn!(
-            target: "txpool::pre_warming",
-            chunk_size,
-            num_chunks = accounts.chunks(chunk_size).len(),
-            ">>> PREFETCH_SYNC: Spawning account fetch threads"
-        );
 
         for chunk in accounts.chunks(chunk_size) {
             let account_results = &account_results;
             let snapshot = &snapshot;
             s.spawn(move || {
-                let mut local_results = Vec::new();
+                let mut local_results = Vec::with_capacity(chunk.len());
                 for &address in chunk {
                     if let Ok(info) = snapshot.basic_account(address) {
                         local_results.push((address, CachedAccount {
@@ -276,7 +268,7 @@ pub fn prefetch_with_snapshot_sync(
             let storage_results = &storage_results;
             let snapshot = &snapshot;
             s.spawn(move || {
-                let mut local_results = Vec::new();
+                let mut local_results = Vec::with_capacity(chunk.len());
                 for &(address, slot) in chunk {
                     if let Ok(value) = snapshot.storage(address, slot) {
                         local_results.push((address, slot, value));
@@ -292,7 +284,7 @@ pub fn prefetch_with_snapshot_sync(
             let bytecode_results = &bytecode_results;
             let snapshot = &snapshot;
             s.spawn(move || {
-                let mut local_results = Vec::new();
+                let mut local_results = Vec::with_capacity(chunk.len());
                 for &code_hash in chunk {
                     if code_hash.is_zero() {
                         continue;
@@ -306,22 +298,17 @@ pub fn prefetch_with_snapshot_sync(
         }
     });
 
-    tracing::warn!(
-        target: "txpool::pre_warming",
-        ">>> PREFETCH_SYNC: All threads completed, merging results"
-    );
-
     // Merge results into cached_reads
     let account_results_vec = account_results.into_inner().unwrap();
     let storage_results_vec = storage_results.into_inner().unwrap();
     let bytecode_results_vec = bytecode_results.into_inner().unwrap();
 
-    tracing::warn!(
+    tracing::trace!(
         target: "txpool::pre_warming",
         accounts_fetched = account_results_vec.len(),
         storage_fetched = storage_results_vec.len(),
         bytecode_fetched = bytecode_results_vec.len(),
-        ">>> PREFETCH_SYNC: Fetched results from MDBX"
+        "PREFETCH_SYNC: Fetched results from MDBX"
     );
 
     for (address, account) in account_results_vec {
