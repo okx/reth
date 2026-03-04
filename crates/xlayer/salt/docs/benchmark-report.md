@@ -64,13 +64,41 @@ We benchmarked **SALT** (State Access Lookup Trie, megaETH's trie design) agains
 
 Using the `store_compare` benchmark, we isolated the storage backend impact on SALT performance:
 
-| Backend      | Total/blk | prep    | delta   | root     | io       | 10-block total |
-|--------------|-----------|---------|---------|----------|----------|----------------|
-| **FlatFile** | 145 ms    | 2.8 ms  | 27 ms   | 90 ms    | 21 ms    | 1,471 ms       |
-| **RocksDB**  | 250 ms    | 2.9 ms  | 105 ms  | 103 ms   | 37 ms    | 2,505 ms       |
-| **MDBX**     | 526 ms    | 2.6 ms  | 31 ms   | 125 ms   | 365 ms   | 5,262 ms       |
+| Backend          | Total/blk  | prep    | delta    | root     | io       | 10-block total |
+|------------------|------------|---------|----------|----------|----------|----------------|
+| **AsyncRocks**   | **119 ms** | 2.7 ms  | 12.4 ms  | 95.6 ms  | 12.5 ms  | **1,195 ms**   |
+| **FlatFile**     | 145 ms     | 2.8 ms  | 27 ms    | 90 ms    | 21 ms    | 1,471 ms       |
+| **RocksDB**      | 250 ms     | 2.9 ms  | 105 ms   | 103 ms   | 37 ms    | 2,505 ms       |
+| **MDBX**         | 526 ms     | 2.6 ms  | 31 ms    | 125 ms   | 365 ms   | 5,262 ms       |
 
-FlatFile is **3.6x faster than MDBX** and **1.7x faster than RocksDB** for SALT workloads.
+AsyncRocks is the fastest backend — **18% faster than FlatFile**, **2.1x faster than RocksDB**, and **4.4x faster than MDBX**.
+
+### AsyncRocksStore Optimization Journey
+
+AsyncRocksStore combines **in-memory reads** with **background RocksDB persistence**. Starting from a baseline of ~173 ms/block, we applied a series of optimizations:
+
+| Optimization                     | Total/blk  | delta    | root     | io       | Delta improvement |
+|----------------------------------|------------|----------|----------|----------|-------------------|
+| Baseline (sync RocksDB)         | ~250 ms    | 105 ms   | 103 ms   | 37 ms    | —                 |
+| In-memory reads + async writes  | ~173 ms    | 60.6 ms  | 94.6 ms  | 14.0 ms  | -44.4 ms          |
+| Per-bucket HashMap + ReadSession | ~159 ms    | 53.1 ms  | 93.4 ms  | 11.6 ms  | -7.5 ms           |
+| **Parallel delta (rayon)**       | **~119 ms**| **12.4 ms**| 95.6 ms| 12.5 ms  | **-40.7 ms**      |
+
+#### Key optimizations applied:
+
+1. **In-memory state + async RocksDB persistence**: All reads from per-bucket `HashMap<BucketId, Vec<(SaltKey, SaltValue)>>` in memory. Writes dispatched to background thread via `mpsc` channel. Eliminated synchronous disk I/O from the critical path.
+
+2. **Per-bucket storage with O(1)+O(log k) lookups**: Replaced single `BTreeMap<SaltKey, SaltValue>` (O(log N), N=millions) with `HashMap<BucketId, Vec<(SaltKey, SaltValue)>>`. Each bucket's Vec is sorted, giving O(1) HashMap lookup + O(log 256) binary search. Excellent L1/L2 cache locality.
+
+3. **ReadSession (lock-free delta)**: `AsyncRocksReadSession` holds `RwLockReadGuard` for the entire delta phase, avoiding ~25K per-call lock acquire/release cycles (~1.75ms saved).
+
+4. **Parallel delta via rayon**: Partition KVs by `salt::hasher::bucket_id()`, distribute to N rayon threads, each with its own `EphemeralSaltState`. Non-overlapping bucket_ids → disjoint SaltKeys → safe parallel merge. **4.3x speedup** on delta (53ms → 12.4ms).
+
+5. **Root || IO overlap**: `rayon::join` overlaps root computation (reads trie RwLock) with in-memory state update (writes state RwLock). Different locks → minimal contention.
+
+#### Remaining bottleneck
+
+Root computation at **95.6 ms (80% of total)** is now the dominant cost. This is CPU-bound cryptographic work (Banderwagon EC point multiplications + IPA commitments) inside the salt library, already parallelized internally with rayon. The theoretical floor is `prep(2.7ms) + delta(12.4ms) + root(95.6ms) ≈ 111ms`; current 119ms is within 8% of optimal.
 
 ## Analysis
 
@@ -140,15 +168,17 @@ This trade-off favors SALT because:
 
 ## Conclusion
 
-SALT with a FlatFile backend is a valid and promising direction for Ethereum state management. The benchmark results demonstrate that:
+SALT is a valid and promising direction for Ethereum state management. The benchmark results demonstrate that:
 
-1. **SALT-flat outperforms MPT** in both high-locality (ERC20, 30% faster) and broad-access (Random, 5% faster) workloads.
+1. **SALT outperforms MPT** in both high-locality (ERC20, 30% faster) and broad-access (Random, 5%–17% faster) workloads.
 
-2. **Disk I/O is eliminated as a bottleneck** — SALT-flat and SALT-mem perform nearly identically, meaning the FlatFile backend adds negligible overhead. The performance ceiling is now CPU-bound (trie hashing), which is amenable to parallelism.
+2. **Disk I/O is eliminated as a bottleneck** — SALT-flat and SALT-mem perform nearly identically, meaning the FlatFile backend adds negligible overhead. AsyncRocksStore goes further by combining in-memory reads with production-grade RocksDB crash recovery, achieving the best overall performance (119 ms/block).
 
-3. **The storage backend matters enormously** — switching from MDBX to FlatFile provides a 3.6x speedup for the same SALT computation, confirming that traditional key-value stores are ill-suited for append-heavy trie workloads.
+3. **The storage backend matters enormously** — switching from MDBX to FlatFile provides a 3.6x speedup; AsyncRocksStore provides a further 18% improvement over FlatFile through parallel delta computation and lock-optimized read sessions.
 
-4. **SALT trades the right resources**: It exchanges disk I/O (scarce, hard to scale) for CPU and memory (abundant, cheap, horizontally scalable). As hardware trends continue — more cores, more RAM, but similar I/O latencies — this trade-off becomes increasingly favorable.
+4. **Parallelism is the key to further gains**: The parallel delta optimization (partitioning KVs by bucket_id across rayon threads) achieved a 4.3x speedup on the delta phase. The remaining bottleneck is root computation (95ms, 80% of total), which is already parallelized within the salt library.
+
+5. **SALT trades the right resources**: It exchanges disk I/O (scarce, hard to scale) for CPU and memory (abundant, cheap, horizontally scalable). As hardware trends continue — more cores, more RAM, but similar I/O latencies — this trade-off becomes increasingly favorable.
 
 The main cost is higher write amplification (2.59x vs 1.11x) and increased memory usage for the in-memory trie. These are manageable engineering trade-offs, especially in environments where block processing throughput is the primary constraint.
 

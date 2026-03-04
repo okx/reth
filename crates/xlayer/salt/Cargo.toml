@@ -32,6 +32,7 @@ tracing.workspace = true
 thiserror.workspace = true
 page_size.workspace = true
 rocksdb.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

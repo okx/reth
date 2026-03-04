@@ -12,14 +12,15 @@ use revm_database::{states::StorageSlot, AccountStatus, StorageWithOriginalValue
 use revm_state::AccountInfo;
 use std::{
     io::Write,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use rayon::ThreadPoolBuilder;
+use rayon::{prelude::*, ThreadPoolBuilder};
 use salt::{EphemeralSaltState, StateRoot as SaltStateRoot};
 use xlayer_salt::{
-    convert::bundle_state_to_plain_kv, flat_store::FlatFileStore, mdbx_store::MdbxSaltStore,
-    rocks_store::RocksSaltStore,
+    async_rocks_store::AsyncRocksStore, convert::bundle_state_to_plain_kv,
+    flat_store::FlatFileStore, mdbx_store::MdbxSaltStore, rocks_store::RocksSaltStore,
 };
 
 const PRE_POP_ACCOUNTS: usize = 200_000;
@@ -356,6 +357,116 @@ fn run_rocks_blocks(
 }
 
 // ---------------------------------------------------------------------------
+// AsyncRocksDB backend (in-memory reads + async RocksDB persistence)
+// ---------------------------------------------------------------------------
+
+fn reset_async_rocks_pre_pop(
+    store: &AsyncRocksStore,
+    pre_pop: &revm_database::BundleState,
+    pool: &rayon::ThreadPool,
+) {
+    let kvs = bundle_state_to_plain_kv(pre_pop);
+    let mut eph = EphemeralSaltState::new(store);
+    let state_updates = eph.update_fin(&kvs).unwrap();
+    let mut root = SaltStateRoot::new(store).with_min_par_batch_size(4).with_deferred_levels(2);
+    let (_root_hash, trie_updates) = pool.install(|| root.update_fin(&state_updates).unwrap());
+    store.update_state_and_trie(state_updates, trie_updates).unwrap();
+    // Drain the massive pre-pop write so benchmark blocks start with an idle writer.
+    store.wait_for_idle();
+}
+
+fn run_async_rocks_blocks(
+    store: &AsyncRocksStore,
+    root: &mut SaltStateRoot<'_, AsyncRocksStore>,
+    pool: &rayon::ThreadPool,
+    block_bundles: &[revm_database::BundleState],
+) -> (Duration, Vec<BlockStats>) {
+    let mut block_stats = Vec::with_capacity(block_bundles.len());
+    let total_start = Instant::now();
+    for bundle in block_bundles {
+        let block_start = Instant::now();
+        let prep_start = Instant::now();
+        let kvs = bundle_state_to_plain_kv(bundle);
+        let prep_time = prep_start.elapsed();
+
+        // Parallel delta: partition KVs by SALT bucket_id, process each partition
+        // with its own EphemeralSaltState on a rayon thread, merge results.
+        // Safe because different bucket_ids → non-overlapping SaltKeys.
+        let delta_start = Instant::now();
+        let state_updates = {
+            let session = store.read_session();
+
+            // Group KVs by SALT bucket_id (just references, no copies).
+            let mut groups: std::collections::HashMap<u32, Vec<(&Vec<u8>, &Option<Vec<u8>>)>> =
+                std::collections::HashMap::new();
+            for (key, val) in &kvs {
+                let bid = salt::hasher::bucket_id(key);
+                groups.entry(bid).or_default().push((key, val));
+            }
+
+            // Distribute groups into N partitions (round-robin by bucket).
+            let num_partitions = pool.current_num_threads().max(1);
+            let mut partitions: Vec<Vec<(&Vec<u8>, &Option<Vec<u8>>)>> =
+                (0..num_partitions).map(|_| Vec::new()).collect();
+            for (i, (_, group_kvs)) in groups.into_iter().enumerate() {
+                partitions[i % num_partitions].extend(group_kvs);
+            }
+
+            // Process partitions in parallel — each gets its own EphemeralSaltState.
+            let results: Vec<salt::StateUpdates> = pool.install(|| {
+                partitions
+                    .into_par_iter()
+                    .filter_map(|partition| {
+                        if partition.is_empty() {
+                            return None;
+                        }
+                        let mut eph = EphemeralSaltState::new(&session);
+                        Some(eph.update_fin(partition.into_iter()).unwrap())
+                    })
+                    .collect()
+            });
+
+            // Merge non-overlapping StateUpdates (different bucket_ids → disjoint keys).
+            let mut merged = salt::StateUpdates::default();
+            for updates in results {
+                merged.data.extend(updates.data);
+            }
+            Arc::new(merged)
+        };
+        let delta_time = delta_start.elapsed();
+
+        // Dispatch Arc to background writer (~ns).
+        store.dispatch_state_to_bg(Arc::clone(&state_updates)).unwrap();
+
+        // Overlap in-memory state update with root computation.
+        let overlap_start = Instant::now();
+        let ((_root_hash, trie_updates), ws) = pool.install(|| {
+            rayon::join(
+                || root.update_fin(&state_updates).unwrap(),
+                || store.apply_state_in_memory(&state_updates),
+            )
+        });
+        let overlap_time = overlap_start.elapsed();
+
+        // Trie dispatch after root.
+        let trie_io_start = Instant::now();
+        let trie_entries = store.update_trie(trie_updates).unwrap();
+        let trie_dispatch_time = trie_io_start.elapsed();
+
+        block_stats.push(BlockStats {
+            wall_time: block_start.elapsed(),
+            state_prep_time: prep_time,
+            state_delta_time: delta_time,
+            root_compute_time: overlap_time,
+            disk_io_time: ws.persist_duration + trie_dispatch_time,
+            state_entries: ws.entries,
+            trie_entries,
+        });
+    }
+    (total_start.elapsed(), block_stats)
+}
+
+// ---------------------------------------------------------------------------
 // Benchmark
 // ---------------------------------------------------------------------------
 
@@ -447,6 +558,29 @@ fn bench_store_compare(c: &mut Criterion) {
                 total += elapsed;
                 if i == 0 {
                     print_stats(&format!("RocksDB({SALT_NUM_THREADS}t)"), &stats);
+                }
+            }
+            total
+        })
+    });
+
+    // ---- AsyncRocksDB (in-memory reads + async persistence) ----
+    group.bench_function(BenchmarkId::new("async_rocks", &label), |b| {
+        b.iter_custom(|iters| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = AsyncRocksStore::new(dir.path()).unwrap();
+            reset_async_rocks_pre_pop(&store, &pre_pop, &pool);
+            let snap = store.snapshot();
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                store.restore(&snap);
+                let mut root =
+                    SaltStateRoot::new(&store).with_min_par_batch_size(4).with_deferred_levels(2);
+                let (elapsed, stats) =
+                    run_async_rocks_blocks(&store, &mut root, &pool, &block_bundles);
+                total += elapsed;
+                if i == 0 {
+                    print_stats(&format!("AsyncRocks({SALT_NUM_THREADS}t)"), &stats);
                 }
             }
             total

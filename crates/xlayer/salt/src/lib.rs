@@ -12,6 +12,7 @@
 //! - [`flat_store`]: Flat-file persistent storage for SALT (Bitcask pattern)
 
 pub mod account;
+pub mod async_rocks_store;
 pub mod convert;
 pub mod flat_store;
 pub mod mdbx_store;
