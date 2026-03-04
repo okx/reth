@@ -11,7 +11,6 @@ use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use revm_database::{states::StorageSlot, AccountStatus, StorageWithOriginalValues};
 use revm_state::AccountInfo;
 use std::{
-    io::Write,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -590,5 +589,297 @@ fn bench_store_compare(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_store_compare);
+// ---------------------------------------------------------------------------
+// QMDB benchmarks (separate groups to avoid thread/state interference)
+// Run: cargo bench --bench store_compare -- "QMDB sync"
+// Run: cargo bench --bench store_compare -- "QMDB pipeline"
+// ---------------------------------------------------------------------------
+
+use parking_lot::RwLock;
+use qmdb::{
+    config::Config as QmdbConfig,
+    def::{IN_BLOCK_IDX_BITS, OP_CREATE, OP_WRITE},
+    seqads::task::{SingleCsTask, TaskBuilder},
+    tasks::TasksManager,
+    AdsCore, AdsWrap, ADS,
+};
+use reth_primitives_traits::Account;
+use xlayer_salt::account::{
+    account_plain_key, encode_account, encode_storage_value, storage_plain_key,
+};
+
+fn bundle_state_to_qmdb_task(
+    bundle: &revm_database::BundleState,
+    op_type: u8,
+) -> (SingleCsTask, usize) {
+    let mut builder = TaskBuilder::new();
+    let mut count = 0usize;
+
+    for (address, bundle_account) in bundle.state() {
+        let address = Address::from(*address);
+
+        if let Some(info) = &bundle_account.info {
+            let code_hash =
+                if info.code_hash == KECCAK_EMPTY { None } else { Some(info.code_hash) };
+            let account =
+                Account { nonce: info.nonce, balance: info.balance, bytecode_hash: code_hash };
+            let key = account_plain_key(&address);
+            let value = encode_account(&account);
+            builder.add_op(op_type, &key, &value);
+            count += 1;
+        }
+
+        for (slot, slot_info) in &bundle_account.storage {
+            let slot_b256 = B256::from(*slot);
+            let key = storage_plain_key(&address, &slot_b256);
+            let value = encode_storage_value(&slot_info.present_value);
+            builder.add_op(op_type, &key, &value);
+            count += 1;
+        }
+    }
+
+    (builder.build(), count)
+}
+
+const QMDB_PRE_POP_CHUNK_SIZE: usize = 20_000;
+
+fn qmdb_pre_populate(ads: &mut AdsWrap<SingleCsTask>, pre_pop: &revm_database::BundleState) -> i64 {
+    let accounts: Vec<_> = pre_pop.state().iter().collect();
+    let num_chunks = (accounts.len() + QMDB_PRE_POP_CHUNK_SIZE - 1) / QMDB_PRE_POP_CHUNK_SIZE;
+
+    for (chunk_idx, chunk) in accounts.chunks(QMDB_PRE_POP_CHUNK_SIZE).enumerate() {
+        let height = (chunk_idx + 1) as i64;
+        let mut builder = TaskBuilder::new();
+
+        for (address, bundle_account) in chunk {
+            let address = Address::from(**address);
+            if let Some(info) = &bundle_account.info {
+                let code_hash =
+                    if info.code_hash == KECCAK_EMPTY { None } else { Some(info.code_hash) };
+                let account =
+                    Account { nonce: info.nonce, balance: info.balance, bytecode_hash: code_hash };
+                let key = account_plain_key(&address);
+                let value = encode_account(&account);
+                builder.add_op(OP_CREATE, &key, &value);
+            }
+            for (slot, slot_info) in &bundle_account.storage {
+                let slot_b256 = B256::from(*slot);
+                let key = storage_plain_key(&address, &slot_b256);
+                let value = encode_storage_value(&slot_info.present_value);
+                builder.add_op(OP_CREATE, &key, &value);
+            }
+        }
+
+        let task = builder.build();
+        let task_id: i64 = height << IN_BLOCK_IDX_BITS;
+        let tasks_manager = Arc::new(TasksManager::new(vec![RwLock::new(Some(task))], task_id));
+        ads.start_block(height, tasks_manager);
+        let shared = ads.get_shared();
+        shared.insert_extra_data(height, String::new());
+        shared.add_task(task_id);
+    }
+
+    ads.flush();
+    num_chunks as i64
+}
+
+fn run_qmdb_blocks(
+    ads: &mut AdsWrap<SingleCsTask>,
+    block_bundles: &[revm_database::BundleState],
+    start_height: i64,
+) -> (Duration, Vec<BlockStats>) {
+    let mut block_stats = Vec::with_capacity(block_bundles.len());
+    let total_start = Instant::now();
+
+    for (i, bundle) in block_bundles.iter().enumerate() {
+        let height = start_height + i as i64;
+        let block_start = Instant::now();
+
+        let prep_start = Instant::now();
+        let (task, state_entries) = bundle_state_to_qmdb_task(bundle, OP_WRITE);
+        let prep_time = prep_start.elapsed();
+
+        let delta_start = Instant::now();
+        let task_id: i64 = height << IN_BLOCK_IDX_BITS;
+        let tasks_manager = Arc::new(TasksManager::new(vec![RwLock::new(Some(task))], task_id));
+        ads.start_block(height, tasks_manager);
+        let shared = ads.get_shared();
+        shared.insert_extra_data(height, String::new());
+        shared.add_task(task_id);
+        let delta_time = delta_start.elapsed();
+
+        let root_start = Instant::now();
+        ads.flush();
+        let root_time = root_start.elapsed();
+
+        block_stats.push(BlockStats {
+            wall_time: block_start.elapsed(),
+            state_prep_time: prep_time,
+            state_delta_time: delta_time,
+            root_compute_time: root_time,
+            disk_io_time: Duration::ZERO,
+            state_entries,
+            trie_entries: 0,
+        });
+    }
+
+    (total_start.elapsed(), block_stats)
+}
+
+fn run_qmdb_blocks_pipelined(
+    ads: &mut AdsWrap<SingleCsTask>,
+    block_bundles: &[revm_database::BundleState],
+    start_height: i64,
+    verbose: bool,
+) -> Duration {
+    let mut total_prep = Duration::ZERO;
+    let mut total_submit = Duration::ZERO;
+
+    let total_start = Instant::now();
+
+    for (i, bundle) in block_bundles.iter().enumerate() {
+        let height = start_height + i as i64;
+
+        let prep_start = Instant::now();
+        let (task, _) = bundle_state_to_qmdb_task(bundle, OP_WRITE);
+        total_prep += prep_start.elapsed();
+
+        let submit_start = Instant::now();
+        let task_id: i64 = height << IN_BLOCK_IDX_BITS;
+        let tasks_manager = Arc::new(TasksManager::new(vec![RwLock::new(Some(task))], task_id));
+        ads.start_block(height, tasks_manager);
+        let shared = ads.get_shared();
+        shared.insert_extra_data(height, String::new());
+        shared.add_task(task_id);
+        total_submit += submit_start.elapsed();
+    }
+
+    let flush_start = Instant::now();
+    ads.flush();
+    let flush_time = flush_start.elapsed();
+
+    let total = total_start.elapsed();
+
+    if verbose {
+        let num = block_bundles.len() as u32;
+        eprintln!(
+            "─── QMDB(pipeline) ───\n  \
+             {} blocks avg: {:.2?}  (prep {:.2?}  submit {:.2?}  flush {:.2?})\n",
+            num,
+            total / num,
+            total_prep / num,
+            total_submit / num,
+            flush_time / num,
+        );
+    }
+
+    total
+}
+
+/// Shared QMDB setup: generate data, create instance, pre-populate.
+fn setup_qmdb(
+) -> (AdsWrap<SingleCsTask>, Vec<revm_database::BundleState>, i64, String, tempfile::TempDir) {
+    let label = format!("pre{PRE_POP_ACCOUNTS}_{NUM_BLOCKS}blk_{ACCOUNTS_PER_BLOCK}accts");
+    let state_changes_per_block = ACCOUNTS_PER_BLOCK * (1 + SLOTS_PER_ACCOUNT);
+
+    let mut rng = StdRng::seed_from_u64(42);
+    let pre_pop = generate_bundle_state_random(PRE_POP_ACCOUNTS, SLOTS_PER_ACCOUNT, &mut rng);
+    let pre_pop_addresses: Vec<Address> = pre_pop.state().keys().copied().collect();
+
+    let mut rng_blocks = StdRng::seed_from_u64(43);
+    let block_bundles: Vec<_> = (0..NUM_BLOCKS)
+        .map(|i| {
+            generate_block_updates_from_addresses(
+                &pre_pop_addresses,
+                SLOTS_PER_ACCOUNT,
+                i,
+                &mut rng_blocks,
+            )
+        })
+        .collect();
+
+    eprintln!(
+        "Setup: {} accounts, {} state changes/block",
+        PRE_POP_ACCOUNTS, state_changes_per_block
+    );
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let config =
+        QmdbConfig { dir: dir.path().to_str().unwrap().to_string(), ..QmdbConfig::default() };
+    AdsCore::init_dir(&config);
+    let mut ads = AdsWrap::<SingleCsTask>::new(&config);
+    let num_pre_pop_blocks = qmdb_pre_populate(&mut ads, &pre_pop);
+    let next_height = num_pre_pop_blocks + 1;
+
+    (ads, block_bundles, next_height, label, dir)
+}
+
+fn bench_qmdb_sync(c: &mut Criterion) {
+    let mut group = c.benchmark_group("QMDB sync");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    let label = format!("pre{PRE_POP_ACCOUNTS}_{NUM_BLOCKS}blk_{ACCOUNTS_PER_BLOCK}accts");
+    let mut state: Option<(
+        AdsWrap<SingleCsTask>,
+        Vec<revm_database::BundleState>,
+        i64,
+        tempfile::TempDir,
+    )> = None;
+
+    group.bench_function(BenchmarkId::new("qmdb", &label), |b| {
+        let (ads, block_bundles, next_height, _dir) = state.get_or_insert_with(|| {
+            let (ads, bundles, h, _, dir) = setup_qmdb();
+            (ads, bundles, h, dir)
+        });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                let (elapsed, stats) = run_qmdb_blocks(ads, block_bundles, *next_height);
+                *next_height += NUM_BLOCKS as i64;
+                total += elapsed;
+                if i == 0 {
+                    print_stats("QMDB", &stats);
+                }
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_qmdb_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("QMDB pipeline");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    let label = format!("pre{PRE_POP_ACCOUNTS}_{NUM_BLOCKS}blk_{ACCOUNTS_PER_BLOCK}accts");
+    let mut state: Option<(
+        AdsWrap<SingleCsTask>,
+        Vec<revm_database::BundleState>,
+        i64,
+        tempfile::TempDir,
+    )> = None;
+
+    group.bench_function(BenchmarkId::new("qmdb_pipeline", &label), |b| {
+        let (ads, block_bundles, next_height, _dir) = state.get_or_insert_with(|| {
+            let (ads, bundles, h, _, dir) = setup_qmdb();
+            (ads, bundles, h, dir)
+        });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                let elapsed = run_qmdb_blocks_pipelined(ads, block_bundles, *next_height, i == 0);
+                *next_height += NUM_BLOCKS as i64;
+                total += elapsed;
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_store_compare, bench_qmdb_pipeline, bench_qmdb_sync);
 criterion_main!(benches);

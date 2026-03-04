@@ -762,6 +762,9 @@ salt = { path = "../salt/salt" }
 banderwagon = { path = "../salt/banderwagon" }
 ipa-multipoint = { path = "../salt/ipa-multipoint" }
 
+# qmdb (LayerZero Quick Merkle Database)
+qmdb = { path = "../megaEth/qmdb/qmdb", default-features = false }
+
 # networking
 ipnet = "2.11"
 

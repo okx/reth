@@ -71,7 +71,39 @@ Using the `store_compare` benchmark, we isolated the storage backend impact on S
 | **RocksDB**      | 250 ms     | 2.9 ms  | 105 ms   | 103 ms   | 37 ms    | 2,505 ms       |
 | **MDBX**         | 526 ms     | 2.6 ms  | 31 ms    | 125 ms   | 365 ms   | 5,262 ms       |
 
-AsyncRocks is the fastest backend — **18% faster than FlatFile**, **2.1x faster than RocksDB**, and **4.4x faster than MDBX**.
+AsyncRocks is the fastest SALT backend — **18% faster than FlatFile**, **2.1x faster than RocksDB**, and **4.4x faster than MDBX**.
+
+### QMDB Comparison (Random Scenario, Per Block)
+
+QMDB (LayerZero's Quick Merkle Database) is architecturally different from SALT — it's a complete authenticated data structure with internal pipelining (16 shards, SHA-256 merkle tree, double-buffer pipeline). It is not a SALT backend; this is a **state management throughput** comparison.
+
+#### Sync Mode (flush after each block)
+
+| Phase        | QMDB sync  | AsyncRocks (best SALT) | Notes                                    |
+|--------------|------------|------------------------|------------------------------------------|
+| **prep**     | 3.5 ms     | 2.7 ms                 | ChangeSet construction                   |
+| **submit**   | 0.2 ms     | 12.4 ms (delta)        | Task submission (QMDB) vs delta (SALT)   |
+| **flush**    | 26 ms      | 95.6 ms (root)         | Bundled delta+root+io (QMDB) vs root (SALT) |
+| **total**    | **~30 ms** | **119 ms**             |                                          |
+| 10-block     | **~296 ms**| 1,195 ms               |                                          |
+
+QMDB sync mode is **4x faster** than the best SALT backend. However, the phases are not directly comparable — QMDB bundles delta computation, root hashing (SHA-256), and disk I/O inside `flush()`, while SALT reports them separately.
+
+#### Pipeline Mode (submit all blocks, flush once at end)
+
+| Metric       | QMDB pipeline | QMDB sync  | Improvement |
+|--------------|---------------|------------|-------------|
+| **per block**| **~21 ms**    | ~30 ms     | **30% faster** |
+| 10-block     | **~218 ms**   | ~296 ms    | **26% faster** |
+| prep/blk     | ~4 ms         | ~3.5 ms    |             |
+| submit/blk   | ~14 ms        | ~0.2 ms    | Includes pipeline stalls |
+| flush/blk    | ~4 ms         | ~26 ms     | Single flush amortized  |
+
+Pipeline mode overlaps block N's flushing with block N+1's update via QMDB's double-buffer architecture. The `submit` time is higher because `start_block` blocks when both buffer slots are full (back-pressure from the flusher). Throughput is bounded by `max(updater_time, flusher_time)`.
+
+**Estimated TPS** (2,000 tx/block, storage + root only, no EVM execution):
+- QMDB sync: 2,000 / 30ms ≈ **~67K TPS**
+- QMDB pipeline: 2,000 / 21ms ≈ **~95K TPS**
 
 ### AsyncRocksStore Optimization Journey
 
@@ -180,7 +212,58 @@ SALT is a valid and promising direction for Ethereum state management. The bench
 
 5. **SALT trades the right resources**: It exchanges disk I/O (scarce, hard to scale) for CPU and memory (abundant, cheap, horizontally scalable). As hardware trends continue — more cores, more RAM, but similar I/O latencies — this trade-off becomes increasingly favorable.
 
+6. **QMDB achieves the highest throughput**: At ~30 ms/block (sync) and ~21 ms/block (pipeline), QMDB is 4x faster than the best SALT backend in sync mode. Its internal pipelining (16 shards, double-buffer, background flushing) amortizes disk I/O completely. However, QMDB uses SHA-256 merkle trees (not Verkle/IPA), so this is a throughput comparison rather than an apples-to-apples state root comparison.
+
 The main cost is higher write amplification (2.59x vs 1.11x) and increased memory usage for the in-memory trie. These are manageable engineering trade-offs, especially in environments where block processing throughput is the primary constraint.
+
+## How to Run
+
+All benchmarks are in the `store_compare` bench target under the `xlayer-salt` crate.
+
+### Run All Benchmarks
+
+```bash
+cargo bench --bench store_compare -p xlayer-salt
+```
+
+### Run by Group
+
+```bash
+# SALT backends only (MDBX, FlatFile, RocksDB, AsyncRocksDB)
+cargo bench --bench store_compare -p xlayer-salt -- "Store"
+
+# QMDB sync mode (flush per block)
+cargo bench --bench store_compare -p xlayer-salt -- "QMDB sync"
+
+# QMDB pipeline mode (submit all blocks, flush once)
+cargo bench --bench store_compare -p xlayer-salt -- "QMDB pipeline"
+```
+
+### Run Individual Backend
+
+```bash
+# Only AsyncRocksDB
+cargo bench --bench store_compare -p xlayer-salt -- "Store comparison/async_rocks"
+
+# Only MDBX
+cargo bench --bench store_compare -p xlayer-salt -- "Store comparison/mdbx"
+
+# Only FlatFile
+cargo bench --bench store_compare -p xlayer-salt -- "Store comparison/flat"
+
+# Only RocksDB
+cargo bench --bench store_compare -p xlayer-salt -- "Store comparison/rocksdb"
+```
+
+### Other Benchmarks
+
+```bash
+# SALT vs MPT end-to-end (ERC20 + Random scenarios)
+cargo bench --bench mpt_vs_salt -p xlayer-salt
+
+# Block I/O benchmark
+cargo bench --bench block_io -p xlayer-salt
+```
 
 ---
 

@@ -44,6 +44,7 @@ reth-trie = { workspace = true }
 reth-trie-db.workspace = true
 proptest.workspace = true
 proptest-arbitrary-interop.workspace = true
+qmdb.workspace = true
 
 [[bench]]
 name = "mpt_vs_salt"
