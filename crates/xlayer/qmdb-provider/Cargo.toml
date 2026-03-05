@@ -1,0 +1,50 @@
+[package]
+name = "xlayer-qmdb-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+description = "QMDB-backed state provider for reth benchmarking"
+
+[dependencies]
+# qmdb
+qmdb.workspace = true
+
+# xlayer
+xlayer-salt.workspace = true
+
+# reth
+reth-storage-api.workspace = true
+reth-storage-errors.workspace = true
+reth-primitives-traits.workspace = true
+reth-trie-common.workspace = true
+reth-execution-types.workspace = true
+
+# alloy
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+
+# revm
+revm-database.workspace = true
+revm-state.workspace = true
+
+# misc
+parking_lot.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+rand.workspace = true
+revm = { workspace = true, features = ["std"] }
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[lints]
+workspace = true
