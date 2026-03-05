@@ -511,25 +511,27 @@ run_parallel_test() {
         if [ $((current_time - last_capture)) -ge $INTERVAL ]; then
             local interval_duration=$((current_time - prev_time))
 
-            # Metrics for ON node - use sync caching metrics for actual EVM cache hits
+            # Metrics for ON node - use CachedReads metrics (reth_txpool_pre_warming_cache_*)
+            # NOT ExecutionCache metrics (reth_sync_caching_*) - they are separate caches
             local metrics_on=$(curl -s http://localhost:9001/metrics 2>/dev/null)
-            local account_hits_on=$(echo "$metrics_on" | grep "^reth_sync_caching_account_cache_hits " | awk '{print $2}' | tr -d '\n' || echo "0")
-            local storage_hits_on=$(echo "$metrics_on" | grep "^reth_sync_caching_storage_cache_hits " | awk '{print $2}' | tr -d '\n' || echo "0")
-            local hits_on=$((${account_hits_on%.*} + ${storage_hits_on%.*}))
+            local hits_on=$(echo "$metrics_on" | grep "^reth_txpool_pre_warming_cache_hits " | awk '{print $2}' | tr -d '\n' || echo "0")
+            hits_on=${hits_on%.*}
+            hits_on=${hits_on:-0}
             local misses_on=$(echo "$metrics_on" | grep "^reth_txpool_pre_warming_cache_misses " | awk '{print $2}' | tr -d '\n' || echo "0")
             misses_on=${misses_on%.*}
+            misses_on=${misses_on:-0}
             local total_on=$((hits_on + misses_on))
             local hit_rate_on=0
             [ "$total_on" -gt 0 ] && hit_rate_on=$(echo "scale=1; $hits_on * 100 / $total_on" | bc)
 
-            # Metrics for OFF node
-            # Metrics for OFF node - also use sync caching metrics
+            # Metrics for OFF node - pre-warming metrics won't exist, so will be 0
             local metrics_off=$(curl -s http://localhost:9002/metrics 2>/dev/null)
-            local account_hits_off=$(echo "$metrics_off" | grep "^reth_sync_caching_account_cache_hits " | awk '{print $2}' | tr -d '\n' || echo "0")
-            local storage_hits_off=$(echo "$metrics_off" | grep "^reth_sync_caching_storage_cache_hits " | awk '{print $2}' | tr -d '\n' || echo "0")
-            local hits_off=$((${account_hits_off%.*} + ${storage_hits_off%.*}))
+            local hits_off=$(echo "$metrics_off" | grep "^reth_txpool_pre_warming_cache_hits " | awk '{print $2}' | tr -d '\n' || echo "0")
+            hits_off=${hits_off%.*}
+            hits_off=${hits_off:-0}
             local misses_off=$(echo "$metrics_off" | grep "^reth_txpool_pre_warming_cache_misses " | awk '{print $2}' | tr -d '\n' || echo "0")
             misses_off=${misses_off%.*}
+            misses_off=${misses_off:-0}
 
             # Calculate INTERVAL TPS (transactions in this interval / interval duration)
             local interval_tx_on=$((total_success_on - prev_tx_on))

@@ -60,13 +60,10 @@ get_histogram_avg_ms() {
 
 #-------------------------------------------------------------------------------
 # Extract Pre-Warming Metrics
+# Use CachedReads metrics (reth_txpool_pre_warming_cache_*) NOT ExecutionCache (reth_sync_caching_*)
 #-------------------------------------------------------------------------------
-ACCOUNT_HITS=$(get_val "reth_sync_caching_account_cache_hits")
-STORAGE_HITS=$(get_val "reth_sync_caching_storage_cache_hits")
-ACCOUNT_MISSES=$(get_val "reth_sync_caching_account_cache_misses")
-STORAGE_MISSES=$(get_val "reth_sync_caching_storage_cache_misses")
-CACHE_MISSES=$(get_val "reth_txpool_pre_warming_cache_misses")
 CACHE_HITS=$(get_val "reth_txpool_pre_warming_cache_hits")
+CACHE_MISSES=$(get_val "reth_txpool_pre_warming_cache_misses")
 
 SIMULATIONS_TRIGGERED=$(get_val "reth_txpool_pre_warming_simulations_triggered")
 SIMULATIONS_COMPLETED=$(get_val "reth_txpool_pre_warming_simulations_completed")

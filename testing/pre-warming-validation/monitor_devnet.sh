@@ -97,8 +97,9 @@ error() {
 }
 
 # Initialize CSV with headers
+# Note: Using reth_txpool_pre_warming_cache_hits/misses (CachedReads), NOT reth_sync_caching_* (ExecutionCache)
 init_csv() {
-    echo "timestamp,epoch,block_number,sim_triggered,sim_completed,sim_failed,sim_dropped,cache_hits,cache_misses,cache_entries,cache_keys,cache_evictions,prefetch_ops,prefetch_accounts,prefetch_storage,prefetch_contracts,evm_account_hits,evm_account_misses,evm_storage_hits,evm_storage_misses" > "$RAW_DATA_FILE"
+    echo "timestamp,epoch,block_number,sim_triggered,sim_completed,sim_failed,sim_dropped,cache_hits,cache_misses,cache_entries,cache_keys,cache_evictions,prefetch_ops,prefetch_accounts,prefetch_storage,prefetch_contracts" > "$RAW_DATA_FILE"
 }
 
 # Fetch single metric value
@@ -152,11 +153,9 @@ sample_metrics() {
     local prefetch_storage=$(get_metric "reth_txpool_pre_warming_prefetch_storage_slots" "$metrics")
     local prefetch_contracts=$(get_metric "reth_txpool_pre_warming_prefetch_contracts" "$metrics")
 
-    # EVM execution cache metrics
-    local evm_account_hits=$(get_metric "reth_sync_caching_account_cache_hits" "$metrics")
-    local evm_account_misses=$(get_metric "reth_sync_caching_account_cache_misses" "$metrics")
-    local evm_storage_hits=$(get_metric "reth_sync_caching_storage_cache_hits" "$metrics")
-    local evm_storage_misses=$(get_metric "reth_sync_caching_storage_cache_misses" "$metrics")
+    # CachedReads cache metrics - what pre-warming/prefetch populates and payload builder uses
+    # NOTE: Using reth_txpool_pre_warming_cache_hits/misses, NOT reth_sync_caching_* (ExecutionCache is separate)
+    # The cache_hits and cache_misses above already capture the correct metrics
 
     # Handle empty values
     sim_triggered=${sim_triggered:-0}
@@ -172,13 +171,9 @@ sample_metrics() {
     prefetch_accounts=${prefetch_accounts:-0}
     prefetch_storage=${prefetch_storage:-0}
     prefetch_contracts=${prefetch_contracts:-0}
-    evm_account_hits=${evm_account_hits:-0}
-    evm_account_misses=${evm_account_misses:-0}
-    evm_storage_hits=${evm_storage_hits:-0}
-    evm_storage_misses=${evm_storage_misses:-0}
 
     # Write to CSV
-    echo "$timestamp,$epoch,$block,$sim_triggered,$sim_completed,$sim_failed,$sim_dropped,$cache_hits,$cache_misses,$cache_entries,$cache_keys,$cache_evictions,$prefetch_ops,$prefetch_accounts,$prefetch_storage,$prefetch_contracts,$evm_account_hits,$evm_account_misses,$evm_storage_hits,$evm_storage_misses" >> "$RAW_DATA_FILE"
+    echo "$timestamp,$epoch,$block,$sim_triggered,$sim_completed,$sim_failed,$sim_dropped,$cache_hits,$cache_misses,$cache_entries,$cache_keys,$cache_evictions,$prefetch_ops,$prefetch_accounts,$prefetch_storage,$prefetch_contracts" >> "$RAW_DATA_FILE"
 
     # Return key values for live display
     echo "$sim_completed|$sim_failed|$cache_hits|$cache_misses|$prefetch_ops|$block"
@@ -266,20 +261,16 @@ delta_cache_misses = calc_delta(first_row, last_row, 'cache_misses')
 delta_prefetch_ops = calc_delta(first_row, last_row, 'prefetch_ops')
 delta_prefetch_accounts = calc_delta(first_row, last_row, 'prefetch_accounts')
 delta_blocks = calc_delta(first_row, last_row, 'block_number')
-delta_evm_hits = calc_delta(first_row, last_row, 'evm_account_hits') + calc_delta(first_row, last_row, 'evm_storage_hits')
-delta_evm_misses = calc_delta(first_row, last_row, 'evm_account_misses') + calc_delta(first_row, last_row, 'evm_storage_misses')
 
 # Rates (per second)
 sim_rate = delta_sim_completed / period_duration if period_duration > 0 else 0
 prefetch_rate = delta_prefetch_ops / period_duration if period_duration > 0 else 0
 block_rate = delta_blocks / period_duration if period_duration > 0 else 0
 
-# Hit rates
+# Hit rates - using CachedReads metrics (reth_txpool_pre_warming_cache_hits/misses)
 total_cache_access = delta_cache_hits + delta_cache_misses
 cache_hit_rate = (delta_cache_hits / total_cache_access * 100) if total_cache_access > 0 else 0
 
-total_evm_access = delta_evm_hits + delta_evm_misses
-evm_hit_rate = (delta_evm_hits / total_evm_access * 100) if total_evm_access > 0 else 0
 
 # Simulation success rate
 total_sim = delta_sim_completed + delta_sim_failed
@@ -300,9 +291,6 @@ print(f"CACHE_HIT_RATE={cache_hit_rate:.1f}")
 print(f"PREFETCH_OPS={int(delta_prefetch_ops)}")
 print(f"PREFETCH_ACCOUNTS={int(delta_prefetch_accounts)}")
 print(f"PREFETCH_RATE={prefetch_rate:.2f}")
-print(f"EVM_HITS={int(delta_evm_hits)}")
-print(f"EVM_MISSES={int(delta_evm_misses)}")
-print(f"EVM_HIT_RATE={evm_hit_rate:.1f}")
 print(f"CACHE_ENTRIES_AVG={calc_stats(data['cache_entries'])['mean']:.0f}")
 print(f"CACHE_ENTRIES_MAX={calc_stats(data['cache_entries'])['max']:.0f}")
 

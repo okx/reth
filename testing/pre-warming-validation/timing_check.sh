@@ -98,26 +98,26 @@ fi
 
 echo ""
 
-# EVM execution cache
-EVM_ACCOUNT_HITS=$(echo "$METRICS" | grep "^reth_sync_caching_account_cache_hits " | awk '{print $2}')
-EVM_STORAGE_HITS=$(echo "$METRICS" | grep "^reth_sync_caching_storage_cache_hits " | awk '{print $2}')
-EVM_ACCOUNT_MISSES=$(echo "$METRICS" | grep "^reth_sync_caching_account_cache_misses " | awk '{print $2}')
-EVM_STORAGE_MISSES=$(echo "$METRICS" | grep "^reth_sync_caching_storage_cache_misses " | awk '{print $2}')
+# CachedReads cache (what pre-warming/prefetch populates and payload builder uses)
+# NOT ExecutionCache (reth_sync_caching_*) which is a separate cache in engine tree
+CACHE_HITS=$(echo "$METRICS" | grep "^reth_txpool_pre_warming_cache_hits " | awk '{print $2}')
+CACHE_MISSES=$(echo "$METRICS" | grep "^reth_txpool_pre_warming_cache_misses " | awk '{print $2}')
 
-EVM_HITS=$((${EVM_ACCOUNT_HITS%.*:-0} + ${EVM_STORAGE_HITS%.*:-0}))
-EVM_MISSES=$((${EVM_ACCOUNT_MISSES%.*:-0} + ${EVM_STORAGE_MISSES%.*:-0}))
-EVM_TOTAL=$((EVM_HITS + EVM_MISSES))
+CACHE_HITS=${CACHE_HITS%.*}
+CACHE_HITS=${CACHE_HITS:-0}
+CACHE_MISSES=${CACHE_MISSES%.*}
+CACHE_MISSES=${CACHE_MISSES:-0}
+CACHE_TOTAL=$((CACHE_HITS + CACHE_MISSES))
 
-echo "⚡ EVM EXECUTION CACHE"
-echo "   ├─ Account Hits:   ${EVM_ACCOUNT_HITS:-0}"
-echo "   ├─ Storage Hits:   ${EVM_STORAGE_HITS:-0}"
-echo "   ├─ Account Misses: ${EVM_ACCOUNT_MISSES:-0}"
-echo "   ├─ Storage Misses: ${EVM_STORAGE_MISSES:-0}"
-if [ "$EVM_TOTAL" -gt 0 ]; then
-    EVM_HIT_RATE=$(echo "scale=1; $EVM_HITS * 100 / $EVM_TOTAL" | bc)
-    echo "   └─ EVM Hit Rate: ${EVM_HIT_RATE}%"
+echo "⚡ CACHEDREADS EXECUTION CACHE (Payload Builder)"
+echo "   ├─ Cache Hits:   ${CACHE_HITS}"
+echo "   ├─ Cache Misses: ${CACHE_MISSES}"
+echo "   ├─ Total Access: ${CACHE_TOTAL}"
+if [ "$CACHE_TOTAL" -gt 0 ]; then
+    CACHE_HIT_RATE=$(echo "scale=1; $CACHE_HITS * 100 / $CACHE_TOTAL" | bc)
+    echo "   └─ Hit Rate: ${CACHE_HIT_RATE}%"
 else
-    echo "   └─ EVM Hit Rate: N/A (no accesses)"
+    echo "   └─ Hit Rate: N/A (no accesses)"
 fi
 
 echo ""

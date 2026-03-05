@@ -298,13 +298,11 @@ run_test() {
     start_node "$PREWARM"
     sleep 5  # Increased wait time for node and pre-warming to stabilize
 
-    # Use sync caching metrics for actual cache hits during EVM execution
-    local BASE_ACCOUNT_HITS=$(get_metric "reth_sync_caching_account_cache_hits")
-    local BASE_STORAGE_HITS=$(get_metric "reth_sync_caching_storage_cache_hits")
-    local BASE_ACCOUNT_MISSES=$(get_metric "reth_sync_caching_account_cache_misses")
-    local BASE_STORAGE_MISSES=$(get_metric "reth_sync_caching_storage_cache_misses")
-    local BASE_HITS=$((BASE_ACCOUNT_HITS + BASE_STORAGE_HITS))
-    local BASE_MISSES=$((BASE_ACCOUNT_MISSES + BASE_STORAGE_MISSES))
+    # Use CachedReads metrics (reth_txpool_pre_warming_cache_*) NOT ExecutionCache (reth_sync_caching_*)
+    local BASE_HITS=$(get_metric "reth_txpool_pre_warming_cache_hits")
+    local BASE_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
+    BASE_HITS=${BASE_HITS:-0}
+    BASE_MISSES=${BASE_MISSES:-0}
 
     local START=$(python3 -c "import time; print(time.time())")
     local SUCCESS=$(send_transactions "$TX_TYPE" "$COUNT" "$ERROR_LOG")
@@ -323,13 +321,11 @@ run_test() {
 
     sleep 5  # Increased wait time for all transactions to be processed and metrics updated
 
-    # Use sync caching metrics for actual cache hits during EVM execution
-    local ACCOUNT_HITS=$(get_metric "reth_sync_caching_account_cache_hits")
-    local STORAGE_HITS=$(get_metric "reth_sync_caching_storage_cache_hits")
-    local ACCOUNT_MISSES=$(get_metric "reth_sync_caching_account_cache_misses")
-    local STORAGE_MISSES=$(get_metric "reth_sync_caching_storage_cache_misses")
-    local FINAL_HITS=$((ACCOUNT_HITS + STORAGE_HITS))
-    local FINAL_MISSES=$((ACCOUNT_MISSES + STORAGE_MISSES))
+    # Use CachedReads metrics (reth_txpool_pre_warming_cache_*) NOT ExecutionCache (reth_sync_caching_*)
+    local FINAL_HITS=$(get_metric "reth_txpool_pre_warming_cache_hits")
+    local FINAL_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
+    FINAL_HITS=${FINAL_HITS:-0}
+    FINAL_MISSES=${FINAL_MISSES:-0}
     local STORAGE=$(get_metric "reth_txpool_pre_warming_prefetch_storage_slots")
 
     local DURATION=$(python3 -c "print(round($END - $START, 2))")

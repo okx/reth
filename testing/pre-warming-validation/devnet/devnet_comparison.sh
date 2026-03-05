@@ -317,11 +317,10 @@ get_metric() {
 }
 
 # Capture initial metrics
+# Use CachedReads metrics (reth_txpool_pre_warming_cache_*) NOT ExecutionCache (reth_sync_caching_*)
 echo -e "${CYAN}Capturing initial metrics...${NC}"
-INITIAL_ACCOUNT_HITS=$(get_metric "reth_sync_caching_account_cache_hits")
-INITIAL_STORAGE_HITS=$(get_metric "reth_sync_caching_storage_cache_hits")
-INITIAL_ACCOUNT_MISSES=$(get_metric "reth_sync_caching_account_cache_misses")
-INITIAL_STORAGE_MISSES=$(get_metric "reth_sync_caching_storage_cache_misses")
+INITIAL_CACHE_HITS=$(get_metric "reth_txpool_pre_warming_cache_hits")
+INITIAL_CACHE_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
 INITIAL_SIMULATIONS=$(get_metric "reth_txpool_pre_warming_simulations_completed")
 INITIAL_PREFETCH_OPS=$(get_metric "reth_txpool_pre_warming_prefetch_operations")
 
@@ -346,11 +345,10 @@ echo ""
 echo ""
 
 # Capture final metrics
+# Use CachedReads metrics (reth_txpool_pre_warming_cache_*) NOT ExecutionCache (reth_sync_caching_*)
 echo -e "${CYAN}Capturing final metrics...${NC}"
-FINAL_ACCOUNT_HITS=$(get_metric "reth_sync_caching_account_cache_hits")
-FINAL_STORAGE_HITS=$(get_metric "reth_sync_caching_storage_cache_hits")
-FINAL_ACCOUNT_MISSES=$(get_metric "reth_sync_caching_account_cache_misses")
-FINAL_STORAGE_MISSES=$(get_metric "reth_sync_caching_storage_cache_misses")
+FINAL_CACHE_HITS=$(get_metric "reth_txpool_pre_warming_cache_hits")
+FINAL_CACHE_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
 FINAL_SIMULATIONS=$(get_metric "reth_txpool_pre_warming_simulations_completed")
 FINAL_PREFETCH_OPS=$(get_metric "reth_txpool_pre_warming_prefetch_operations")
 FINAL_PREFETCH_ACCOUNTS=$(get_metric "reth_txpool_pre_warming_prefetch_accounts")
@@ -369,9 +367,9 @@ FINAL_BLOCK=$(curl -s "http://${METRICS_HOST}:8545" -X POST -H "Content-Type: ap
 
 FINAL_TIME=$(date +%s)
 
-# Calculate deltas
-DELTA_HITS=$(( (FINAL_ACCOUNT_HITS - INITIAL_ACCOUNT_HITS) + (FINAL_STORAGE_HITS - INITIAL_STORAGE_HITS) ))
-DELTA_MISSES=$(( (FINAL_ACCOUNT_MISSES - INITIAL_ACCOUNT_MISSES) + (FINAL_STORAGE_MISSES - INITIAL_STORAGE_MISSES) ))
+# Calculate deltas - use CachedReads metrics
+DELTA_HITS=$((FINAL_CACHE_HITS - INITIAL_CACHE_HITS))
+DELTA_MISSES=$((FINAL_CACHE_MISSES - INITIAL_CACHE_MISSES))
 TOTAL_ACCESS=$((DELTA_HITS + DELTA_MISSES))
 DELTA_BLOCKS=$((FINAL_BLOCK - INITIAL_BLOCK))
 DURATION_SECONDS=$((FINAL_TIME - INITIAL_TIME))

@@ -24,9 +24,9 @@ echo "----------------------------------------------"
 echo "$METRICS" | grep "reth_txpool_pre_warming" | grep -v "^#" | head -15
 echo ""
 
-echo "RAW CACHE METRICS (sync caching):"
+echo "RAW PRE-WARMING CACHE METRICS:"
 echo "----------------------------------------------"
-echo "$METRICS" | grep "reth_sync_caching" | grep -v "^#" | grep -v "precompile" | head -10
+echo "$METRICS" | grep "reth_txpool_pre_warming" | grep -v "^#" | head -15
 echo ""
 
 # Extract PRE-WARMING values
@@ -37,12 +37,11 @@ CACHE_KEYS=$(echo "$METRICS" | grep "reth_txpool_pre_warming_cache_keys_total" |
 PREFETCH_OPS=$(echo "$METRICS" | grep "reth_txpool_pre_warming_prefetch_operations" | grep -v "^#" | awk '{print $2}' | head -1)
 PREFETCH_ACCOUNTS=$(echo "$METRICS" | grep "reth_txpool_pre_warming_prefetch_accounts" | grep -v "^#" | awk '{print $2}' | head -1)
 PREFETCH_STORAGE=$(echo "$METRICS" | grep "reth_txpool_pre_warming_prefetch_storage_slots" | grep -v "^#" | awk '{print $2}' | head -1)
-CACHE_MISSES=$(echo "$METRICS" | grep "reth_txpool_pre_warming_cache_misses" | grep -v "^#" | awk '{print $2}' | head -1)
 
-# Extract SYNC CACHING values (actual cache hits during EVM execution)
-ACCOUNT_CACHE_HITS=$(echo "$METRICS" | grep "reth_sync_caching_account_cache_hits" | grep -v "^#" | awk '{print $2}' | head -1)
-STORAGE_CACHE_HITS=$(echo "$METRICS" | grep "reth_sync_caching_storage_cache_hits" | grep -v "^#" | awk '{print $2}' | head -1)
-CODE_CACHE_HITS=$(echo "$METRICS" | grep "reth_sync_caching_code_cache_hits" | grep -v "^#" | awk '{print $2}' | head -1)
+# Extract CORRECT cache hits/misses from CachedReads (NOT ExecutionCache)
+# reth_txpool_pre_warming_cache_hits/misses are from the CachedReads used by payload builder
+CACHE_HITS=$(echo "$METRICS" | grep "reth_txpool_pre_warming_cache_hits" | grep -v "^#" | awk '{print $2}' | head -1)
+CACHE_MISSES=$(echo "$METRICS" | grep "reth_txpool_pre_warming_cache_misses" | grep -v "^#" | awk '{print $2}' | head -1)
 
 # Handle empty values
 SIMULATIONS="${SIMULATIONS:-0}"
@@ -52,13 +51,11 @@ CACHE_KEYS="${CACHE_KEYS:-0}"
 PREFETCH_OPS="${PREFETCH_OPS:-0}"
 PREFETCH_ACCOUNTS="${PREFETCH_ACCOUNTS:-0}"
 PREFETCH_STORAGE="${PREFETCH_STORAGE:-0}"
+CACHE_HITS="${CACHE_HITS:-0}"
 CACHE_MISSES="${CACHE_MISSES:-0}"
-ACCOUNT_CACHE_HITS="${ACCOUNT_CACHE_HITS:-0}"
-STORAGE_CACHE_HITS="${STORAGE_CACHE_HITS:-0}"
-CODE_CACHE_HITS="${CODE_CACHE_HITS:-0}"
 
-# Calculate total cache hits
-TOTAL_CACHE_HITS=$(echo "$ACCOUNT_CACHE_HITS + $STORAGE_CACHE_HITS + $CODE_CACHE_HITS" | bc 2>/dev/null || echo "0")
+# Calculate total cache accesses and hit rate
+TOTAL_CACHE_ACCESS=$(echo "$CACHE_HITS + $CACHE_MISSES" | bc 2>/dev/null || echo "0")
 
 # Print report
 echo ""
@@ -80,27 +77,24 @@ printf "  Storage Slots Prefetched: %s\n" "$PREFETCH_STORAGE"
 echo ""
 
 echo "=============================================="
-echo "  CACHE HITS (EVM Execution)"
+echo "  CACHE HITS/MISSES (CachedReads - Payload Builder)"
 echo "=============================================="
-printf "  Account Cache Hits:     %s\n" "$ACCOUNT_CACHE_HITS"
-printf "  Storage Cache Hits:     %s\n" "$STORAGE_CACHE_HITS"
-printf "  Code Cache Hits:        %s\n" "$CODE_CACHE_HITS"
-printf "  -----------------------------------\n"
-printf "  TOTAL CACHE HITS:       %s\n" "$TOTAL_CACHE_HITS"
+printf "  Cache Hits:             %s\n" "$CACHE_HITS"
+printf "  Cache Misses:           %s\n" "$CACHE_MISSES"
+printf "  Total Accesses:         %s\n" "$TOTAL_CACHE_ACCESS"
 echo ""
 
 echo "=============================================="
 echo "  SUMMARY"
 echo "=============================================="
 printf "  Keys Pre-warmed:        %s\n" "$CACHE_KEYS"
-printf "  Total Cache Hits:       %s\n" "$TOTAL_CACHE_HITS"
+printf "  Cache Hits:             %s\n" "$CACHE_HITS"
 printf "  Cache Misses:           %s\n" "$CACHE_MISSES"
 
 # Calculate hit rate if we have data
-if [ "$TOTAL_CACHE_HITS" != "0" ] || [ "$CACHE_MISSES" != "0" ]; then
-    TOTAL_ACCESS=$(echo "$TOTAL_CACHE_HITS + $CACHE_MISSES" | bc 2>/dev/null || echo "0")
-    if [ "$TOTAL_ACCESS" != "0" ]; then
-        HIT_RATE=$(echo "scale=1; $TOTAL_CACHE_HITS * 100 / $TOTAL_ACCESS" | bc 2>/dev/null || echo "N/A")
+if [ "$CACHE_HITS" != "0" ] || [ "$CACHE_MISSES" != "0" ]; then
+    if [ "$TOTAL_CACHE_ACCESS" != "0" ]; then
+        HIT_RATE=$(echo "scale=1; $CACHE_HITS * 100 / $TOTAL_CACHE_ACCESS" | bc 2>/dev/null || echo "N/A")
         printf "  Hit Rate:               %s%%\n" "$HIT_RATE"
     fi
 fi
