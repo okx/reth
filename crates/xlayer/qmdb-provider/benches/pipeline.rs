@@ -382,18 +382,12 @@ fn run_qmdb_sync_bench(
     b: &mut criterion::Bencher<'_>,
     cache: &InMemoryCache,
     block_txs: &[Vec<TxEnv>],
+    store: &Arc<QmdbStore>,
     label: &str,
 ) {
     b.iter_custom(|iters| {
         let mut total = Duration::ZERO;
         for i in 0..iters {
-            let dir = tempfile::TempDir::new().unwrap();
-            let store = Arc::new(QmdbStore::new(dir.path()));
-
-            // Pre-populate QMDB
-            let bundle = cache_to_bundle(cache);
-            store.pre_populate(&bundle);
-
             let mut evm_cache = InMemoryCache {
                 accounts: cache.accounts.clone(),
                 storage: cache.storage.clone(),
@@ -447,17 +441,12 @@ fn run_qmdb_pipeline_bench(
     b: &mut criterion::Bencher<'_>,
     cache: &InMemoryCache,
     block_txs: &[Vec<TxEnv>],
+    store: &Arc<QmdbStore>,
     label: &str,
 ) {
     b.iter_custom(|iters| {
         let mut total = Duration::ZERO;
         for i in 0..iters {
-            let dir = tempfile::TempDir::new().unwrap();
-            let store = Arc::new(QmdbStore::new(dir.path()));
-
-            let bundle = cache_to_bundle(cache);
-            store.pre_populate(&bundle);
-
             let mut evm_cache = InMemoryCache {
                 accounts: cache.accounts.clone(),
                 storage: cache.storage.clone(),
@@ -509,6 +498,16 @@ fn run_qmdb_pipeline_bench(
 // Criterion benchmark groups
 // ---------------------------------------------------------------------------
 
+/// Helper: create a single QmdbStore, pre-populate it, and return (store, _dir).
+/// The TempDir is returned to keep it alive for the store's lifetime.
+fn create_prepopulated_store(cache: &InMemoryCache) -> (Arc<QmdbStore>, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(QmdbStore::new(dir.path()));
+    let bundle = cache_to_bundle(cache);
+    store.pre_populate(&bundle);
+    (store, dir)
+}
+
 fn bench_qmdb_sync(c: &mut Criterion) {
     let mut group = c.benchmark_group("QMDB provider sync");
     group.sample_size(10);
@@ -531,12 +530,15 @@ fn bench_qmdb_sync(c: &mut Criterion) {
 
     eprintln!("QMDB provider sync: {} accounts, {} tx/block", PRE_POP_ACCOUNTS, TXS_PER_BLOCK);
 
+    // Create one QMDB instance per workload, reused across all iterations
+    let (eth_store, _eth_dir) = create_prepopulated_store(&cache);
     group.bench_function(BenchmarkId::new("eth_sync", &label), |b| {
-        run_qmdb_sync_bench(b, &cache, &eth_blocks, "QMDB Provider ETH (sync)");
+        run_qmdb_sync_bench(b, &cache, &eth_blocks, &eth_store, "QMDB Provider ETH (sync)");
     });
 
+    let (erc20_store, _erc20_dir) = create_prepopulated_store(&cache);
     group.bench_function(BenchmarkId::new("erc20_sync", &label), |b| {
-        run_qmdb_sync_bench(b, &cache, &erc20_blocks, "QMDB Provider ERC20 (sync)");
+        run_qmdb_sync_bench(b, &cache, &erc20_blocks, &erc20_store, "QMDB Provider ERC20 (sync)");
     });
 
     group.finish();
@@ -562,12 +564,20 @@ fn bench_qmdb_pipeline(c: &mut Criterion) {
 
     eprintln!("QMDB provider pipeline: {} accounts, {} tx/block", PRE_POP_ACCOUNTS, TXS_PER_BLOCK);
 
+    let (eth_store, _eth_dir) = create_prepopulated_store(&cache);
     group.bench_function(BenchmarkId::new("eth_pipeline", &label), |b| {
-        run_qmdb_pipeline_bench(b, &cache, &eth_blocks, "QMDB Provider ETH (pipeline)");
+        run_qmdb_pipeline_bench(b, &cache, &eth_blocks, &eth_store, "QMDB Provider ETH (pipeline)");
     });
 
+    let (erc20_store, _erc20_dir) = create_prepopulated_store(&cache);
     group.bench_function(BenchmarkId::new("erc20_pipeline", &label), |b| {
-        run_qmdb_pipeline_bench(b, &cache, &erc20_blocks, "QMDB Provider ERC20 (pipeline)");
+        run_qmdb_pipeline_bench(
+            b,
+            &cache,
+            &erc20_blocks,
+            &erc20_store,
+            "QMDB Provider ERC20 (pipeline)",
+        );
     });
 
     group.finish();
