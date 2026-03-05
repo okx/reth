@@ -355,20 +355,24 @@ fn print_stats(label: &str, stats: &[BlockStats]) {
     if n == 0 {
         return;
     }
-    let total_evm: Duration = stats.iter().map(|s| s.evm_time).sum();
-    let total_commit: Duration = stats.iter().map(|s| s.commit_time).sum();
+    let avg = |f: fn(&BlockStats) -> Duration| -> Duration {
+        stats.iter().map(f).sum::<Duration>() / n as u32
+    };
     let total_time: Duration = stats.iter().map(|s| s.total_time).sum();
-    let total_entries: usize = stats.iter().map(|s| s.state_entries).sum();
     let total_tx = n * TXS_PER_BLOCK;
     let tps = total_tx as f64 / total_time.as_secs_f64();
+    let avg_entries = stats.iter().map(|s| s.state_entries).sum::<usize>() / n;
     eprintln!("─── {} ───", label);
-    eprintln!("  {} blocks, {} tx total in {:.2?}  ({:.0} tx/s)", n, total_tx, total_time, tps,);
     eprintln!(
-        "  breakdown: evm {:.2?}  commit {:.2?}  |  entries/block: {}",
-        total_evm,
-        total_commit,
-        total_entries / n,
+        "  {} blocks, {} tx/block  |  avg block: {:.2?}  (evm {:.2?}  commit {:.2?})  entries: {}",
+        n,
+        TXS_PER_BLOCK,
+        avg(|s| s.total_time),
+        avg(|s| s.evm_time),
+        avg(|s| s.commit_time),
+        avg_entries,
     );
+    eprintln!("  throughput: {:.0} tx/s", tps);
 }
 
 // ---------------------------------------------------------------------------
@@ -484,7 +488,12 @@ fn run_qmdb_pipeline_bench(
 
             if i == 0 {
                 print_stats(label, &block_stats);
-                eprintln!("  pipeline: submit {:.2?}  flush {:.2?}", total_submit, flush_time,);
+                let num = block_txs.len() as u32;
+                eprintln!(
+                    "  pipeline: avg submit {:.2?}  flush {:.2?}",
+                    total_submit / num,
+                    flush_time,
+                );
                 let root = store.state_root();
                 eprintln!("  state root: {root}");
             }
