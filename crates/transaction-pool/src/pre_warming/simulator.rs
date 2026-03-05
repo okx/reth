@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::cell::RefCell;
 use parking_lot::Mutex;
+use std::collections::HashSet;
+use std::sync::LazyLock;
 
 
 // Use alloy_evm and reth_evm to suppress unused crate warnings
@@ -27,7 +29,48 @@ use alloy_evm as _;
 #[allow(unused_imports)]
 use reth_evm as _;
 
-/// Transaction simulator that uses REVM for accurate key discovery
+/// Pre-computed set of known selectors for O(1) lookup
+/// This is faster than pattern matching for selector detection
+static KNOWN_SELECTORS: LazyLock<HashSet<[u8; 4]>> = LazyLock::new(|| {
+    [
+        // ERC20 Core
+        [0xa9, 0x05, 0x9c, 0xbb], // transfer
+        [0x23, 0xb8, 0x72, 0xdd], // transferFrom
+        [0x09, 0x5e, 0xa7, 0xb3], // approve
+        [0x70, 0xa0, 0x82, 0x31], // balanceOf
+        [0xdd, 0x62, 0xed, 0x3e], // allowance
+        // ERC20 Extensions
+        [0x40, 0xc1, 0x0f, 0x19], // mint
+        [0x42, 0x96, 0x6c, 0x68], // burn
+        [0x79, 0xcc, 0x67, 0x90], // burnFrom
+        [0x39, 0x50, 0x93, 0x51], // increaseAllowance
+        [0xa4, 0x57, 0xc2, 0xd7], // decreaseAllowance
+        // ERC721
+        [0x42, 0x84, 0x2e, 0x0e], // safeTransferFrom
+        [0xb8, 0x8d, 0x4f, 0xde], // safeTransferFrom with data
+        [0xa2, 0x2c, 0xb4, 0x65], // setApprovalForAll
+        [0x08, 0x18, 0x12, 0xfc], // getApproved
+        [0xe9, 0x85, 0xe9, 0xc5], // isApprovedForAll
+        [0x63, 0x52, 0x21, 0x1e], // ownerOf
+        // ERC1155
+        [0xf2, 0x42, 0x43, 0x2a], // safeTransferFrom
+        [0x2e, 0xb2, 0xc2, 0xd6], // safeBatchTransferFrom
+        [0x4e, 0x12, 0x73, 0xf4], // balanceOfBatch
+        // Uniswap V2
+        [0x02, 0x2c, 0x0d, 0x9f], // swap
+        [0xff, 0xf6, 0xca, 0xe9], // sync
+        [0x6a, 0x62, 0x78, 0x42], // mint
+        [0x89, 0xaf, 0xcb, 0x44], // burn
+        [0x09, 0x02, 0xf1, 0xac], // getReserves
+        // Uniswap V3
+        [0x41, 0x4b, 0xf3, 0x89], // exactInputSingle
+        [0xdb, 0x3e, 0x21, 0x98], // exactOutputSingle
+        [0xac, 0x96, 0x50, 0xd8], // multicall
+        // WETH
+        [0xd0, 0xe3, 0x0d, 0xb0], // deposit
+        [0x2e, 0x1a, 0x7d, 0x4d], // withdraw
+    ].into_iter().collect()
+});
 ///
 /// Each worker thread creates its own Simulator instance.
 /// The Simulator uses a shared SnapshotState to query blockchain state.
@@ -380,70 +423,11 @@ impl Simulator {
 
     /// Check if selector is a known ERC20/ERC721/DeFi function
     fn is_known_erc20_selector(selector: &[u8]) -> bool {
-        // ERC20 Core
-        const TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];           // transfer(address,uint256)
-        const TRANSFER_FROM: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd];      // transferFrom(address,address,uint256)
-        const APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];            // approve(address,uint256)
-        const BALANCE_OF: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];         // balanceOf(address)
-        const ALLOWANCE: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];          // allowance(address,address)
-
-        // ERC20 Extensions (mint/burn)
-        const MINT: [u8; 4] = [0x40, 0xc1, 0x0f, 0x19];               // mint(address,uint256)
-        const BURN: [u8; 4] = [0x42, 0x96, 0x6c, 0x68];               // burn(uint256)
-        const BURN_FROM: [u8; 4] = [0x79, 0xcc, 0x67, 0x90];          // burnFrom(address,uint256)
-        const INCREASE_ALLOWANCE: [u8; 4] = [0x39, 0x50, 0x93, 0x51]; // increaseAllowance(address,uint256)
-        const DECREASE_ALLOWANCE: [u8; 4] = [0xa4, 0x57, 0xc2, 0xd7]; // decreaseAllowance(address,uint256)
-
-        // ERC721 Core
-        const SAFE_TRANSFER_FROM: [u8; 4] = [0x42, 0x84, 0x2e, 0x0e]; // safeTransferFrom(address,address,uint256)
-        const SAFE_TRANSFER_FROM_DATA: [u8; 4] = [0xb8, 0x8d, 0x4f, 0xde]; // safeTransferFrom(address,address,uint256,bytes)
-        const SET_APPROVAL_FOR_ALL: [u8; 4] = [0xa2, 0x2c, 0xb4, 0x65]; // setApprovalForAll(address,bool)
-        const GET_APPROVED: [u8; 4] = [0x08, 0x18, 0x12, 0xfc];       // getApproved(uint256)
-        const IS_APPROVED_FOR_ALL: [u8; 4] = [0xe9, 0x85, 0xe9, 0xc5]; // isApprovedForAll(address,address)
-        const OWNER_OF: [u8; 4] = [0x63, 0x52, 0x21, 0x1e];           // ownerOf(uint256)
-
-        // ERC1155
-        const SAFE_TRANSFER_FROM_1155: [u8; 4] = [0xf2, 0x42, 0x43, 0x2a]; // safeTransferFrom(address,address,uint256,uint256,bytes)
-        const SAFE_BATCH_TRANSFER: [u8; 4] = [0x2e, 0xb2, 0xc2, 0xd6]; // safeBatchTransferFrom(...)
-        const BALANCE_OF_BATCH: [u8; 4] = [0x4e, 0x12, 0x73, 0xf4];   // balanceOfBatch(address[],uint256[])
-
-        // Uniswap V2
-        const SWAP: [u8; 4] = [0x02, 0x2c, 0x0d, 0x9f];               // swap(uint256,uint256,address,bytes)
-        const SYNC: [u8; 4] = [0xff, 0xf6, 0xca, 0xe9];               // sync()
-        const MINT_LP: [u8; 4] = [0x6a, 0x62, 0x78, 0x42];            // mint(address)
-        const BURN_LP: [u8; 4] = [0x89, 0xaf, 0xcb, 0x44];            // burn(address)
-        const GET_RESERVES: [u8; 4] = [0x09, 0x02, 0xf1, 0xac];       // getReserves()
-
-        // Uniswap V3 / Router
-        const EXACT_INPUT_SINGLE: [u8; 4] = [0x41, 0x4b, 0xf3, 0x89]; // exactInputSingle(...)
-        const EXACT_OUTPUT_SINGLE: [u8; 4] = [0xdb, 0x3e, 0x21, 0x98]; // exactOutputSingle(...)
-        const MULTICALL: [u8; 4] = [0xac, 0x96, 0x50, 0xd8];          // multicall(bytes[])
-
-        // WETH
-        const DEPOSIT: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];            // deposit()
-        const WITHDRAW: [u8; 4] = [0x2e, 0x1a, 0x7d, 0x4d];           // withdraw(uint256)
-
-        matches!(
-            selector,
-            s if s == TRANSFER || s == TRANSFER_FROM || s == APPROVE ||
-                 s == BALANCE_OF || s == ALLOWANCE ||
-                 // ERC20 Extensions
-                 s == MINT || s == BURN || s == BURN_FROM ||
-                 s == INCREASE_ALLOWANCE || s == DECREASE_ALLOWANCE ||
-                 // ERC721
-                 s == SAFE_TRANSFER_FROM || s == SAFE_TRANSFER_FROM_DATA ||
-                 s == SET_APPROVAL_FOR_ALL || s == GET_APPROVED ||
-                 s == IS_APPROVED_FOR_ALL || s == OWNER_OF ||
-                 // ERC1155
-                 s == SAFE_TRANSFER_FROM_1155 || s == SAFE_BATCH_TRANSFER ||
-                 s == BALANCE_OF_BATCH ||
-                 // Uniswap V2
-                 s == SWAP || s == SYNC || s == MINT_LP || s == BURN_LP || s == GET_RESERVES ||
-                 // Uniswap V3
-                 s == EXACT_INPUT_SINGLE || s == EXACT_OUTPUT_SINGLE || s == MULTICALL ||
-                 // WETH
-                 s == DEPOSIT || s == WITHDRAW
-        )
+        if selector.len() != 4 {
+            return false;
+        }
+        let selector_arr: [u8; 4] = selector.try_into().unwrap_or_default();
+        KNOWN_SELECTORS.contains(&selector_arr)
     }
 
     /// Predict storage slots from ERC20/ERC721/DeFi calldata patterns
@@ -1260,4 +1244,7 @@ mod tests {
         // TODO: Implement with real transaction
     }
 }
+
+
+
 

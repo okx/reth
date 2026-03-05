@@ -39,6 +39,8 @@ CAPTURE_DURATION=1        # Minutes to capture after load (1 min is enough since
 SKIP_BUILD=false
 TX_TYPE="mixed"           # eth, erc20, or mixed
 UNIQUE_ADDRESSES=false    # Use unique random addresses for each transaction
+PREWARM_WORKERS=""        # Empty = use all CPUs
+PREFETCH_WORKERS=""       # Empty = use all CPUs
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -63,13 +65,30 @@ while [[ $# -gt 0 ]]; do
             TX_TYPE="$2"
             shift 2
             ;;
+        --prewarm-workers)
+            PREWARM_WORKERS="$2"
+            shift 2
+            ;;
+        --prefetch-workers)
+            PREFETCH_WORKERS="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--txns N] [--burst N] [--tx-type eth|erc20|mixed] [--unique-addresses] [--skip-build]"
+            echo "Usage: $0 [--txns N] [--burst N] [--tx-type eth|erc20|mixed] [--unique-addresses] [--prewarm-workers N] [--prefetch-workers N] [--skip-build]"
             exit 1
             ;;
     esac
 done
+
+# Resolve worker counts (default to all CPUs)
+NUM_CPUS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo "8")
+if [ -z "$PREWARM_WORKERS" ]; then
+    PREWARM_WORKERS="$NUM_CPUS"
+fi
+if [ -z "$PREFETCH_WORKERS" ]; then
+    PREFETCH_WORKERS="$NUM_CPUS"
+fi
 
 RESULTS_DIR="$RETH_DIR/.devnet-simulation-$(date +%Y%m%d_%H%M%S)"
 RESULTS_OFF="$RESULTS_DIR/results_prewarm_OFF.json"
@@ -89,6 +108,8 @@ echo -e "  Total Transactions: ${TOTAL_TXNS}"
 echo -e "  Burst Size:        ${BURST_SIZE} txns"
 echo -e "  TX Type:           ${TX_TYPE}"
 echo -e "  Unique Addresses:  ${UNIQUE_ADDRESSES}"
+echo -e "  Prewarm Workers:   ${PREWARM_WORKERS}"
+echo -e "  Prefetch Workers:  ${PREFETCH_WORKERS}"
 echo -e "  Results Dir:       ${RESULTS_DIR}"
 echo ""
 
@@ -559,11 +580,11 @@ capture_metrics() {
 
     echo -e "  ${CYAN}Capturing final metrics...${NC}"
 
-    # Get metrics - Use CachedReads metrics (reth_txpool_pre_warming_cache_*) NOT ExecutionCache metrics
-    # The CachedReads cache is what prefetch populates and execution uses in payload builder
-    # ExecutionCache (reth_sync_caching_*) is a separate cache in the engine tree
-    local FINAL_HITS=$(get_metric "reth_txpool_pre_warming_cache_hits")
-    local FINAL_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
+    # Get metrics - Use ALWAYS-ON CachedReads metrics (reth_payloads_cached_reads_*)
+    # These are tracked regardless of pre-warming being enabled or disabled
+    # The pre-warming specific metrics (reth_txpool_pre_warming_cache_*) only exist when pre-warming is ON
+    local FINAL_HITS=$(get_metric "reth_payloads_cached_reads_hits")
+    local FINAL_MISSES=$(get_metric "reth_payloads_cached_reads_misses")
     local FINAL_SIMS=$(get_metric "reth_txpool_pre_warming_simulations_completed")
     local FINAL_PREFETCH=$(get_metric "reth_txpool_pre_warming_prefetch_operations")
     local PREFETCH_ACCOUNTS=$(get_metric "reth_txpool_pre_warming_prefetch_accounts")
@@ -705,16 +726,14 @@ echo -e "  ${CYAN}Starting node (pre-warming ON)...${NC}"
 DATA_DIR_ON="$RESULTS_DIR/data-on"
 rm -rf "$DATA_DIR_ON"
 
-NUM_CPUS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo "8")
-
 "$RETH_DIR/target/release/op-reth" node \
     --datadir "$DATA_DIR_ON" \
     --dev --dev.block-time ${BLOCK_TIME}s \
     --http --http.api eth,debug,net,web3,txpool \
     --metrics 0.0.0.0:9001 \
     --txpool.pre-warming true \
-    --txpool.pre-warming-workers $NUM_CPUS \
-    --txpool.pre-fetch-workers $NUM_CPUS \
+    --txpool.pre-warming-workers $PREWARM_WORKERS \
+    --txpool.pre-fetch-workers $PREFETCH_WORKERS \
     --log.stdout.filter error > "$RESULTS_DIR/node_on.log" 2>&1 &
 
 NODE_PID=$!

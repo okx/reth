@@ -107,14 +107,27 @@ pub fn set_global_prefetch_threads(num_threads: usize) {
 /// Returns the configured number of prefetch threads, or defaults to available CPUs.
 pub fn get_global_prefetch_threads() -> usize {
     let stored = GLOBAL_PREFETCH_THREADS.load(Ordering::Relaxed);
-    if stored == 0 {
+    let result = if stored == 0 {
         // Default to available CPUs if not set
-        std::thread::available_parallelism()
+        let default = std::thread::available_parallelism()
             .map(|p| p.get())
-            .unwrap_or(4)
+            .unwrap_or(4);
+        tracing::warn!(
+            target: "txpool::pre_warming",
+            stored,
+            default,
+            ">>> get_global_prefetch_threads: returning DEFAULT (global not set yet)"
+        );
+        default
     } else {
+        tracing::debug!(
+            target: "txpool::pre_warming",
+            stored,
+            ">>> get_global_prefetch_threads: returning configured value"
+        );
         stored
-    }
+    };
+    result
 }
 
 /// Check if pre-warming is active (cache registered)

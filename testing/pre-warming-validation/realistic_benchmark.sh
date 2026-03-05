@@ -47,6 +47,8 @@ TX_TYPE="eth"
 BURST_SIZE=50
 BLOCK_TIME=2
 FULL_LOAD=false
+PREWARM_WORKERS=""
+PREFETCH_WORKERS=""
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -59,6 +61,8 @@ while [[ $# -gt 0 ]]; do
         --tx-type) TX_TYPE="$2"; shift 2 ;;
         --burst) BURST_SIZE="$2"; shift 2 ;;
         --block-time) BLOCK_TIME="$2"; shift 2 ;;
+        --prewarm-workers) PREWARM_WORKERS="$2"; shift 2 ;;
+        --prefetch-workers) PREFETCH_WORKERS="$2"; shift 2 ;;
         --full-load) FULL_LOAD=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -78,6 +82,14 @@ mkdir -p "$RESULTS_DIR"
 
 NUM_CPUS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
+# Resolve effective worker counts (default: all CPUs)
+if [ -z "$PREWARM_WORKERS" ]; then
+    PREWARM_WORKERS="$NUM_CPUS"
+fi
+if [ -z "$PREFETCH_WORKERS" ]; then
+    PREFETCH_WORKERS="$NUM_CPUS"
+fi
+
 echo ""
 echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}${BLUE}║          REALISTIC PRE-WARMING BENCHMARK (with Warm-up Phase)                ║${NC}"
@@ -88,6 +100,8 @@ echo "  Warm-up Txns:      ${WARMUP_TXNS} (populates natural cache)"
 echo "  Measurement Txns:  ${TOTAL_TXNS}"
 echo "  Reuse Percentage:  ${REUSE_PCT}%"
 echo "  Address Pool Size: ${POOL_SIZE}"
+echo "  Prewarm Workers:   ${PREWARM_WORKERS}"
+echo "  Prefetch Workers:  ${PREFETCH_WORKERS}"
 echo "  Results Dir:       ${RESULTS_DIR}"
 echo ""
 
@@ -121,8 +135,8 @@ start_node() {
             --http --http.api eth,debug,net,web3,txpool \
             --metrics 0.0.0.0:9001 \
             --txpool.pre-warming true \
-            --txpool.pre-warming-workers $NUM_CPUS \
-            --txpool.pre-fetch-workers $NUM_CPUS \
+            --txpool.pre-warming-workers $PREWARM_WORKERS \
+            --txpool.pre-fetch-workers $PREFETCH_WORKERS \
             --log.stdout.filter error > "$RESULTS_DIR/node_${PREWARM}.log" 2>&1 &
     else
         "$RETH_DIR/target/release/op-reth" node \
