@@ -65,7 +65,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--txns N] [--burst N] [--tx-type eth|erc20|mixed] [--skip-build]"
+            echo "Usage: $0 [--txns N] [--burst N] [--tx-type eth|erc20|mixed] [--unique-addresses] [--skip-build]"
             exit 1
             ;;
     esac
@@ -88,6 +88,7 @@ echo -e "  Date:              $(date '+%Y-%m-%d %H:%M:%S')"
 echo -e "  Total Transactions: ${TOTAL_TXNS}"
 echo -e "  Burst Size:        ${BURST_SIZE} txns"
 echo -e "  TX Type:           ${TX_TYPE}"
+echo -e "  Unique Addresses:  ${UNIQUE_ADDRESSES}"
 echo -e "  Results Dir:       ${RESULTS_DIR}"
 echo ""
 
@@ -124,7 +125,8 @@ wait_for_node() {
 }
 
 get_metric() {
-    curl -s "http://localhost:9001/metrics" 2>/dev/null | grep "$1 " | grep -v "#" | awk '{print $2}' | head -1
+    local val=$(curl -s "http://localhost:9001/metrics" 2>/dev/null | grep "^$1 " | grep -v "#" | awk '{print $2}' | head -1)
+    echo "${val:-0}"
 }
 
 # ERC20 contract bytecode (simple token with transfer, transferFrom, approve)
@@ -281,21 +283,33 @@ import subprocess
 import json
 import time
 import sys
+import secrets
 
 TOTAL = $TOTAL
 BURST_SIZE = $BURST_SIZE
 BURST_DELAY = $BURST_DELAY
 TX_TYPE = "$TX_TYPE"
 CONTRACT_ADDR = "$CONTRACT_ADDR"
+UNIQUE_ADDRESSES = "$UNIQUE_ADDRESSES" == "true"
 
 # Dev account
 PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 SENDER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-RECIPIENTS = ["0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+STATIC_RECIPIENTS = ["0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
               "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
               "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
               "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65",
               "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"]
+
+def generate_random_address():
+    """Generate a random Ethereum address"""
+    return "0x" + secrets.token_hex(20)
+
+def get_recipient(index):
+    """Get recipient address - random if UNIQUE_ADDRESSES, else cycle through static list"""
+    if UNIQUE_ADDRESSES:
+        return generate_random_address()
+    return STATIC_RECIPIENTS[index % len(STATIC_RECIPIENTS)]
 
 # Try to use eth_account for signing
 try:
@@ -479,10 +493,10 @@ nonce_result = subprocess.run(
 )
 nonce = int(json.loads(nonce_result.stdout)["result"], 16)
 
-# For mixed/erc20 mode, setup approvals first
+# For mixed/erc20 mode, setup approvals first (use static recipients for approvals)
 if TX_TYPE in ["erc20", "mixed"] and CONTRACT_ADDR:
     print(f"    Setting up approvals...")
-    for recipient in RECIPIENTS:
+    for recipient in STATIC_RECIPIENTS:
         if send_erc20_approve(recipient, nonce, CONTRACT_ADDR):
             nonce += 1
             success += 1
@@ -497,7 +511,7 @@ for burst in range(num_bursts + (1 if remainder > 0 else 0)):
         break
 
     for i in range(burst_count):
-        to_addr = RECIPIENTS[i % len(RECIPIENTS)]
+        to_addr = get_recipient(success + i)  # Use success+i to get unique index across bursts
 
         if TX_TYPE == "eth":
             ok = send_eth_tx(to_addr, nonce)
@@ -545,9 +559,11 @@ capture_metrics() {
 
     echo -e "  ${CYAN}Capturing final metrics...${NC}"
 
-    # Get metrics (no need to wait - transactions already processed)
-    local FINAL_HITS=$(($(get_metric "reth_sync_caching_account_cache_hits") + $(get_metric "reth_sync_caching_storage_cache_hits")))
-    local FINAL_MISSES=$(($(get_metric "reth_sync_caching_account_cache_misses") + $(get_metric "reth_sync_caching_storage_cache_misses")))
+    # Get metrics - Use CachedReads metrics (reth_txpool_pre_warming_cache_*) NOT ExecutionCache metrics
+    # The CachedReads cache is what prefetch populates and execution uses in payload builder
+    # ExecutionCache (reth_sync_caching_*) is a separate cache in the engine tree
+    local FINAL_HITS=$(get_metric "reth_txpool_pre_warming_cache_hits")
+    local FINAL_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
     local FINAL_SIMS=$(get_metric "reth_txpool_pre_warming_simulations_completed")
     local FINAL_PREFETCH=$(get_metric "reth_txpool_pre_warming_prefetch_operations")
     local PREFETCH_ACCOUNTS=$(get_metric "reth_txpool_pre_warming_prefetch_accounts")
