@@ -355,23 +355,20 @@ fn print_stats(label: &str, stats: &[BlockStats]) {
     if n == 0 {
         return;
     }
-    let avg = |f: fn(&BlockStats) -> Duration| -> Duration {
-        stats.iter().map(f).sum::<Duration>() / n as u32
-    };
+    let total_evm: Duration = stats.iter().map(|s| s.evm_time).sum();
+    let total_commit: Duration = stats.iter().map(|s| s.commit_time).sum();
+    let total_time: Duration = stats.iter().map(|s| s.total_time).sum();
     let total_entries: usize = stats.iter().map(|s| s.state_entries).sum();
+    let total_tx = n * TXS_PER_BLOCK;
+    let tps = total_tx as f64 / total_time.as_secs_f64();
     eprintln!("─── {} ───", label);
+    eprintln!("  {} blocks, {} tx total in {:.2?}  ({:.0} tx/s)", n, total_tx, total_time, tps,);
     eprintln!(
-        "  {} blocks avg: {:.2?}  (evm {:.2?}  commit {:.2?})  entries/block: {}",
-        n,
-        avg(|s| s.total_time),
-        avg(|s| s.evm_time),
-        avg(|s| s.commit_time),
+        "  breakdown: evm {:.2?}  commit {:.2?}  |  entries/block: {}",
+        total_evm,
+        total_commit,
         total_entries / n,
     );
-    let total_time: Duration = stats.iter().map(|s| s.total_time).sum();
-    let total_tx: usize = n * TXS_PER_BLOCK;
-    let tps = total_tx as f64 / total_time.as_secs_f64();
-    eprintln!("  throughput: {:.0} tx/s  total: {:.2?}", tps, total_time);
 }
 
 // ---------------------------------------------------------------------------
@@ -453,20 +450,29 @@ fn run_qmdb_pipeline_bench(
                 code_by_hash: cache.code_by_hash.clone(),
             };
 
-            let mut total_evm = Duration::ZERO;
+            let mut block_stats = Vec::with_capacity(block_txs.len());
             let mut total_submit = Duration::ZERO;
             let iter_start = Instant::now();
 
             for (blk_idx, txs) in block_txs.iter().enumerate() {
+                let block_start = Instant::now();
+
                 let (bundle, evm_time) =
                     execute_block_evm(&evm_cache, txs.clone().into_iter(), blk_idx as u64 + 1);
-                total_evm += evm_time;
+                let state_entries = bundle.state().len();
 
                 let submit_start = Instant::now();
                 store.submit_bundle(&bundle);
                 total_submit += submit_start.elapsed();
 
                 evm_cache.apply_bundle(&bundle);
+
+                block_stats.push(BlockStats {
+                    evm_time,
+                    commit_time: submit_start.elapsed(),
+                    total_time: block_start.elapsed(),
+                    state_entries,
+                });
             }
 
             let flush_start = Instant::now();
@@ -477,15 +483,8 @@ fn run_qmdb_pipeline_bench(
             total += total_elapsed;
 
             if i == 0 {
-                let num = block_txs.len() as u32;
-                let total_tx = block_txs.len() * TXS_PER_BLOCK;
-                let tps = total_tx as f64 / total_elapsed.as_secs_f64();
-                eprintln!("─── {} ───", label);
-                eprintln!(
-                    "  {} blocks total: {:.2?}  (evm {:.2?}  submit {:.2?}  flush {:.2?})",
-                    num, total_elapsed, total_evm, total_submit, flush_time,
-                );
-                eprintln!("  throughput: {:.0} tx/s", tps);
+                print_stats(label, &block_stats);
+                eprintln!("  pipeline: submit {:.2?}  flush {:.2?}", total_submit, flush_time,);
                 let root = store.state_root();
                 eprintln!("  state root: {root}");
             }
