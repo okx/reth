@@ -7,6 +7,98 @@ This guide provides instructions for extracting and monitoring pre-warming metri
 - op-reth node running with `--metrics 0.0.0.0:9001`
 - Pre-warming enabled: `--txpool.pre-warming true`
 - curl installed
+- python3 installed (for statistical calculations)
+
+---
+
+## Automated Continuous Monitoring (Recommended)
+
+Use the `monitor_devnet.sh` script for continuous monitoring with automatic report generation:
+
+### Quick Start
+
+```bash
+# Default: Monitor localhost:9001, sample every 30s, report every 5 mins
+./monitor_devnet.sh
+
+# Monitor devnet with custom settings
+./monitor_devnet.sh --url http://devnet-ip:9001/metrics --interval 60 --report-interval 3600
+
+# Run for 2 hours then generate final report
+./monitor_devnet.sh --duration 7200
+
+# Show all options
+./monitor_devnet.sh --help
+```
+
+### What It Does
+
+1. **Samples metrics** at regular intervals (default: 30 seconds)
+2. **Stores raw data** in CSV format for analysis
+3. **Generates periodic reports** with calculated statistics
+4. **Shows live dashboard** with real-time metrics
+5. **Calculates meaningful rates**:
+   - Cache Hit Rate (%)
+   - Simulation Success Rate (%)
+   - Prefetch Rate (ops/sec)
+   - Block Processing Rate
+
+### Output Files
+
+```
+devnet_monitoring_YYYYMMDD_HHMMSS/
+├── raw_metrics.csv       # All sampled data
+├── latest_report.txt     # Most recent report
+└── report_history.log    # Summary of all reports
+```
+
+### Sample Report Output
+
+```
+================================================================================
+                    PRE-WARMING PERFORMANCE REPORT
+================================================================================
+Generated: 2026-03-04 10:30:00
+Period: 60.0 minutes (120 samples)
+--------------------------------------------------------------------------------
+
+📊 THROUGHPUT
+--------------------------------------------------------------------------------
+  Blocks Processed:     3600
+  Block Rate:           1.00/sec
+
+🔄 SIMULATIONS
+--------------------------------------------------------------------------------
+  Completed:            15420
+  Failed:               23
+  Success Rate:         99.8%
+  Simulation Rate:      4.28/sec
+
+💾 PRE-WARMING CACHE
+--------------------------------------------------------------------------------
+  Cache Hits:           45230
+  Cache Misses:         12450
+  Hit Rate:             78.4%
+
+📥 PREFETCH OPERATIONS
+--------------------------------------------------------------------------------
+  Total Operations:     15420
+  Accounts Prefetched:  62580
+  Prefetch Rate:        4.28/sec
+
+⚡ EVM EXECUTION CACHE (Actual Performance)
+--------------------------------------------------------------------------------
+  EVM Cache Hits:       89340
+  EVM Cache Misses:     23120
+  EVM Hit Rate:         79.4%
+
+📈 HEALTH INDICATORS
+--------------------------------------------------------------------------------
+  Simulation Health:    ✅ GOOD (99.8% success)
+  Cache Efficiency:     ✅ GOOD (78.4% hit rate)
+  EVM Cache Efficiency: ✅ GOOD (79.4% hit rate)
+================================================================================
+```
 
 ---
 

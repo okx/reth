@@ -11,10 +11,11 @@
 #  Usage:
 #    ./unified_benchmark.sh                      # Quick test (~10K txs, ~6 min)
 #    ./unified_benchmark.sh --rebuild            # Rebuild binary first
+#    ./unified_benchmark.sh --skip-build         # Skip build, but cleanup data dirs
 #    ./unified_benchmark.sh --max-workers        # Use all CPUs as workers
 #    ./unified_benchmark.sh --full-load          # Medium load (~28K txs, ~20 min)
 #    ./unified_benchmark.sh --high-load          # High load (~100K txs, ~60-90 min)
-#    ./unified_benchmark.sh --rebuild --max-workers --high-load  # All options
+#    ./unified_benchmark.sh --skip-build --max-workers --full-load  # Fresh run, no rebuild
 #===============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,12 +30,26 @@ echo "=== Benchmark Error Log - $(date '+%Y-%m-%d %H:%M:%S') ===" > "$ERROR_LOG"
 
 # Parse arguments
 REBUILD=false
+SKIP_BUILD=false
 MAX_WORKERS=false
-if [ "$1" = "--rebuild" ] || [ "$2" = "--rebuild" ]; then
-    REBUILD=true
-fi
-if [ "$1" = "--max-workers" ] || [ "$2" = "--max-workers" ]; then
-    MAX_WORKERS=true
+
+for arg in "$@"; do
+    case $arg in
+        --rebuild)
+            REBUILD=true
+            ;;
+        --skip-build)
+            SKIP_BUILD=true
+            ;;
+        --max-workers)
+            MAX_WORKERS=true
+            ;;
+    esac
+done
+
+# --skip-build takes precedence over --rebuild
+if [ "$SKIP_BUILD" = true ]; then
+    REBUILD=false
 fi
 
 # Colors
@@ -281,13 +296,15 @@ run_test() {
     echo "Started: $(date '+%Y-%m-%d %H:%M:%S')" >> "$ERROR_LOG"
 
     start_node "$PREWARM"
-    sleep 3
+    sleep 5  # Increased wait time for node and pre-warming to stabilize
 
     # Use sync caching metrics for actual cache hits during EVM execution
     local BASE_ACCOUNT_HITS=$(get_metric "reth_sync_caching_account_cache_hits")
     local BASE_STORAGE_HITS=$(get_metric "reth_sync_caching_storage_cache_hits")
+    local BASE_ACCOUNT_MISSES=$(get_metric "reth_sync_caching_account_cache_misses")
+    local BASE_STORAGE_MISSES=$(get_metric "reth_sync_caching_storage_cache_misses")
     local BASE_HITS=$((BASE_ACCOUNT_HITS + BASE_STORAGE_HITS))
-    local BASE_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
+    local BASE_MISSES=$((BASE_ACCOUNT_MISSES + BASE_STORAGE_MISSES))
 
     local START=$(python3 -c "import time; print(time.time())")
     local SUCCESS=$(send_transactions "$TX_TYPE" "$COUNT" "$ERROR_LOG")
@@ -304,13 +321,15 @@ run_test() {
         return
     fi
 
-    sleep 3
+    sleep 5  # Increased wait time for all transactions to be processed and metrics updated
 
     # Use sync caching metrics for actual cache hits during EVM execution
     local ACCOUNT_HITS=$(get_metric "reth_sync_caching_account_cache_hits")
     local STORAGE_HITS=$(get_metric "reth_sync_caching_storage_cache_hits")
+    local ACCOUNT_MISSES=$(get_metric "reth_sync_caching_account_cache_misses")
+    local STORAGE_MISSES=$(get_metric "reth_sync_caching_storage_cache_misses")
     local FINAL_HITS=$((ACCOUNT_HITS + STORAGE_HITS))
-    local FINAL_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
+    local FINAL_MISSES=$((ACCOUNT_MISSES + STORAGE_MISSES))
     local STORAGE=$(get_metric "reth_txpool_pre_warming_prefetch_storage_slots")
 
     local DURATION=$(python3 -c "print(round($END - $START, 2))")
@@ -328,6 +347,11 @@ run_test() {
     if [ $TOTAL -gt 0 ]; then
         HIT_RATE=$((DELTA_HITS * 100 / TOTAL))
     fi
+
+    # Debug: Log delta values to help diagnose hit rate issues
+    echo "DEBUG: BASE_HITS=$BASE_HITS, FINAL_HITS=$FINAL_HITS, DELTA_HITS=$DELTA_HITS" >> "$ERROR_LOG"
+    echo "DEBUG: BASE_MISSES=$BASE_MISSES, FINAL_MISSES=$FINAL_MISSES, DELTA_MISSES=$DELTA_MISSES" >> "$ERROR_LOG"
+    echo "DEBUG: TOTAL=$TOTAL, HIT_RATE=$HIT_RATE%" >> "$ERROR_LOG"
 
     echo -e "    ${GREEN}✓${NC} Complete: ${SUCCESS}/${COUNT} txs, ${BOLD}${TPS} TPS${NC}, Hit Rate: ${HIT_RATE}%"
 
@@ -424,6 +448,44 @@ if [ "$REBUILD" = true ]; then
         echo -e "  ${RED}✗${NC} Build failed!"
         exit 1
     fi
+
+#-------------------------------------------------------------------------------
+# SKIP-BUILD: Fresh start without rebuild (cleanup data dirs only)
+#-------------------------------------------------------------------------------
+elif [ "$SKIP_BUILD" = true ]; then
+    echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  FRESH START (Skip Build)${NC}"
+    echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    cd "$RETH_DIR"
+
+    # Kill any running op-reth processes
+    echo -e "  ${CYAN}Killing any running op-reth processes...${NC}"
+    pkill -9 op-reth 2>/dev/null || true
+    sleep 2
+    echo -e "  ${GREEN}✓${NC} Processes killed"
+
+    # Clean up old data directories from previous benchmark runs
+    echo -e "  ${CYAN}Cleaning old data directories...${NC}"
+    rm -rf "$RETH_DIR"/.unified-benchmark-* 2>/dev/null
+    rm -rf "$RETH_DIR"/.erc20-benchmark-* 2>/dev/null
+    rm -rf "$RETH_DIR"/.erc20-test-* 2>/dev/null
+    rm -rf "$RETH_DIR"/.op-reth-* 2>/dev/null
+    rm -rf "$RETH_DIR"/.test-* 2>/dev/null
+    rm -rf "$RETH_DIR"/.debug-* 2>/dev/null
+    rm -rf "$RETH_DIR"/.continuous-benchmark-* 2>/dev/null
+    rm -rf "$RETH_DIR"/.diag-* 2>/dev/null
+    rm -f /tmp/reth.ipc 2>/dev/null
+    echo -e "  ${GREEN}✓${NC} Old data directories cleaned"
+
+    # Verify binary exists
+    if [ ! -f "$RETH_DIR/target/release/op-reth" ]; then
+        echo -e "  ${RED}✗${NC} Binary not found! Run with --rebuild first."
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} Using existing binary"
+    echo ""
     echo ""
 fi
 
@@ -437,6 +499,7 @@ echo -e "${BOLD}${BLUE}═══════════════════
 echo -e "\n  ${CYAN}Normal Load (${NORMAL_LOAD} txs):${NC}"
 RESULT=$(run_test "ETH Normal" "eth" $NORMAL_LOAD "disabled" 2>/dev/null | tail -1)
 ETH_NORMAL_OFF_TPS=$(echo $RESULT | awk '{print $1}')
+ETH_NORMAL_OFF_HIT=$(echo $RESULT | awk '{print $2}')
 
 RESULT=$(run_test "ETH Normal" "eth" $NORMAL_LOAD "enabled" 2>/dev/null | tail -1)
 ETH_NORMAL_ON_TPS=$(echo $RESULT | awk '{print $1}')
@@ -445,6 +508,7 @@ ETH_NORMAL_ON_HIT=$(echo $RESULT | awk '{print $2}')
 echo -e "\n  ${CYAN}Peak Load (${PEAK_LOAD} txs):${NC}"
 RESULT=$(run_test "ETH Peak" "eth" $PEAK_LOAD "disabled" 2>/dev/null | tail -1)
 ETH_PEAK_OFF_TPS=$(echo $RESULT | awk '{print $1}')
+ETH_PEAK_OFF_HIT=$(echo $RESULT | awk '{print $2}')
 
 RESULT=$(run_test "ETH Peak" "eth" $PEAK_LOAD "enabled" 2>/dev/null | tail -1)
 ETH_PEAK_ON_TPS=$(echo $RESULT | awk '{print $1}')
@@ -460,6 +524,7 @@ echo -e "${BOLD}${BLUE}═══════════════════
 echo -e "\n  ${CYAN}ERC20 transfer() - Normal Load:${NC}"
 RESULT=$(run_test "ERC20 transfer Normal" "erc20_transfer" $NORMAL_LOAD "disabled" 2>/dev/null | tail -1)
 ERC20_TRANSFER_NORMAL_OFF_TPS=$(echo $RESULT | awk '{print $1}')
+ERC20_TRANSFER_NORMAL_OFF_HIT=$(echo $RESULT | awk '{print $2}')
 
 RESULT=$(run_test "ERC20 transfer Normal" "erc20_transfer" $NORMAL_LOAD "enabled" 2>/dev/null | tail -1)
 ERC20_TRANSFER_NORMAL_ON_TPS=$(echo $RESULT | awk '{print $1}')
@@ -469,6 +534,7 @@ ERC20_TRANSFER_NORMAL_ON_STORAGE=$(echo $RESULT | awk '{print $3}')
 echo -e "\n  ${CYAN}ERC20 transfer() - Peak Load:${NC}"
 RESULT=$(run_test "ERC20 transfer Peak" "erc20_transfer" $PEAK_LOAD "disabled" 2>/dev/null | tail -1)
 ERC20_TRANSFER_PEAK_OFF_TPS=$(echo $RESULT | awk '{print $1}')
+ERC20_TRANSFER_PEAK_OFF_HIT=$(echo $RESULT | awk '{print $2}')
 
 RESULT=$(run_test "ERC20 transfer Peak" "erc20_transfer" $PEAK_LOAD "enabled" 2>/dev/null | tail -1)
 ERC20_TRANSFER_PEAK_ON_TPS=$(echo $RESULT | awk '{print $1}')
@@ -478,6 +544,7 @@ ERC20_TRANSFER_PEAK_ON_STORAGE=$(echo $RESULT | awk '{print $3}')
 echo -e "\n  ${CYAN}ERC20 transferFrom() - Normal Load:${NC}"
 RESULT=$(run_test "ERC20 transferFrom Normal" "erc20_transferFrom" $NORMAL_LOAD "disabled" 2>/dev/null | tail -1)
 ERC20_TRANSFERFROM_NORMAL_OFF_TPS=$(echo $RESULT | awk '{print $1}')
+ERC20_TRANSFERFROM_NORMAL_OFF_HIT=$(echo $RESULT | awk '{print $2}')
 
 RESULT=$(run_test "ERC20 transferFrom Normal" "erc20_transferFrom" $NORMAL_LOAD "enabled" 2>/dev/null | tail -1)
 ERC20_TRANSFERFROM_NORMAL_ON_TPS=$(echo $RESULT | awk '{print $1}')
@@ -486,6 +553,7 @@ ERC20_TRANSFERFROM_NORMAL_ON_HIT=$(echo $RESULT | awk '{print $2}')
 echo -e "\n  ${CYAN}ERC20 transferFrom() - Peak Load:${NC}"
 RESULT=$(run_test "ERC20 transferFrom Peak" "erc20_transferFrom" $PEAK_LOAD "disabled" 2>/dev/null | tail -1)
 ERC20_TRANSFERFROM_PEAK_OFF_TPS=$(echo $RESULT | awk '{print $1}')
+ERC20_TRANSFERFROM_PEAK_OFF_HIT=$(echo $RESULT | awk '{print $2}')
 
 RESULT=$(run_test "ERC20 transferFrom Peak" "erc20_transferFrom" $PEAK_LOAD "enabled" 2>/dev/null | tail -1)
 ERC20_TRANSFERFROM_PEAK_ON_TPS=$(echo $RESULT | awk '{print $1}')
@@ -566,12 +634,10 @@ Simple ETH value transfers between accounts.
 
 ### Results
 
-| Load | Pre-warming | TPS | Cache Hit Rate | TPS Change |
-|------|-------------|-----|----------------|------------|
-| Normal (${NORMAL_LOAD} txs) | OFF | ${ETH_NORMAL_OFF_TPS} | - | baseline |
-| Normal (${NORMAL_LOAD} txs) | ON | ${ETH_NORMAL_ON_TPS} | ${ETH_NORMAL_ON_HIT}% | **${ETH_NORMAL_CHANGE}** |
-| Peak (${PEAK_LOAD} txs) | OFF | ${ETH_PEAK_OFF_TPS} | - | baseline |
-| Peak (${PEAK_LOAD} txs) | ON | ${ETH_PEAK_ON_TPS} | ${ETH_PEAK_ON_HIT}% | **${ETH_PEAK_CHANGE}** |
+| Load | TPS (OFF) | TPS (ON) | TPS Change | HitRate (OFF) | HitRate (ON) | Hit Change |
+|------|-----------|----------|------------|---------------|--------------|------------|
+| Normal (${NORMAL_LOAD} txs) | ${ETH_NORMAL_OFF_TPS} | ${ETH_NORMAL_ON_TPS} | **${ETH_NORMAL_CHANGE}** | ${ETH_NORMAL_OFF_HIT}% | ${ETH_NORMAL_ON_HIT}% | $((${ETH_NORMAL_ON_HIT} - ${ETH_NORMAL_OFF_HIT}))% |
+| Peak (${PEAK_LOAD} txs) | ${ETH_PEAK_OFF_TPS} | ${ETH_PEAK_ON_TPS} | **${ETH_PEAK_CHANGE}** | ${ETH_PEAK_OFF_HIT}% | ${ETH_PEAK_ON_HIT}% | $((${ETH_PEAK_ON_HIT} - ${ETH_PEAK_OFF_HIT}))% |
 
 ---
 
@@ -581,21 +647,17 @@ ERC20 token operations with storage slot pre-warming.
 
 ### ERC20 transfer()
 
-| Load | Pre-warming | TPS | Cache Hit Rate | Storage Slots | TPS Change |
-|------|-------------|-----|----------------|---------------|------------|
-| Normal (${NORMAL_LOAD} txs) | OFF | ${ERC20_TRANSFER_NORMAL_OFF_TPS} | - | - | baseline |
-| Normal (${NORMAL_LOAD} txs) | ON | ${ERC20_TRANSFER_NORMAL_ON_TPS} | ${ERC20_TRANSFER_NORMAL_ON_HIT}% | ${ERC20_TRANSFER_NORMAL_ON_STORAGE} | **${ERC20_TRANSFER_NORMAL_CHANGE}** |
-| Peak (${PEAK_LOAD} txs) | OFF | ${ERC20_TRANSFER_PEAK_OFF_TPS} | - | - | baseline |
-| Peak (${PEAK_LOAD} txs) | ON | ${ERC20_TRANSFER_PEAK_ON_TPS} | ${ERC20_TRANSFER_PEAK_ON_HIT}% | ${ERC20_TRANSFER_PEAK_ON_STORAGE} | **${ERC20_TRANSFER_PEAK_CHANGE}** |
+| Load | TPS (OFF) | TPS (ON) | TPS Change | HitRate (OFF) | HitRate (ON) | Hit Change |
+|------|-----------|----------|------------|---------------|--------------|------------|
+| Normal (${NORMAL_LOAD} txs) | ${ERC20_TRANSFER_NORMAL_OFF_TPS} | ${ERC20_TRANSFER_NORMAL_ON_TPS} | **${ERC20_TRANSFER_NORMAL_CHANGE}** | ${ERC20_TRANSFER_NORMAL_OFF_HIT}% | ${ERC20_TRANSFER_NORMAL_ON_HIT}% | $((${ERC20_TRANSFER_NORMAL_ON_HIT} - ${ERC20_TRANSFER_NORMAL_OFF_HIT}))% |
+| Peak (${PEAK_LOAD} txs) | ${ERC20_TRANSFER_PEAK_OFF_TPS} | ${ERC20_TRANSFER_PEAK_ON_TPS} | **${ERC20_TRANSFER_PEAK_CHANGE}** | ${ERC20_TRANSFER_PEAK_OFF_HIT}% | ${ERC20_TRANSFER_PEAK_ON_HIT}% | $((${ERC20_TRANSFER_PEAK_ON_HIT} - ${ERC20_TRANSFER_PEAK_OFF_HIT}))% |
 
 ### ERC20 transferFrom()
 
-| Load | Pre-warming | TPS | Cache Hit Rate | TPS Change |
-|------|-------------|-----|----------------|------------|
-| Normal (${NORMAL_LOAD} txs) | OFF | ${ERC20_TRANSFERFROM_NORMAL_OFF_TPS} | - | baseline |
-| Normal (${NORMAL_LOAD} txs) | ON | ${ERC20_TRANSFERFROM_NORMAL_ON_TPS} | ${ERC20_TRANSFERFROM_NORMAL_ON_HIT}% | **${ERC20_TRANSFERFROM_NORMAL_CHANGE}** |
-| Peak (${PEAK_LOAD} txs) | OFF | ${ERC20_TRANSFERFROM_PEAK_OFF_TPS} | - | baseline |
-| Peak (${PEAK_LOAD} txs) | ON | ${ERC20_TRANSFERFROM_PEAK_ON_TPS} | ${ERC20_TRANSFERFROM_PEAK_ON_HIT}% | **${ERC20_TRANSFERFROM_PEAK_CHANGE}** |
+| Load | TPS (OFF) | TPS (ON) | TPS Change | HitRate (OFF) | HitRate (ON) | Hit Change |
+|------|-----------|----------|------------|---------------|--------------|------------|
+| Normal (${NORMAL_LOAD} txs) | ${ERC20_TRANSFERFROM_NORMAL_OFF_TPS} | ${ERC20_TRANSFERFROM_NORMAL_ON_TPS} | **${ERC20_TRANSFERFROM_NORMAL_CHANGE}** | ${ERC20_TRANSFERFROM_NORMAL_OFF_HIT}% | ${ERC20_TRANSFERFROM_NORMAL_ON_HIT}% | $((${ERC20_TRANSFERFROM_NORMAL_ON_HIT} - ${ERC20_TRANSFERFROM_NORMAL_OFF_HIT}))% |
+| Peak (${PEAK_LOAD} txs) | ${ERC20_TRANSFERFROM_PEAK_OFF_TPS} | ${ERC20_TRANSFERFROM_PEAK_ON_TPS} | **${ERC20_TRANSFERFROM_PEAK_CHANGE}** | ${ERC20_TRANSFERFROM_PEAK_OFF_HIT}% | ${ERC20_TRANSFERFROM_PEAK_ON_HIT}% | $((${ERC20_TRANSFERFROM_PEAK_ON_HIT} - ${ERC20_TRANSFERFROM_PEAK_OFF_HIT}))% |
 
 ---
 
@@ -635,23 +697,23 @@ echo -e "${BOLD}${MAGENTA}══════════════════
 
 echo ""
 echo -e "${BOLD}  ETH TRANSFERS${NC}"
-echo -e "  ┌─────────────┬──────────────┬──────────────┬───────────┬──────────┐"
-echo -e "  │ Load        │ Pre-warm OFF │ Pre-warm ON  │ Hit Rate  │ Change   │"
-echo -e "  ├─────────────┼──────────────┼──────────────┼───────────┼──────────┤"
-echo -e "  │ Normal      │ ${ETH_NORMAL_OFF_TPS} TPS     │ ${ETH_NORMAL_ON_TPS} TPS     │ ${ETH_NORMAL_ON_HIT}%       │ ${ETH_NORMAL_CHANGE}    │"
-echo -e "  │ Peak        │ ${ETH_PEAK_OFF_TPS} TPS     │ ${ETH_PEAK_ON_TPS} TPS     │ ${ETH_PEAK_ON_HIT}%       │ ${ETH_PEAK_CHANGE}    │"
-echo -e "  └─────────────┴──────────────┴──────────────┴───────────┴──────────┘"
+echo -e "  ┌─────────────┬───────────────┬───────────────┬──────────┬─────────────┬─────────────┬──────────┐"
+echo -e "  │ Load        │ TPS (OFF)     │ TPS (ON)      │ TPS Chg  │ HitRate OFF │ HitRate ON  │ Hit Chg  │"
+echo -e "  ├─────────────┼───────────────┼───────────────┼──────────┼─────────────┼─────────────┼──────────┤"
+echo -e "  │ Normal      │ ${ETH_NORMAL_OFF_TPS}        │ ${ETH_NORMAL_ON_TPS}        │ ${ETH_NORMAL_CHANGE}   │ ${ETH_NORMAL_OFF_HIT}%        │ ${ETH_NORMAL_ON_HIT}%        │ $((ETH_NORMAL_ON_HIT - ETH_NORMAL_OFF_HIT))%      │"
+echo -e "  │ Peak        │ ${ETH_PEAK_OFF_TPS}        │ ${ETH_PEAK_ON_TPS}        │ ${ETH_PEAK_CHANGE}   │ ${ETH_PEAK_OFF_HIT}%        │ ${ETH_PEAK_ON_HIT}%        │ $((ETH_PEAK_ON_HIT - ETH_PEAK_OFF_HIT))%      │"
+echo -e "  └─────────────┴───────────────┴───────────────┴──────────┴─────────────┴─────────────┴──────────┘"
 
 echo ""
 echo -e "${BOLD}  ERC20 OPERATIONS${NC}"
-echo -e "  ┌─────────────────────┬──────────────┬──────────────┬───────────┬──────────┐"
-echo -e "  │ Operation           │ Pre-warm OFF │ Pre-warm ON  │ Hit Rate  │ Change   │"
-echo -e "  ├─────────────────────┼──────────────┼──────────────┼───────────┼──────────┤"
-echo -e "  │ transfer() Normal   │ ${ERC20_TRANSFER_NORMAL_OFF_TPS} TPS     │ ${ERC20_TRANSFER_NORMAL_ON_TPS} TPS     │ ${ERC20_TRANSFER_NORMAL_ON_HIT}%       │ ${ERC20_TRANSFER_NORMAL_CHANGE}    │"
-echo -e "  │ transfer() Peak     │ ${ERC20_TRANSFER_PEAK_OFF_TPS} TPS     │ ${ERC20_TRANSFER_PEAK_ON_TPS} TPS     │ ${ERC20_TRANSFER_PEAK_ON_HIT}%       │ ${ERC20_TRANSFER_PEAK_CHANGE}    │"
-echo -e "  │ transferFrom() Norm │ ${ERC20_TRANSFERFROM_NORMAL_OFF_TPS} TPS     │ ${ERC20_TRANSFERFROM_NORMAL_ON_TPS} TPS     │ ${ERC20_TRANSFERFROM_NORMAL_ON_HIT}%       │ ${ERC20_TRANSFERFROM_NORMAL_CHANGE}    │"
-echo -e "  │ transferFrom() Peak │ ${ERC20_TRANSFERFROM_PEAK_OFF_TPS} TPS     │ ${ERC20_TRANSFERFROM_PEAK_ON_TPS} TPS     │ ${ERC20_TRANSFERFROM_PEAK_ON_HIT}%       │ ${ERC20_TRANSFERFROM_PEAK_CHANGE}    │"
-echo -e "  └─────────────────────┴──────────────┴──────────────┴───────────┴──────────┘"
+echo -e "  ┌─────────────────────┬───────────────┬───────────────┬──────────┬─────────────┬─────────────┬──────────┐"
+echo -e "  │ Operation           │ TPS (OFF)     │ TPS (ON)      │ TPS Chg  │ HitRate OFF │ HitRate ON  │ Hit Chg  │"
+echo -e "  ├─────────────────────┼───────────────┼───────────────┼──────────┼─────────────┼─────────────┼──────────┤"
+echo -e "  │ transfer() Normal   │ ${ERC20_TRANSFER_NORMAL_OFF_TPS}        │ ${ERC20_TRANSFER_NORMAL_ON_TPS}        │ ${ERC20_TRANSFER_NORMAL_CHANGE}   │ ${ERC20_TRANSFER_NORMAL_OFF_HIT}%        │ ${ERC20_TRANSFER_NORMAL_ON_HIT}%        │ $((ERC20_TRANSFER_NORMAL_ON_HIT - ERC20_TRANSFER_NORMAL_OFF_HIT))%      │"
+echo -e "  │ transfer() Peak     │ ${ERC20_TRANSFER_PEAK_OFF_TPS}        │ ${ERC20_TRANSFER_PEAK_ON_TPS}        │ ${ERC20_TRANSFER_PEAK_CHANGE}   │ ${ERC20_TRANSFER_PEAK_OFF_HIT}%        │ ${ERC20_TRANSFER_PEAK_ON_HIT}%        │ $((ERC20_TRANSFER_PEAK_ON_HIT - ERC20_TRANSFER_PEAK_OFF_HIT))%      │"
+echo -e "  │ transferFrom() Norm │ ${ERC20_TRANSFERFROM_NORMAL_OFF_TPS}        │ ${ERC20_TRANSFERFROM_NORMAL_ON_TPS}        │ ${ERC20_TRANSFERFROM_NORMAL_CHANGE}   │ ${ERC20_TRANSFERFROM_NORMAL_OFF_HIT}%        │ ${ERC20_TRANSFERFROM_NORMAL_ON_HIT}%        │ $((ERC20_TRANSFERFROM_NORMAL_ON_HIT - ERC20_TRANSFERFROM_NORMAL_OFF_HIT))%      │"
+echo -e "  │ transferFrom() Peak │ ${ERC20_TRANSFERFROM_PEAK_OFF_TPS}        │ ${ERC20_TRANSFERFROM_PEAK_ON_TPS}        │ ${ERC20_TRANSFERFROM_PEAK_CHANGE}   │ ${ERC20_TRANSFERFROM_PEAK_OFF_HIT}%        │ ${ERC20_TRANSFERFROM_PEAK_ON_HIT}%        │ $((ERC20_TRANSFERFROM_PEAK_ON_HIT - ERC20_TRANSFERFROM_PEAK_OFF_HIT))%      │"
+echo -e "  └─────────────────────┴───────────────┴───────────────┴──────────┴─────────────┴─────────────┴──────────┘"
 
 echo ""
 echo -e "${GREEN}✅ Markdown report saved to: ${REPORT_FILE}${NC}"

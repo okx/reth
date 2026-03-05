@@ -213,6 +213,10 @@ pub fn prefetch_with_snapshot_sync(
     metrics: Option<&crate::pre_warming::PreWarmingMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::sync::Mutex;
+    use std::time::Instant;
+
+    // Start timing the entire prefetch operation
+    let prefetch_start = Instant::now();
 
     // Use trace level for hot path logging to avoid overhead
     tracing::trace!(
@@ -235,6 +239,9 @@ pub fn prefetch_with_snapshot_sync(
     if accounts.is_empty() && storage_slots.is_empty() && code_hashes.is_empty() {
         return Ok(());
     }
+
+    // Start timing MDBX queries
+    let mdbx_query_start = Instant::now();
 
     // Use Mutex to collect results from threads
     let account_results: Mutex<Vec<(Address, CachedAccount)>> = Mutex::new(Vec::with_capacity(accounts.len()));
@@ -298,17 +305,22 @@ pub fn prefetch_with_snapshot_sync(
         }
     });
 
+    // Record MDBX query time
+    let mdbx_query_duration = mdbx_query_start.elapsed();
+
     // Merge results into cached_reads
     let account_results_vec = account_results.into_inner().unwrap();
     let storage_results_vec = storage_results.into_inner().unwrap();
     let bytecode_results_vec = bytecode_results.into_inner().unwrap();
 
-    tracing::trace!(
+    // Log MDBX timing at INFO level (important for performance analysis)
+    tracing::info!(
         target: "txpool::pre_warming",
         accounts_fetched = account_results_vec.len(),
         storage_fetched = storage_results_vec.len(),
         bytecode_fetched = bytecode_results_vec.len(),
-        "PREFETCH_SYNC: Fetched results from MDBX"
+        mdbx_query_ms = mdbx_query_duration.as_millis(),
+        "PREFETCH: MDBX queries completed"
     );
 
     for (address, account) in account_results_vec {
@@ -333,25 +345,34 @@ pub fn prefetch_with_snapshot_sync(
     let final_contracts = cached_reads.contracts.len();
     let final_storage: usize = cached_reads.accounts.values().map(|a| a.storage.len()).sum();
 
+    // Record total prefetch duration
+    let prefetch_duration = prefetch_start.elapsed();
+
     // Update metrics if provided
     if let Some(metrics) = metrics {
         metrics.prefetch_operations.increment(1);
         metrics.prefetch_accounts.increment(accounts.len() as u64);
         metrics.prefetch_storage_slots.increment(storage_slots.len() as u64);
         metrics.prefetch_contracts.increment(code_hashes.len() as u64);
+        metrics.prefetch_duration.record(prefetch_duration.as_secs_f64());
 
-        tracing::warn!(
+        // Log timing at INFO level (visible with --log.stdout.filter info)
+        tracing::info!(
             target: "txpool::pre_warming",
-            ">>> PREFETCH_SYNC: Metrics updated successfully"
+            prefetch_duration_ms = prefetch_duration.as_millis(),
+            mdbx_query_ms = mdbx_query_duration.as_millis(),
+            "PREFETCH: Metrics recorded"
         );
     }
 
-    tracing::warn!(
+    tracing::info!(
         target: "txpool::pre_warming",
         final_accounts,
         final_storage,
         final_contracts,
-        ">>> PREFETCH_SYNC: Results merged into cached_reads - COMPLETE ✅"
+        prefetch_duration_us = prefetch_duration.as_micros(),
+        mdbx_query_us = mdbx_query_duration.as_micros(),
+        ">>> PREFETCH_SYNC: Complete"
     );
 
 

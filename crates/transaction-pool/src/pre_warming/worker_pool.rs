@@ -918,6 +918,25 @@ async fn worker_loop<T>(
 
                 // Store keys per transaction (thread-safe)
                 let keys_count = keys.accounts.len() + keys.storage_slots.len() + keys.code_hashes.len() + keys.block_hashes.len();
+                let accounts_count = keys.accounts.len();
+                let storage_count = keys.storage_slots.len();
+                let code_count = keys.code_hashes.len();
+
+                // Log simulation timing at INFO level with full details for per-TX tracking
+                // Format: TX_TIMING|SIMULATION|<tx_hash>|<duration_us>|<keys_count>
+                tracing::info!(
+                    target: "txpool::pre_warming",
+                    tx_hash = ?req.tx_hash,
+                    phase = "SIMULATION",
+                    duration_us = simulation_duration.as_micros(),
+                    keys_total = keys_count,
+                    accounts = accounts_count,
+                    storage_slots = storage_count,
+                    code_hashes = code_count,
+                    worker_id,
+                    "TX_TIMING: Simulation complete"
+                );
+
                 let cache_ptr = std::sync::Arc::as_ptr(&cache);
                 cache.store_tx_keys(req.tx_hash, keys);
 
