@@ -15272,6 +15272,7 @@ dependencies = [
  "reth-trie",
  "reth-trie-common",
  "reth-trie-db",
+ "revm",
  "revm-database",
  "revm-state 9.0.0",
  "rocksdb",

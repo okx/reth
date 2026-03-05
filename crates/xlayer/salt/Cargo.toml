@@ -45,6 +45,7 @@ reth-trie-db.workspace = true
 proptest.workspace = true
 proptest-arbitrary-interop.workspace = true
 qmdb.workspace = true
+revm = { workspace = true, features = ["std"] }
 
 [[bench]]
 name = "mpt_vs_salt"
@@ -56,6 +57,10 @@ harness = false
 
 [[bench]]
 name = "store_compare"
+harness = false
+
+[[bench]]
+name = "evm_compare"
 harness = false
 
 [lints]
