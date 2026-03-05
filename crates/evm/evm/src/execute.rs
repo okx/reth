@@ -507,22 +507,29 @@ where
         self,
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcome<N>, BlockExecutionError> {
-        // Measure EVM execution finalization time
+        #[cfg(feature = "std")]
         let evm_start = std::time::Instant::now();
+
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
         db.merge_transitions(BundleRetention::Reverts);
+
+        #[cfg(feature = "std")]
         let evm_execution_us = evm_start.elapsed().as_micros();
 
-        // Measure state root calculation time
+        #[cfg(feature = "std")]
         let state_root_start = std::time::Instant::now();
+
         let hashed_state = state.hashed_post_state(&db.bundle_state);
         let (state_root, trie_updates) = state
             .state_root_with_updates(hashed_state.clone())
             .map_err(BlockExecutionError::other)?;
+
+        #[cfg(feature = "std")]
         let state_root_us = state_root_start.elapsed().as_micros();
 
-        // Log timing - simple and clear
+        // Log timing - only when std is available
+        #[cfg(feature = "std")]
         tracing::info!(
             target: "evm::execute",
             evm_execution_us,

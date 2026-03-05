@@ -41,6 +41,7 @@ mod metrics;
 mod stack;
 
 pub use better_payload_emitter::BetterPayloadEmitter;
+pub use metrics::CachedReadsMetrics;
 pub use stack::PayloadBuilderStack;
 
 /// Re-export the PreWarmingPool trait from transaction-pool.
@@ -179,8 +180,27 @@ where
         };
 
         let mut cached_reads = self.maybe_pre_cached(parent_header.hash()).unwrap_or_default();
+
+        // ALWAYS set metrics callbacks for CachedReads hit/miss tracking
+        // This ensures we track cache performance regardless of pre-warming feature
+        {
+            use crate::metrics::CachedReadsMetrics;
+            use std::sync::Arc;
+
+            let on_hit = Arc::new(|| {
+                CachedReadsMetrics::global().inc_hits();
+            });
+
+            let on_miss = Arc::new(|| {
+                CachedReadsMetrics::global().inc_misses();
+            });
+
+            cached_reads.set_metrics_callbacks(on_hit, on_miss);
+        }
+
         // Pre-warming: Prefetch state using keys discovered by simulation (PARALLEL)
         // Uses global registry to access pre-warmed cache without complex trait bounds
+        // Note: Pre-warming may override the metrics callbacks above with its own
         #[cfg(feature = "pre-warming")]
         {
             tracing::debug!(

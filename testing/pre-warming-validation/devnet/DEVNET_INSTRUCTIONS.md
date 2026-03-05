@@ -122,6 +122,27 @@ With pre-warming enabled, expect:
 
 ---
 
+## Metrics Reference
+
+### Always-On Metrics (tracked regardless of pre-warming)
+
+| Metric | Description |
+|--------|-------------|
+| `reth_payloads_cached_reads_hits` | Cache hits in CachedReads during EVM execution |
+| `reth_payloads_cached_reads_misses` | Cache misses in CachedReads during EVM execution |
+
+### Pre-warming Specific Metrics (only when pre-warming is ON)
+
+| Metric | Description |
+|--------|-------------|
+| `reth_txpool_pre_warming_simulations_completed` | Number of transaction simulations completed |
+| `reth_txpool_pre_warming_prefetch_operations` | Number of prefetch operations performed |
+| `reth_txpool_pre_warming_prefetch_accounts` | Number of accounts prefetched |
+| `reth_txpool_pre_warming_cache_hits` | Pre-warming specific cache hits |
+| `reth_txpool_pre_warming_cache_misses` | Pre-warming specific cache misses |
+
+---
+
 ## Troubleshooting
 
 | Issue | Check |

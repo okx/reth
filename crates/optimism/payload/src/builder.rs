@@ -210,6 +210,23 @@ where
     {
         let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
 
+        // ALWAYS set metrics callbacks for CachedReads hit/miss tracking
+        // This ensures we track cache performance regardless of pre-warming feature
+        // Uses the shared global metrics from reth_basic_payload_builder
+        {
+            use std::sync::Arc;
+
+            let on_hit = Arc::new(|| {
+                CachedReadsMetrics::global().inc_hits();
+            });
+
+            let on_miss = Arc::new(|| {
+                CachedReadsMetrics::global().inc_misses();
+            });
+
+            cached_reads.set_metrics_callbacks(on_hit, on_miss);
+        }
+
         // Pre-warming: Prefetch state using keys discovered by simulation
         #[cfg(feature = "pre-warming")]
         {
@@ -224,16 +241,23 @@ where
             );
 
             // Get metrics and set callbacks on cached_reads for tracking hits/misses
+            // IMPORTANT: Also increment the always-on payloads_cached_reads_* metrics
             if let Some(metrics) = reth_transaction_pool::pre_warming::get_global_metrics() {
                 let metrics_clone_hit = metrics.clone();
                 let metrics_clone_miss = metrics.clone();
                 
                 let on_hit = std::sync::Arc::new(move || {
+                    // Increment pre-warming specific metrics
                     metrics_clone_hit.cache_hits.increment(1);
+                    // ALSO increment always-on metrics
+                    CachedReadsMetrics::global().inc_hits();
                 });
                 
                 let on_miss = std::sync::Arc::new(move || {
+                    // Increment pre-warming specific metrics
                     metrics_clone_miss.cache_misses.increment(1);
+                    // ALSO increment always-on metrics
+                    CachedReadsMetrics::global().inc_misses();
                 });
                 
                 cached_reads.set_metrics_callbacks(on_hit, on_miss);
