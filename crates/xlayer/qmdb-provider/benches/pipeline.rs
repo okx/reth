@@ -43,7 +43,7 @@ use xlayer_qmdb_provider::QmdbStore;
 // -- Configuration --
 const PRE_POP_ACCOUNTS: usize = 100_000;
 const NUM_BLOCKS: usize = 10;
-const TXS_PER_BLOCK: usize = 2000;
+const TXS_PER_BLOCK: usize = 20_000;
 const INITIAL_BALANCE: u128 = 1_000_000_000_000_000_000; // 1 ETH
 
 // ---------------------------------------------------------------------------

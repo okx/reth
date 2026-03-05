@@ -31,7 +31,7 @@ echo "============================================"
 echo " QMDB Provider Pipeline Benchmark"
 echo "============================================"
 echo ""
-echo "Config: 100k pre-populated accounts, 10 blocks, 2000 tx/block"
+echo "Config: 100k pre-populated accounts, 10 blocks, 20000 tx/block"
 echo ""
 
 if [ -n "$FILTER" ]; then
