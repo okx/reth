@@ -16,7 +16,7 @@ use alloy_rpc_types_engine::{
 };
 use core::convert::Infallible;
 use reth_ethereum_primitives::EthPrimitives;
-use reth_payload_primitives::{BuiltPayload, PayloadBuilderAttributes};
+use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderAttributes};
 use reth_primitives_traits::{NodePrimitives, SealedBlock};
 
 use crate::BuiltPayloadConversionError;
@@ -41,6 +41,9 @@ pub struct EthBuiltPayload<N: NodePrimitives = EthPrimitives> {
     pub(crate) sidecars: BlobSidecars,
     /// The requests of the payload
     pub(crate) requests: Option<Requests>,
+    /// Optional executed block data from the payload builder.
+    /// When set, the engine can skip re-execution via the `InsertExecutedBlock` path.
+    pub(crate) executed_block: Option<BuiltPayloadExecutedBlock<N>>,
 }
 
 // === impl BuiltPayload ===
@@ -55,7 +58,13 @@ impl<N: NodePrimitives> EthBuiltPayload<N> {
         fees: U256,
         requests: Option<Requests>,
     ) -> Self {
-        Self { id, block, fees, requests, sidecars: BlobSidecars::Empty }
+        Self { id, block, fees, requests, sidecars: BlobSidecars::Empty, executed_block: None }
+    }
+
+    /// Attaches executed block data so the engine can skip re-execution.
+    pub fn with_executed_block(mut self, executed_block: BuiltPayloadExecutedBlock<N>) -> Self {
+        self.executed_block = Some(executed_block);
+        self
     }
 
     /// Returns the identifier of the payload.
@@ -175,6 +184,10 @@ impl<N: NodePrimitives> BuiltPayload for EthBuiltPayload<N> {
 
     fn requests(&self) -> Option<Requests> {
         self.requests.clone()
+    }
+
+    fn executed_block(&self) -> Option<BuiltPayloadExecutedBlock<N>> {
+        self.executed_block.clone()
     }
 }
 

@@ -16,6 +16,7 @@ use reth_primitives_traits::{Account, Bytecode};
 use revm_database::BundleState;
 use sha2::{Digest, Sha256};
 use std::{
+    cell::RefCell,
     path::Path,
     sync::{
         atomic::{AtomicI64, Ordering},
@@ -241,52 +242,61 @@ impl QmdbStore {
     }
 
     /// Read raw bytes from QMDB for a given key.
+    ///
+    /// Uses a thread-local buffer to avoid 64KB heap allocation per read.
     fn read_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
+        thread_local! {
+            static READ_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; MAX_ENTRY_SIZE]);
+        }
+
         let key_hash = sha256_key(key);
         let height = self.next_height.load(Ordering::SeqCst) - 1;
-        let mut buf = vec![0u8; MAX_ENTRY_SIZE];
 
-        let ads = self.ads.lock();
-        let shared = ads.get_shared();
-        let (size, found) = shared.read_entry(height, &key_hash, key, &mut buf);
+        READ_BUF.with(|buf_cell| {
+            let mut buf = buf_cell.borrow_mut();
 
-        if !found {
-            return None;
-        }
+            let ads = self.ads.lock();
+            let shared = ads.get_shared();
+            let (size, found) = shared.read_entry(height, &key_hash, key, &mut buf);
 
-        // If the buffer was too small, retry with a larger one
-        if size > MAX_ENTRY_SIZE {
-            buf.resize(size, 0);
-            let (size2, found2) = shared.read_entry(height, &key_hash, key, &mut buf);
-            if !found2 || size2 != size {
+            if !found {
                 return None;
             }
-        }
 
-        // EntryBz format (from entry.rs):
-        //   [0..4]: u32 LE encoding (value_len << 8 | key_len)
-        //   [4]:    deactivated SN count
-        //   [5..5+key_len]: key bytes
-        //   [5+key_len..5+key_len+value_len]: value bytes
-        //   followed by: next_key_hash (32), version (8), serial_number (8), ...
-        if size < 5 {
-            return None;
-        }
-        let first32 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let key_len = (first32 & 0xff) as usize;
-        let value_len = (first32 >> 8) as usize;
+            // If the buffer was too small, retry with a larger one
+            if size > buf.len() {
+                buf.resize(size, 0);
+                let (size2, found2) = shared.read_entry(height, &key_hash, key, &mut buf);
+                if !found2 || size2 != size {
+                    return None;
+                }
+            }
 
-        if value_len == 0 {
-            return None;
-        }
+            // EntryBz format (from entry.rs):
+            //   [0..4]: u32 LE encoding (value_len << 8 | key_len)
+            //   [4]:    deactivated SN count
+            //   [5..5+key_len]: key bytes
+            //   [5+key_len..5+key_len+value_len]: value bytes
+            //   followed by: next_key_hash (32), version (8), serial_number (8), ...
+            if size < 5 {
+                return None;
+            }
+            let first32 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let key_len = (first32 & 0xff) as usize;
+            let value_len = (first32 >> 8) as usize;
 
-        let value_start = 5 + key_len;
-        let value_end = value_start + value_len;
-        if value_end > size {
-            return None;
-        }
+            if value_len == 0 {
+                return None;
+            }
 
-        Some(buf[value_start..value_end].to_vec())
+            let value_start = 5 + key_len;
+            let value_end = value_start + value_len;
+            if value_end > size {
+                return None;
+            }
+
+            Some(buf[value_start..value_end].to_vec())
+        })
     }
 
     /// Convert a `BundleState` into a QMDB task, automatically choosing

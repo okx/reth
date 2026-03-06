@@ -9277,6 +9277,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
+ "either",
  "reth-basic-payload-builder",
  "reth-chainspec",
  "reth-consensus-common",
@@ -9294,6 +9295,7 @@ dependencies = [
  "reth-storage-api",
  "reth-transaction-pool",
  "revm",
+ "revm-database",
  "tracing",
 ]
 

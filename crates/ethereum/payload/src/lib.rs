@@ -27,7 +27,7 @@ use reth_evm::{
 use reth_evm_ethereum::EthEvmConfig;
 use reth_payload_builder::{BlobSidecars, EthBuiltPayload, EthPayloadBuilderAttributes};
 use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_payload_primitives::PayloadBuilderAttributes;
+use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderAttributes};
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::StateProviderFactory;
@@ -37,6 +37,7 @@ use reth_transaction_pool::{
     ValidPoolTransaction,
 };
 use revm::context_interface::Block as _;
+use revm_database::states::bundle_state::BundleRetention;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -360,12 +361,16 @@ where
         return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
     }
 
-    let BlockBuilderOutcome { execution_result, block, .. } =
+    let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
         builder.finish(state_provider.as_ref())?;
+
+    // Extract BundleState from the execution database for InsertExecutedBlock fast path.
+    db.merge_transitions(BundleRetention::Reverts);
+    let bundle_state = db.take_bundle();
 
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
-        .then_some(execution_result.requests);
+        .then_some(execution_result.requests.clone());
 
     let sealed_block = Arc::new(block.sealed_block().clone());
     debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");
@@ -377,9 +382,24 @@ where
         }));
     }
 
+    // Build the executed block so the engine can skip re-execution.
+    let executed_block = {
+        use either::Either;
+        use reth_evm::execute::BlockExecutionOutput;
+        let execution_output =
+            Arc::new(BlockExecutionOutput { result: execution_result, state: bundle_state });
+        let recovered_block = Arc::new(block);
+        BuiltPayloadExecutedBlock {
+            recovered_block,
+            execution_output,
+            hashed_state: Either::Left(Arc::new(hashed_state)),
+            trie_updates: Either::Left(Arc::new(trie_updates)),
+        }
+    };
+
     let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
-        // add blob sidecars from the executed txs
-        .with_sidecars(blob_sidecars);
+        .with_sidecars(blob_sidecars)
+        .with_executed_block(executed_block);
 
     Ok(BuildOutcome::Better { payload, cached_reads })
 }
