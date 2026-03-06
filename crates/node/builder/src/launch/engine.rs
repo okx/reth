@@ -59,6 +59,12 @@ pub struct EngineNodeLauncher {
     /// Optional state provider override factory. When set, state reads go through
     /// this factory instead of the default database/in-memory providers.
     pub state_provider_override: Option<reth_provider::providers::StateProviderOverride>,
+
+    /// When true, skip the `InsertExecutedBlock` fast path so that locally-built
+    /// blocks are re-executed through `NewPayload`. This is needed for QMDB
+    /// benchmarking: the NewPayload path triggers `state_by_block_hash()` (QMDB
+    /// reads) and records full per-block timing metrics.
+    pub force_new_payload_path: bool,
 }
 
 impl std::fmt::Debug for EngineNodeLauncher {
@@ -71,6 +77,7 @@ impl std::fmt::Debug for EngineNodeLauncher {
                 "state_provider_override",
                 &self.state_provider_override.as_ref().map(|_| "Some(...)"),
             )
+            .field("force_new_payload_path", &self.force_new_payload_path)
             .finish()
     }
 }
@@ -87,6 +94,7 @@ impl EngineNodeLauncher {
             engine_tree_config,
             on_canonical_commit: None,
             state_provider_override: None,
+            force_new_payload_path: false,
         }
     }
 
@@ -96,6 +104,12 @@ impl EngineNodeLauncher {
         cb: Box<dyn Fn(&revm_database::BundleState) + Send>,
     ) -> Self {
         self.on_canonical_commit = Some(cb);
+        self
+    }
+
+    /// Force blocks through the `NewPayload` path instead of `InsertExecutedBlock`.
+    pub fn with_force_new_payload_path(mut self) -> Self {
+        self.force_new_payload_path = true;
         self
     }
 
@@ -123,7 +137,13 @@ impl EngineNodeLauncher {
         AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>
             + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>,
     {
-        let Self { ctx, engine_tree_config, on_canonical_commit, state_provider_override } = self;
+        let Self {
+            ctx,
+            engine_tree_config,
+            on_canonical_commit,
+            state_provider_override,
+            force_new_payload_path,
+        } = self;
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
             components_builder,
@@ -380,9 +400,11 @@ impl EngineNodeLauncher {
                         }
                     }
                     payload = built_payloads.select_next_some() => {
-                        if let Some(executed_block) = payload.executed_block() {
-                            debug!(target: "reth::cli", block=?executed_block.recovered_block.num_hash(),  "inserting built payload");
-                            engine_service.orchestrator_mut().handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block.into_executed_payload()).into());
+                        if !force_new_payload_path {
+                            if let Some(executed_block) = payload.executed_block() {
+                                debug!(target: "reth::cli", block=?executed_block.recovered_block.num_hash(),  "inserting built payload");
+                                engine_service.orchestrator_mut().handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block.into_executed_payload()).into());
+                            }
                         }
                     }
                     event = engine_service.next() => {

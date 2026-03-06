@@ -25,6 +25,7 @@ use reth_evm::{
     ConfigureEvm, Evm, NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::EthEvmConfig;
+use reth_node_metrics::block_timing::{BlockTimingContext, BlockTimingPrometheusMetrics};
 use reth_payload_builder::{BlobSidecars, EthBuiltPayload, EthPayloadBuilderAttributes};
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderAttributes};
@@ -187,10 +188,18 @@ where
     ));
     let mut total_fees = U256::ZERO;
 
-    builder.apply_pre_execution_changes().map_err(|err| {
-        warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
-        PayloadBuilderError::Internal(err.into())
-    })?;
+    // Initialize build timing context (block hash unknown until block is sealed)
+    let prom_metrics = BlockTimingPrometheusMetrics::default();
+    let mut timing_ctx =
+        BlockTimingContext::new_empty_with_prometheus(alloy_primitives::B256::ZERO, prom_metrics);
+
+    {
+        let _guard = timing_ctx.time_apply_pre_execution_changes();
+        builder.apply_pre_execution_changes().map_err(|err| {
+            warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
+            PayloadBuilderError::Internal(err.into())
+        })?;
+    }
 
     // initialize empty blob sidecars at first. If cancun is active then this will be populated by
     // blob sidecars if any.
@@ -214,6 +223,7 @@ where
 
     let withdrawals_rlp_length = attributes.withdrawals().length();
 
+    let _exec_guard = timing_ctx.time_exec_mempool_transactions();
     while let Some(pool_tx) = best_txs.next() {
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
@@ -353,6 +363,8 @@ where
         }
     }
 
+    drop(_exec_guard);
+
     // check if we have a better block
     if !is_better_payload(best_payload.as_ref(), total_fees) {
         // Release db
@@ -361,8 +373,10 @@ where
         return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
     }
 
-    let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-        builder.finish(state_provider.as_ref())?;
+    let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = {
+        let _guard = timing_ctx.time_calc_state_root();
+        builder.finish(state_provider.as_ref())?
+    };
 
     // Extract BundleState from the execution database for InsertExecutedBlock fast path.
     db.merge_transitions(BundleRetention::Reverts);
@@ -373,6 +387,12 @@ where
         .then_some(execution_result.requests.clone());
 
     let sealed_block = Arc::new(block.sealed_block().clone());
+
+    // Store build timing with actual block hash
+    timing_ctx.set_block_hash(sealed_block.hash());
+    timing_ctx.update_totals();
+    timing_ctx.store();
+
     debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");
 
     if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {

@@ -1447,6 +1447,10 @@ where
                         debug!(target: "engine::tree", block=?block_num_hash, "inserting already executed block");
                         let now = Instant::now();
 
+                        // Load any existing build-phase timing recorded by the payload builder.
+                        use reth_node_metrics::block_timing::BlockTimingContext;
+                        let mut timing_ctx = BlockTimingContext::new(block_num_hash.hash);
+
                         // if the parent is the canonical head, we can insert the block as the
                         // pending block
                         if self.state.tree_state.canonical_block_hash() ==
@@ -1456,11 +1460,16 @@ where
                             self.canonical_in_memory_state.set_pending_block(block.clone());
                         }
 
-                        let insert_tree_start = Instant::now();
-                        self.state.tree_state.insert_executed(block.clone());
-                        self.payload_validator.on_inserted_executed_block(block.clone());
+                        {
+                            let _guard = timing_ctx.time_insert_to_tree();
+                            self.state.tree_state.insert_executed(block.clone());
+                            self.payload_validator.on_inserted_executed_block(block.clone());
+                        }
                         self.metrics.engine.inserted_already_executed_blocks.increment(1);
                         let elapsed = now.elapsed();
+
+                        timing_ctx.update_totals();
+                        // timing_ctx will auto-store on drop
 
                         self.emit_event(EngineApiEvent::BeaconConsensus(
                             ConsensusEngineEvent::CanonicalBlockAdded(block, elapsed),
