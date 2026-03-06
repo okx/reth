@@ -510,6 +510,25 @@ where
             block
         );
 
+        if self.config.skip_state_root_validation() {
+            // Skip state root computation entirely when using an external state backend.
+            debug!(target: "engine::tree::payload_validator", "Skipping state root validation");
+
+            if let Some(valid_block_tx) = valid_block_tx {
+                let _ = valid_block_tx.send(());
+            }
+
+            let trie_output = TrieUpdates::default();
+            return Ok(self.spawn_deferred_trie_task(
+                block,
+                output,
+                &ctx,
+                hashed_state,
+                trie_output,
+                overlay_factory,
+            ))
+        }
+
         let root_time = Instant::now();
         let mut maybe_state_root = None;
 

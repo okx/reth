@@ -44,7 +44,6 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 /// The engine node launcher.
-#[derive(Debug)]
 pub struct EngineNodeLauncher {
     /// The task executor for the node.
     pub ctx: LaunchContext,
@@ -52,16 +51,61 @@ pub struct EngineNodeLauncher {
     /// Temporary configuration for engine tree.
     /// After engine is stabilized, this should be configured through node builder.
     pub engine_tree_config: TreeConfig,
+
+    /// Optional callback invoked synchronously for each new canonical block.
+    /// Used by QMDB integration to commit state before the next block is processed.
+    pub on_canonical_commit: Option<Box<dyn Fn(&revm_database::BundleState) + Send>>,
+
+    /// Optional state provider override factory. When set, state reads go through
+    /// this factory instead of the default database/in-memory providers.
+    pub state_provider_override: Option<reth_provider::providers::StateProviderOverride>,
+}
+
+impl std::fmt::Debug for EngineNodeLauncher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineNodeLauncher")
+            .field("ctx", &self.ctx)
+            .field("engine_tree_config", &self.engine_tree_config)
+            .field("on_canonical_commit", &self.on_canonical_commit.as_ref().map(|_| "Some(...)"))
+            .field(
+                "state_provider_override",
+                &self.state_provider_override.as_ref().map(|_| "Some(...)"),
+            )
+            .finish()
+    }
 }
 
 impl EngineNodeLauncher {
     /// Create a new instance of the ethereum node launcher.
-    pub const fn new(
+    pub fn new(
         task_executor: TaskExecutor,
         data_dir: ChainPath<DataDirPath>,
         engine_tree_config: TreeConfig,
     ) -> Self {
-        Self { ctx: LaunchContext::new(task_executor, data_dir), engine_tree_config }
+        Self {
+            ctx: LaunchContext::new(task_executor, data_dir),
+            engine_tree_config,
+            on_canonical_commit: None,
+            state_provider_override: None,
+        }
+    }
+
+    /// Set the canonical commit callback.
+    pub fn with_on_canonical_commit(
+        mut self,
+        cb: Box<dyn Fn(&revm_database::BundleState) + Send>,
+    ) -> Self {
+        self.on_canonical_commit = Some(cb);
+        self
+    }
+
+    /// Set the state provider override factory.
+    pub fn with_state_provider_override(
+        mut self,
+        override_fn: reth_provider::providers::StateProviderOverride,
+    ) -> Self {
+        self.state_provider_override = Some(override_fn);
+        self
     }
 
     async fn launch_node<T, CB, AO>(
@@ -79,7 +123,7 @@ impl EngineNodeLauncher {
         AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>
             + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>,
     {
-        let Self { ctx, engine_tree_config } = self;
+        let Self { ctx, engine_tree_config, on_canonical_commit, state_provider_override } = self;
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
             components_builder,
@@ -135,7 +179,11 @@ impl EngineNodeLauncher {
             // passing FullNodeTypes as type parameter here so that we can build
             // later the components.
             .with_blockchain_db::<T, _>(move |provider_factory| {
-                Ok(BlockchainProvider::new(provider_factory)?)
+                let mut provider = BlockchainProvider::new(provider_factory)?;
+                if let Some(override_fn) = state_provider_override {
+                    provider.set_state_provider_override(override_fn);
+                }
+                Ok(provider)
             })?
             .with_components(components_builder, on_component_initialized).await?;
 
@@ -250,6 +298,7 @@ impl EngineNodeLauncher {
             ctx.sync_metrics_tx(),
             ctx.components().evm_config().clone(),
             changeset_cache,
+            on_canonical_commit,
         );
 
         info!(target: "reth::cli", "Consensus engine initialized");

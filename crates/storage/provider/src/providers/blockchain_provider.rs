@@ -38,18 +38,36 @@ use std::{
 };
 use tracing::trace;
 
+/// Factory for creating state provider overrides (e.g., QMDB-backed state).
+pub type StateProviderOverride = Arc<dyn Fn() -> StateProviderBox + Send + Sync>;
+
 /// The main type for interacting with the blockchain.
 ///
 /// This type serves as the main entry point for interacting with the blockchain and provides data
 /// from database storage and from the blockchain tree (pending state etc.) It is a simple wrapper
 /// type that holds an instance of the database and the blockchain tree.
-#[derive(Debug)]
 pub struct BlockchainProvider<N: NodeTypesWithDB> {
     /// Provider factory used to access the database.
     pub(crate) database: ProviderFactory<N>,
     /// Tracks the chain info wrt forkchoice updates and in memory canonical
     /// state.
     pub(crate) canonical_in_memory_state: CanonicalInMemoryState<N::Primitives>,
+    /// Optional override for state provider creation. When set, `latest()` and
+    /// `state_by_block_hash()` use this instead of the default database/in-memory providers.
+    state_provider_override: Option<StateProviderOverride>,
+}
+
+impl<N: NodeTypesWithDB> std::fmt::Debug for BlockchainProvider<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockchainProvider")
+            .field("database", &self.database)
+            .field("canonical_in_memory_state", &self.canonical_in_memory_state)
+            .field(
+                "state_provider_override",
+                &self.state_provider_override.as_ref().map(|_| "Some(...)"),
+            )
+            .finish()
+    }
 }
 
 impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
@@ -57,6 +75,7 @@ impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
         Self {
             database: self.database.clone(),
             canonical_in_memory_state: self.canonical_in_memory_state.clone(),
+            state_provider_override: self.state_provider_override.clone(),
         }
     }
 }
@@ -108,7 +127,15 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
                 finalized_header,
                 safe_header,
             ),
+            state_provider_override: None,
         })
+    }
+
+    /// Set a state provider override factory.
+    /// When set, `latest()` and `state_by_block_hash()` will use this factory
+    /// instead of the default database/in-memory providers.
+    pub fn set_state_provider_override(&mut self, override_fn: StateProviderOverride) {
+        self.state_provider_override = Some(override_fn);
     }
 
     /// Gets a clone of `canonical_in_memory_state`.
@@ -505,6 +532,10 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
     /// Storage provider for latest block
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", "Getting latest block state provider");
+        if let Some(ref override_fn) = self.state_provider_override {
+            trace!(target: "providers::blockchain", "Using state provider override for latest");
+            return Ok(override_fn());
+        }
         // use latest state provider if the head state exists
         if let Some(state) = self.canonical_in_memory_state.head_state() {
             trace!(target: "providers::blockchain", "Using head state for latest state provider");
@@ -566,6 +597,10 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
 
     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", ?hash, "Getting state by block hash");
+        if let Some(ref override_fn) = self.state_provider_override {
+            trace!(target: "providers::blockchain", "Using state provider override for block hash");
+            return Ok(override_fn());
+        }
         if let Ok(state) = self.history_by_block_hash(hash) {
             // This could be tracked by a historical block
             Ok(state)

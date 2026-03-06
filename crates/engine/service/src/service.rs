@@ -86,6 +86,7 @@ where
         sync_metrics_tx: MetricEventsSender,
         evm_config: C,
         changeset_cache: ChangesetCache,
+        on_canonical_commit: Option<Box<dyn Fn(&revm_database::BundleState) + Send>>,
     ) -> Self
     where
         V: EngineValidator<N::Payload>,
@@ -112,6 +113,7 @@ where
             engine_kind,
             evm_config,
             changeset_cache,
+            on_canonical_commit,
         );
 
         let engine_handler = EngineApiRequestHandler::new(to_tree_tx, from_tree);
@@ -222,6 +224,7 @@ mod tests {
             sync_metrics_tx,
             evm_config,
             changeset_cache,
+            None,
         );
     }
 }

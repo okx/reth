@@ -137,6 +137,10 @@ pub struct TreeConfig {
     account_worker_count: usize,
     /// Whether to enable V2 storage proofs.
     enable_proof_v2: bool,
+    /// Whether to skip state root validation entirely.
+    /// Used when an external state backend (e.g., QMDB) manages state
+    /// and the MPT state root is not meaningful.
+    skip_state_root_validation: bool,
 }
 
 impl Default for TreeConfig {
@@ -166,6 +170,7 @@ impl Default for TreeConfig {
             storage_worker_count: default_storage_worker_count(),
             account_worker_count: default_account_worker_count(),
             enable_proof_v2: false,
+            skip_state_root_validation: false,
         }
     }
 }
@@ -198,6 +203,7 @@ impl TreeConfig {
         storage_worker_count: usize,
         account_worker_count: usize,
         enable_proof_v2: bool,
+        skip_state_root_validation: bool,
     ) -> Self {
         Self {
             persistence_threshold,
@@ -224,6 +230,7 @@ impl TreeConfig {
             storage_worker_count,
             account_worker_count,
             enable_proof_v2,
+            skip_state_root_validation,
         }
     }
 
@@ -514,6 +521,20 @@ impl TreeConfig {
     /// Setter for whether to enable V2 storage proofs.
     pub const fn with_enable_proof_v2(mut self, enable_proof_v2: bool) -> Self {
         self.enable_proof_v2 = enable_proof_v2;
+        self
+    }
+
+    /// Returns whether state root validation should be skipped.
+    pub const fn skip_state_root_validation(&self) -> bool {
+        self.skip_state_root_validation
+    }
+
+    /// Setter for skipping state root validation.
+    pub const fn with_skip_state_root_validation(
+        mut self,
+        skip_state_root_validation: bool,
+    ) -> Self {
+        self.skip_state_root_validation = skip_state_root_validation;
         self
     }
 }

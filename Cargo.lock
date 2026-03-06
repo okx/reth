@@ -8911,6 +8911,7 @@ dependencies = [
  "reth-stages-api",
  "reth-tasks",
  "reth-trie-db",
+ "revm-database",
  "tokio",
  "tokio-stream",
 ]
@@ -9874,6 +9875,7 @@ dependencies = [
  "reth-tracing",
  "reth-transaction-pool",
  "reth-trie-db",
+ "revm-database",
  "secp256k1 0.30.0",
  "serde_json",
  "tempfile",
@@ -10795,6 +10797,29 @@ dependencies = [
  "strum 0.27.2",
  "thiserror 2.0.18",
  "toml",
+]
+
+[[package]]
+name = "reth-qmdb"
+version = "1.10.2"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "clap",
+ "eyre",
+ "reth-chainspec",
+ "reth-cli-util",
+ "reth-engine-primitives",
+ "reth-ethereum-cli",
+ "reth-node-builder",
+ "reth-node-core",
+ "reth-node-ethereum",
+ "reth-provider",
+ "revm-database",
+ "revm-state 9.0.0",
+ "tokio",
+ "tracing",
+ "xlayer-qmdb-provider",
 ]
 
 [[package]]

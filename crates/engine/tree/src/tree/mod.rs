@@ -34,7 +34,7 @@ use reth_provider::{
     DatabaseProviderFactory, HashedPostStateProvider, ProviderError, StageCheckpointReader,
     StateProviderBox, StateProviderFactory, StateReader, TransactionVariant,
 };
-use reth_revm::database::StateProviderDatabase;
+use reth_revm::{database::StateProviderDatabase, db::BundleState};
 use reth_stages_api::ControlFlow;
 use reth_trie_db::ChangesetCache;
 use revm::state::EvmState;
@@ -275,6 +275,10 @@ where
     evm_config: C,
     /// Changeset cache for in-memory trie changesets
     changeset_cache: ChangesetCache,
+    /// Optional callback invoked synchronously for each new canonical block.
+    /// Receives the block's BundleState. Runs on the engine's dedicated thread
+    /// before notifications are sent.
+    on_canonical_commit: Option<Box<dyn Fn(&BundleState) + Send>>,
 }
 
 impl<N, P: Debug, T: PayloadTypes + Debug, V: Debug, C> std::fmt::Debug
@@ -338,6 +342,7 @@ where
         engine_kind: EngineApiKind,
         evm_config: C,
         changeset_cache: ChangesetCache,
+        on_canonical_commit: Option<Box<dyn Fn(&BundleState) + Send>>,
     ) -> Self {
         let (incoming_tx, incoming) = crossbeam_channel::unbounded();
 
@@ -359,6 +364,7 @@ where
             engine_kind,
             evm_config,
             changeset_cache,
+            on_canonical_commit,
         }
     }
 
@@ -379,6 +385,7 @@ where
         kind: EngineApiKind,
         evm_config: C,
         changeset_cache: ChangesetCache,
+        on_canonical_commit: Option<Box<dyn Fn(&BundleState) + Send>>,
     ) -> (Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>, UnboundedReceiver<EngineApiEvent<N>>)
     {
         let best_block_number = provider.best_block_number().unwrap_or(0);
@@ -411,6 +418,7 @@ where
             kind,
             evm_config,
             changeset_cache,
+            on_canonical_commit,
         );
         let incoming = task.incoming_tx.clone();
         std::thread::Builder::new().name("Engine Task".to_string()).spawn(|| task.run()).unwrap();
@@ -2360,6 +2368,17 @@ where
 
         let tip = chain_update.tip().clone_sealed_header();
         let notification = chain_update.to_chain_notification();
+
+        // Invoke the synchronous commit callback for each new block before updating in-memory
+        // state.
+        if let Some(ref on_commit) = self.on_canonical_commit {
+            let new_blocks = match &chain_update {
+                NewCanonicalChain::Commit { new } | NewCanonicalChain::Reorg { new, .. } => new,
+            };
+            for block in new_blocks {
+                on_commit(&block.execution_output.state);
+            }
+        }
 
         // reinsert any missing reorged blocks
         if let NewCanonicalChain::Reorg { new, old } = &chain_update {

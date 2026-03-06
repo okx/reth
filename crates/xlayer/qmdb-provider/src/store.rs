@@ -108,9 +108,10 @@ impl QmdbStore {
     /// Commit a `BundleState` to QMDB as a new block.
     ///
     /// Converts the bundle into QMDB operations, submits the block, and flushes.
+    /// Uses `OP_CREATE` for new accounts/storage and `OP_WRITE` for existing ones.
     pub fn commit_bundle(&self, bundle: &BundleState) {
         let height = self.next_height.fetch_add(1, Ordering::SeqCst);
-        let task = Self::bundle_to_task(bundle, OP_WRITE);
+        let task = Self::bundle_to_task_auto_op(bundle);
 
         let task_id: i64 = height << IN_BLOCK_IDX_BITS;
         let tasks_manager = Arc::new(TasksManager::new(vec![RwLock::new(Some(task))], task_id));
@@ -128,7 +129,7 @@ impl QmdbStore {
     /// Call [`flush`] separately after submitting all blocks.
     pub fn submit_bundle(&self, bundle: &BundleState) {
         let height = self.next_height.fetch_add(1, Ordering::SeqCst);
-        let task = Self::bundle_to_task(bundle, OP_WRITE);
+        let task = Self::bundle_to_task_auto_op(bundle);
 
         let task_id: i64 = height << IN_BLOCK_IDX_BITS;
         let tasks_manager = Arc::new(TasksManager::new(vec![RwLock::new(Some(task))], task_id));
@@ -288,33 +289,44 @@ impl QmdbStore {
         Some(buf[value_start..value_end].to_vec())
     }
 
-    /// Convert a `BundleState` into a QMDB task.
-    fn bundle_to_task(bundle: &BundleState, op_type: u8) -> SingleCsTask {
+    /// Convert a `BundleState` into a QMDB task, automatically choosing
+    /// `OP_CREATE` for new entries and `OP_WRITE` for existing ones.
+    fn bundle_to_task_auto_op(bundle: &BundleState) -> SingleCsTask {
         let mut builder = TaskBuilder::new();
 
         for (address, bundle_account) in bundle.state() {
             let address = Address::from(*address);
+
+            // Account is new if it had no original_info (didn't exist before this block)
+            let account_is_new = bundle_account.original_info.is_none();
+            let account_op = if account_is_new { OP_CREATE } else { OP_WRITE };
 
             if let Some(info) = &bundle_account.info {
                 let code_hash =
                     if info.code_hash == KECCAK_EMPTY { None } else { Some(info.code_hash) };
                 let account =
                     Account { nonce: info.nonce, balance: info.balance, bytecode_hash: code_hash };
-                builder.add_op(op_type, &account_plain_key(&address), &encode_account(&account));
+                builder.add_op(account_op, &account_plain_key(&address), &encode_account(&account));
 
-                // Store bytecode if present and new
+                // Bytecode is always CREATE since it's content-addressed and immutable
                 if let Some(code) = &info.code {
                     if info.code_hash != KECCAK_EMPTY {
                         let key = bytecode_key(&info.code_hash);
-                        builder.add_op(op_type, &key, code.bytes_slice());
+                        builder.add_op(OP_CREATE, &key, code.bytes_slice());
                     }
                 }
             }
 
             for (slot, slot_info) in &bundle_account.storage {
                 let slot_b256 = B256::from(*slot);
+                // Storage slot is new if its previous/original value was zero (non-existent)
+                let storage_op = if slot_info.previous_or_original_value.is_zero() {
+                    OP_CREATE
+                } else {
+                    OP_WRITE
+                };
                 builder.add_op(
-                    op_type,
+                    storage_op,
                     &storage_plain_key(&address, &slot_b256),
                     &encode_storage_value(&slot_info.present_value),
                 );

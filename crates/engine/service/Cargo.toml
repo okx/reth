@@ -26,6 +26,7 @@ reth-node-types.workspace = true
 reth-chainspec.workspace = true
 reth-engine-primitives.workspace = true
 reth-trie-db.workspace = true
+revm-database.workspace = true
 
 # async
 futures.workspace = true
