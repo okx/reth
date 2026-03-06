@@ -49,6 +49,12 @@ impl QmdbStateProvider {
 
 impl AccountReader for QmdbStateProvider {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        // First check reth's in-memory state (recent canonical blocks), then fall back to QMDB.
+        if let Some(ref fallback) = self.fallback {
+            if let Some(account) = fallback.basic_account(address)? {
+                return Ok(Some(account));
+            }
+        }
         Ok(self.store.read_account(address))
     }
 }
@@ -177,6 +183,12 @@ impl StateProvider for QmdbStateProvider {
         account: Address,
         storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>> {
+        // First check reth's in-memory state (recent canonical blocks), then fall back to QMDB.
+        if let Some(ref fallback) = self.fallback {
+            if let Some(value) = fallback.storage(account, storage_key)? {
+                return Ok(Some(value));
+            }
+        }
         Ok(self.store.read_storage(&account, &storage_key))
     }
 }

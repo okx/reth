@@ -11,7 +11,7 @@ use qmdb::{
     def::{IN_BLOCK_IDX_BITS, OP_CREATE, OP_WRITE},
     seqads::task::{SingleCsTask, TaskBuilder},
     tasks::TasksManager,
-    AdsCore, AdsWrap, ADS,
+    AdsCore, AdsWrap, SharedAdsWrap, ADS,
 };
 use reth_primitives_traits::Account;
 use revm_database::BundleState;
@@ -45,7 +45,10 @@ fn sha256_key(key: &[u8]) -> [u8; 32] {
 
 /// Typed wrapper over QMDB providing account/storage/bytecode operations.
 pub struct QmdbStore {
+    /// Exclusive access for write operations (start_block, flush).
     ads: Mutex<AdsWrap<SingleCsTask>>,
+    /// Lock-free shared handle for concurrent reads.
+    shared: SharedAdsWrap,
     next_height: AtomicI64,
 }
 
@@ -68,7 +71,8 @@ impl QmdbStore {
         };
         AdsCore::init_dir(&config);
         let ads = AdsWrap::<SingleCsTask>::new(&config);
-        Self { ads: Mutex::new(ads), next_height: AtomicI64::new(1) }
+        let shared = ads.get_shared();
+        Self { ads: Mutex::new(ads), shared, next_height: AtomicI64::new(1) }
     }
 
     /// Read an account from QMDB.
@@ -131,16 +135,15 @@ impl QmdbStore {
     /// First tries `get_root_hash_of_height` (populated after flush). If that returns
     /// zeros, falls back to hashing all per-shard root hashes from the metadb.
     pub fn state_root(&self) -> B256 {
-        let ads = self.ads.lock();
         let height = self.next_height.load(Ordering::SeqCst) - 1;
-        let shared = ads.get_shared();
-        let hash = shared.get_root_hash_of_height(height);
+        let hash = self.shared.get_root_hash_of_height(height);
 
         if hash != [0u8; 32] {
             return B256::from(hash);
         }
 
         // Fall back: hash all per-shard root hashes together
+        let ads = self.ads.lock();
         let metadb = ads.get_metadb();
         let mdb = metadb.read();
         let mut hasher = Sha256::new();
@@ -228,9 +231,7 @@ impl QmdbStore {
         READ_BUF.with(|buf_cell| {
             let mut buf = buf_cell.borrow_mut();
 
-            let ads = self.ads.lock();
-            let shared = ads.get_shared();
-            let (size, found) = shared.read_entry(height, &key_hash, key, &mut buf);
+            let (size, found) = self.shared.read_entry(height, &key_hash, key, &mut buf);
 
             if !found {
                 return None;
@@ -239,7 +240,7 @@ impl QmdbStore {
             // If the buffer was too small, retry with a larger one
             if size > buf.len() {
                 buf.resize(size, 0);
-                let (size2, found2) = shared.read_entry(height, &key_hash, key, &mut buf);
+                let (size2, found2) = self.shared.read_entry(height, &key_hash, key, &mut buf);
                 if !found2 || size2 != size {
                     return None;
                 }
