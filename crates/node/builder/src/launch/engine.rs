@@ -366,7 +366,11 @@ impl EngineNodeLauncher {
             // tree handler to prevent re-execution if that block is received as payload from
             // the CL
             loop {
+                // Use biased; to ensure built_payloads (InsertExecutedBlock) is always
+                // processed before engine_service (which handles new_payload). This prevents
+                // re-execution of blocks that were already executed by the payload builder.
                 tokio::select! {
+                    biased;
                     shutdown_req = &mut shutdown_rx => {
                         if let Ok(req) = shutdown_req {
                             debug!(target: "reth::cli", "received engine shutdown request");
