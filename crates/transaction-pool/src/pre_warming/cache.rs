@@ -64,25 +64,7 @@ impl PreWarmedCache {
     /// This is called by simulation workers after extracting keys from a transaction.
     /// Each transaction's keys are stored separately.
     pub fn store_tx_keys(&self, tx_hash: TxHash, keys: ExtractedKeys) {
-        let keys_count = keys.total_keys();
-        let accounts = keys.accounts.len();
-        let storage = keys.storage_slots.len();
-        let code_hashes = keys.code_hashes.len();
-
         self.per_tx_keys.write().insert(tx_hash, keys);
-
-        let cache_size = self.per_tx_keys.read().len();
-
-        tracing::warn!(
-            target: "txpool::pre_warming",
-            tx_hash = ?tx_hash,
-            keys_count,
-            accounts,
-            storage,
-            code_hashes,
-            cache_size,
-            ">>> CACHE: store_tx_keys - Keys stored for transaction"
-        );
     }
 
     /// Get merged keys for selected transactions (called during block building)
@@ -113,25 +95,12 @@ impl PreWarmedCache {
     /// you know which transactions will be selected.
     pub fn get_all_keys(&self) -> ExtractedKeys {
         let cache = self.per_tx_keys.read();
-        let cache_size = cache.len();
         let mut merged = ExtractedKeys::new();
 
         for keys in cache.values() {
             merged.merge(keys.clone());
         }
 
-        let result_accounts = merged.accounts.len();
-        let result_storage = merged.storage_slots.len();
-        let result_is_empty = merged.is_empty();
-
-        tracing::warn!(
-            target: "txpool::pre_warming",
-            cache_size,
-            result_accounts,
-            result_storage,
-            result_is_empty,
-            ">>> get_all_keys called"
-        );
 
         merged
     }
@@ -145,13 +114,7 @@ impl PreWarmedCache {
     pub fn remove_txs(&self, tx_hashes: &[TxHash]) {
         // DISABLED: Don't evict keys immediately - payload builder needs them
         // TODO: Implement TTL-based eviction instead
-        let cache = self.per_tx_keys.read();
-        tracing::warn!(
-            target: "txpool::pre_warming",
-            cache_size = cache.len(),
-            requested_removal = tx_hashes.len(),
-            ">>> cache.remove_txs called - EVICTION DISABLED"
-        );
+        let _ = tx_hashes; // Suppress unused warning
     }
 
     /// Get cache statistics

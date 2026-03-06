@@ -33,7 +33,7 @@ NC='\033[0m'
 # Configuration
 TOTAL_TXNS=50000          # Total transactions to send
 BURST_SIZE=500            # Transactions per burst
-BURST_DELAY=0.5           # Delay between bursts (seconds)
+BURST_DELAY=0.1           # Delay between bursts (seconds) - reduced for faster throughput
 BLOCK_TIME=1              # Block time in seconds
 CAPTURE_DURATION=1        # Minutes to capture after load (1 min is enough since txns already processed)
 SKIP_BUILD=false
@@ -57,6 +57,10 @@ while [[ $# -gt 0 ]]; do
             BURST_SIZE="$2"
             shift 2
             ;;
+        --burst-delay)
+            BURST_DELAY="$2"
+            shift 2
+            ;;
         --unique-addresses)
             UNIQUE_ADDRESSES=true
             shift
@@ -75,7 +79,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--txns N] [--burst N] [--tx-type eth|erc20|mixed] [--unique-addresses] [--prewarm-workers N] [--prefetch-workers N] [--skip-build]"
+            echo "Usage: $0 [--txns N] [--burst N] [--burst-delay N] [--tx-type eth|erc20|mixed] [--unique-addresses] [--prewarm-workers N] [--prefetch-workers N] [--skip-build]"
             exit 1
             ;;
     esac
@@ -106,6 +110,7 @@ echo ""
 echo -e "  Date:              $(date '+%Y-%m-%d %H:%M:%S')"
 echo -e "  Total Transactions: ${TOTAL_TXNS}"
 echo -e "  Burst Size:        ${BURST_SIZE} txns"
+echo -e "  Burst Delay:       ${BURST_DELAY}s"
 echo -e "  TX Type:           ${TX_TYPE}"
 echo -e "  Unique Addresses:  ${UNIQUE_ADDRESSES}"
 echo -e "  Prewarm Workers:   ${PREWARM_WORKERS}"

@@ -313,8 +313,8 @@ pub fn prefetch_with_snapshot_sync(
     let storage_results_vec = storage_results.into_inner().unwrap();
     let bytecode_results_vec = bytecode_results.into_inner().unwrap();
 
-    // Log MDBX timing at INFO level (important for performance analysis)
-    tracing::info!(
+    // Log MDBX timing at TRACE level (hot path - use debug/trace to avoid overhead)
+    tracing::trace!(
         target: "txpool::pre_warming",
         accounts_fetched = account_results_vec.len(),
         storage_fetched = storage_results_vec.len(),
@@ -356,8 +356,8 @@ pub fn prefetch_with_snapshot_sync(
         metrics.prefetch_contracts.increment(code_hashes.len() as u64);
         metrics.prefetch_duration.record(prefetch_duration.as_secs_f64());
 
-        // Log timing at INFO level (visible with --log.stdout.filter info)
-        tracing::info!(
+        // Log timing at TRACE level (hot path - avoid overhead)
+        tracing::trace!(
             target: "txpool::pre_warming",
             prefetch_duration_ms = prefetch_duration.as_millis(),
             mdbx_query_ms = mdbx_query_duration.as_millis(),
@@ -365,7 +365,7 @@ pub fn prefetch_with_snapshot_sync(
         );
     }
 
-    tracing::info!(
+    tracing::trace!(
         target: "txpool::pre_warming",
         final_accounts,
         final_storage,

@@ -63,24 +63,7 @@ pub fn set_global_metrics(metrics: Arc<PreWarmingMetrics>) {
 ///
 /// Returns None if pre-warming is not initialized.
 pub fn get_global_cache() -> Option<Arc<PreWarmedCache>> {
-    let cache = GLOBAL_CACHE.read().clone();
-    if let Some(ref c) = cache {
-        let ptr = Arc::as_ptr(c);
-        let stats = c.stats();
-        tracing::warn!(
-            target: "txpool::pre_warming",
-            cache_ptr = ?ptr,
-            total_transactions = stats.total_transactions,
-            total_keys = stats.total_keys,
-            ">>> get_global_cache returning Some(cache)"
-        );
-    } else {
-        tracing::warn!(
-            target: "txpool::pre_warming",
-            ">>> get_global_cache returning None"
-        );
-    }
-    cache
+    GLOBAL_CACHE.read().clone()
 }
 
 /// Get the global pre-warming metrics (if registered)
@@ -107,27 +90,14 @@ pub fn set_global_prefetch_threads(num_threads: usize) {
 /// Returns the configured number of prefetch threads, or defaults to available CPUs.
 pub fn get_global_prefetch_threads() -> usize {
     let stored = GLOBAL_PREFETCH_THREADS.load(Ordering::Relaxed);
-    let result = if stored == 0 {
+    if stored == 0 {
         // Default to available CPUs if not set
-        let default = std::thread::available_parallelism()
+        std::thread::available_parallelism()
             .map(|p| p.get())
-            .unwrap_or(4);
-        tracing::warn!(
-            target: "txpool::pre_warming",
-            stored,
-            default,
-            ">>> get_global_prefetch_threads: returning DEFAULT (global not set yet)"
-        );
-        default
+            .unwrap_or(4)
     } else {
-        tracing::debug!(
-            target: "txpool::pre_warming",
-            stored,
-            ">>> get_global_prefetch_threads: returning configured value"
-        );
         stored
-    };
-    result
+    }
 }
 
 /// Check if pre-warming is active (cache registered)

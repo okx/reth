@@ -924,7 +924,8 @@ async fn worker_loop<T>(
 
                 // Log simulation timing at INFO level with full details for per-TX tracking
                 // Format: TX_TIMING|SIMULATION|<tx_hash>|<duration_us>|<keys_count>
-                tracing::info!(
+                // Use trace level to avoid per-TX logging overhead in production
+                tracing::trace!(
                     target: "txpool::pre_warming",
                     tx_hash = ?req.tx_hash,
                     phase = "SIMULATION",
@@ -937,22 +938,11 @@ async fn worker_loop<T>(
                     "TX_TIMING: Simulation complete"
                 );
 
-                let cache_ptr = std::sync::Arc::as_ptr(&cache);
                 cache.store_tx_keys(req.tx_hash, keys);
 
                 // Update cache metrics
                 metrics.cache_entries.increment(1);
                 metrics.cache_keys_total.increment(keys_count as f64);
-
-                tracing::warn!(
-                    target: "txpool::pre_warming",
-                    worker_id,
-                    tx_hash = ?req.tx_hash,
-                    keys_count,
-                    cache_ptr = ?cache_ptr,
-                    cache_len = cache.len(),
-                    ">>> Simulation complete, keys stored in cache"
-                );
             }
             Err(mpsc::error::TryRecvError::Empty) => {
                 // Channel empty - adaptive sleep

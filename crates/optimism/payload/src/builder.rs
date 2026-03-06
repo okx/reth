@@ -210,68 +210,56 @@ where
     {
         let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
 
-        // ALWAYS set metrics callbacks for CachedReads hit/miss tracking
-        // This ensures we track cache performance regardless of pre-warming feature
-        // Uses the shared global metrics from reth_basic_payload_builder
+        // Set up metrics callbacks for CachedReads hit/miss tracking
+        // Use only the always-on CachedReadsMetrics (works in both pre-warming ON and OFF modes)
+        // This avoids 2x atomic increment overhead when pre-warming is enabled
         {
             use std::sync::Arc;
-
             let on_hit = Arc::new(|| {
                 CachedReadsMetrics::global().inc_hits();
             });
-
             let on_miss = Arc::new(|| {
                 CachedReadsMetrics::global().inc_misses();
             });
-
             cached_reads.set_metrics_callbacks(on_hit, on_miss);
         }
 
         // Pre-warming: Prefetch state using keys discovered by simulation
+        // TARGETED PREFETCH: Only fetch keys for transactions likely to be in this block
         #[cfg(feature = "pre-warming")]
         {
-            tracing::warn!(
+            tracing::debug!(
                 target: "payload_builder",
-                ">>> PREFETCH Step 1: pre-warming feature COMPILED IN"
+                ">>> PREFETCH: Starting targeted prefetch for pending transactions"
             );
-
-            tracing::warn!(
-                target: "payload_builder",
-                ">>> PREFETCH Step 2: Checking global cache"
-            );
-
-            // Get metrics and set callbacks on cached_reads for tracking hits/misses
-            // IMPORTANT: Also increment the always-on payloads_cached_reads_* metrics
-            if let Some(metrics) = reth_transaction_pool::pre_warming::get_global_metrics() {
-                let metrics_clone_hit = metrics.clone();
-                let metrics_clone_miss = metrics.clone();
-                
-                let on_hit = std::sync::Arc::new(move || {
-                    // Increment pre-warming specific metrics
-                    metrics_clone_hit.cache_hits.increment(1);
-                    // ALSO increment always-on metrics
-                    CachedReadsMetrics::global().inc_hits();
-                });
-                
-                let on_miss = std::sync::Arc::new(move || {
-                    // Increment pre-warming specific metrics
-                    metrics_clone_miss.cache_misses.increment(1);
-                    // ALSO increment always-on metrics
-                    CachedReadsMetrics::global().inc_misses();
-                });
-                
-                cached_reads.set_metrics_callbacks(on_hit, on_miss);
-            }
 
             if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
-                let keys = cache.get_all_keys();
+                // Get top pending transactions from pool (these are most likely to be selected)
+                // Limit to 500 to avoid fetching too many keys
+                const MAX_TXS_TO_PREFETCH: usize = 500;
+                let pending_txs = self.pool.pending_transactions_max(MAX_TXS_TO_PREFETCH);
+
+                // Extract transaction hashes
+                let tx_hashes: Vec<alloy_primitives::B256> = pending_txs
+                    .iter()
+                    .map(|tx| *tx.hash())
+                    .collect();
+
+                tracing::debug!(
+                    target: "payload_builder",
+                    pending_count = tx_hashes.len(),
+                    "PREFETCH: Got pending transactions from pool"
+                );
+
+                // Get keys ONLY for these transactions (not all cached keys)
+                let keys = cache.get_keys_for_txs(&tx_hashes);
 
                 tracing::debug!(
                     target: "payload_builder",
                     accounts = keys.accounts.len(),
                     storage_slots = keys.storage_slots.len(),
                     code_hashes = keys.code_hashes.len(),
-                    "PREFETCH: Retrieved keys from cache"
+                    "PREFETCH: Retrieved TARGETED keys from cache"
                 );
 
                 if !keys.is_empty() {
@@ -327,24 +315,24 @@ where
                         }
                     }
                 } else {
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "payload_builder",
                         ">>> PREFETCH Step 5: Keys ARE empty, skipping prefetch"
                     );
                 }
             } else {
-                tracing::warn!(
+                tracing::debug!(
                     target: "payload_builder",
-                    ">>> PREFETCH Step 3: Global cache is None ❌"
+                    ">>> PREFETCH Step 3: Global cache is None"
                 );
             }
         }
 
         #[cfg(not(feature = "pre-warming"))]
         {
-            tracing::warn!(
+            tracing::debug!(
                 target: "payload_builder",
-                ">>> PREFETCH: pre-warming feature NOT COMPILED ❌"
+                ">>> PREFETCH: pre-warming feature NOT COMPILED"
             );
         }
 

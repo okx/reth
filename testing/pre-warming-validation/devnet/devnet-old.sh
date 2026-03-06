@@ -22,7 +22,7 @@
 #
 #===============================================================================
 
-set -e
+# set -e
 
 # Colors
 RED='\033[0;31m'
@@ -317,10 +317,10 @@ get_metric() {
 }
 
 # Capture initial metrics
-# Use ALWAYS-ON CachedReads metrics: reth_payloads_cached_reads_* (NOT reth_txpool_pre_warming_cache_*)
+# Use CachedReads metrics (reth_txpool_pre_warming_cache_*) NOT ExecutionCache (reth_sync_caching_*)
 echo -e "${CYAN}Capturing initial metrics...${NC}"
-INITIAL_CACHE_HITS=$(get_metric "reth_payloads_cached_reads_hits")
-INITIAL_CACHE_MISSES=$(get_metric "reth_payloads_cached_reads_misses")
+INITIAL_CACHE_HITS=$(get_metric "reth_txpool_pre_warming_cache_hits")
+INITIAL_CACHE_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
 INITIAL_SIMULATIONS=$(get_metric "reth_txpool_pre_warming_simulations_completed")
 INITIAL_PREFETCH_OPS=$(get_metric "reth_txpool_pre_warming_prefetch_operations")
 
@@ -345,10 +345,10 @@ echo ""
 echo ""
 
 # Capture final metrics
-# Use ALWAYS-ON CachedReads metrics: reth_payloads_cached_reads_* (NOT reth_txpool_pre_warming_cache_*)
+# Use CachedReads metrics (reth_txpool_pre_warming_cache_*) NOT ExecutionCache (reth_sync_caching_*)
 echo -e "${CYAN}Capturing final metrics...${NC}"
-FINAL_CACHE_HITS=$(get_metric "reth_payloads_cached_reads_hits")
-FINAL_CACHE_MISSES=$(get_metric "reth_payloads_cached_reads_misses")
+FINAL_CACHE_HITS=$(get_metric "reth_txpool_pre_warming_cache_hits")
+FINAL_CACHE_MISSES=$(get_metric "reth_txpool_pre_warming_cache_misses")
 FINAL_SIMULATIONS=$(get_metric "reth_txpool_pre_warming_simulations_completed")
 FINAL_PREFETCH_OPS=$(get_metric "reth_txpool_pre_warming_prefetch_operations")
 FINAL_PREFETCH_ACCOUNTS=$(get_metric "reth_txpool_pre_warming_prefetch_accounts")
@@ -498,4 +498,3 @@ echo -e "  2. Run this script again with a different output file"
 echo -e "  3. Compare results:"
 echo -e "     ${CYAN}$0 --compare results_off.json results_on.json${NC}"
 echo ""
-
