@@ -1,15 +1,15 @@
 //! QMDB-backed implementation of reth's `StateProvider` trait.
 //!
-//! Reads account/storage/bytecode from QMDB. Delegates block hash queries
-//! to an optional MDBX-backed provider. Proof/trie methods return stubs
-//! since QMDB uses SHA-256 roots internally.
+//! Reads account/storage from QMDB. Delegates block hash and bytecode queries
+//! to optional MDBX-backed providers. Proof/trie methods return stubs since
+//! QMDB uses SHA-256 roots internally.
 
 use crate::store::QmdbStore;
 use alloy_primitives::{Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
 use reth_primitives_traits::{Account, Bytecode};
 use reth_storage_api::{
     AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, StateProofProvider,
-    StateProvider, StateRootProvider, StorageRootProvider,
+    StateProvider, StateProviderBox, StateRootProvider, StorageRootProvider,
 };
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use reth_trie_common::{
@@ -19,14 +19,14 @@ use reth_trie_common::{
 use revm_database::BundleState;
 use std::sync::Arc;
 
-/// A `StateProvider` backed by QMDB for state reads.
+/// A `StateProvider` backed by QMDB for account/storage reads.
 ///
-/// Block hash lookups are delegated to an optional inner provider (typically MDBX).
+/// Bytecode and block hash lookups are delegated to the optional fallback provider (MDBX).
 /// Trie proof methods are stubbed out since QMDB computes SHA-256 roots internally.
 pub struct QmdbStateProvider {
     store: Arc<QmdbStore>,
-    /// Optional delegate for block hash queries.
-    block_hash_provider: Option<Box<dyn BlockHashReader + Send + Sync>>,
+    /// Fallback provider for bytecodes, block hashes, and anything QMDB doesn't store.
+    fallback: Option<StateProviderBox>,
 }
 
 impl std::fmt::Debug for QmdbStateProvider {
@@ -36,17 +36,14 @@ impl std::fmt::Debug for QmdbStateProvider {
 }
 
 impl QmdbStateProvider {
-    /// Create a new `QmdbStateProvider` wrapping the given store.
+    /// Create a new `QmdbStateProvider` wrapping the given store, with no fallback.
     pub fn new(store: Arc<QmdbStore>) -> Self {
-        Self { store, block_hash_provider: None }
+        Self { store, fallback: None }
     }
 
-    /// Create a new `QmdbStateProvider` with a block hash delegate.
-    pub fn with_block_hash_provider(
-        store: Arc<QmdbStore>,
-        block_hash_provider: Box<dyn BlockHashReader + Send + Sync>,
-    ) -> Self {
-        Self { store, block_hash_provider: Some(block_hash_provider) }
+    /// Create a new `QmdbStateProvider` with a fallback provider for bytecodes/block hashes.
+    pub fn with_fallback(store: Arc<QmdbStore>, fallback: StateProviderBox) -> Self {
+        Self { store, fallback: Some(fallback) }
     }
 }
 
@@ -58,14 +55,19 @@ impl AccountReader for QmdbStateProvider {
 
 impl BytecodeReader for QmdbStateProvider {
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
-        Ok(self.store.read_bytecode(code_hash))
+        // Bytecodes are not stored in QMDB — delegate to fallback (MDBX).
+        if let Some(ref fallback) = self.fallback {
+            fallback.bytecode_by_hash(code_hash)
+        } else {
+            Ok(None)
+        }
     }
 }
 
 impl BlockHashReader for QmdbStateProvider {
     fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
-        if let Some(ref provider) = self.block_hash_provider {
-            provider.block_hash(number)
+        if let Some(ref fallback) = self.fallback {
+            fallback.block_hash(number)
         } else {
             Ok(None)
         }
@@ -76,8 +78,8 @@ impl BlockHashReader for QmdbStateProvider {
         start: BlockNumber,
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
-        if let Some(ref provider) = self.block_hash_provider {
-            provider.canonical_hashes_range(start, end)
+        if let Some(ref fallback) = self.fallback {
+            fallback.canonical_hashes_range(start, end)
         } else {
             Ok(vec![])
         }

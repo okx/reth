@@ -1,6 +1,7 @@
 //! Typed wrapper over QMDB's low-level ADS API.
 //!
-//! Provides account/storage/bytecode read/write methods and state root retrieval.
+//! Provides account/storage read/write methods and state root retrieval.
+//! Bytecodes are NOT stored in QMDB — they stay in MDBX.
 
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{Address, B256, U256};
@@ -12,7 +13,7 @@ use qmdb::{
     tasks::TasksManager,
     AdsCore, AdsWrap, ADS,
 };
-use reth_primitives_traits::{Account, Bytecode};
+use reth_primitives_traits::Account;
 use revm_database::BundleState;
 use sha2::{Digest, Sha256};
 use std::{
@@ -34,24 +35,12 @@ const MAX_ENTRY_SIZE: usize = 64 * 1024;
 /// Chunk size for pre-populating QMDB.
 const PRE_POP_CHUNK_SIZE: usize = 20_000;
 
-/// Prefix byte for bytecode keys to distinguish from account/storage keys.
-const BYTECODE_PREFIX: u8 = 0xFF;
-
 /// Compute SHA-256 hash of a key (used for QMDB key_hash parameter).
 #[inline]
 fn sha256_key(key: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(key);
     hasher.finalize().into()
-}
-
-/// Build a bytecode key from a code hash: prefix byte + code_hash (33 bytes).
-#[inline]
-fn bytecode_key(code_hash: &B256) -> Vec<u8> {
-    let mut key = Vec::with_capacity(33);
-    key.push(BYTECODE_PREFIX);
-    key.extend_from_slice(code_hash.as_slice());
-    key
 }
 
 /// Typed wrapper over QMDB providing account/storage/bytecode operations.
@@ -94,16 +83,6 @@ impl QmdbStore {
         let key = storage_plain_key(address, slot);
         let value = self.read_raw(&key)?;
         decode_storage_value(&value)
-    }
-
-    /// Read bytecode by its code hash from QMDB.
-    pub fn read_bytecode(&self, code_hash: &B256) -> Option<Bytecode> {
-        if *code_hash == KECCAK_EMPTY {
-            return None;
-        }
-        let key = bytecode_key(code_hash);
-        let value = self.read_raw(&key)?;
-        Some(Bytecode::new_raw(value.into()))
     }
 
     /// Commit a `BundleState` to QMDB as a new block.
@@ -207,13 +186,7 @@ impl QmdbStore {
                         &encode_account(&account),
                     );
 
-                    // Store bytecode if present
-                    if let Some(code) = &info.code {
-                        if info.code_hash != KECCAK_EMPTY {
-                            let key = bytecode_key(&info.code_hash);
-                            builder.add_op(OP_CREATE, &key, code.bytes_slice());
-                        }
-                    }
+                    // Bytecodes are NOT stored in QMDB — they stay in MDBX.
                 }
                 for (slot, slot_info) in &bundle_account.storage {
                     let slot_b256 = B256::from(*slot);
@@ -318,13 +291,9 @@ impl QmdbStore {
                     Account { nonce: info.nonce, balance: info.balance, bytecode_hash: code_hash };
                 builder.add_op(account_op, &account_plain_key(&address), &encode_account(&account));
 
-                // Bytecode is always CREATE since it's content-addressed and immutable
-                if let Some(code) = &info.code {
-                    if info.code_hash != KECCAK_EMPTY {
-                        let key = bytecode_key(&info.code_hash);
-                        builder.add_op(OP_CREATE, &key, code.bytes_slice());
-                    }
-                }
+                // Bytecodes are NOT stored in QMDB — they stay in MDBX (like LayerZero's CodeDB
+                // pattern). QMDB entries must stay under DEFAULT_ENTRY_SIZE (300
+                // bytes).
             }
 
             for (slot, slot_info) in &bundle_account.storage {

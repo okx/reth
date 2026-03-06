@@ -39,7 +39,10 @@ use std::{
 use tracing::trace;
 
 /// Factory for creating state provider overrides (e.g., QMDB-backed state).
-pub type StateProviderOverride = Arc<dyn Fn() -> StateProviderBox + Send + Sync>;
+///
+/// Receives the default `StateProviderBox` (from MDBX/in-memory) so the override can delegate
+/// certain queries (e.g., bytecodes) back to it while handling others (accounts, storage) itself.
+pub type StateProviderOverride = Arc<dyn Fn(StateProviderBox) -> StateProviderBox + Send + Sync>;
 
 /// The main type for interacting with the blockchain.
 ///
@@ -52,8 +55,9 @@ pub struct BlockchainProvider<N: NodeTypesWithDB> {
     /// Tracks the chain info wrt forkchoice updates and in memory canonical
     /// state.
     pub(crate) canonical_in_memory_state: CanonicalInMemoryState<N::Primitives>,
-    /// Optional override for state provider creation. When set, `latest()` and
-    /// `state_by_block_hash()` use this instead of the default database/in-memory providers.
+    /// Optional override for state provider creation. When set, `state_by_block_hash()` uses this
+    /// instead of the default database/in-memory providers. `latest()` is NOT overridden so that
+    /// the transaction pool and payload builder can still see in-memory state from pending blocks.
     state_provider_override: Option<StateProviderOverride>,
 }
 
@@ -532,10 +536,9 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
     /// Storage provider for latest block
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", "Getting latest block state provider");
-        if let Some(ref override_fn) = self.state_provider_override {
-            trace!(target: "providers::blockchain", "Using state provider override for latest");
-            return Ok(override_fn());
-        }
+        // NOTE: Do NOT use state_provider_override here. The override is only for
+        // state_by_block_hash() (engine tree execution). latest() must return the normal
+        // in-memory state so the transaction pool and payload builder can see pending blocks.
         // use latest state provider if the head state exists
         if let Some(state) = self.canonical_in_memory_state.head_state() {
             trace!(target: "providers::blockchain", "Using head state for latest state provider");
@@ -597,20 +600,20 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
 
     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", ?hash, "Getting state by block hash");
+        // Compute the default provider first (MDBX/in-memory).
+        let default_provider = if let Ok(state) = self.history_by_block_hash(hash) {
+            state
+        } else if let Ok(Some(pending)) = self.pending_state_by_hash(hash) {
+            pending
+        } else {
+            return Err(ProviderError::StateForHashNotFound(hash));
+        };
+
         if let Some(ref override_fn) = self.state_provider_override {
             trace!(target: "providers::blockchain", "Using state provider override for block hash");
-            return Ok(override_fn());
+            return Ok(override_fn(default_provider));
         }
-        if let Ok(state) = self.history_by_block_hash(hash) {
-            // This could be tracked by a historical block
-            Ok(state)
-        } else if let Ok(Some(pending)) = self.pending_state_by_hash(hash) {
-            // .. or this could be the pending state
-            Ok(pending)
-        } else {
-            // if we couldn't find it anywhere, then we should return an error
-            Err(ProviderError::StateForHashNotFound(hash))
-        }
+        Ok(default_provider)
     }
 
     /// Returns the state provider for pending state.

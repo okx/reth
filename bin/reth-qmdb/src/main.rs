@@ -86,12 +86,14 @@ fn main() {
                 store_for_commit.commit_bundle(bundle);
             });
 
-            // State provider override: all state reads go through QMDB.
+            // State provider override: account/storage reads go through QMDB,
+            // bytecodes and block hashes fall back to the default MDBX provider.
             let store_for_override = qmdb_store.clone();
             let state_override: reth_provider::providers::StateProviderOverride =
-                Arc::new(move || {
-                    Box::new(xlayer_qmdb_provider::QmdbStateProvider::new(
+                Arc::new(move |default_provider| {
+                    Box::new(xlayer_qmdb_provider::QmdbStateProvider::with_fallback(
                         store_for_override.clone(),
+                        default_provider,
                     ))
                 });
 
