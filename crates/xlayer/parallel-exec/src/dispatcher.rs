@@ -4,7 +4,12 @@
 //! previous one), but tasks within each frame are executed in parallel
 //! using rayon since they have no read/write conflicts.
 
-use crate::{framer::Frame, simulator::SimTxEnv, state_cache::ParallelStateCache, task::ExeTask};
+use crate::{
+    framer::Frame,
+    simulator::SimTxEnv,
+    state_cache::{FrameStateOverlay, OverlayStateProvider},
+    task::ExeTask,
+};
 use rayon::prelude::*;
 use revm::context::BlockEnv;
 
@@ -57,12 +62,17 @@ impl Dispatcher {
     /// state changes). Tasks within each frame are executed in parallel via rayon,
     /// since they have no read/write conflicts.
     ///
+    /// State propagation between frames uses a [`FrameStateOverlay`] (plain
+    /// HashMap). Within each frame, parallel threads read from an immutable
+    /// `&OverlayStateProvider` and each use their own `CacheDB` for per-tx
+    /// caching — no shared mutable state, no lock contention.
+    ///
     /// Results are returned sorted by `original_index` to restore the original
     /// transaction ordering.
     pub fn execute(
         &self,
         frames: Vec<Frame>,
-        cache: &ParallelStateCache,
+        overlay: &mut FrameStateOverlay,
         fallback: &(dyn reth_storage_api::StateProvider + Sync),
         block_env: &BlockEnv,
         txs: &[SimTxEnv],
@@ -70,20 +80,23 @@ impl Dispatcher {
         let mut all_results = Vec::new();
 
         for frame in frames {
+            // Create immutable provider for this frame's parallel execution
+            let provider = OverlayStateProvider::new(overlay, fallback);
+
             // Execute tasks within this frame in parallel
             let frame_results: Vec<Vec<TxExecutionResult>> = self.pool.install(|| {
                 frame
                     .tasks
                     .par_iter()
-                    .map(|task| self.execute_task(task, cache, fallback, block_env, txs))
+                    .map(|task| self.execute_task(task, &provider, block_env, txs))
                     .collect()
             });
 
-            // Apply state changes from this frame to the cache,
+            // Apply state changes from this frame to the overlay (sequential),
             // making them visible to subsequent frames.
             for task_results in &frame_results {
                 for tx_result in task_results {
-                    apply_state_to_cache(cache, &tx_result.state);
+                    overlay.apply_evm_state(&tx_result.state);
                 }
             }
 
@@ -100,17 +113,16 @@ impl Dispatcher {
 
     /// Execute a single `ExeTask` (sequentially execute its transactions).
     ///
-    /// Each transaction gets its own EVM instance backed by the shared
-    /// `CachedStateProvider` (DashMap cache + fallback `StateProvider`).
+    /// Each transaction gets its own EVM instance backed by `CacheDB` wrapping
+    /// the shared `OverlayStateProvider`. `CacheDB` provides per-tx caching
+    /// with zero contention (it's thread-local).
     fn execute_task(
         &self,
         task: &ExeTask,
-        cache: &ParallelStateCache,
-        fallback: &(dyn reth_storage_api::StateProvider + Sync),
+        provider: &OverlayStateProvider<'_>,
         block_env: &BlockEnv,
         txs: &[SimTxEnv],
     ) -> Vec<TxExecutionResult> {
-        use crate::state_cache::CachedStateProvider;
         use alloy_evm::{precompiles::PrecompilesMap, Evm, EvmEnv};
         use revm::{
             context::{CfgEnv, Context},
@@ -120,15 +132,14 @@ impl Dispatcher {
             MainBuilder, MainContext,
         };
 
-        let cached_provider = CachedStateProvider::new(cache, fallback);
-
         task.sim_results
             .iter()
             .map(|sim_result| {
                 let tx_env = &txs[sim_result.original_index];
 
-                // Build EVM with the cached state provider
-                let cache_db = CacheDB::new(&cached_provider);
+                // Build EVM with CacheDB wrapping the shared immutable provider.
+                // CacheDB is per-tx — each tx gets its own local HashMap cache.
+                let cache_db = CacheDB::new(provider);
                 let cfg = CfgEnv::default();
                 let evm_env = EvmEnv { cfg_env: cfg, block_env: block_env.clone() };
 
@@ -177,28 +188,6 @@ impl Dispatcher {
     }
 }
 
-/// Apply EVM state changes to the parallel cache so subsequent frames can see them.
-fn apply_state_to_cache(cache: &ParallelStateCache, state: &revm::state::EvmState) {
-    use revm_state::AccountInfo;
-
-    for (address, account) in state {
-        // Update account info in cache
-        let info = AccountInfo {
-            balance: account.info.balance,
-            nonce: account.info.nonce,
-            code_hash: account.info.code_hash,
-            code: account.info.code.clone(),
-            account_id: None,
-        };
-        cache.insert_account(*address, Some(info));
-
-        // Update storage slots
-        for (slot, value) in &account.storage {
-            cache.insert_storage(*address, *slot, Some(value.present_value));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,8 +208,8 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_state_to_cache() {
-        let cache = ParallelStateCache::new();
+    fn test_overlay_apply_from_tx_result() {
+        let mut overlay = FrameStateOverlay::new();
         let addr = Address::with_last_byte(0x42);
 
         // Build mock EvmState
@@ -245,18 +234,17 @@ mod tests {
 
         state.insert(addr, account);
 
-        // Apply to cache
-        apply_state_to_cache(&cache, &state);
+        // Apply to overlay
+        overlay.apply_evm_state(&state);
 
-        // Verify account info cached
-        let cached_account = cache.get_account(&addr).expect("account should be cached");
+        // Verify account info
+        let cached_account = overlay.get_account(&addr).expect("account should be in overlay");
         let info = cached_account.expect("account should exist");
         assert_eq!(info.balance, U256::from(1000));
         assert_eq!(info.nonce, 5);
 
-        // Verify storage slot cached
-        let cached_storage = cache.get_storage(&addr, &U256::from(7));
-        assert_eq!(cached_storage, Some(Some(U256::from(999))));
+        // Verify storage slot
+        assert_eq!(overlay.get_storage(&addr, &U256::from(7)), Some(U256::from(999)));
     }
 
     #[test]
@@ -302,11 +290,7 @@ mod tests {
 
     #[test]
     fn test_dispatcher_single_frame() {
-        // Create a single frame with one task that has one transaction.
-        // The transaction will fail because EmptyDB has no balance,
-        // but the dispatcher should handle this gracefully.
         let dispatcher = Dispatcher::new(2);
-        let _cache = ParallelStateCache::new();
 
         let sender = Address::with_last_byte(1);
         let recipient = Address::with_last_byte(2);
@@ -315,9 +299,6 @@ mod tests {
         let frame = make_frame(vec![0]);
         let frames = vec![frame];
 
-        // Full execution requires a StateProvider implementation (trait object).
-        // Without reth test-utils providing a mock, we verify the dispatcher
-        // struct, frame construction, and transaction setup are correct.
         assert_eq!(dispatcher.thread_count(), 2);
         assert_eq!(txs.len(), 1);
         assert_eq!(frames.len(), 1);
@@ -325,8 +306,6 @@ mod tests {
 
     #[test]
     fn test_dispatcher_sorts_by_original_index() {
-        // Verify that if we manually construct TxExecutionResults out of order,
-        // the sorting logic works.
         let mut results = vec![
             TxExecutionResult {
                 original_index: 3,

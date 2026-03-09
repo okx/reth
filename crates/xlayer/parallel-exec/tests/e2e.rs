@@ -631,37 +631,35 @@ fn test_e2e_different_configs() {
     }
 }
 
-/// Test 12: CachedStateProvider properly caches data.
+/// Test 12: OverlayStateProvider reads from overlay first, then fallback.
 #[test]
-fn test_e2e_state_cache_population() {
-    use xlayer_parallel_exec::state_cache::{CachedStateProvider, ParallelStateCache};
+fn test_e2e_overlay_state_provider() {
+    use xlayer_parallel_exec::state_cache::{FrameStateOverlay, OverlayStateProvider};
 
     let sender = addr(0);
     let balance = U256::from(1_000_000);
 
     let provider = TestStateProvider::new().with_account(sender, balance, 0);
 
-    let cache = ParallelStateCache::new();
-    let cached_provider = CachedStateProvider::new(&cache, &provider);
+    let overlay = FrameStateOverlay::new();
+    let overlay_provider = OverlayStateProvider::new(&overlay, &provider);
 
-    // First read — should miss cache, hit fallback
-    let account = revm::DatabaseRef::basic_ref(&cached_provider, sender).expect("should not error");
+    // Read from fallback (overlay is empty)
+    let account =
+        revm::DatabaseRef::basic_ref(&overlay_provider, sender).expect("should not error");
     assert!(account.is_some(), "Sender account should exist");
-    assert_eq!(account.clone().unwrap().balance, balance);
+    assert_eq!(account.unwrap().balance, balance);
 
-    // Second read — should hit cache
-    let account2 =
-        revm::DatabaseRef::basic_ref(&cached_provider, sender).expect("should not error");
-    assert_eq!(account, account2, "Cached value should match");
-
-    let stats = cache.stats();
-    assert!(stats.accounts_cached >= 1, "At least 1 account should be cached");
+    // Non-existent account
+    let missing = revm::DatabaseRef::basic_ref(&overlay_provider, Address::with_last_byte(0x01))
+        .expect("should not error");
+    assert!(missing.is_none(), "Non-existent account should be None");
 }
 
-/// Test 13: Storage reads through CachedStateProvider.
+/// Test 13: Storage reads through OverlayStateProvider with overlay data.
 #[test]
-fn test_e2e_storage_cache_population() {
-    use xlayer_parallel_exec::state_cache::{CachedStateProvider, ParallelStateCache};
+fn test_e2e_overlay_storage_reads() {
+    use xlayer_parallel_exec::state_cache::{FrameStateOverlay, OverlayStateProvider};
 
     let contract = addr(10);
     let slot = B256::with_last_byte(0x07);
@@ -671,16 +669,13 @@ fn test_e2e_storage_cache_population() {
         .with_account(contract, U256::ZERO, 0)
         .with_storage(contract, slot, value);
 
-    let cache = ParallelStateCache::new();
-    let cached_provider = CachedStateProvider::new(&cache, &provider);
+    let overlay = FrameStateOverlay::new();
+    let overlay_provider = OverlayStateProvider::new(&overlay, &provider);
 
     let slot_u256 = U256::from_be_bytes(slot.0);
-    let result = revm::DatabaseRef::storage_ref(&cached_provider, contract, slot_u256)
+    let result = revm::DatabaseRef::storage_ref(&overlay_provider, contract, slot_u256)
         .expect("should not error");
-    assert_eq!(result, value, "Storage value should match");
-
-    let cached = cache.get_storage(&contract, &slot_u256);
-    assert_eq!(cached, Some(Some(value)), "Storage should be cached");
+    assert_eq!(result, value, "Storage value should match fallback");
 }
 
 /// Test 14: Deterministic ordering — same inputs produce same outputs.
@@ -753,7 +748,7 @@ fn test_e2e_framer_conflict_separation() {
     use xlayer_parallel_exec::{
         framer::Framer,
         simulator::Simulator,
-        state_cache::{CachedStateProvider, ParallelStateCache},
+        state_cache::{FrameStateOverlay, OverlayStateProvider},
     };
 
     let sender = addr(0);
@@ -766,8 +761,8 @@ fn test_e2e_framer_conflict_separation() {
         .with_account(recipient_a, U256::ZERO, 0)
         .with_account(recipient_b, U256::ZERO, 0);
 
-    let cache = ParallelStateCache::new();
-    let cached_provider = CachedStateProvider::new(&cache, &provider);
+    let overlay = FrameStateOverlay::new();
+    let overlay_provider = OverlayStateProvider::new(&overlay, &provider);
     let block_env = BlockEnv::default();
     let simulator = Simulator::new();
 
@@ -777,7 +772,7 @@ fn test_e2e_framer_conflict_separation() {
         make_transfer_tx(sender, recipient_b, U256::from(200), 1),
     ];
 
-    let sim_results = simulator.simulate(&txs, &cached_provider, &block_env);
+    let sim_results = simulator.simulate(&txs, &overlay_provider, &block_env);
     assert_eq!(sim_results.len(), 2);
 
     let mut framer = Framer::new();
@@ -803,7 +798,7 @@ fn test_e2e_framer_parallel_grouping() {
     use xlayer_parallel_exec::{
         framer::Framer,
         simulator::Simulator,
-        state_cache::{CachedStateProvider, ParallelStateCache},
+        state_cache::{FrameStateOverlay, OverlayStateProvider},
     };
 
     let sender_a = addr(0);
@@ -818,8 +813,8 @@ fn test_e2e_framer_parallel_grouping() {
         .with_account(recipient_a, U256::ZERO, 0)
         .with_account(recipient_b, U256::ZERO, 0);
 
-    let cache = ParallelStateCache::new();
-    let cached_provider = CachedStateProvider::new(&cache, &provider);
+    let overlay = FrameStateOverlay::new();
+    let overlay_provider = OverlayStateProvider::new(&overlay, &provider);
     let block_env = BlockEnv::default();
     let simulator = Simulator::new();
 
@@ -828,7 +823,7 @@ fn test_e2e_framer_parallel_grouping() {
         make_transfer_tx(sender_b, recipient_b, U256::from(200), 0),
     ];
 
-    let sim_results = simulator.simulate(&txs, &cached_provider, &block_env);
+    let sim_results = simulator.simulate(&txs, &overlay_provider, &block_env);
 
     let mut framer = Framer::new();
     for sr in sim_results {
@@ -853,7 +848,7 @@ fn test_e2e_framer_parallel_grouping() {
 fn test_e2e_simulator_crw_extraction() {
     use xlayer_parallel_exec::{
         simulator::Simulator,
-        state_cache::{CachedStateProvider, ParallelStateCache},
+        state_cache::{FrameStateOverlay, OverlayStateProvider},
     };
 
     let sender = addr(0);
@@ -866,13 +861,13 @@ fn test_e2e_simulator_crw_extraction() {
         0,
     );
 
-    let cache = ParallelStateCache::new();
-    let cached_provider = CachedStateProvider::new(&cache, &provider);
+    let overlay = FrameStateOverlay::new();
+    let overlay_provider = OverlayStateProvider::new(&overlay, &provider);
     let block_env = BlockEnv::default();
     let simulator = Simulator::new();
 
     let txs = vec![make_transfer_tx(sender, recipient, U256::from(100), 0)];
-    let sim_results = simulator.simulate(&txs, &cached_provider, &block_env);
+    let sim_results = simulator.simulate(&txs, &overlay_provider, &block_env);
 
     assert_eq!(sim_results.len(), 1);
     let sr = &sim_results[0];
@@ -900,7 +895,7 @@ fn test_e2e_dispatcher_inter_frame_state() {
         crw_sets::CrwSets,
         dispatcher::Dispatcher,
         framer::Frame,
-        state_cache::ParallelStateCache,
+        state_cache::FrameStateOverlay,
         task::{ExeTask, SimResult},
     };
 
@@ -915,7 +910,7 @@ fn test_e2e_dispatcher_inter_frame_state() {
         .with_account(recipient_b, U256::ZERO, 0);
 
     let dispatcher = Dispatcher::new(4);
-    let cache = ParallelStateCache::new();
+    let mut overlay = FrameStateOverlay::new();
     let block_env = BlockEnv::default();
 
     let txs = vec![
@@ -938,7 +933,8 @@ fn test_e2e_dispatcher_inter_frame_state() {
         })],
     };
 
-    let results = dispatcher.execute(vec![frame1, frame2], &cache, &provider, &block_env, &txs);
+    let results =
+        dispatcher.execute(vec![frame1, frame2], &mut overlay, &provider, &block_env, &txs);
 
     assert_eq!(results.len(), 2, "Should have 2 results");
     assert_eq!(results[0].original_index, 0);

@@ -3,7 +3,7 @@
 //! Pipeline: Simulator -> Framer -> Dispatcher -> ResultCollector
 //!
 //! The builder owns the [`Simulator`] and [`Dispatcher`], reusing them
-//! across blocks. A fresh [`ParallelStateCache`] is created per block to
+//! across blocks. A fresh [`FrameStateOverlay`] is created per block to
 //! avoid stale intra-block state leaking across boundaries.
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
     framer::Framer,
     result_collector,
     simulator::{SimTxEnv, Simulator},
-    state_cache::ParallelStateCache,
+    state_cache::{FrameStateOverlay, OverlayStateProvider},
 };
 use alloy_primitives::U256;
 use revm::context::BlockEnv;
@@ -41,7 +41,7 @@ impl core::fmt::Debug for ParallelBlockResult {
 /// Orchestrates parallel block building.
 ///
 /// Owns the [`Simulator`] and [`Dispatcher`], reusing them across blocks.
-/// The state cache is created per-block to ensure isolation.
+/// The state overlay is created per-block to ensure isolation.
 pub struct ParallelBlockBuilder {
     simulator: Simulator,
     dispatcher: Dispatcher,
@@ -77,18 +77,23 @@ impl ParallelBlockBuilder {
     /// 2. **Framer**: group non-conflicting txs into frames
     /// 3. **Dispatcher**: execute frames serially with intra-frame parallelism
     /// 4. **ResultCollector**: merge results into ordered output
+    ///
+    /// State propagation uses [`FrameStateOverlay`] (plain HashMap):
+    /// - Simulation reads go directly to the fallback `StateProvider` (QMDB lock-free)
+    /// - Between frames, state diffs are applied to the overlay
+    /// - Within frames, parallel threads read from immutable `&OverlayStateProvider`
     pub fn build(
         &self,
         txs: Vec<SimTxEnv>,
         fallback: &(dyn reth_storage_api::StateProvider + Sync),
         block_env: &BlockEnv,
     ) -> ParallelBlockResult {
-        // Create per-block state cache
-        let cache = ParallelStateCache::new();
+        // Create per-block state overlay
+        let mut overlay = FrameStateOverlay::new();
 
-        // 1. Simulate to extract CrwSets
-        let cached_provider = crate::state_cache::CachedStateProvider::new(&cache, fallback);
-        let sim_results = self.simulator.simulate(&txs, &cached_provider, block_env);
+        // 1. Simulate to extract CrwSets (reads go directly to StateProvider)
+        let sim_provider = OverlayStateProvider::new(&overlay, fallback);
+        let sim_results = self.simulator.simulate(&txs, &sim_provider, block_env);
 
         // 2. Frame non-conflicting transactions
         let mut framer = Framer::new();
@@ -98,7 +103,7 @@ impl ParallelBlockBuilder {
         let frames = framer.finish();
 
         // 3. Execute frames with intra-frame parallelism
-        let raw_results = self.dispatcher.execute(frames, &cache, fallback, block_env, &txs);
+        let raw_results = self.dispatcher.execute(frames, &mut overlay, fallback, block_env, &txs);
 
         // 4. Collect and merge results
         let ordered_results = result_collector::collect_ordered_results(raw_results);

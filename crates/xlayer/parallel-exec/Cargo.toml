@@ -28,7 +28,6 @@ revm-database.workspace = true
 revm-state.workspace = true
 
 # concurrency
-dashmap.workspace = true
 rayon.workspace = true
 parking_lot.workspace = true
 

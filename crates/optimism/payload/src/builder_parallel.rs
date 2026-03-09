@@ -37,13 +37,9 @@ use reth_primitives_traits::{HeaderTy, TxTy};
 use reth_storage_api::{errors::ProviderError, StateProvider};
 use reth_transaction_pool::PoolTransaction;
 use revm::context::{result::ExecutionResult, Block, BlockEnv, TxEnv};
-use revm_database::states::cache::CacheState;
 use std::collections::HashMap;
 use tracing::{debug, trace};
-use xlayer_parallel_exec::{
-    simulator::{SimTxEnv, Simulator},
-    state_cache::ParallelStateCache,
-};
+use xlayer_parallel_exec::simulator::{SimTxEnv, Simulator};
 
 /// A [`DatabaseRef`](revm::DatabaseRef) adapter with account state overlay.
 ///
@@ -101,35 +97,6 @@ impl revm::DatabaseRef for SimDatabaseRef<'_> {
         Ok(reth_storage_api::BlockHashReader::block_hash(self.provider, number)?
             .unwrap_or_default())
     }
-}
-
-/// Populate a [`ParallelStateCache`] with the full post-sequencer state diff
-/// from revm's [`CacheState`].
-///
-/// After sequencer transactions execute (L1 deposits, L1BlockInfo updates),
-/// the builder's `State<DB>.cache` contains the latest account info and storage
-/// values. This function copies those entries into the `ParallelStateCache` so
-/// that Phase 2 parallel EVM threads see the correct post-sequencer state
-/// instead of stale parent-block state from the fallback `StateProvider`.
-///
-/// Entries already present in the `ParallelStateCache` are NOT overwritten.
-fn populate_cache_from_sequencer_state(
-    cache_state: &CacheState,
-    parallel_cache: &ParallelStateCache,
-) {
-    let accounts = cache_state.accounts.iter().map(|(addr, cache_account)| {
-        let info = cache_account.account.as_ref().map(|plain| plain.info.clone());
-        let storage: Vec<(U256, U256)> = cache_account
-            .account
-            .as_ref()
-            .map(|plain| plain.storage.iter().map(|(slot, value)| (*slot, *value)).collect())
-            .unwrap_or_default();
-        (*addr, info, storage)
-    });
-
-    let bytecodes = cache_state.contracts.iter().map(|(hash, code)| (*hash, code.clone()));
-
-    parallel_cache.pre_populate_state(accounts, bytecodes);
 }
 
 /// Convert a consensus transaction into a [`SimTxEnv`] for pre-simulation.
@@ -1049,96 +1016,5 @@ mod tests {
             results[0].success,
             "tx should succeed with overridden balance even though provider has no account"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Tests for populate_cache_from_sequencer_state
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_populate_cache_from_sequencer_state_accounts_and_storage() {
-        use revm_database::states::{
-            cache::CacheState, plain_account::PlainAccount, AccountStatus, CacheAccount,
-        };
-
-        let mut cache_state = CacheState::new(true);
-        let addr = Address::with_last_byte(0xA0);
-        let info = revm::state::AccountInfo {
-            balance: U256::from(5000),
-            nonce: 3,
-            code_hash: B256::ZERO,
-            code: None,
-            account_id: None,
-        };
-        let mut storage = revm_database::states::plain_account::PlainStorage::default();
-        storage.insert(U256::from(1), U256::from(42));
-        storage.insert(U256::from(2), U256::from(99));
-
-        cache_state.accounts.insert(
-            addr,
-            CacheAccount {
-                account: Some(PlainAccount { info: info.clone(), storage }),
-                status: AccountStatus::Loaded,
-            },
-        );
-
-        let parallel_cache = ParallelStateCache::new();
-        populate_cache_from_sequencer_state(&cache_state, &parallel_cache);
-
-        // Account should be populated
-        let cached_info = parallel_cache.get_account(&addr).unwrap().unwrap();
-        assert_eq!(cached_info.balance, U256::from(5000));
-        assert_eq!(cached_info.nonce, 3);
-
-        // Storage slots should be populated
-        assert_eq!(parallel_cache.get_storage(&addr, &U256::from(1)), Some(Some(U256::from(42))));
-        assert_eq!(parallel_cache.get_storage(&addr, &U256::from(2)), Some(Some(U256::from(99))));
-    }
-
-    #[test]
-    fn test_populate_cache_does_not_overwrite_existing() {
-        use revm_database::states::{
-            cache::CacheState, plain_account::PlainAccount, AccountStatus, CacheAccount,
-        };
-
-        let mut cache_state = CacheState::new(true);
-        let addr = Address::with_last_byte(0xA0);
-
-        cache_state.accounts.insert(
-            addr,
-            CacheAccount {
-                account: Some(PlainAccount {
-                    info: revm::state::AccountInfo {
-                        balance: U256::from(100),
-                        nonce: 0,
-                        code_hash: B256::ZERO,
-                        code: None,
-                        account_id: None,
-                    },
-                    storage: Default::default(),
-                }),
-                status: AccountStatus::Loaded,
-            },
-        );
-
-        let parallel_cache = ParallelStateCache::new();
-        // Pre-existing intra-block state
-        parallel_cache.insert_account(
-            addr,
-            Some(revm::state::AccountInfo {
-                balance: U256::from(9999),
-                nonce: 10,
-                code_hash: B256::ZERO,
-                code: None,
-                account_id: None,
-            }),
-        );
-
-        populate_cache_from_sequencer_state(&cache_state, &parallel_cache);
-
-        // Existing entry should NOT be overwritten
-        let cached = parallel_cache.get_account(&addr).unwrap().unwrap();
-        assert_eq!(cached.balance, U256::from(9999));
-        assert_eq!(cached.nonce, 10);
     }
 }
