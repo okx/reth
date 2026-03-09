@@ -149,7 +149,8 @@ pub struct CachedStateProvider<'a> {
     /// Shared parallel state cache (DashMap-based).
     cache: &'a ParallelStateCache,
     /// Fallback: reth StateProvider (MemoryOverlayStateProvider -> QMDB/MDBX)
-    fallback: &'a dyn StateProvider,
+    /// Requires `Sync` so that `CachedStateProvider` can be shared across rayon threads.
+    fallback: &'a (dyn StateProvider + Sync),
 }
 
 impl core::fmt::Debug for CachedStateProvider<'_> {
@@ -160,7 +161,7 @@ impl core::fmt::Debug for CachedStateProvider<'_> {
 
 impl<'a> CachedStateProvider<'a> {
     /// Create a new provider with the given cache and fallback.
-    pub fn new(cache: &'a ParallelStateCache, fallback: &'a dyn StateProvider) -> Self {
+    pub fn new(cache: &'a ParallelStateCache, fallback: &'a (dyn StateProvider + Sync)) -> Self {
         Self { cache, fallback }
     }
 }
