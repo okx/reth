@@ -78,6 +78,8 @@ pub struct OpPayloadBuilder<
     pub config: OpBuilderConfig,
     /// Bridge transaction interception configuration
     pub bridge_intercept: BridgeInterceptConfig,
+    /// Enable parallel execution for mempool transactions
+    pub parallel_exec: bool,
     /// The type responsible for yielding the best transactions for the payload if mempool
     /// transactions are allowed.
     pub best_transactions: Txs,
@@ -99,6 +101,7 @@ where
             client: self.client.clone(),
             config: self.config.clone(),
             bridge_intercept: self.bridge_intercept.clone(),
+            parallel_exec: self.parallel_exec,
             best_transactions: self.best_transactions.clone(),
             compute_pending_block: self.compute_pending_block,
             _pd: PhantomData,
@@ -116,6 +119,7 @@ impl<Pool, Client, Evm, Attrs> OpPayloadBuilder<Pool, Client, Evm, (), Attrs> {
             client,
             evm_config,
             BridgeInterceptConfig::default(),
+            false,
             Default::default(),
         )
     }
@@ -126,6 +130,7 @@ impl<Pool, Client, Evm, Attrs> OpPayloadBuilder<Pool, Client, Evm, (), Attrs> {
         client: Client,
         evm_config: Evm,
         bridge_intercept: BridgeInterceptConfig,
+        parallel_exec: bool,
         config: OpBuilderConfig,
     ) -> Self {
         Self {
@@ -135,6 +140,7 @@ impl<Pool, Client, Evm, Attrs> OpPayloadBuilder<Pool, Client, Evm, (), Attrs> {
             evm_config,
             config,
             bridge_intercept,
+            parallel_exec,
             best_transactions: (),
             _pd: PhantomData,
         }
@@ -155,7 +161,14 @@ impl<Pool, Client, Evm, Txs, Attrs> OpPayloadBuilder<Pool, Client, Evm, Txs, Att
         best_transactions: T,
     ) -> OpPayloadBuilder<Pool, Client, Evm, T, Attrs> {
         let Self {
-            pool, client, compute_pending_block, evm_config, config, bridge_intercept, ..
+            pool,
+            client,
+            compute_pending_block,
+            evm_config,
+            config,
+            bridge_intercept,
+            parallel_exec,
+            ..
         } = self;
         OpPayloadBuilder {
             pool,
@@ -163,6 +176,7 @@ impl<Pool, Client, Evm, Txs, Attrs> OpPayloadBuilder<Pool, Client, Evm, Txs, Att
             compute_pending_block,
             evm_config,
             bridge_intercept,
+            parallel_exec,
             best_transactions,
             config,
             _pd: PhantomData,
@@ -214,6 +228,7 @@ where
             evm_config: self.evm_config.clone(),
             builder_config: self.config.clone(),
             bridge_intercept: self.bridge_intercept.clone(),
+            parallel_exec: self.parallel_exec,
             chain_spec: self.client.chain_spec(),
             config,
             cancel,
@@ -253,6 +268,7 @@ where
             chain_spec: self.client.chain_spec(),
             config,
             bridge_intercept: self.bridge_intercept.clone(),
+            parallel_exec: self.parallel_exec,
             cancel: Default::default(),
             best_payload: Default::default(),
         };
@@ -434,10 +450,17 @@ impl<Txs> OpBuilder<'_, Txs> {
             // 3.2. execute mempool transactions
             {
                 let _guard = timing_ctx.time_exec_mempool_transactions();
-                if ctx
-                    .execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?
-                    .is_some()
-                {
+                let cancelled = if ctx.parallel_exec {
+                    ctx.execute_best_transactions_parallel(
+                        &mut info,
+                        &mut builder,
+                        best_txs,
+                        &state_provider,
+                    )?
+                } else {
+                    ctx.execute_best_transactions_xlayer(&mut info, &mut builder, best_txs)?
+                };
+                if cancelled.is_some() {
                     return Ok(BuildOutcomeKind::Cancelled)
                 }
             }
@@ -666,6 +689,8 @@ pub struct OpPayloadBuilderCtx<
     pub config: PayloadConfig<Attrs, HeaderTy<Evm::Primitives>>,
     /// Bridge transaction interception configuration
     pub bridge_intercept: BridgeInterceptConfig,
+    /// Enable parallel execution for mempool transactions
+    pub parallel_exec: bool,
     /// Marker to check whether the job has been cancelled.
     pub cancel: CancelOnDrop,
     /// The currently best payload.

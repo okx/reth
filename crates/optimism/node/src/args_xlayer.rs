@@ -20,6 +20,14 @@ pub struct XLayerArgs {
         default_value = "false"
     )]
     pub enable_inner_tx: bool,
+
+    /// Enable parallel execution for mempool transactions
+    #[arg(
+        long = "xlayer.parallel-exec",
+        help = "Enable parallel transaction execution for mempool transactions (disabled by default)",
+        default_value = "false"
+    )]
+    pub parallel_exec: bool,
     // /// Another X Layer feature
     // #[command(flatten)]
     // pub another_feature: AnotherFeatureArgs,
@@ -341,6 +349,32 @@ mod tests {
 
         let config = args.to_bridge_intercept_config().unwrap();
         assert!(!config.enabled);
+    }
+
+    #[test]
+    fn test_xlayer_parallel_exec_default_disabled() {
+        let args = CommandParser::<XLayerArgs>::parse_from(["reth"]).args;
+        assert!(!args.parallel_exec);
+    }
+
+    #[test]
+    fn test_xlayer_parallel_exec_enabled() {
+        let args = CommandParser::<XLayerArgs>::parse_from(["reth", "--xlayer.parallel-exec"]).args;
+        assert!(args.parallel_exec);
+    }
+
+    #[test]
+    fn test_xlayer_parallel_exec_with_other_flags() {
+        let args = CommandParser::<XLayerArgs>::parse_from([
+            "reth",
+            "--xlayer.parallel-exec",
+            "--xlayer.intercept.enabled",
+            "--xlayer.intercept.bridge-contract",
+            "0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe",
+        ])
+        .args;
+        assert!(args.parallel_exec);
+        assert!(args.intercept.enabled);
     }
 
     #[test]

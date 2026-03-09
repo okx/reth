@@ -60,7 +60,7 @@ impl Simulator {
     /// the accessed accounts/slots are still captured.
     pub fn simulate<DB>(&self, txs: &[SimTxEnv], db: &DB, block_env: &BlockEnv) -> Vec<SimResult>
     where
-        DB: revm::DatabaseRef + core::fmt::Debug + Send + Sync,
+        DB: revm::DatabaseRef + core::fmt::Debug,
         DB::Error: core::fmt::Debug + core::error::Error + Send + Sync + 'static,
     {
         txs.iter().enumerate().map(|(idx, tx)| self.simulate_one(tx, idx, db, block_env)).collect()
@@ -78,7 +78,7 @@ impl Simulator {
         block_env: &BlockEnv,
     ) -> SimResult
     where
-        DB: revm::DatabaseRef + core::fmt::Debug + Send + Sync,
+        DB: revm::DatabaseRef + core::fmt::Debug,
         DB::Error: core::fmt::Debug + core::error::Error + Send + Sync + 'static,
     {
         let mut cfg = CfgEnv::default();

@@ -10413,12 +10413,15 @@ dependencies = [
  "reth-revm",
  "reth-storage-api",
  "reth-transaction-pool",
+ "reth-trie-common",
  "revm",
+ "revm-database",
  "serde",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tracing",
  "xlayer-db",
+ "xlayer-parallel-exec",
 ]
 
 [[package]]

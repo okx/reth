@@ -1193,6 +1193,7 @@ where
             ctx.provider().clone(),
             evm_config,
             bridge_intercept,
+            self.xlayer_args.parallel_exec,
             OpBuilderConfig {
                 da_config: self.da_config.clone(),
                 gas_limit_config: self.gas_limit_config.clone(),

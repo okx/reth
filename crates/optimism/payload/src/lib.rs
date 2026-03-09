@@ -55,6 +55,7 @@ where
     }
 }
 
+mod builder_parallel;
 mod builder_xlayer;
 mod intercept_xlayer;
 
