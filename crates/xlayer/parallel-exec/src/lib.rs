@@ -5,6 +5,7 @@
 //! reth's native infrastructure (EVM, StateProvider, BundleState).
 
 pub mod crw_sets;
+pub mod dispatcher;
 pub mod framer;
 pub mod para_bloom;
 pub mod simulator;
