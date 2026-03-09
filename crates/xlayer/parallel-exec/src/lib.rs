@@ -7,5 +7,6 @@
 pub mod crw_sets;
 pub mod framer;
 pub mod para_bloom;
+pub mod simulator;
 pub mod state_cache;
 pub mod task;

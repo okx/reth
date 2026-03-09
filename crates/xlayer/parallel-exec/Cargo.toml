@@ -19,6 +19,7 @@ reth-execution-types.workspace = true
 # alloy
 alloy-primitives = { workspace = true, features = ["map-foldhash"] }
 alloy-consensus.workspace = true
+alloy-evm.workspace = true
 
 # revm
 revm.workspace = true
