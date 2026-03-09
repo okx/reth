@@ -181,6 +181,7 @@ members = [
     "testing/runner",
     "crates/tracing-otlp",
     "crates/xlayer/db",
+    "crates/xlayer/parallel-exec",
     "crates/xlayer/qmdb-provider",
     "crates/xlayer/rpc",
     "crates/xlayer/salt",
@@ -756,6 +757,7 @@ vergen-git2 = "9.1.0"
 
 # xlayer
 xlayer-db = { path = "crates/xlayer/db" }
+xlayer-parallel-exec = { path = "crates/xlayer/parallel-exec" }
 xlayer-qmdb-provider = { path = "crates/xlayer/qmdb-provider" }
 xlayer-rpc = { path = "crates/xlayer/rpc" }
 xlayer-salt = { path = "crates/xlayer/salt" }
