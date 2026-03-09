@@ -2,7 +2,7 @@
 //! [`LocalMiner`](super::LocalMiner).
 
 use alloy_consensus::BlockHeader;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, B64};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_primitives::PayloadAttributesBuilder;
@@ -66,14 +66,25 @@ impl<ChainSpec>
     PayloadAttributesBuilder<op_alloy_rpc_types_engine::OpPayloadAttributes, ChainSpec::Header>
     for LocalPayloadAttributesBuilder<ChainSpec>
 where
-    ChainSpec: EthChainSpec + EthereumHardforks + 'static,
+    ChainSpec: EthChainSpec + EthereumHardforks + reth_optimism_chainspec::OpHardforks + 'static,
 {
     fn build(
         &self,
         parent: &SealedHeader<ChainSpec::Header>,
     ) -> op_alloy_rpc_types_engine::OpPayloadAttributes {
+        let eth_attrs: EthPayloadAttributes = self.build(parent);
+        let timestamp = eth_attrs.timestamp;
+
+        let is_holocene = self.chain_spec.is_holocene_active_at_timestamp(timestamp);
+        let is_jovian = self.chain_spec.is_jovian_active_at_timestamp(timestamp);
+
+        // After Holocene, eip_1559_params must be set (B64::ZERO = use chain defaults).
+        let eip_1559_params = is_holocene.then_some(B64::ZERO);
+        // After Jovian, min_base_fee must be set in payload attributes.
+        let min_base_fee = is_jovian.then_some(0u64);
+
         op_alloy_rpc_types_engine::OpPayloadAttributes {
-            payload_attributes: self.build(parent),
+            payload_attributes: eth_attrs,
             // Add dummy system transaction
             transactions: Some(vec![
                 reth_optimism_chainspec::constants::TX_SET_L1_BLOCK_OP_MAINNET_BLOCK_124665056
@@ -81,8 +92,8 @@ where
             ]),
             no_tx_pool: None,
             gas_limit: None,
-            eip_1559_params: None,
-            min_base_fee: None,
+            eip_1559_params,
+            min_base_fee,
         }
     }
 }

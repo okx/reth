@@ -7,9 +7,9 @@ use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::map::HashMap;
 use clap::Parser;
 use reth_chainspec::EthChainSpec;
-use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::{DebugNodeLauncher, EngineNodeLauncher, NodeHandle};
-use reth_node_ethereum::EthereumNode;
+use reth_optimism_cli::{chainspec::OpChainSpecParser, Cli};
+use reth_optimism_node::{args::RollupArgs, OpNode};
 use revm_database::{states::StorageSlot, AccountStatus, BundleAccount, BundleState};
 use revm_state::AccountInfo;
 use std::sync::Arc;
@@ -23,8 +23,14 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    if let Err(err) = reth_ethereum_cli::interface::Cli::<EthereumChainSpecParser>::parse()
-        .run(|builder, _| async move {
+    if let Err(err) =
+        Cli::<OpChainSpecParser, RollupArgs>::parse().run(|builder, rollup_args| async move {
+            info!(target: "reth::cli", "Launching QMDB node with OP support");
+
+            // ---------------------------------------------------------------
+            // QMDB initialization
+            // ---------------------------------------------------------------
+
             // QMDB path: use QMDB_PATH env var if set, otherwise <datadir>/qmdb
             let qmdb_path = std::env::var("QMDB_PATH")
                 .map(std::path::PathBuf::from)
@@ -97,7 +103,11 @@ fn main() {
                     ))
                 });
 
-            // Configure engine tree: skip state root validation.
+            // ---------------------------------------------------------------
+            // Engine tree configuration
+            // ---------------------------------------------------------------
+
+            // Skip state root validation (QMDB manages its own state).
             let engine_tree_config = builder
                 .config()
                 .engine
@@ -111,8 +121,19 @@ fn main() {
                 .with_on_canonical_commit(on_canonical_commit)
                 .with_state_provider_override(state_override);
 
+            // ---------------------------------------------------------------
+            // Launch with OpNode (provides parallel execution + OP payload builder)
+            // ---------------------------------------------------------------
+
+            let parallel_exec = rollup_args.xlayer_args.parallel_exec;
+            info!(
+                target: "reth::cli",
+                parallel_exec,
+                "QMDB node configuration"
+            );
+
             let NodeHandle { node: _node, node_exit_future } = builder
-                .node(EthereumNode::default())
+                .node(OpNode::new(rollup_args))
                 .launch_with(DebugNodeLauncher::new(launcher))
                 .await?;
 
