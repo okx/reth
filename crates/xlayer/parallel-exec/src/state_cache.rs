@@ -116,6 +116,67 @@ impl ParallelStateCache {
         Self::new()
     }
 
+    /// Pre-populate accounts from post-sequencer state.
+    ///
+    /// Call this before dispatching parallel execution to ensure all EVM threads
+    /// see the correct post-sequencer account state (e.g., after L1 deposits
+    /// update balances/nonces). Without this, parallel threads would read stale
+    /// parent-block state from the fallback `StateProvider`.
+    ///
+    /// Entries already present in the cache are NOT overwritten, so any state
+    /// written by prior frames takes priority.
+    pub fn pre_populate_accounts(
+        &self,
+        accounts: impl IntoIterator<Item = (Address, Option<AccountInfo>)>,
+    ) {
+        for (address, info) in accounts {
+            // Only insert if not already cached (don't overwrite intra-block state)
+            if self.accounts.get(&address).is_none() {
+                self.accounts.insert(address, info);
+            }
+        }
+    }
+
+    /// Pre-populate **both** accounts and storage from post-sequencer state.
+    ///
+    /// This is the comprehensive version of [`pre_populate_accounts`]: it seeds
+    /// the cache with the full state diff produced by sequencer transactions
+    /// (L1 deposits, L1BlockInfo updates, etc.), covering accounts, storage
+    /// slots, and bytecodes.
+    ///
+    /// Call this before dispatching Phase 2 parallel execution. Without it,
+    /// parallel EVM threads would read stale parent-block state from the
+    /// fallback `StateProvider` and cache those stale values, polluting the
+    /// `ParallelStateCache` for all subsequent threads in the same block.
+    ///
+    /// Entries already present in the cache are NOT overwritten.
+    pub fn pre_populate_state(
+        &self,
+        accounts: impl IntoIterator<Item = (Address, Option<AccountInfo>, Vec<(U256, U256)>)>,
+        bytecodes: impl IntoIterator<Item = (B256, revm_bytecode::Bytecode)>,
+    ) {
+        for (address, info, storage_slots) in accounts {
+            // Populate account info if not already cached
+            if self.accounts.get(&address).is_none() {
+                self.accounts.insert(address, info);
+            }
+
+            // Populate storage slots if not already cached
+            for (slot, value) in storage_slots {
+                if self.storage.get(&(address, slot)).is_none() {
+                    self.storage.insert((address, slot), Some(value));
+                }
+            }
+        }
+
+        // Populate bytecodes
+        for (hash, code) in bytecodes {
+            if self.bytecodes.get(&hash).is_none() {
+                self.bytecodes.insert(hash, code);
+            }
+        }
+    }
+
     /// Clear all cached data.
     pub fn clear(&self) {
         self.accounts.clear();
@@ -298,6 +359,116 @@ mod tests {
         assert!(cache.get_bytecode(&B256::with_last_byte(1)).is_none());
         assert!(cache.get_block_hash(&42).is_none());
         assert_eq!(cache.stats().accounts_cached, 0);
+    }
+
+    #[test]
+    fn test_pre_populate_accounts() {
+        let cache = ParallelStateCache::new();
+        let addr_a = Address::with_last_byte(0xA0);
+        let addr_b = Address::with_last_byte(0xB0);
+
+        let accounts = vec![
+            (
+                addr_a,
+                Some(AccountInfo { balance: U256::from(1000), nonce: 5, ..Default::default() }),
+            ),
+            (addr_b, None), // confirmed non-existent
+        ];
+
+        cache.pre_populate_accounts(accounts);
+
+        // Both should be cached
+        let a = cache.get_account(&addr_a).unwrap().unwrap();
+        assert_eq!(a.balance, U256::from(1000));
+        assert_eq!(a.nonce, 5);
+        assert_eq!(cache.get_account(&addr_b), Some(None));
+    }
+
+    #[test]
+    fn test_pre_populate_does_not_overwrite_existing() {
+        let cache = ParallelStateCache::new();
+        let addr = Address::with_last_byte(0xA0);
+
+        // Simulate intra-block state already written (e.g., by a prior frame)
+        cache.insert_account(
+            addr,
+            Some(AccountInfo { balance: U256::from(9999), nonce: 10, ..Default::default() }),
+        );
+
+        // Pre-populate with older state — should NOT overwrite
+        cache.pre_populate_accounts(vec![(
+            addr,
+            Some(AccountInfo { balance: U256::from(100), nonce: 0, ..Default::default() }),
+        )]);
+
+        let info = cache.get_account(&addr).unwrap().unwrap();
+        assert_eq!(info.balance, U256::from(9999), "existing entry should not be overwritten");
+        assert_eq!(info.nonce, 10);
+    }
+
+    #[test]
+    fn test_pre_populate_state_accounts_and_storage() {
+        let cache = ParallelStateCache::new();
+        let addr = Address::with_last_byte(0xA0);
+
+        let accounts = vec![(
+            addr,
+            Some(AccountInfo { balance: U256::from(500), nonce: 2, ..Default::default() }),
+            vec![(U256::from(1), U256::from(100)), (U256::from(2), U256::from(200))],
+        )];
+
+        cache.pre_populate_state(accounts, std::iter::empty());
+
+        // Account should be populated
+        let info = cache.get_account(&addr).unwrap().unwrap();
+        assert_eq!(info.balance, U256::from(500));
+
+        // Storage slots should be populated
+        assert_eq!(cache.get_storage(&addr, &U256::from(1)), Some(Some(U256::from(100))));
+        assert_eq!(cache.get_storage(&addr, &U256::from(2)), Some(Some(U256::from(200))));
+
+        // Unrelated slot is a miss
+        assert!(cache.get_storage(&addr, &U256::from(99)).is_none());
+    }
+
+    #[test]
+    fn test_pre_populate_state_does_not_overwrite() {
+        let cache = ParallelStateCache::new();
+        let addr = Address::with_last_byte(0xA0);
+
+        // Pre-existing intra-block state
+        cache.insert_account(
+            addr,
+            Some(AccountInfo { balance: U256::from(9999), nonce: 10, ..Default::default() }),
+        );
+        cache.insert_storage(addr, U256::from(1), Some(U256::from(42)));
+
+        // pre_populate_state with "older" sequencer state
+        let accounts = vec![(
+            addr,
+            Some(AccountInfo { balance: U256::from(100), nonce: 0, ..Default::default() }),
+            vec![(U256::from(1), U256::from(7))],
+        )];
+
+        cache.pre_populate_state(accounts, std::iter::empty());
+
+        // Existing entries should NOT be overwritten
+        let info = cache.get_account(&addr).unwrap().unwrap();
+        assert_eq!(info.balance, U256::from(9999));
+        assert_eq!(cache.get_storage(&addr, &U256::from(1)), Some(Some(U256::from(42))));
+    }
+
+    #[test]
+    fn test_pre_populate_state_bytecodes() {
+        let cache = ParallelStateCache::new();
+        let hash = B256::with_last_byte(0xCC);
+        let code =
+            revm_bytecode::Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+
+        cache.pre_populate_state(std::iter::empty(), vec![(hash, code.clone())]);
+
+        let cached = cache.get_bytecode(&hash).unwrap();
+        assert_eq!(cached.bytes_slice(), code.bytes_slice());
     }
 
     #[test]

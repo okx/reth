@@ -57,6 +57,7 @@ either.workspace = true
 # xlayer
 xlayer-db.workspace = true
 xlayer-parallel-exec.workspace = true
+revm-database.workspace = true
 
 [dev-dependencies]
 reth-trie-common.workspace = true

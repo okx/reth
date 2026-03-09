@@ -37,22 +37,43 @@ use reth_primitives_traits::{HeaderTy, TxTy};
 use reth_storage_api::{errors::ProviderError, StateProvider};
 use reth_transaction_pool::PoolTransaction;
 use revm::context::{result::ExecutionResult, Block, BlockEnv, TxEnv};
+use revm_database::states::cache::CacheState;
+use std::collections::HashMap;
 use tracing::{debug, trace};
-use xlayer_parallel_exec::simulator::{SimTxEnv, Simulator};
+use xlayer_parallel_exec::{
+    simulator::{SimTxEnv, Simulator},
+    state_cache::ParallelStateCache,
+};
 
-/// A lightweight [`DatabaseRef`](revm::DatabaseRef) adapter for `&dyn StateProvider`.
+/// A [`DatabaseRef`](revm::DatabaseRef) adapter with account state overlay.
 ///
-/// Used for pre-simulation only. Unlike [`CachedStateProvider`], this does not
-/// maintain a shared DashMap cache — each read goes directly to the state provider.
-/// This is sufficient for Phase 1 pre-filtering where we only need to determine
-/// which transactions would succeed or fail.
+/// Reads account info from `account_overrides` first (post-sequencer state),
+/// then falls back to the base `StateProvider` (pre-block state).
+///
+/// This solves a critical consistency issue: the `StateProvider` from
+/// `state_by_block_hash()` reflects the parent block's state. After sequencer
+/// transactions execute (L1 deposits, L1BlockInfo updates), accounts may have
+/// updated balances/nonces that are not visible through the raw `StateProvider`.
+/// By pre-reading these accounts from the builder's `State<DB>` and storing
+/// them as overrides, the simulation sees the correct post-sequencer state.
+///
+/// For bytecodes, storage, and block hashes, reads go directly to the
+/// `StateProvider` since sequencer transactions rarely modify arbitrary storage
+/// slots that mempool transactions depend on.
 struct SimDatabaseRef<'a> {
+    /// Account state overrides from post-sequencer execution.
+    /// Pre-read from `builder.evm_mut().db_mut()` which includes all state
+    /// changes from pre-execution and sequencer transactions.
+    account_overrides: HashMap<Address, Option<revm::state::AccountInfo>>,
+    /// Base state provider (parent block state, does NOT include sequencer changes).
     provider: &'a dyn StateProvider,
 }
 
 impl core::fmt::Debug for SimDatabaseRef<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("SimDatabaseRef").finish_non_exhaustive()
+        f.debug_struct("SimDatabaseRef")
+            .field("account_overrides", &self.account_overrides.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -60,6 +81,11 @@ impl revm::DatabaseRef for SimDatabaseRef<'_> {
     type Error = ProviderError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+        // Check post-sequencer override first
+        if let Some(info) = self.account_overrides.get(&address) {
+            return Ok(info.clone());
+        }
+        // Fall back to base state provider (parent block state)
         Ok(self.provider.basic_account(&address)?.map(Into::into))
     }
 
@@ -75,6 +101,35 @@ impl revm::DatabaseRef for SimDatabaseRef<'_> {
         Ok(reth_storage_api::BlockHashReader::block_hash(self.provider, number)?
             .unwrap_or_default())
     }
+}
+
+/// Populate a [`ParallelStateCache`] with the full post-sequencer state diff
+/// from revm's [`CacheState`].
+///
+/// After sequencer transactions execute (L1 deposits, L1BlockInfo updates),
+/// the builder's `State<DB>.cache` contains the latest account info and storage
+/// values. This function copies those entries into the `ParallelStateCache` so
+/// that Phase 2 parallel EVM threads see the correct post-sequencer state
+/// instead of stale parent-block state from the fallback `StateProvider`.
+///
+/// Entries already present in the `ParallelStateCache` are NOT overwritten.
+fn populate_cache_from_sequencer_state(
+    cache_state: &CacheState,
+    parallel_cache: &ParallelStateCache,
+) {
+    let accounts = cache_state.accounts.iter().map(|(addr, cache_account)| {
+        let info = cache_account.account.as_ref().map(|plain| plain.info.clone());
+        let storage: Vec<(U256, U256)> = cache_account
+            .account
+            .as_ref()
+            .map(|plain| plain.storage.iter().map(|(slot, value)| (*slot, *value)).collect())
+            .unwrap_or_default();
+        (*addr, info, storage)
+    });
+
+    let bytecodes = cache_state.contracts.iter().map(|(hash, code)| (*hash, code.clone()));
+
+    parallel_cache.pre_populate_state(accounts, bytecodes);
 }
 
 /// Convert a consensus transaction into a [`SimTxEnv`] for pre-simulation.
@@ -176,9 +231,25 @@ where
         let sim_txs: Vec<SimTxEnv> =
             candidates.iter().map(|(tx, _)| consensus_tx_to_sim_env(tx.signer(), &**tx)).collect();
 
+        // Pre-read sender accounts from post-sequencer state (builder's State<DB>)
+        // so simulation sees correct balances/nonces after L1 deposits execute.
+        let account_overrides = {
+            let mut overrides = HashMap::new();
+            let db = builder.evm_mut().db_mut();
+            for (tx, _) in &candidates {
+                let sender = tx.signer();
+                if let std::collections::hash_map::Entry::Vacant(e) = overrides.entry(sender) {
+                    if let Ok(info) = revm::Database::basic(db, sender) {
+                        e.insert(info);
+                    }
+                }
+            }
+            overrides
+        };
+
         // Pre-simulate using the parallel framework's Simulator
         let simulator = Simulator::new();
-        let sim_db = SimDatabaseRef { provider: state_provider };
+        let sim_db = SimDatabaseRef { account_overrides, provider: state_provider };
         let block_env = BlockEnv {
             number: builder.evm_mut().block().number().saturating_to(),
             beneficiary: builder.evm_mut().block().beneficiary(),
@@ -606,7 +677,7 @@ mod tests {
 
         let addr = Address::with_last_byte(0xA0);
         let provider = TestStateProvider::new().with_account(addr, U256::from(1000), 5);
-        let db = SimDatabaseRef { provider: &provider };
+        let db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
 
         let result = db.basic_ref(addr).unwrap();
         assert!(result.is_some());
@@ -620,7 +691,7 @@ mod tests {
         use revm::DatabaseRef;
 
         let provider = TestStateProvider::new();
-        let db = SimDatabaseRef { provider: &provider };
+        let db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
 
         let result = db.basic_ref(Address::with_last_byte(0x99)).unwrap();
         assert!(result.is_none());
@@ -634,7 +705,7 @@ mod tests {
         let slot = B256::with_last_byte(7);
         let value = U256::from(42);
         let provider = TestStateProvider::new().with_storage(addr, slot, StorageValue::from(value));
-        let db = SimDatabaseRef { provider: &provider };
+        let db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
 
         let result = db.storage_ref(addr, U256::from(7)).unwrap();
         assert_eq!(result, value);
@@ -645,7 +716,7 @@ mod tests {
         use revm::DatabaseRef;
 
         let provider = TestStateProvider::new();
-        let db = SimDatabaseRef { provider: &provider };
+        let db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
 
         let result = db.storage_ref(Address::with_last_byte(0xA0), U256::from(7)).unwrap();
         assert_eq!(result, U256::ZERO);
@@ -657,7 +728,7 @@ mod tests {
 
         let hash = B256::with_last_byte(0xAB);
         let provider = TestStateProvider::new().with_block_hash(42, hash);
-        let db = SimDatabaseRef { provider: &provider };
+        let db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
 
         let result = db.block_hash_ref(42).unwrap();
         assert_eq!(result, hash);
@@ -668,7 +739,7 @@ mod tests {
         use revm::DatabaseRef;
 
         let provider = TestStateProvider::new();
-        let db = SimDatabaseRef { provider: &provider };
+        let db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
 
         let result = db.block_hash_ref(999).unwrap();
         assert_eq!(result, B256::ZERO);
@@ -679,7 +750,7 @@ mod tests {
         use revm::DatabaseRef;
 
         let provider = TestStateProvider::new();
-        let db = SimDatabaseRef { provider: &provider };
+        let db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
 
         let result = db.code_by_hash_ref(B256::with_last_byte(0x42)).unwrap();
         assert!(result.is_empty());
@@ -688,7 +759,7 @@ mod tests {
     #[test]
     fn test_sim_database_ref_debug() {
         let provider = TestStateProvider::new();
-        let db = SimDatabaseRef { provider: &provider };
+        let db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
         let debug_str = format!("{:?}", db);
         assert!(debug_str.contains("SimDatabaseRef"));
     }
@@ -704,7 +775,7 @@ mod tests {
 
         let provider = TestStateProvider::new().with_account(sender, U256::from(1_000_000), 0);
 
-        let sim_db = SimDatabaseRef { provider: &provider };
+        let sim_db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
         let simulator = Simulator::new();
         let block_env = BlockEnv::default();
 
@@ -736,7 +807,7 @@ mod tests {
         let provider =
             TestStateProvider::new().with_account(funded_sender, U256::from(1_000_000), 0);
 
-        let sim_db = SimDatabaseRef { provider: &provider };
+        let sim_db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
         let simulator = Simulator::new();
         let block_env = BlockEnv::default();
 
@@ -789,7 +860,7 @@ mod tests {
             .with_account(sender_a, U256::from(1_000_000), 0)
             .with_account(sender_b, U256::from(2_000_000), 3);
 
-        let sim_db = SimDatabaseRef { provider: &provider };
+        let sim_db = SimDatabaseRef { account_overrides: HashMap::new(), provider: &provider };
         let simulator = Simulator::new();
         let block_env = BlockEnv::default();
 
@@ -826,5 +897,248 @@ mod tests {
         assert!(results[1].success);
         assert!(!results[0].crw_sets.account_writes.is_empty());
         assert!(!results[1].crw_sets.account_writes.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for account_overrides (post-sequencer state overlay)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sim_database_ref_override_takes_priority() {
+        use revm::DatabaseRef;
+
+        let addr = Address::with_last_byte(0xA0);
+        // Provider has old state: balance=100, nonce=0
+        let provider = TestStateProvider::new().with_account(addr, U256::from(100), 0);
+
+        // Override with post-sequencer state: balance=9999, nonce=5
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            addr,
+            Some(revm::state::AccountInfo {
+                balance: U256::from(9999),
+                nonce: 5,
+                code_hash: B256::ZERO,
+                code: None,
+                account_id: None,
+            }),
+        );
+
+        let db = SimDatabaseRef { account_overrides: overrides, provider: &provider };
+        let result = db.basic_ref(addr).unwrap().unwrap();
+        assert_eq!(result.balance, U256::from(9999), "override balance should take priority");
+        assert_eq!(result.nonce, 5, "override nonce should take priority");
+    }
+
+    #[test]
+    fn test_sim_database_ref_override_none_means_no_account() {
+        use revm::DatabaseRef;
+
+        let addr = Address::with_last_byte(0xA0);
+        // Provider has the account
+        let provider = TestStateProvider::new().with_account(addr, U256::from(100), 0);
+
+        // Override says account doesn't exist (None)
+        let mut overrides = HashMap::new();
+        overrides.insert(addr, None);
+
+        let db = SimDatabaseRef { account_overrides: overrides, provider: &provider };
+        let result = db.basic_ref(addr).unwrap();
+        assert!(result.is_none(), "None override should mean account doesn't exist");
+    }
+
+    #[test]
+    fn test_sim_database_ref_falls_through_without_override() {
+        use revm::DatabaseRef;
+
+        let addr_overridden = Address::with_last_byte(0xA0);
+        let addr_not_overridden = Address::with_last_byte(0xB0);
+
+        let provider = TestStateProvider::new()
+            .with_account(addr_overridden, U256::from(100), 0)
+            .with_account(addr_not_overridden, U256::from(200), 1);
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            addr_overridden,
+            Some(revm::state::AccountInfo {
+                balance: U256::from(9999),
+                nonce: 5,
+                code_hash: B256::ZERO,
+                code: None,
+                account_id: None,
+            }),
+        );
+
+        let db = SimDatabaseRef { account_overrides: overrides, provider: &provider };
+
+        // addr_not_overridden should fall through to provider
+        let result = db.basic_ref(addr_not_overridden).unwrap().unwrap();
+        assert_eq!(result.balance, U256::from(200), "non-overridden address should use provider");
+        assert_eq!(result.nonce, 1);
+    }
+
+    #[test]
+    fn test_sim_database_ref_storage_not_affected_by_overrides() {
+        use revm::DatabaseRef;
+
+        let addr = Address::with_last_byte(0xA0);
+        let slot = B256::with_last_byte(1);
+        let provider =
+            TestStateProvider::new().with_storage(addr, slot, StorageValue::from(U256::from(42)));
+
+        // Even with account override, storage still comes from provider
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            addr,
+            Some(revm::state::AccountInfo {
+                balance: U256::from(9999),
+                nonce: 5,
+                code_hash: B256::ZERO,
+                code: None,
+                account_id: None,
+            }),
+        );
+
+        let db = SimDatabaseRef { account_overrides: overrides, provider: &provider };
+        let result = db.storage_ref(addr, U256::from(1)).unwrap();
+        assert_eq!(result, U256::from(42), "storage should come from provider regardless");
+    }
+
+    #[test]
+    fn test_simulator_with_overridden_balance() {
+        let sender = Address::with_last_byte(0xA0);
+        let recipient = Address::with_last_byte(0xB0);
+
+        // Provider has no balance for sender
+        let provider = TestStateProvider::new();
+
+        // But override gives sender enough balance
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            sender,
+            Some(revm::state::AccountInfo {
+                balance: U256::from(1_000_000),
+                nonce: 0,
+                code_hash: B256::ZERO,
+                code: None,
+                account_id: None,
+            }),
+        );
+
+        let sim_db = SimDatabaseRef { account_overrides: overrides, provider: &provider };
+        let simulator = Simulator::new();
+        let block_env = BlockEnv::default();
+
+        let tx = SimTxEnv {
+            sender,
+            tx_env: TxEnv {
+                caller: sender,
+                gas_limit: 100_000,
+                gas_price: 0,
+                kind: TxKind::Call(recipient),
+                value: U256::from(100),
+                nonce: 0,
+                ..Default::default()
+            },
+        };
+
+        let results = simulator.simulate(&[tx], &sim_db, &block_env);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].success,
+            "tx should succeed with overridden balance even though provider has no account"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for populate_cache_from_sequencer_state
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_populate_cache_from_sequencer_state_accounts_and_storage() {
+        use revm_database::states::{
+            cache::CacheState, plain_account::PlainAccount, AccountStatus, CacheAccount,
+        };
+
+        let mut cache_state = CacheState::new(true);
+        let addr = Address::with_last_byte(0xA0);
+        let info = revm::state::AccountInfo {
+            balance: U256::from(5000),
+            nonce: 3,
+            code_hash: B256::ZERO,
+            code: None,
+            account_id: None,
+        };
+        let mut storage = revm_database::states::plain_account::PlainStorage::default();
+        storage.insert(U256::from(1), U256::from(42));
+        storage.insert(U256::from(2), U256::from(99));
+
+        cache_state.accounts.insert(
+            addr,
+            CacheAccount {
+                account: Some(PlainAccount { info: info.clone(), storage }),
+                status: AccountStatus::Loaded,
+            },
+        );
+
+        let parallel_cache = ParallelStateCache::new();
+        populate_cache_from_sequencer_state(&cache_state, &parallel_cache);
+
+        // Account should be populated
+        let cached_info = parallel_cache.get_account(&addr).unwrap().unwrap();
+        assert_eq!(cached_info.balance, U256::from(5000));
+        assert_eq!(cached_info.nonce, 3);
+
+        // Storage slots should be populated
+        assert_eq!(parallel_cache.get_storage(&addr, &U256::from(1)), Some(Some(U256::from(42))));
+        assert_eq!(parallel_cache.get_storage(&addr, &U256::from(2)), Some(Some(U256::from(99))));
+    }
+
+    #[test]
+    fn test_populate_cache_does_not_overwrite_existing() {
+        use revm_database::states::{
+            cache::CacheState, plain_account::PlainAccount, AccountStatus, CacheAccount,
+        };
+
+        let mut cache_state = CacheState::new(true);
+        let addr = Address::with_last_byte(0xA0);
+
+        cache_state.accounts.insert(
+            addr,
+            CacheAccount {
+                account: Some(PlainAccount {
+                    info: revm::state::AccountInfo {
+                        balance: U256::from(100),
+                        nonce: 0,
+                        code_hash: B256::ZERO,
+                        code: None,
+                        account_id: None,
+                    },
+                    storage: Default::default(),
+                }),
+                status: AccountStatus::Loaded,
+            },
+        );
+
+        let parallel_cache = ParallelStateCache::new();
+        // Pre-existing intra-block state
+        parallel_cache.insert_account(
+            addr,
+            Some(revm::state::AccountInfo {
+                balance: U256::from(9999),
+                nonce: 10,
+                code_hash: B256::ZERO,
+                code: None,
+                account_id: None,
+            }),
+        );
+
+        populate_cache_from_sequencer_state(&cache_state, &parallel_cache);
+
+        // Existing entry should NOT be overwritten
+        let cached = parallel_cache.get_account(&addr).unwrap().unwrap();
+        assert_eq!(cached.balance, U256::from(9999));
+        assert_eq!(cached.nonce, 10);
     }
 }
