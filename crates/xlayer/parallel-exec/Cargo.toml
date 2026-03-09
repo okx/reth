@@ -17,11 +17,12 @@ reth-storage-errors.workspace = true
 reth-execution-types.workspace = true
 
 # alloy
-alloy-primitives.workspace = true
+alloy-primitives = { workspace = true, features = ["map-foldhash"] }
 alloy-consensus.workspace = true
 
 # revm
 revm.workspace = true
+revm-bytecode.workspace = true
 revm-database.workspace = true
 revm-state.workspace = true
 
