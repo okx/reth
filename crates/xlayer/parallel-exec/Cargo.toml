@@ -38,6 +38,8 @@ tracing.workspace = true
 [dev-dependencies]
 rand.workspace = true
 tempfile.workspace = true
+reth-trie-common.workspace = true
+revm-database.workspace = true
 
 [lints]
 workspace = true
