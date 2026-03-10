@@ -10,6 +10,7 @@ pub mod dashboard;
 pub mod dispatcher;
 pub mod framer;
 pub mod para_bloom;
+pub mod parallel_state_cache;
 pub mod result_collector;
 pub mod simulator;
 pub mod state_cache;
