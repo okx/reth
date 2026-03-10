@@ -29,15 +29,30 @@ reth-ethereum-primitives.workspace = true
 reth-evm.workspace = true
 reth-node-api.workspace = true
 reth-transaction-pool.workspace = true
+reth-basic-payload-builder.workspace = true
+reth-payload-builder.workspace = true
+reth-payload-builder-primitives.workspace = true
+reth-payload-primitives.workspace = true
+reth-revm.workspace = true
+reth-storage-api.workspace = true
+reth-execution-types.workspace = true
+reth-errors.workspace = true
+reth-primitives-traits.workspace = true
+reth-consensus-common.workspace = true
+reth-node-metrics.workspace = true
 
 # xlayer
 xlayer-qmdb-provider.workspace = true
+xlayer-parallel-exec.workspace = true
 
 # alloy
 alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-primitives.workspace = true
+alloy-rlp.workspace = true
 
 # revm
+revm.workspace = true
 revm-database.workspace = true
 revm-state.workspace = true
 
@@ -46,7 +61,9 @@ tokio = { workspace = true, features = ["sync", "macros", "time", "rt-multi-thre
 
 # misc
 clap = { workspace = true, features = ["derive", "env"] }
+either.workspace = true
 eyre.workspace = true
+parking_lot.workspace = true
 tracing.workspace = true
 
 [features]

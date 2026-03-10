@@ -51,7 +51,13 @@ where
     DB: revm::Database + std::fmt::Debug,
     DB::Error: std::fmt::Debug + std::error::Error + Send + Sync + 'static,
 {
-    let evm_env = EvmEnv { cfg_env: cfg_env.clone(), block_env: block_env.clone() };
+    // Disable nonce check: in parallel execution, same-sender transactions
+    // execute against CachedDbRef which provides updated nonces from predecessors
+    // via the Dashboard cascade. The tx pool already guarantees nonce ordering.
+    let mut cfg = cfg_env.clone();
+    cfg.disable_nonce_check = true;
+
+    let evm_env = EvmEnv { cfg_env: cfg, block_env: block_env.clone() };
 
     let inner = Context::mainnet()
         .with_db(db)

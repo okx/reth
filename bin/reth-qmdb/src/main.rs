@@ -3,6 +3,8 @@
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
+mod parallel_payload;
+
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::map::HashMap;
 use clap::{Args, Parser};
@@ -47,6 +49,70 @@ struct QmdbPayloadBuilder {
     parallel_exec: bool,
 }
 
+/// Enum to hold either the sequential or parallel payload builder.
+#[derive(Debug, Clone)]
+enum QmdbPayloadBuilderInner<Pool, Provider, Evm> {
+    Sequential(reth_ethereum_payload_builder::EthereumPayloadBuilder<Pool, Provider, Evm>),
+    Parallel(parallel_payload::ParallelPayloadBuilder<Pool, Provider, Evm>),
+}
+
+impl<Pool, Provider, Evm> reth_basic_payload_builder::PayloadBuilder
+    for QmdbPayloadBuilderInner<Pool, Provider, Evm>
+where
+    Evm: ConfigureEvm<
+        Primitives = EthPrimitives,
+        NextBlockEnvCtx = reth_evm::NextBlockEnvAttributes,
+    >,
+    Provider: reth_storage_api::StateProviderFactory
+        + reth_chainspec::ChainSpecProvider<ChainSpec: EthereumHardforks>
+        + Clone,
+    Pool: TransactionPool<
+        Transaction: PoolTransaction<Consensus = reth_ethereum_primitives::TransactionSigned>,
+    >,
+{
+    type Attributes = EthPayloadBuilderAttributes;
+    type BuiltPayload = EthBuiltPayload;
+
+    fn try_build(
+        &self,
+        args: reth_basic_payload_builder::BuildArguments<
+            EthPayloadBuilderAttributes,
+            EthBuiltPayload,
+        >,
+    ) -> Result<
+        reth_basic_payload_builder::BuildOutcome<EthBuiltPayload>,
+        reth_payload_builder_primitives::PayloadBuilderError,
+    > {
+        match self {
+            Self::Sequential(b) => b.try_build(args),
+            Self::Parallel(b) => b.try_build(args),
+        }
+    }
+
+    fn on_missing_payload(
+        &self,
+        args: reth_basic_payload_builder::BuildArguments<
+            EthPayloadBuilderAttributes,
+            EthBuiltPayload,
+        >,
+    ) -> reth_basic_payload_builder::MissingPayloadBehaviour<EthBuiltPayload> {
+        match self {
+            Self::Sequential(b) => b.on_missing_payload(args),
+            Self::Parallel(b) => b.on_missing_payload(args),
+        }
+    }
+
+    fn build_empty_payload(
+        &self,
+        config: reth_basic_payload_builder::PayloadConfig<EthPayloadBuilderAttributes>,
+    ) -> Result<EthBuiltPayload, reth_payload_builder_primitives::PayloadBuilderError> {
+        match self {
+            Self::Sequential(b) => b.build_empty_payload(config),
+            Self::Parallel(b) => b.build_empty_payload(config),
+        }
+    }
+}
+
 impl<Types, Node, Pool, Evm> PayloadBuilderBuilder<Node, Pool, Evm> for QmdbPayloadBuilder
 where
     Types: NodeTypes<ChainSpec: EthereumHardforks, Primitives = EthPrimitives>,
@@ -64,8 +130,7 @@ where
         PayloadBuilderAttributes = EthPayloadBuilderAttributes,
     >,
 {
-    type PayloadBuilder =
-        reth_ethereum_payload_builder::EthereumPayloadBuilder<Pool, Node::Provider, Evm>;
+    type PayloadBuilder = QmdbPayloadBuilderInner<Pool, Node::Provider, Evm>;
 
     async fn build_payload_builder(
         self,
@@ -83,16 +148,29 @@ where
             "Payload builder configured"
         );
 
-        Ok(reth_ethereum_payload_builder::EthereumPayloadBuilder::new(
-            ctx.provider().clone(),
-            pool,
-            evm_config,
-            EthereumBuilderConfig::new()
-                .with_gas_limit(gas_limit)
-                .with_max_blobs_per_block(conf.max_blobs_per_block())
-                .with_extra_data(conf.extra_data_bytes())
-                .with_parallel_exec(self.parallel_exec),
-        ))
+        let builder_config = EthereumBuilderConfig::new()
+            .with_gas_limit(gas_limit)
+            .with_max_blobs_per_block(conf.max_blobs_per_block())
+            .with_extra_data(conf.extra_data_bytes());
+
+        if self.parallel_exec {
+            info!(target: "reth::cli", "Using PARALLEL payload builder (true parallel execution)");
+            Ok(QmdbPayloadBuilderInner::Parallel(parallel_payload::ParallelPayloadBuilder::new(
+                ctx.provider().clone(),
+                pool,
+                evm_config,
+                builder_config,
+            )))
+        } else {
+            Ok(QmdbPayloadBuilderInner::Sequential(
+                reth_ethereum_payload_builder::EthereumPayloadBuilder::new(
+                    ctx.provider().clone(),
+                    pool,
+                    evm_config,
+                    builder_config.with_parallel_exec(false),
+                ),
+            ))
+        }
     }
 }
 
