@@ -30,6 +30,7 @@ revm-state.workspace = true
 # concurrency
 rayon.workspace = true
 parking_lot.workspace = true
+dashmap.workspace = true
 
 # misc
 tracing.workspace = true
