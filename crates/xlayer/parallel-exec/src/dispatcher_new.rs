@@ -130,6 +130,19 @@ impl ParallelDispatcher {
         self.num_exe_threads
     }
 
+    /// Run a closure on the execution thread pool.
+    ///
+    /// Allows callers to leverage the dispatcher's pre-built rayon pool
+    /// for parallel work (e.g., intra-frame parallel execution in the
+    /// pipeline's MVP mode).
+    pub fn exe_pool_install<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R + Send,
+        R: Send,
+    {
+        self.exe_pool.install(f)
+    }
+
     /// Execute all tasks for a block.
     ///
     /// This is the main entry point. Each task goes through:
