@@ -11452,6 +11452,7 @@ dependencies = [
  "auto_impl",
  "bitflags 2.10.0",
  "codspeed-criterion-compat",
+ "dashmap 6.1.0",
  "futures",
  "futures-util",
  "metrics",

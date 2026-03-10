@@ -303,9 +303,12 @@ use alloy_primitives::{Address, B256, U256, KECCAK256_EMPTY};
 use reth_provider::{AccountReader, StateProvider, ProviderError};
 use revm::bytecode::Bytecode;
 use revm::state::AccountInfo;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Mutex;
 use parking_lot::RwLock;
+
+/// Default cache capacity for typical block simulation
+const DEFAULT_STATE_CACHE_CAPACITY: usize = 512;
 
 /// Immutable state snapshot for parallel simulation
 ///
@@ -319,6 +322,10 @@ use parking_lot::RwLock;
 /// Uses Mutex for state_provider access to allow Send-only providers
 /// (like StateProviderBox) to be used in parallel context.
 ///
+/// ## Performance Notes
+/// - Uses FxHashMap for faster hashing of StateKey
+/// - Pre-allocated capacity to avoid rehashing during simulation
+///
 /// # Note on Clone
 /// `SnapshotState` intentionally does NOT implement `Clone` because:
 /// - The underlying `StateProvider` is a trait object that cannot be cloned
@@ -330,8 +337,8 @@ pub struct SnapshotState {
     state_provider: Mutex<Box<dyn StateProvider + Send>>,
 
     /// Internal cache for deduplication (CRITICAL - reduces MDBX queries 6x!)
-    /// Uses RwLock for fast concurrent reads
-    cache: RwLock<HashMap<StateKey, StateValue>>,
+    /// Uses FxHashMap for faster hashing, RwLock for concurrent reads
+    cache: RwLock<FxHashMap<StateKey, StateValue>>,
 }
 
 // SnapshotState is Sync because:
@@ -370,7 +377,10 @@ impl SnapshotState {
     pub fn new(state_provider: Box<dyn StateProvider + Send>) -> Self {
         Self {
             state_provider: Mutex::new(state_provider),
-            cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(FxHashMap::with_capacity_and_hasher(
+                DEFAULT_STATE_CACHE_CAPACITY,
+                Default::default(),
+            )),
         }
     }
 
@@ -378,7 +388,7 @@ impl SnapshotState {
     pub fn with_capacity(state_provider: Box<dyn StateProvider + Send>, capacity: usize) -> Self {
         Self {
             state_provider: Mutex::new(state_provider),
-            cache: RwLock::new(HashMap::with_capacity(capacity)),
+            cache: RwLock::new(FxHashMap::with_capacity_and_hasher(capacity, Default::default())),
         }
     }
 
@@ -539,6 +549,7 @@ mod tests {
 
     use super::*;
     use alloy_primitives::{address, b256, Address, B256, U256};
+    use rustc_hash::FxHashMap;
     use std::sync::Arc;
     use std::thread;
 
@@ -1197,7 +1208,7 @@ mod tests {
     /// - Each type retrievable independently
     #[test]
     fn test_hashmap_with_state_keys() {
-        let mut map: HashMap<StateKey, StateValue> = HashMap::new();
+        let mut map: FxHashMap<StateKey, StateValue> = FxHashMap::default();
 
         let code_hash = b256!("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
 
@@ -1250,7 +1261,7 @@ mod tests {
     /// - Latest value returned
     #[test]
     fn test_hashmap_overwrite() {
-        let mut map: HashMap<StateKey, StateValue> = HashMap::new();
+        let mut map: FxHashMap<StateKey, StateValue> = FxHashMap::default();
 
         // Initial value
         map.insert(
@@ -1269,7 +1280,7 @@ mod tests {
 
         // Value updated
         if let Some(StateValue::Storage(v)) = map.get(&StateKey::Storage(USDC, U256::ZERO)) {
-            assert_eq!(*v, U256::from(200));
+            assert_eq!(v, &U256::from(200));
         } else {
             panic!("Expected storage value");
         }
@@ -1285,7 +1296,7 @@ mod tests {
     /// - Removed key no longer found
     #[test]
     fn test_hashmap_remove() {
-        let mut map: HashMap<StateKey, StateValue> = HashMap::new();
+        let mut map: FxHashMap<StateKey, StateValue> = FxHashMap::default();
 
         map.insert(
             StateKey::Account(ALICE),
@@ -1369,8 +1380,8 @@ mod tests {
     fn test_concurrent_hashmap_access() {
         use parking_lot::RwLock;
 
-        let map: Arc<RwLock<HashMap<StateKey, StateValue>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let map: Arc<RwLock<FxHashMap<StateKey, StateValue>>> =
+            Arc::new(RwLock::new(FxHashMap::default()));
 
         let handles: Vec<_> = (0..10)
             .map(|i| {
@@ -1427,8 +1438,8 @@ mod tests {
     fn test_high_contention_concurrent_access() {
         use parking_lot::RwLock;
 
-        let map: Arc<RwLock<HashMap<StateKey, StateValue>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let map: Arc<RwLock<FxHashMap<StateKey, StateValue>>> =
+            Arc::new(RwLock::new(FxHashMap::default()));
 
         // Initialize
         map.write().insert(
@@ -1490,7 +1501,7 @@ mod tests {
     /// - No memory issues
     #[test]
     fn test_many_keys_in_hashmap() {
-        let mut map: HashMap<StateKey, StateValue> = HashMap::new();
+        let mut map: FxHashMap<StateKey, StateValue> = FxHashMap::default();
 
         for i in 0u16..1000 {
             let addr = Address::from_slice(&[
@@ -1515,7 +1526,7 @@ mod tests {
     /// - Each slot independently accessible
     #[test]
     fn test_many_storage_slots() {
-        let mut map: HashMap<StateKey, StateValue> = HashMap::new();
+        let mut map: FxHashMap<StateKey, StateValue> = FxHashMap::default();
 
         for i in 0u64..1000 {
             map.insert(
@@ -1545,7 +1556,7 @@ mod tests {
     /// - Memory roughly as expected
     #[test]
     fn test_large_cache_creation() {
-        let mut map: HashMap<StateKey, StateValue> = HashMap::with_capacity(10_000);
+        let mut map: FxHashMap<StateKey, StateValue> = FxHashMap::with_capacity_and_hasher(10_000, Default::default());
 
         // Insert 10K mixed entries
         for i in 0..10_000u64 {

@@ -13,6 +13,12 @@
 //! - Direct cleanup when TX is mined/dropped
 //! - No over-fetching or cache pollution
 //!
+//! ## Performance Optimizations
+//! - Uses DashMap for lock-free concurrent access
+//! - Sharded internally - different TxHashes map to different shards
+//! - Simulation workers can write in parallel without contention
+//! - Block builder can read while simulations are writing
+//!
 //! ## Usage Flow:
 //! ```text
 //! Simulation workers:
@@ -33,17 +39,22 @@
 
 use crate::pre_warming::{ExtractedKeys, PreWarmingConfig};
 use alloy_primitives::TxHash;
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use dashmap::DashMap;
+
+/// Default capacity for transaction cache (typical mempool batch)
+const DEFAULT_CACHE_CAPACITY: usize = 256;
 
 /// Thread-safe cache for per-transaction pre-warmed keys
 ///
 /// Stores extracted keys for each transaction separately, enabling precise
 /// prefetching and direct cleanup when transactions are mined/dropped.
+///
+/// Uses DashMap for lock-free concurrent access - simulation workers can
+/// write to different keys in parallel without blocking each other.
 #[derive(Debug)]
 pub struct PreWarmedCache {
-    /// Per-transaction extracted keys
-    per_tx_keys: RwLock<HashMap<TxHash, ExtractedKeys>>,
+    /// Per-transaction extracted keys (lock-free concurrent map)
+    per_tx_keys: DashMap<TxHash, ExtractedKeys>,
 
     /// Configuration
     #[allow(unused)]
@@ -54,7 +65,7 @@ impl PreWarmedCache {
     /// Create new cache with given configuration
     pub fn new(config: PreWarmingConfig) -> Self {
         Self {
-            per_tx_keys: RwLock::new(HashMap::new()),
+            per_tx_keys: DashMap::with_capacity(DEFAULT_CACHE_CAPACITY),
             config,
         }
     }
@@ -63,8 +74,9 @@ impl PreWarmedCache {
     ///
     /// This is called by simulation workers after extracting keys from a transaction.
     /// Each transaction's keys are stored separately.
+    /// Lock-free: different tx hashes go to different shards.
     pub fn store_tx_keys(&self, tx_hash: TxHash, keys: ExtractedKeys) {
-        self.per_tx_keys.write().insert(tx_hash, keys);
+        self.per_tx_keys.insert(tx_hash, keys);
     }
 
     /// Get merged keys for selected transactions (called during block building)
@@ -73,13 +85,13 @@ impl PreWarmedCache {
     /// Returns the merged ExtractedKeys for only those transactions.
     ///
     /// Returns empty ExtractedKeys if none of the transactions are in cache.
+    /// Lock-free: reads don't block writes to other keys.
     pub fn get_keys_for_txs(&self, tx_hashes: &[TxHash]) -> ExtractedKeys {
-        let cache = self.per_tx_keys.read();
         let mut merged = ExtractedKeys::new();
 
         for tx_hash in tx_hashes {
-            if let Some(keys) = cache.get(tx_hash) {
-                merged.merge(keys.clone());
+            if let Some(keys) = self.per_tx_keys.get(tx_hash) {
+                merged.merge_ref(&keys);
             }
         }
 
@@ -94,11 +106,10 @@ impl PreWarmedCache {
     /// NOTE: This may return more keys than needed. Prefer `get_keys_for_txs()` when
     /// you know which transactions will be selected.
     pub fn get_all_keys(&self) -> ExtractedKeys {
-        let cache = self.per_tx_keys.read();
         let mut merged = ExtractedKeys::new();
 
-        for keys in cache.values() {
-            merged.merge(keys.clone());
+        for entry in self.per_tx_keys.iter() {
+            merged.merge_ref(entry.value());
         }
 
 
@@ -119,16 +130,25 @@ impl PreWarmedCache {
 
     /// Get cache statistics
     pub fn stats(&self) -> CacheStats {
-        let cache = self.per_tx_keys.read();
+        let mut total_keys: usize = 0;
+        let mut total_accounts: usize = 0;
+        let mut total_storage_slots: usize = 0;
+        let mut total_code_hashes: usize = 0;
+        let mut total_block_hashes: usize = 0;
+        let mut total_transactions: usize = 0;
 
-        let total_keys: usize = cache.values().map(|k| k.total_keys()).sum();
-        let total_accounts: usize = cache.values().map(|k| k.accounts.len()).sum();
-        let total_storage_slots: usize = cache.values().map(|k| k.storage_slots.len()).sum();
-        let total_code_hashes: usize = cache.values().map(|k| k.code_hashes.len()).sum();
-        let total_block_hashes: usize = cache.values().map(|k| k.block_hashes.len()).sum();
+        for entry in self.per_tx_keys.iter() {
+            let k = entry.value();
+            total_keys += k.total_keys();
+            total_accounts += k.accounts.len();
+            total_storage_slots += k.storage_slots.len();
+            total_code_hashes += k.code_hashes.len();
+            total_block_hashes += k.block_hashes.len();
+            total_transactions += 1;
+        }
 
         CacheStats {
-            total_transactions: cache.len(),
+            total_transactions,
             total_accounts,
             total_storage_slots,
             total_code_hashes,
@@ -139,17 +159,17 @@ impl PreWarmedCache {
 
     /// Clear all cached keys (for testing)
     pub fn clear(&self) {
-        self.per_tx_keys.write().clear();
+        self.per_tx_keys.clear();
     }
 
     /// Get number of cached transactions
     pub fn len(&self) -> usize {
-        self.per_tx_keys.read().len()
+        self.per_tx_keys.len()
     }
 
     /// Check if cache is empty
     pub fn is_empty(&self) -> bool {
-        self.per_tx_keys.read().is_empty()
+        self.per_tx_keys.is_empty()
     }
 }
 

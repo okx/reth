@@ -13,14 +13,50 @@
 #    - Auto-generates comparison reports at end
 #    - Better logging and progress output
 #
-#  Metric Keys Used (via devnet_comparison.sh):
-#    - reth_payloads_cached_reads_hits (always-on cache hits)
-#    - reth_payloads_cached_reads_misses (always-on cache misses)
+#-------------------------------------------------------------------------------
+#  METRIC KEYS & CALCULATION LOGIC
+#-------------------------------------------------------------------------------
+#
+#  CACHE HIT RATE (always-on, tracked regardless of pre-warming):
+#    - reth_payloads_cached_reads_hits
+#    - reth_payloads_cached_reads_misses
+#    - Calculation: cache_hit_rate = hits / (hits + misses) * 100
+#
+#  BLOCK EXECUTION TIME:
+#    - Metric: reth_block_timing_build_exec_mempool_transactions_sum/count
+#    - Source: crates/optimism/payload/src/builder.rs (Lines 559-568)
+#    - Calculation: block_execution_ms = sum / count * 1000
+#    - Note: This is the time to execute user transactions through EVM
+#           (Phase 4 of block building - does NOT include prefetch time)
+#
+#  STATE ROOT CALCULATION TIME:
+#    - Metric: reth_block_timing_build_calc_state_root_sum/count
+#    - Source: crates/optimism/payload/src/builder.rs (Lines 575-578)
+#    - Calculation: state_root_ms = sum / count * 1000
+#    - Note: This is the time to compute the Merkle Patricia Trie root hash
+#
+#  PRE-WARMING METRICS (only populated when pre-warming=true):
 #    - reth_txpool_pre_warming_simulations_completed
+#    - reth_txpool_pre_warming_simulations_failed
 #    - reth_txpool_pre_warming_prefetch_operations
 #    - reth_txpool_pre_warming_prefetch_accounts
-#    - reth_block_timing_build_exec_mempool_transactions_sum/count
-#    - reth_block_timing_build_calc_state_root_sum/count
+#    - reth_txpool_pre_warming_prefetch_storage_slots
+#
+#  TIMING FLOW (from builder.rs):
+#    ┌─────────────────────────────────────────────────────────────────────┐
+#    │  PREFETCH (pre-warming)       ◄── NOT included in timing           │
+#    │  Lines 195-295: Load state from MDBX → CachedReads                  │
+#    ├─────────────────────────────────────────────────────────────────────┤
+#    │  TIMING CONTEXT STARTS (Line 530)                                   │
+#    │                                                                     │
+#    │  [1] apply_pre_execution_changes (system setup)                    │
+#    │  [2] exec_sequencer_transactions (L1 deposits)                     │
+#    │  [3] select_mempool_transactions (TX selection)                    │
+#    │  [4] exec_mempool_transactions   ◄── "BLOCK EXECUTION TIME"        │
+#    │  [5] calc_state_root             ◄── "STATE ROOT TIME"             │
+#    └─────────────────────────────────────────────────────────────────────┘
+#
+#-------------------------------------------------------------------------------
 #
 #  USAGE:
 #    ./run-pre-warming-benchmark-v2.sh

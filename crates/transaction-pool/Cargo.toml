@@ -32,6 +32,7 @@ reth-revm = { workspace = true, optional = true }
 reth-evm = { workspace = true, optional = true }
 alloy-evm = { workspace = true, optional = true }
 revm = { workspace = true, optional = true }
+dashmap = { workspace = true, optional = true }
 
 # ethereum
 alloy-eips = { workspace = true, features = ["kzg"] }
@@ -91,6 +92,7 @@ pre-warming = [
     "reth-evm",
     "alloy-evm",
     "revm",
+    "dashmap",
 ]  # Experimental: opt-in only for now
 serde = [
     "reth-execution-types/serde",

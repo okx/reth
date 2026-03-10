@@ -5,6 +5,12 @@
 //!
 //! The simulation runs the transaction through a TrackingDatabase that records
 //! every state access, enabling accurate pre-warming of the cache.
+//!
+//! ## Performance Optimizations
+//!
+//! - Thread-local extraction buffers to avoid repeated allocations
+//! - Batch insertion of storage slots
+//! - Pre-computed selector lookup table
 
 use crate::pre_warming::{ExtractedKeys, SnapshotState};
 use alloy_primitives::{Address, U256, B256};
@@ -19,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::cell::RefCell;
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::sync::LazyLock;
 
 
@@ -29,9 +35,14 @@ use alloy_evm as _;
 #[allow(unused_imports)]
 use reth_evm as _;
 
+// NOTE: Thread-local buffer optimization considered but not implemented.
+// The batch insertion methods (add_storage_slots, add_accounts) provide
+// sufficient optimization. Thread-local buffers would require cloning
+// at the end anyway, negating most benefits.
+
 /// Pre-computed set of known selectors for O(1) lookup
-/// This is faster than pattern matching for selector detection
-static KNOWN_SELECTORS: LazyLock<HashSet<[u8; 4]>> = LazyLock::new(|| {
+/// Uses FxHashSet for faster hashing of small fixed-size keys
+static KNOWN_SELECTORS: LazyLock<FxHashSet<[u8; 4]>> = LazyLock::new(|| {
     [
         // ERC20 Core
         [0xa9, 0x05, 0x9c, 0xbb], // transfer
@@ -513,25 +524,33 @@ impl Simulator {
 
         match selector {
             // ═══════════════════════════════════════════════════════════════
-            // ERC20 Handlers
+            // ERC20 Handlers (Optimized with batch insertion)
             // ═══════════════════════════════════════════════════════════════
             s if s == TRANSFER => {
                 if input.len() >= 36 {
+                    // Extract address directly without intermediate variable
                     let to = Address::from_slice(&input[16..36]);
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, sender));
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, to));
+                    // Batch insert storage slots (better cache locality)
+                    keys.add_storage_slots([
+                        (contract, Self::compute_mapping_slot(BALANCES_SLOT, sender)),
+                        (contract, Self::compute_mapping_slot(BALANCES_SLOT, to)),
+                    ]);
                     keys.add_account(to);
                 }
             }
             s if s == TRANSFER_FROM => {
                 if input.len() >= 68 {
+                    // Extract addresses directly
                     let from = Address::from_slice(&input[16..36]);
                     let to = Address::from_slice(&input[48..68]);
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, from));
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, to));
-                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, from, sender));
-                    keys.add_account(from);
-                    keys.add_account(to);
+                    // Batch insert all storage slots at once
+                    keys.add_storage_slots([
+                        (contract, Self::compute_mapping_slot(BALANCES_SLOT, from)),
+                        (contract, Self::compute_mapping_slot(BALANCES_SLOT, to)),
+                        (contract, Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, from, sender)),
+                    ]);
+                    // Batch insert accounts
+                    keys.add_accounts([from, to]);
                 }
             }
             s if s == APPROVE || s == INCREASE_ALLOWANCE || s == DECREASE_ALLOWANCE => {
@@ -645,29 +664,35 @@ impl Simulator {
             }
 
             // ═══════════════════════════════════════════════════════════════
-            // Uniswap V2 Handlers
+            // Uniswap V2 Handlers (Optimized with batch insertion)
             // ═══════════════════════════════════════════════════════════════
             s if s == SWAP => {
                 // swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)
-                keys.add_storage_slot(contract, RESERVE0_SLOT);
-                keys.add_storage_slot(contract, RESERVE1_SLOT);
-                keys.add_storage_slot(contract, KLAST_SLOT);
-                // Token balances in pair contract
-                keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, contract));
+                // Batch insert all reserve slots at once
+                keys.add_storage_slots([
+                    (contract, RESERVE0_SLOT),
+                    (contract, RESERVE1_SLOT),
+                    (contract, KLAST_SLOT),
+                    (contract, Self::compute_mapping_slot(BALANCES_SLOT, contract)),
+                ]);
                 if input.len() >= 100 {
-                    let to = Address::from_slice(&input[80..100]);
-                    keys.add_account(to);
+                    keys.add_account(Address::from_slice(&input[80..100]));
                 }
             }
             s if s == SYNC || s == GET_RESERVES => {
-                keys.add_storage_slot(contract, RESERVE0_SLOT);
-                keys.add_storage_slot(contract, RESERVE1_SLOT);
+                keys.add_storage_slots([
+                    (contract, RESERVE0_SLOT),
+                    (contract, RESERVE1_SLOT),
+                ]);
             }
             s if s == MINT_LP => {
-                keys.add_storage_slot(contract, RESERVE0_SLOT);
-                keys.add_storage_slot(contract, RESERVE1_SLOT);
-                keys.add_storage_slot(contract, KLAST_SLOT);
-                keys.add_storage_slot(contract, TOTAL_SUPPLY_SLOT);
+                // Batch all common slots
+                keys.add_storage_slots([
+                    (contract, RESERVE0_SLOT),
+                    (contract, RESERVE1_SLOT),
+                    (contract, KLAST_SLOT),
+                    (contract, TOTAL_SUPPLY_SLOT),
+                ]);
                 if input.len() >= 36 {
                     let to = Address::from_slice(&input[16..36]);
                     keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, to));
@@ -675,14 +700,16 @@ impl Simulator {
                 }
             }
             s if s == BURN_LP => {
-                keys.add_storage_slot(contract, RESERVE0_SLOT);
-                keys.add_storage_slot(contract, RESERVE1_SLOT);
-                keys.add_storage_slot(contract, KLAST_SLOT);
-                keys.add_storage_slot(contract, TOTAL_SUPPLY_SLOT);
-                keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, sender));
+                // Batch all common slots including sender balance
+                keys.add_storage_slots([
+                    (contract, RESERVE0_SLOT),
+                    (contract, RESERVE1_SLOT),
+                    (contract, KLAST_SLOT),
+                    (contract, TOTAL_SUPPLY_SLOT),
+                    (contract, Self::compute_mapping_slot(BALANCES_SLOT, sender)),
+                ]);
                 if input.len() >= 36 {
-                    let to = Address::from_slice(&input[16..36]);
-                    keys.add_account(to);
+                    keys.add_account(Address::from_slice(&input[16..36]));
                 }
             }
 

@@ -6,10 +6,20 @@
 //!
 //! These keys will be used in Phase 2 to batch-fetch actual data from MDBX
 //! and pre-populate the existing CachedReads cache.
+//!
+//! ## Performance Optimizations
+//! - Uses FxHashSet (rustc-hash) instead of std::HashSet for faster hashing
+//! - Pre-allocates capacity for expected key counts
+//! - Keys are addresses and storage slots which don't need cryptographic hashing
 
 use alloy_primitives::{Address, TxHash, B256, U256};
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::time::Instant;
+
+/// Default capacity for accounts (typical ERC20 transfer touches 2-3 accounts)
+const DEFAULT_ACCOUNTS_CAPACITY: usize = 8;
+/// Default capacity for storage slots (typical ERC20 touches ~6 slots)
+const DEFAULT_STORAGE_CAPACITY: usize = 16;
 
 /// Request to simulate a transaction and extract accessed keys
 #[derive(Debug, Clone)]
@@ -51,36 +61,42 @@ impl<T> SimulationRequest<T> {
 ///
 /// In Phase 2, these keys will be used to batch-fetch actual values from MDBX
 /// and pre-populate the existing CachedReads cache before execution.
+///
+/// ## Performance Notes
+/// Uses FxHashSet (rustc-hash) instead of std::HashSet:
+/// - 2-3x faster insertion/lookup for small keys like Address (20 bytes)
+/// - Non-cryptographic hash is safe here (not security-sensitive)
+/// - Pre-allocated capacity avoids rehashing during simulation
 #[derive(Debug, Clone)]
 pub struct ExtractedKeys {
     /// Accounts needing basic_account() query
-    /// HashSet provides O(1) deduplication and lookup
-    pub accounts: HashSet<Address>,
+    /// FxHashSet provides O(1) deduplication with faster hashing
+    pub accounts: FxHashSet<Address>,
 
     /// Storage slots needing storage() query
     /// Key: (address, slot)
-    pub storage_slots: HashSet<(Address, U256)>,
+    pub storage_slots: FxHashSet<(Address, U256)>,
 
     /// Code hashes needing code_by_hash() query
     /// Note: Multiple addresses may share same code_hash (proxy contracts)
-    pub code_hashes: HashSet<B256>,
+    pub code_hashes: FxHashSet<B256>,
 
     /// Block numbers needing block_hash() query
     /// For BLOCKHASH opcode (rare)
-    pub block_hashes: HashSet<u64>,
+    pub block_hashes: FxHashSet<u64>,
 
     /// When these keys were extracted
     pub timestamp: Instant,
 }
 
 impl ExtractedKeys {
-    /// Create new empty ExtractedKeys
+    /// Create new empty ExtractedKeys with pre-allocated capacity
     pub fn new() -> Self {
         Self {
-            accounts: HashSet::new(),
-            storage_slots: HashSet::new(),
-            code_hashes: HashSet::new(),
-            block_hashes: HashSet::new(),
+            accounts: FxHashSet::with_capacity_and_hasher(DEFAULT_ACCOUNTS_CAPACITY, Default::default()),
+            storage_slots: FxHashSet::with_capacity_and_hasher(DEFAULT_STORAGE_CAPACITY, Default::default()),
+            code_hashes: FxHashSet::with_capacity_and_hasher(4, Default::default()),
+            block_hashes: FxHashSet::with_capacity_and_hasher(2, Default::default()),
             timestamp: Instant::now(),
         }
     }
@@ -110,6 +126,24 @@ impl ExtractedKeys {
     /// Add a block hash (will query block_hash in Phase 2)
     pub fn add_block_hash(&mut self, block_number: u64) {
         self.block_hashes.insert(block_number);
+    }
+
+    /// Add multiple accounts at once (batch insert)
+    ///
+    /// More efficient than calling add_account() in a loop because
+    /// it avoids repeated hash map operations.
+    #[inline]
+    pub fn add_accounts(&mut self, addresses: impl IntoIterator<Item = Address>) {
+        self.accounts.extend(addresses);
+    }
+
+    /// Add multiple storage slots at once (batch insert)
+    ///
+    /// More efficient than calling add_storage_slot() in a loop.
+    /// Use this when computing multiple slots for the same contract.
+    #[inline]
+    pub fn add_storage_slots(&mut self, slots: impl IntoIterator<Item = (Address, U256)>) {
+        self.storage_slots.extend(slots);
     }
 
     /// Total number of keys
@@ -142,6 +176,18 @@ impl ExtractedKeys {
         self.storage_slots.extend(other.storage_slots);
         self.code_hashes.extend(other.code_hashes);
         self.block_hashes.extend(other.block_hashes);
+    }
+
+    /// Merge from a reference without cloning the entire structure
+    ///
+    /// This is more efficient than `merge(other.clone())` because it only
+    /// clones the individual keys that need to be inserted, not the entire
+    /// HashSet structures.
+    pub fn merge_ref(&mut self, other: &ExtractedKeys) {
+        self.accounts.extend(other.accounts.iter().copied());
+        self.storage_slots.extend(other.storage_slots.iter().copied());
+        self.code_hashes.extend(other.code_hashes.iter().copied());
+        self.block_hashes.extend(other.block_hashes.iter().copied());
     }
 }
 

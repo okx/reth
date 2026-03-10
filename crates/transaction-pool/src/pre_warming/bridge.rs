@@ -13,28 +13,6 @@
 //! | `prefetch_with_snapshot` | Async | `tokio::spawn` |
 //! | `prefetch_with_snapshot_sync` | Sync | `std::thread::scope` |
 //!
-//! ## Why Tokio for async version (not Rayon)?
-//!
-//! | Aspect | Tokio | Rayon |
-//! |--------|-------|-------|
-//! | Runtime | Already used throughout codebase | Would add separate thread pool |
-//! | Task overhead | ~100ns per task | ~100ns per task |
-//! | Work stealing | Yes (tokio scheduler) | Yes (rayon scheduler) |
-//! | Trait requirements | `Send + 'static` | `Send + Sync` on captured data |
-//! | Integration | Native async/await | Requires `block_on` in async context |
-//!
-//! **Decision:** Tokio is preferred because:
-//! 1. Codebase already runs on tokio runtime - no additional thread pool overhead
-//! 2. Payload builder is async - native `.await` integration
-//! 3. `SnapshotState` is `Send + Sync` via `unsafe impl` - works with both, but tokio is simpler
-//! 4. Team convention - all async work uses tokio
-//!
-//! ## Why sync version exists?
-//!
-//! The payload builder's `new_payload_job()` is synchronous. To avoid complex
-//! `block_on` wrappers, we provide `prefetch_with_snapshot_sync` which uses
-//! `std::thread::scope` internally - still parallel, just not async.
-//!
 //! ## Usage
 //!
 //! ```ignore
@@ -92,20 +70,29 @@ pub async fn prefetch_with_snapshot(
 
     let num_tasks = num_tasks.max(1);
 
-    // Collect keys to fetch
+    // Collect keys to fetch (pre-allocated)
     let accounts: Vec<Address> = keys.accounts.iter().copied().collect();
     let storage_slots: Vec<(Address, U256)> = keys.storage_slots.iter().copied().collect();
     let code_hashes: Vec<B256> = keys.code_hashes.iter().copied().collect();
 
-    // Use Arc<TokioMutex> to collect results from async tasks
-    let account_results: Arc<TokioMutex<Vec<(Address, CachedAccount)>>> =
-        Arc::new(TokioMutex::new(Vec::new()));
-    let storage_results: Arc<TokioMutex<Vec<(Address, U256, U256)>>> =
-        Arc::new(TokioMutex::new(Vec::new()));
-    let bytecode_results: Arc<TokioMutex<Vec<(B256, revm::bytecode::Bytecode)>>> =
-        Arc::new(TokioMutex::new(Vec::new()));
+    // Skip if nothing to prefetch
+    if accounts.is_empty() && storage_slots.is_empty() && code_hashes.is_empty() {
+        return Ok(());
+    }
 
-    let mut handles = Vec::new();
+    // Pre-allocate result vectors with expected capacity
+    let account_results: Arc<TokioMutex<Vec<(Address, CachedAccount)>>> =
+        Arc::new(TokioMutex::new(Vec::with_capacity(accounts.len())));
+    let storage_results: Arc<TokioMutex<Vec<(Address, U256, U256)>>> =
+        Arc::new(TokioMutex::new(Vec::with_capacity(storage_slots.len())));
+    let bytecode_results: Arc<TokioMutex<Vec<(B256, revm::bytecode::Bytecode)>>> =
+        Arc::new(TokioMutex::new(Vec::with_capacity(code_hashes.len())));
+
+    // Pre-allocate handles vector
+    let total_chunks = (accounts.len() / num_tasks.max(1)).max(1)
+        + (storage_slots.len() / num_tasks.max(1)).max(1)
+        + (code_hashes.len() / num_tasks.max(1)).max(1);
+    let mut handles = Vec::with_capacity(total_chunks);
 
     // Spawn account prefetch tasks
     let chunk_size = (accounts.len() / num_tasks).max(1);
@@ -115,7 +102,7 @@ pub async fn prefetch_with_snapshot(
         let results = Arc::clone(&account_results);
 
         handles.push(tokio::spawn(async move {
-            let mut local_results = Vec::new();
+            let mut local_results = Vec::with_capacity(chunk.len());
             for address in chunk {
                 if let Ok(info) = snapshot.basic_account(address) {
                     local_results.push((address, CachedAccount {
@@ -136,7 +123,7 @@ pub async fn prefetch_with_snapshot(
         let results = Arc::clone(&storage_results);
 
         handles.push(tokio::spawn(async move {
-            let mut local_results = Vec::new();
+            let mut local_results = Vec::with_capacity(chunk.len());
             for (address, slot) in chunk {
                 if let Ok(value) = snapshot.storage(address, slot) {
                     local_results.push((address, slot, value));
@@ -154,7 +141,7 @@ pub async fn prefetch_with_snapshot(
         let results = Arc::clone(&bytecode_results);
 
         handles.push(tokio::spawn(async move {
-            let mut local_results = Vec::new();
+            let mut local_results = Vec::with_capacity(chunk.len());
             for code_hash in chunk {
                 if code_hash.is_zero() {
                     continue;

@@ -20,6 +20,35 @@
 #    ./devnet_comparison.sh 192.168.1.100 9001 30 results_prewarm_on.json
 #    ./devnet_comparison.sh --compare results_prewarm_off.json results_prewarm_on.json
 #
+#-------------------------------------------------------------------------------
+#  METRIC KEYS & CALCULATION LOGIC
+#-------------------------------------------------------------------------------
+#
+#  CACHE HIT RATE (always-on, tracked regardless of pre-warming):
+#    - reth_payloads_cached_reads_hits
+#    - reth_payloads_cached_reads_misses
+#    - Calculation: cache_hit_rate = hits / (hits + misses) * 100
+#
+#  BLOCK EXECUTION TIME:
+#    - Metric: reth_block_timing_build_exec_mempool_transactions_sum/count
+#    - Source: crates/optimism/payload/src/builder.rs (Lines 559-568)
+#    - Calculation: block_execution_ms = sum / count * 1000
+#    - What it measures: Time to execute user transactions through EVM
+#    - Note: Does NOT include prefetch time (prefetch happens BEFORE timing)
+#
+#  STATE ROOT CALCULATION TIME:
+#    - Metric: reth_block_timing_build_calc_state_root_sum/count
+#    - Source: crates/optimism/payload/src/builder.rs (Lines 575-578)
+#    - Calculation: state_root_ms = sum / count * 1000
+#    - What it measures: Time to compute Merkle Patricia Trie root hash
+#
+#  PRE-WARMING METRICS (only populated when pre-warming=true):
+#    - reth_txpool_pre_warming_simulations_completed (key extraction count)
+#    - reth_txpool_pre_warming_simulations_failed
+#    - reth_txpool_pre_warming_prefetch_operations (prefetch batch count)
+#    - reth_txpool_pre_warming_prefetch_accounts (accounts loaded)
+#    - reth_txpool_pre_warming_prefetch_storage_slots (storage slots loaded)
+#
 #===============================================================================
 
 set -e
@@ -365,6 +394,13 @@ FINAL_PREFETCH_STORAGE=$(get_metric "reth_txpool_pre_warming_prefetch_storage_sl
 FINAL_SIMULATIONS_FAILED=$(get_metric "reth_txpool_pre_warming_simulations_failed")
 
 # Get block timing metrics (averages)
+# These metrics are recorded in builder.rs using RAII timing guards:
+#   - exec_mempool_transactions: Phase 4 - EVM execution time (Lines 559-568)
+#   - calc_state_root: Phase 5 - State root computation (Lines 575-578)
+#
+# The _sum is total seconds spent across all blocks
+# The _count is number of blocks measured
+# Average time per block = sum / count (in seconds), then * 1000 for ms
 BUILD_EXEC_SUM=$(get_metric "reth_block_timing_build_exec_mempool_transactions_sum")
 BUILD_EXEC_COUNT=$(get_metric "reth_block_timing_build_exec_mempool_transactions_count")
 STATE_ROOT_SUM=$(get_metric "reth_block_timing_build_calc_state_root_sum")
@@ -399,7 +435,16 @@ else
     AVG_TPS="0"
 fi
 
-# Calculate block timing averages (in milliseconds, or microseconds if very small)
+# Calculate block timing averages (in milliseconds)
+#
+# Formula: block_execution_ms = (sum / count) * 1000
+#   - sum is in seconds (cumulative across all blocks)
+#   - count is number of blocks
+#   - multiply by 1000 to convert to milliseconds
+#
+# Note: Prefetch time is NOT included in these metrics.
+# Prefetch happens BEFORE BlockTimingContext is created (builder.rs Lines 195-295).
+# These metrics only capture Phases 1-5 (starting at Line 530).
 BUILD_EXEC_SUM="${BUILD_EXEC_SUM:-0}"
 BUILD_EXEC_COUNT="${BUILD_EXEC_COUNT:-0}"
 STATE_ROOT_SUM="${STATE_ROOT_SUM:-0}"
@@ -409,12 +454,14 @@ STATE_ROOT_COUNT="${STATE_ROOT_COUNT:-0}"
 BLOCK_EXEC_RAW_MS="0"
 STATE_ROOT_RAW_MS="0"
 
+# Calculate block execution time (EVM execution of mempool transactions)
 if [ "$BUILD_EXEC_COUNT" != "0" ] && [ "$BUILD_EXEC_COUNT" != "" ]; then
+    # block_execution_ms = (sum_seconds / count) * 1000
     BLOCK_EXEC_RAW_MS=$(python3 -c "print(round(float('$BUILD_EXEC_SUM') / float('$BUILD_EXEC_COUNT') * 1000, 4))")
     BLOCK_EXEC_MS=$(python3 -c "
 val = float('$BUILD_EXEC_SUM') / float('$BUILD_EXEC_COUNT') * 1000
 if val < 0.01:
-    print(f'{round(val * 1000, 2)} us')  # Show in microseconds
+    print(f'{round(val * 1000, 2)} us')  # Show in microseconds if very small
 else:
     print(f'{round(val, 2)} ms')
 ")
@@ -422,12 +469,14 @@ else
     BLOCK_EXEC_MS="0 ms"
 fi
 
+# Calculate state root time (Merkle Patricia Trie computation)
 if [ "$STATE_ROOT_COUNT" != "0" ] && [ "$STATE_ROOT_COUNT" != "" ]; then
+    # state_root_ms = (sum_seconds / count) * 1000
     STATE_ROOT_RAW_MS=$(python3 -c "print(round(float('$STATE_ROOT_SUM') / float('$STATE_ROOT_COUNT') * 1000, 4))")
     STATE_ROOT_MS=$(python3 -c "
 val = float('$STATE_ROOT_SUM') / float('$STATE_ROOT_COUNT') * 1000
 if val < 0.01:
-    print(f'{round(val * 1000, 2)} us')  # Show in microseconds
+    print(f'{round(val * 1000, 2)} us')  # Show in microseconds if very small
 else:
     print(f'{round(val, 2)} ms')
 ")
