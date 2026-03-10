@@ -65,6 +65,14 @@ struct SimDatabaseRef<'a> {
     provider: &'a dyn StateProvider,
 }
 
+/// SAFETY: `SimDatabaseRef` is read-only during parallel simulation.
+/// `account_overrides` is an immutable `HashMap` (Sync by default).
+/// `provider` points to a `StateProvider` backed by QMDB (lock-free reads)
+/// or `MemoryOverlayStateProvider` (Arc-wrapped, thread-safe).
+/// The `StateProviderBox` type lacks `Sync` in its trait object bound,
+/// but all concrete implementations used in reth are thread-safe for reads.
+unsafe impl Sync for SimDatabaseRef<'_> {}
+
 impl core::fmt::Debug for SimDatabaseRef<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SimDatabaseRef")
@@ -127,18 +135,16 @@ where
     ChainSpec: EthChainSpec + OpHardforks,
     Attrs: OpAttributes<Transaction = TxTy<Evm::Primitives>>,
 {
-    /// Execute best transactions with parallel pre-simulation and filtering.
+    /// Execute best transactions with background parallel simulation.
     ///
-    /// Phase 1 strategy:
-    /// 1. Collect all candidate transactions from the pool
-    /// 2. Pre-simulate each using the parallel framework's [`Simulator`]
-    /// 3. Filter out transactions that failed simulation (would revert/fail)
-    /// 4. Execute surviving transactions through the existing sequential path with bridge
-    ///    interception
+    /// Strategy: execute sequentially at full speed (same as non-parallel path),
+    /// while simultaneously running rayon simulation in a background thread to
+    /// collect CrwSets for Phase 2 framing. This decouples simulation from
+    /// execution so simulation overhead does not block the critical path.
     ///
-    /// This provides two benefits over the pure sequential path:
-    /// - Failed transactions are skipped without paying full EVM execution cost
-    /// - State reads during simulation pre-warm provider caches
+    /// Execution proceeds immediately without waiting for simulation results.
+    /// The simulation runs on spare CPU cores via rayon, collecting CrwSets
+    /// that will be used by the Framer in Phase 2 for conflict-free grouping.
     pub fn execute_best_transactions_parallel<Builder>(
         &self,
         info: &mut ExecutionInfo,
@@ -163,8 +169,6 @@ where
         let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
         let base_fee = builder.evm_mut().block().basefee();
         let block_number: u64 = builder.evm_mut().block().number().saturating_to();
-
-        // --- Phase 1: Collect and pre-simulate ---
 
         // Collect all candidate transactions from the pool
         let mut candidates: Vec<_> = Vec::new();
@@ -194,12 +198,13 @@ where
             return Ok(None);
         }
 
-        // Build SimTxEnvs for pre-simulation
+        // --- Launch background simulation (rayon) ---
+        // Build SimTxEnvs and kick off parallel simulation on spare cores.
+        // Execution proceeds immediately without waiting for results.
         let sim_txs: Vec<SimTxEnv> =
             candidates.iter().map(|(tx, _)| consensus_tx_to_sim_env(tx.signer(), &**tx)).collect();
 
-        // Pre-read sender accounts from post-sequencer state (builder's State<DB>)
-        // so simulation sees correct balances/nonces after L1 deposits execute.
+        // Pre-read sender accounts from post-sequencer state
         let account_overrides = {
             let mut overrides = HashMap::new();
             let db = builder.evm_mut().db_mut();
@@ -214,8 +219,15 @@ where
             overrides
         };
 
-        // Pre-simulate using the parallel framework's Simulator
-        let simulator = Simulator::new();
+        // Cache DA footprint gas scalar — it's block-level constant, no need to
+        // fetch from DB on every transaction.
+        let da_footprint_gas_scalar =
+            self.chain_spec.is_jovian_active_at_timestamp(self.attributes().timestamp()).then_some(
+                L1BlockInfo::fetch_da_footprint_gas_scalar(builder.evm_mut().db_mut()).expect(
+                    "DA footprint should always be available from the database post jovian",
+                ),
+            );
+
         let sim_db = SimDatabaseRef { account_overrides, provider: state_provider };
         let block_env = BlockEnv {
             number: builder.evm_mut().block().number().saturating_to(),
@@ -225,146 +237,136 @@ where
             basefee: builder.evm_mut().block().basefee(),
             ..Default::default()
         };
-        let sim_results = simulator.simulate(&sim_txs, &sim_db, &block_env);
 
-        let total_candidates = candidates.len();
-        let sim_success_count = sim_results.iter().filter(|r| r.success).count();
-        debug!(
-            target: "payload_builder::parallel",
-            total_candidates,
-            sim_success_count,
-            sim_failed = total_candidates - sim_success_count,
-            "pre-simulation complete"
-        );
+        // Launch background simulation using std::thread::scope.
+        // Scoped threads can borrow from the parent stack, avoiding 'static requirement.
+        // Simulation runs on a separate thread (using rayon internally for
+        // per-tx parallelism) while execution proceeds on the main thread.
+        let sim_start = std::time::Instant::now();
 
-        // --- Phase 1: Execute surviving transactions sequentially ---
+        let mut exec_result: Result<Option<()>, PayloadBuilderError> = Ok(None);
 
-        for (idx, ((consensus_tx, tx_da_size), sim_result)) in
-            candidates.into_iter().zip(sim_results.iter()).enumerate()
-        {
-            // Check cancellation
-            if self.cancel.is_cancelled() {
-                return Ok(Some(()));
-            }
+        std::thread::scope(|scope| {
+            // Spawn simulation on a background thread
+            let sim_handle = scope.spawn(|| {
+                let simulator = Simulator::new();
+                simulator.simulate(&sim_txs, &sim_db, &block_env)
+            });
 
-            // Skip transactions that failed simulation
-            if !sim_result.success {
-                trace!(
-                    target: "payload_builder::parallel",
-                    tx_idx = idx,
-                    tx_hash = ?consensus_tx.tx_hash(),
-                    "skipping transaction that failed pre-simulation"
-                );
-                best_txs.mark_invalid(consensus_tx.signer(), consensus_tx.nonce());
-                continue;
-            }
+            // --- Sequential execution on main thread (critical path) ---
 
-            let da_footprint_gas_scalar = self
-                .chain_spec
-                .is_jovian_active_at_timestamp(self.attributes().timestamp())
-                .then_some(
-                    L1BlockInfo::fetch_da_footprint_gas_scalar(builder.evm_mut().db_mut()).expect(
-                        "DA footprint should always be available from the database post jovian",
-                    ),
-                );
+            for (consensus_tx, tx_da_size) in candidates {
+                if self.cancel.is_cancelled() {
+                    exec_result = Ok(Some(()));
+                    break;
+                }
 
-            // Check gas/DA limits
-            if info.is_tx_over_limits(
-                tx_da_size,
-                block_gas_limit,
-                tx_da_limit,
-                block_da_limit,
-                consensus_tx.gas_limit(),
-                da_footprint_gas_scalar,
-            ) {
-                best_txs.mark_invalid(consensus_tx.signer(), consensus_tx.nonce());
-                continue;
-            }
+                if info.is_tx_over_limits(
+                    tx_da_size,
+                    block_gas_limit,
+                    tx_da_limit,
+                    block_da_limit,
+                    consensus_tx.gas_limit(),
+                    da_footprint_gas_scalar,
+                ) {
+                    best_txs.mark_invalid(consensus_tx.signer(), consensus_tx.nonce());
+                    continue;
+                }
 
-            // Execute through BlockBuilder with bridge interception
-            let signer = consensus_tx.signer();
-            let nonce = consensus_tx.nonce();
-            let tx_hash = *consensus_tx.tx_hash();
-            let miner_fee = consensus_tx
-                .effective_tip_per_gas(base_fee)
-                .expect("fee is always valid; execution succeeded");
+                let signer = consensus_tx.signer();
+                let nonce = consensus_tx.nonce();
+                let tx_hash = *consensus_tx.tx_hash();
+                let miner_fee = consensus_tx
+                    .effective_tip_per_gas(base_fee)
+                    .expect("fee is always valid; execution succeeded");
 
-            let gas_used = match builder.execute_transaction_with_commit_condition(
-                consensus_tx,
-                |result| {
-                    if let ExecutionResult::Success { logs, .. } = result {
-                        if intercept_bridge_transaction_if_need(
-                            logs,
-                            signer,
-                            &self.bridge_intercept,
-                        )
-                        .is_err()
-                        {
-                            return CommitChanges::No;
+                let gas_used = match builder.execute_transaction_with_commit_condition(
+                    consensus_tx,
+                    |result| {
+                        if let ExecutionResult::Success { logs, .. } = result {
+                            if intercept_bridge_transaction_if_need(
+                                logs,
+                                signer,
+                                &self.bridge_intercept,
+                            )
+                            .is_err()
+                            {
+                                return CommitChanges::No;
+                            }
                         }
+                        CommitChanges::Yes
+                    },
+                ) {
+                    Ok(Some(gas_used)) => {
+                        if let Some(tracer) = get_global_tracer() {
+                            tracer.log_transaction(
+                                tx_hash,
+                                TransactionProcessId::SeqTxExecutionEnd,
+                                Some(block_number),
+                            );
+                        }
+                        gas_used
                     }
-                    CommitChanges::Yes
-                },
-            ) {
-                Ok(Some(gas_used)) => {
-                    if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction(
-                            tx_hash,
-                            TransactionProcessId::SeqTxExecutionEnd,
-                            Some(block_number),
-                        );
-                    }
-                    gas_used
-                }
-                Ok(None) => {
-                    if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction(
-                            tx_hash,
-                            TransactionProcessId::SeqTxExecutionEnd,
-                            Some(block_number),
-                        );
-                    }
-                    trace!(target: "payload_builder::parallel", ?tx_hash, "bridge transaction intercepted");
-                    best_txs.mark_invalid(signer, nonce);
-                    continue;
-                }
-                Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-                    error,
-                    ..
-                })) => {
-                    if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction(
-                            tx_hash,
-                            TransactionProcessId::SeqTxExecutionEnd,
-                            Some(block_number),
-                        );
-                    }
-                    if error.is_nonce_too_low() {
-                        trace!(target: "payload_builder::parallel", %error, ?tx_hash, "skipping nonce too low transaction");
-                    } else {
-                        trace!(target: "payload_builder::parallel", %error, ?tx_hash, "skipping invalid transaction and its descendants");
+                    Ok(None) => {
+                        if let Some(tracer) = get_global_tracer() {
+                            tracer.log_transaction(
+                                tx_hash,
+                                TransactionProcessId::SeqTxExecutionEnd,
+                                Some(block_number),
+                            );
+                        }
+                        trace!(target: "payload_builder::parallel", ?tx_hash, "bridge transaction intercepted");
                         best_txs.mark_invalid(signer, nonce);
+                        continue;
                     }
-                    continue;
-                }
-                Err(err) => {
-                    if let Some(tracer) = get_global_tracer() {
-                        tracer.log_transaction(
-                            tx_hash,
-                            TransactionProcessId::SeqTxExecutionEnd,
-                            Some(block_number),
-                        );
+                    Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+                        error,
+                        ..
+                    })) => {
+                        if let Some(tracer) = get_global_tracer() {
+                            tracer.log_transaction(
+                                tx_hash,
+                                TransactionProcessId::SeqTxExecutionEnd,
+                                Some(block_number),
+                            );
+                        }
+                        if error.is_nonce_too_low() {
+                            trace!(target: "payload_builder::parallel", %error, ?tx_hash, "skipping nonce too low transaction");
+                        } else {
+                            trace!(target: "payload_builder::parallel", %error, ?tx_hash, "skipping invalid transaction and its descendants");
+                            best_txs.mark_invalid(signer, nonce);
+                        }
+                        continue;
                     }
-                    return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)));
-                }
-            };
+                    Err(err) => {
+                        exec_result = Err(PayloadBuilderError::EvmExecutionError(Box::new(err)));
+                        break;
+                    }
+                };
 
-            info.cumulative_gas_used += gas_used;
-            info.cumulative_da_bytes_used += tx_da_size;
-            info.total_fees += U256::from(miner_fee) * U256::from(gas_used);
-        }
+                info.cumulative_gas_used += gas_used;
+                info.cumulative_da_bytes_used += tx_da_size;
+                info.total_fees += U256::from(miner_fee) * U256::from(gas_used);
+            }
 
-        Ok(None)
+            // Wait for background simulation to complete and collect CrwSets
+            let sim_results = sim_handle.join().expect("simulation thread panicked");
+            let sim_elapsed = sim_start.elapsed();
+            let total = sim_results.len();
+            let success = sim_results.iter().filter(|r| r.success).count();
+            debug!(
+                target: "payload_builder::parallel",
+                ?sim_elapsed,
+                total,
+                success,
+                failed = total - success,
+                "background simulation complete (CrwSets ready for Phase 2)"
+            );
+
+            // TODO(Phase 2): Use sim_results CrwSets with Framer for parallel dispatch
+        });
+
+        exec_result
     }
 }
 

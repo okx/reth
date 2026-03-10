@@ -16,6 +16,10 @@ pub struct EthereumBuilderConfig {
     pub max_blobs_per_block: Option<u64>,
     /// Extra data for built blocks.
     pub extra_data: Bytes,
+    /// Enable background parallel simulation for CrwSets collection.
+    /// When enabled, transactions are pre-simulated in a background thread
+    /// to extract read/write sets for Phase 2 parallel dispatch.
+    pub parallel_exec: bool,
 }
 
 impl Default for EthereumBuilderConfig {
@@ -32,6 +36,7 @@ impl EthereumBuilderConfig {
             await_payload_on_missing: true,
             max_blobs_per_block: None,
             extra_data: Bytes::new(),
+            parallel_exec: false,
         }
     }
 
@@ -57,6 +62,12 @@ impl EthereumBuilderConfig {
     /// Set the extra data for built blocks.
     pub fn with_extra_data(mut self, extra_data: Bytes) -> Self {
         self.extra_data = extra_data;
+        self
+    }
+
+    /// Enable or disable background parallel simulation.
+    pub const fn with_parallel_exec(mut self, parallel_exec: bool) -> Self {
+        self.parallel_exec = parallel_exec;
         self
     }
 }

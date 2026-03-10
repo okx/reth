@@ -10,6 +10,7 @@ use crate::{
 };
 use alloy_evm::{precompiles::PrecompilesMap, Evm, EvmEnv};
 use alloy_primitives::Address;
+use rayon::prelude::*;
 use revm::{
     context::{BlockEnv, CfgEnv, Context, TxEnv},
     database::CacheDB,
@@ -20,6 +21,10 @@ use revm::{
 
 pub use alloy_evm::EthEvm;
 
+/// Default number of threads for the simulation thread pool.
+/// Kept low to avoid competing with the main execution thread for CPU.
+const DEFAULT_SIM_THREADS: usize = 2;
+
 /// Simulates transactions to extract their read/write sets.
 ///
 /// Transactions are split into shards by sender address to maintain
@@ -28,6 +33,9 @@ pub use alloy_evm::EthEvm;
 pub struct Simulator {
     /// Number of parallel shards (default: 4).
     shard_count: usize,
+    /// Dedicated rayon thread pool for simulation with limited thread count.
+    /// Avoids competing with the main execution thread for CPU resources.
+    pool: rayon::ThreadPool,
 }
 
 impl Default for Simulator {
@@ -37,14 +45,24 @@ impl Default for Simulator {
 }
 
 impl Simulator {
-    /// Create a new simulator with the default shard count (4).
+    /// Create a new simulator with the default shard count (4) and 2 sim threads.
     pub fn new() -> Self {
-        Self { shard_count: 4 }
+        Self::with_shard_count(4)
     }
 
     /// Create a new simulator with a custom shard count.
     pub fn with_shard_count(shard_count: usize) -> Self {
-        Self { shard_count }
+        Self::with_config(shard_count, DEFAULT_SIM_THREADS)
+    }
+
+    /// Create a new simulator with custom shard count and thread count.
+    pub fn with_config(shard_count: usize, num_threads: usize) -> Self {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .thread_name(|i| format!("sim-worker-{i}"))
+            .build()
+            .expect("failed to build simulation thread pool");
+        Self { shard_count, pool }
     }
 
     /// Returns the configured shard count.
@@ -52,18 +70,28 @@ impl Simulator {
         self.shard_count
     }
 
-    /// Simulate a batch of transactions, extracting CrwSets for each.
+    /// Simulate a batch of transactions in parallel, extracting CrwSets for each.
     ///
     /// Returns [`SimResult`]s in original transaction order.
     /// Each transaction is executed in an isolated EVM with nonce checking
     /// disabled, so execution may fail (e.g. insufficient balance) but
     /// the accessed accounts/slots are still captured.
+    ///
+    /// Uses a dedicated rayon thread pool (not the global pool) to avoid
+    /// competing with the main execution thread for CPU resources.
+    /// The `DB: Sync` bound ensures safe concurrent reads — QMDB provides
+    /// lock-free reads, and `SimDatabaseRef` holds only immutable references.
     pub fn simulate<DB>(&self, txs: &[SimTxEnv], db: &DB, block_env: &BlockEnv) -> Vec<SimResult>
     where
-        DB: revm::DatabaseRef + core::fmt::Debug,
+        DB: revm::DatabaseRef + core::fmt::Debug + Sync,
         DB::Error: core::fmt::Debug + core::error::Error + Send + Sync + 'static,
     {
-        txs.iter().enumerate().map(|(idx, tx)| self.simulate_one(tx, idx, db, block_env)).collect()
+        self.pool.install(|| {
+            txs.par_iter()
+                .enumerate()
+                .map(|(idx, tx)| self.simulate_one(tx, idx, db, block_env))
+                .collect()
+        })
     }
 
     /// Simulate a single transaction.

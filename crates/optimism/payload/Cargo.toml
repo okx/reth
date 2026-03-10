@@ -46,6 +46,9 @@ alloy-rpc-types-debug.workspace = true
 alloy-consensus.workspace = true
 alloy-evm.workspace = true
 
+# concurrency
+rayon.workspace = true
+
 # misc
 derive_more.workspace = true
 tracing.workspace = true

@@ -5,16 +5,96 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::map::HashMap;
-use clap::Parser;
-use reth_chainspec::EthChainSpec;
-use reth_node_builder::{DebugNodeLauncher, EngineNodeLauncher, NodeHandle};
-use reth_optimism_cli::{chainspec::OpChainSpecParser, Cli};
-use reth_optimism_node::{args::RollupArgs, OpNode};
+use clap::{Args, Parser};
+use reth_chainspec::{EthChainSpec, EthereumHardforks};
+use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
+use reth_ethereum_engine_primitives::{
+    EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
+};
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
+use reth_ethereum_primitives::EthPrimitives;
+use reth_evm::ConfigureEvm;
+use reth_node_api::{FullNodeTypes, NodeTypes, PrimitivesTy, TxTy};
+use reth_node_builder::{
+    components::{BasicPayloadServiceBuilder, PayloadBuilderBuilder},
+    BuilderContext, DebugNodeLauncher, EngineNodeLauncher, Node, NodeHandle, PayloadBuilderConfig,
+    PayloadTypes,
+};
+use reth_node_ethereum::EthereumNode;
+use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use revm_database::{states::StorageSlot, AccountStatus, BundleAccount, BundleState};
 use revm_state::AccountInfo;
 use std::sync::Arc;
 use tracing::info;
 use xlayer_qmdb_provider::QmdbStore;
+
+/// XLayer-specific CLI arguments for reth-qmdb
+#[derive(Debug, Clone, Args, PartialEq, Eq, Default)]
+#[command(next_help_heading = "XLayer")]
+pub struct QmdbArgs {
+    /// Enable parallel transaction execution (background simulation for CrwSets)
+    #[arg(
+        long = "xlayer.parallel-exec",
+        help = "Enable parallel transaction execution for mempool transactions (disabled by default)",
+        default_value = "false"
+    )]
+    pub parallel_exec: bool,
+}
+
+/// Custom payload builder that passes parallel_exec flag to EthereumBuilderConfig
+#[derive(Clone, Debug)]
+struct QmdbPayloadBuilder {
+    parallel_exec: bool,
+}
+
+impl<Types, Node, Pool, Evm> PayloadBuilderBuilder<Node, Pool, Evm> for QmdbPayloadBuilder
+where
+    Types: NodeTypes<ChainSpec: EthereumHardforks, Primitives = EthPrimitives>,
+    Node: FullNodeTypes<Types = Types>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
+        + Unpin
+        + 'static,
+    Evm: ConfigureEvm<
+            Primitives = PrimitivesTy<Types>,
+            NextBlockEnvCtx = reth_evm::NextBlockEnvAttributes,
+        > + 'static,
+    Types::Payload: PayloadTypes<
+        BuiltPayload = EthBuiltPayload,
+        PayloadAttributes = EthPayloadAttributes,
+        PayloadBuilderAttributes = EthPayloadBuilderAttributes,
+    >,
+{
+    type PayloadBuilder =
+        reth_ethereum_payload_builder::EthereumPayloadBuilder<Pool, Node::Provider, Evm>;
+
+    async fn build_payload_builder(
+        self,
+        ctx: &BuilderContext<Node>,
+        pool: Pool,
+        evm_config: Evm,
+    ) -> eyre::Result<Self::PayloadBuilder> {
+        let conf = ctx.payload_builder_config();
+        let chain = ctx.chain_spec().chain();
+        let gas_limit = conf.gas_limit_for(chain);
+
+        info!(
+            target: "reth::cli",
+            parallel_exec = self.parallel_exec,
+            "Payload builder configured"
+        );
+
+        Ok(reth_ethereum_payload_builder::EthereumPayloadBuilder::new(
+            ctx.provider().clone(),
+            pool,
+            evm_config,
+            EthereumBuilderConfig::new()
+                .with_gas_limit(gas_limit)
+                .with_max_blobs_per_block(conf.max_blobs_per_block())
+                .with_extra_data(conf.extra_data_bytes())
+                .with_parallel_exec(self.parallel_exec),
+        ))
+    }
+}
 
 fn main() {
     reth_cli_util::sigsegv_handler::install();
@@ -23,20 +103,22 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    if let Err(err) =
-        Cli::<OpChainSpecParser, RollupArgs>::parse().run(|builder, rollup_args| async move {
-            info!(target: "reth::cli", "Launching QMDB node with OP support");
+    if let Err(err) = reth_ethereum_cli::Cli::<EthereumChainSpecParser, QmdbArgs>::parse()
+        .run(|builder, qmdb_args| async move {
+            info!(
+                target: "reth::cli",
+                parallel_exec = qmdb_args.parallel_exec,
+                "Launching QMDB node (L1 mode)"
+            );
 
             // ---------------------------------------------------------------
             // QMDB initialization
             // ---------------------------------------------------------------
 
-            // QMDB path: use QMDB_PATH env var if set, otherwise <datadir>/qmdb
             let qmdb_path = std::env::var("QMDB_PATH")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| builder.config().datadir().data_dir().join("qmdb"));
 
-            // Clean QMDB directory on startup for fresh benchmark runs.
             if qmdb_path.exists() {
                 info!(target: "reth::cli", path = %qmdb_path.display(), "Removing existing QMDB directory");
                 std::fs::remove_dir_all(&qmdb_path)?;
@@ -92,8 +174,7 @@ fn main() {
                 store_for_commit.commit_bundle(bundle);
             });
 
-            // State provider override: account/storage reads go through QMDB,
-            // bytecodes and block hashes fall back to the default MDBX provider.
+            // State provider override: account/storage reads go through QMDB.
             let store_for_override = qmdb_store.clone();
             let state_override: reth_provider::providers::StateProviderOverride =
                 Arc::new(move |default_provider| {
@@ -107,7 +188,6 @@ fn main() {
             // Engine tree configuration
             // ---------------------------------------------------------------
 
-            // Skip state root validation (QMDB manages its own state).
             let engine_tree_config = builder
                 .config()
                 .engine
@@ -122,22 +202,21 @@ fn main() {
                 .with_state_provider_override(state_override);
 
             // ---------------------------------------------------------------
-            // Launch with OpNode (provides parallel execution + OP payload builder)
+            // Launch with EthereumNode + custom payload builder
             // ---------------------------------------------------------------
 
-            let parallel_exec = rollup_args.xlayer_args.parallel_exec;
-            info!(
-                target: "reth::cli",
-                parallel_exec,
-                "QMDB node configuration"
-            );
-
             let NodeHandle { node: _node, node_exit_future } = builder
-                .node(OpNode::new(rollup_args))
+                .with_types::<EthereumNode>()
+                .with_components(
+                    EthereumNode::components().payload(BasicPayloadServiceBuilder::new(
+                        QmdbPayloadBuilder { parallel_exec: qmdb_args.parallel_exec },
+                    )),
+                )
+                .with_add_ons(EthereumNode::default().add_ons())
                 .launch_with(DebugNodeLauncher::new(launcher))
                 .await?;
 
-            info!(target: "reth::cli", "QMDB node launched successfully");
+            info!(target: "reth::cli", "QMDB node launched successfully (L1 mode)");
 
             node_exit_future.await
         })

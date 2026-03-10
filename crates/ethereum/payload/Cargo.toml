@@ -43,6 +43,9 @@ alloy-primitives.workspace = true
 # revm
 revm-database.workspace = true
 
+# xlayer
+xlayer-parallel-exec.workspace = true
+
 # misc
 either.workspace = true
 tracing.workspace = true

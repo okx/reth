@@ -42,6 +42,10 @@ use revm_database::states::bundle_state::BundleRetention;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
+mod parallel;
+use parallel::{tx_to_sim_env, SimDatabaseRef};
+use xlayer_parallel_exec::simulator::Simulator;
+
 mod config;
 pub use config::*;
 
@@ -223,147 +227,329 @@ where
 
     let withdrawals_rlp_length = attributes.withdrawals().length();
 
-    let _exec_guard = timing_ctx.time_exec_mempool_transactions();
-    while let Some(pool_tx) = best_txs.next() {
-        // ensure we still have capacity for this transaction
-        if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
-            // we can't fit this transaction into the block, so we need to mark it as invalid
-            // which also removes all dependent transaction from the iterator before we can
-            // continue
-            best_txs.mark_invalid(
-                &pool_tx,
-                &InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
-            );
-            continue
-        }
+    {
+        let _exec_guard = timing_ctx.time_exec_mempool_transactions();
 
-        // check if the job was cancelled, if so we can exit early
-        if cancel.is_cancelled() {
-            return Ok(BuildOutcome::Cancelled)
-        }
+        if builder_config.parallel_exec {
+            // --- Parallel path ---
+            // Collect all candidates, launch background simulation, execute sequentially.
 
-        // convert tx to a signed transaction
-        let tx = pool_tx.to_consensus();
-
-        let tx_rlp_len = tx.inner().length();
-
-        let estimated_block_size_with_tx =
-            block_transactions_rlp_length + tx_rlp_len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
-
-        if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
-            best_txs.mark_invalid(
-                &pool_tx,
-                &InvalidPoolTransactionError::OversizedData {
-                    size: estimated_block_size_with_tx,
-                    limit: MAX_RLP_BLOCK_SIZE,
-                },
-            );
-            continue
-        }
-
-        // There's only limited amount of blob space available per block, so we need to check if
-        // the EIP-4844 can still fit in the block
-        let mut blob_tx_sidecar = None;
-        if let Some(blob_tx) = tx.as_eip4844() {
-            let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
-
-            if block_blob_count + tx_blob_count > max_blob_count {
-                // we can't fit this _blob_ transaction into the block, so we mark it as
-                // invalid, which removes its dependent transactions from
-                // the iterator. This is similar to the gas limit condition
-                // for regular transactions above.
-                trace!(target: "payload_builder", tx=?tx.hash(), ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
-                best_txs.mark_invalid(
-                    &pool_tx,
-                    &InvalidPoolTransactionError::Eip4844(
-                        Eip4844PoolTransactionError::TooManyEip4844Blobs {
-                            have: block_blob_count + tx_blob_count,
-                            permitted: max_blob_count,
-                        },
-                    ),
-                );
-                continue
+            // 1. Collect candidates from pool iterator
+            let mut candidates: Vec<(
+                Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>,
+                alloy_consensus::transaction::Recovered<TransactionSigned>,
+            )> = Vec::new();
+            while let Some(pool_tx) = best_txs.next() {
+                let tx = pool_tx.to_consensus();
+                candidates.push((pool_tx, tx));
             }
 
-            let blob_sidecar_result = 'sidecar: {
-                let Some(sidecar) =
-                    pool.get_blob(*tx.hash()).map_err(PayloadBuilderError::other)?
-                else {
-                    break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar)
+            if !candidates.is_empty() {
+                // 2. Build SimTxEnvs for background simulation (skip blob txs)
+                let sim_txs: Vec<_> = candidates
+                    .iter()
+                    .filter(|(_, tx)| !tx.is_eip4844())
+                    .map(|(_, tx)| tx_to_sim_env(tx))
+                    .collect();
+
+                let sim_db = SimDatabaseRef { provider: state_provider.as_ref() };
+                let block_env = revm::context::BlockEnv {
+                    number: builder.evm_mut().block().number().saturating_to(),
+                    beneficiary: builder.evm_mut().block().beneficiary(),
+                    timestamp: builder.evm_mut().block().timestamp().saturating_to(),
+                    gas_limit: builder.evm_mut().block().gas_limit(),
+                    basefee: builder.evm_mut().block().basefee(),
+                    ..Default::default()
                 };
 
-                if is_osaka {
-                    if sidecar.is_eip7594() {
-                        Ok(sidecar)
-                    } else {
-                        Err(Eip4844PoolTransactionError::UnexpectedEip4844SidecarAfterOsaka)
+                let sim_start = std::time::Instant::now();
+
+                // 3. Scoped thread: simulation in background, execution on main thread
+                let exec_result: Result<bool, PayloadBuilderError> = std::thread::scope(|scope| {
+                    let sim_handle = scope.spawn(|| {
+                        let simulator = Simulator::new();
+                        simulator.simulate(&sim_txs, &sim_db, &block_env)
+                    });
+
+                    for (pool_tx, tx) in candidates {
+                        if cancel.is_cancelled() {
+                            return Ok(true);
+                        }
+
+                        if cumulative_gas_used + tx.gas_limit() > block_gas_limit {
+                            best_txs.mark_invalid(
+                                &pool_tx,
+                                &InvalidPoolTransactionError::ExceedsGasLimit(
+                                    tx.gas_limit(),
+                                    block_gas_limit,
+                                ),
+                            );
+                            continue;
+                        }
+
+                        let tx_rlp_len = tx.inner().length();
+                        let estimated_block_size_with_tx = block_transactions_rlp_length +
+                            tx_rlp_len +
+                            withdrawals_rlp_length +
+                            1024;
+                        if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
+                            best_txs.mark_invalid(
+                                &pool_tx,
+                                &InvalidPoolTransactionError::OversizedData {
+                                    size: estimated_block_size_with_tx,
+                                    limit: MAX_RLP_BLOCK_SIZE,
+                                },
+                            );
+                            continue;
+                        }
+
+                        // Blob transaction handling
+                        let mut blob_tx_sidecar = None;
+                        if let Some(blob_tx) = tx.as_eip4844() {
+                            let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
+                            if block_blob_count + tx_blob_count > max_blob_count {
+                                best_txs.mark_invalid(
+                                    &pool_tx,
+                                    &InvalidPoolTransactionError::Eip4844(
+                                        Eip4844PoolTransactionError::TooManyEip4844Blobs {
+                                            have: block_blob_count + tx_blob_count,
+                                            permitted: max_blob_count,
+                                        },
+                                    ),
+                                );
+                                continue;
+                            }
+
+                            let blob_sidecar_result = 'sidecar: {
+                                let Some(sidecar) = pool
+                                    .get_blob(*tx.hash())
+                                    .map_err(PayloadBuilderError::other)?
+                                else {
+                                    break 'sidecar Err(
+                                        Eip4844PoolTransactionError::MissingEip4844BlobSidecar,
+                                    )
+                                };
+                                if is_osaka {
+                                    if sidecar.is_eip7594() {
+                                        Ok(sidecar)
+                                    } else {
+                                        Err(Eip4844PoolTransactionError::UnexpectedEip4844SidecarAfterOsaka)
+                                    }
+                                } else if sidecar.is_eip4844() {
+                                    Ok(sidecar)
+                                } else {
+                                    Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
+                                }
+                            };
+                            blob_tx_sidecar = match blob_sidecar_result {
+                                Ok(sidecar) => Some(sidecar),
+                                Err(error) => {
+                                    best_txs.mark_invalid(
+                                        &pool_tx,
+                                        &InvalidPoolTransactionError::Eip4844(error),
+                                    );
+                                    continue;
+                                }
+                            };
+                        }
+
+                        let gas_used = match builder.execute_transaction(tx.clone()) {
+                            Ok(gas_used) => gas_used,
+                            Err(BlockExecutionError::Validation(
+                                BlockValidationError::InvalidTx { error, .. },
+                            )) => {
+                                if error.is_nonce_too_low() {
+                                    trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
+                                } else {
+                                    trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
+                                    best_txs.mark_invalid(
+                                        &pool_tx,
+                                        &InvalidPoolTransactionError::Consensus(
+                                            InvalidTransactionError::TxTypeNotSupported,
+                                        ),
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(err) => return Err(PayloadBuilderError::evm(err)),
+                        };
+
+                        if let Some(blob_tx) = tx.as_eip4844() {
+                            block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
+                            if block_blob_count == max_blob_count {
+                                best_txs.skip_blobs();
+                            }
+                        }
+
+                        block_transactions_rlp_length += tx_rlp_len;
+                        let miner_fee = tx
+                            .effective_tip_per_gas(base_fee)
+                            .expect("fee is always valid; execution succeeded");
+                        total_fees += U256::from(miner_fee) * U256::from(gas_used);
+                        cumulative_gas_used += gas_used;
+
+                        if let Some(sidecar) = blob_tx_sidecar {
+                            blob_sidecars.push_sidecar_variant(sidecar.as_ref().clone());
+                        }
                     }
-                } else if sidecar.is_eip4844() {
-                    Ok(sidecar)
-                } else {
-                    Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
-                }
-            };
 
-            blob_tx_sidecar = match blob_sidecar_result {
-                Ok(sidecar) => Some(sidecar),
-                Err(error) => {
-                    best_txs.mark_invalid(&pool_tx, &InvalidPoolTransactionError::Eip4844(error));
-                    continue
-                }
-            };
-        }
+                    // Wait for background simulation
+                    let sim_results = sim_handle.join().expect("simulation thread panicked");
+                    let sim_elapsed = sim_start.elapsed();
+                    let total = sim_results.len();
+                    let success = sim_results.iter().filter(|r| r.success).count();
+                    tracing::info!(
+                        target: "payload_builder::parallel",
+                        ?sim_elapsed,
+                        total,
+                        success,
+                        failed = total - success,
+                        "background simulation complete (CrwSets ready for Phase 2)"
+                    );
 
-        let gas_used = match builder.execute_transaction(tx.clone()) {
-            Ok(gas_used) => gas_used,
-            Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-                error, ..
-            })) => {
-                if error.is_nonce_too_low() {
-                    // if the nonce is too low, we can skip this transaction
-                    trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
-                } else {
-                    // if the transaction is invalid, we can skip it and all of its
-                    // descendants
-                    trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
+                    Ok(false)
+                });
+
+                match exec_result {
+                    Ok(true) => return Ok(BuildOutcome::Cancelled),
+                    Err(e) => return Err(e),
+                    Ok(false) => {}
+                }
+            }
+        } else {
+            // --- Original serial path ---
+            while let Some(pool_tx) = best_txs.next() {
+                // ensure we still have capacity for this transaction
+                if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
                     best_txs.mark_invalid(
                         &pool_tx,
-                        &InvalidPoolTransactionError::Consensus(
-                            InvalidTransactionError::TxTypeNotSupported,
+                        &InvalidPoolTransactionError::ExceedsGasLimit(
+                            pool_tx.gas_limit(),
+                            block_gas_limit,
                         ),
                     );
+                    continue
                 }
-                continue
+
+                // check if the job was cancelled, if so we can exit early
+                if cancel.is_cancelled() {
+                    return Ok(BuildOutcome::Cancelled)
+                }
+
+                // convert tx to a signed transaction
+                let tx = pool_tx.to_consensus();
+
+                let tx_rlp_len = tx.inner().length();
+
+                let estimated_block_size_with_tx =
+                    block_transactions_rlp_length + tx_rlp_len + withdrawals_rlp_length + 1024;
+
+                if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
+                    best_txs.mark_invalid(
+                        &pool_tx,
+                        &InvalidPoolTransactionError::OversizedData {
+                            size: estimated_block_size_with_tx,
+                            limit: MAX_RLP_BLOCK_SIZE,
+                        },
+                    );
+                    continue
+                }
+
+                let mut blob_tx_sidecar = None;
+                if let Some(blob_tx) = tx.as_eip4844() {
+                    let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
+
+                    if block_blob_count + tx_blob_count > max_blob_count {
+                        trace!(target: "payload_builder", tx=?tx.hash(), ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
+                        best_txs.mark_invalid(
+                            &pool_tx,
+                            &InvalidPoolTransactionError::Eip4844(
+                                Eip4844PoolTransactionError::TooManyEip4844Blobs {
+                                    have: block_blob_count + tx_blob_count,
+                                    permitted: max_blob_count,
+                                },
+                            ),
+                        );
+                        continue
+                    }
+
+                    let blob_sidecar_result = 'sidecar: {
+                        let Some(sidecar) =
+                            pool.get_blob(*tx.hash()).map_err(PayloadBuilderError::other)?
+                        else {
+                            break 'sidecar Err(
+                                Eip4844PoolTransactionError::MissingEip4844BlobSidecar,
+                            )
+                        };
+
+                        if is_osaka {
+                            if sidecar.is_eip7594() {
+                                Ok(sidecar)
+                            } else {
+                                Err(Eip4844PoolTransactionError::UnexpectedEip4844SidecarAfterOsaka)
+                            }
+                        } else if sidecar.is_eip4844() {
+                            Ok(sidecar)
+                        } else {
+                            Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
+                        }
+                    };
+
+                    blob_tx_sidecar = match blob_sidecar_result {
+                        Ok(sidecar) => Some(sidecar),
+                        Err(error) => {
+                            best_txs.mark_invalid(
+                                &pool_tx,
+                                &InvalidPoolTransactionError::Eip4844(error),
+                            );
+                            continue
+                        }
+                    };
+                }
+
+                let gas_used = match builder.execute_transaction(tx.clone()) {
+                    Ok(gas_used) => gas_used,
+                    Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+                        error,
+                        ..
+                    })) => {
+                        if error.is_nonce_too_low() {
+                            trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
+                        } else {
+                            trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
+                            best_txs.mark_invalid(
+                                &pool_tx,
+                                &InvalidPoolTransactionError::Consensus(
+                                    InvalidTransactionError::TxTypeNotSupported,
+                                ),
+                            );
+                        }
+                        continue
+                    }
+                    Err(err) => return Err(PayloadBuilderError::evm(err)),
+                };
+
+                if let Some(blob_tx) = tx.as_eip4844() {
+                    block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
+                    if block_blob_count == max_blob_count {
+                        best_txs.skip_blobs();
+                    }
+                }
+
+                block_transactions_rlp_length += tx_rlp_len;
+
+                let miner_fee = tx
+                    .effective_tip_per_gas(base_fee)
+                    .expect("fee is always valid; execution succeeded");
+                total_fees += U256::from(miner_fee) * U256::from(gas_used);
+                cumulative_gas_used += gas_used;
+
+                if let Some(sidecar) = blob_tx_sidecar {
+                    blob_sidecars.push_sidecar_variant(sidecar.as_ref().clone());
+                }
             }
-            // this is an error that we should treat as fatal for this attempt
-            Err(err) => return Err(PayloadBuilderError::evm(err)),
-        };
-
-        // add to the total blob gas used if the transaction successfully executed
-        if let Some(blob_tx) = tx.as_eip4844() {
-            block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
-
-            // if we've reached the max blob count, we can skip blob txs entirely
-            if block_blob_count == max_blob_count {
-                best_txs.skip_blobs();
-            }
-        }
-
-        block_transactions_rlp_length += tx_rlp_len;
-
-        // update and add to total fees
-        let miner_fee =
-            tx.effective_tip_per_gas(base_fee).expect("fee is always valid; execution succeeded");
-        total_fees += U256::from(miner_fee) * U256::from(gas_used);
-        cumulative_gas_used += gas_used;
-
-        // Add blob tx sidecar to the payload.
-        if let Some(sidecar) = blob_tx_sidecar {
-            blob_sidecars.push_sidecar_variant(sidecar.as_ref().clone());
         }
     }
-
-    drop(_exec_guard);
 
     // check if we have a better block
     if !is_better_payload(best_payload.as_ref(), total_fees) {

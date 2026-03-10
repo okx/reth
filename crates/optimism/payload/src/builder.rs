@@ -830,20 +830,20 @@ where
         let base_fee = builder.evm_mut().block().basefee();
         let block_number = builder.evm_mut().block().number().saturating_to();
 
+        // Cache DA footprint gas scalar — it's block-level constant, no need to
+        // fetch from DB on every transaction.
+        let da_footprint_gas_scalar =
+            self.chain_spec.is_jovian_active_at_timestamp(self.attributes().timestamp()).then_some(
+                L1BlockInfo::fetch_da_footprint_gas_scalar(builder.evm_mut().db_mut()).expect(
+                    "DA footprint should always be available from the database post jovian",
+                ),
+            );
+
         while let Some(tx) = best_txs.next(()) {
             let tx_hash = *tx.hash();
             let interop = tx.interop_deadline();
             let tx_da_size = tx.estimated_da_size();
             let tx = tx.into_consensus();
-
-            let da_footprint_gas_scalar = self
-                .chain_spec
-                .is_jovian_active_at_timestamp(self.attributes().timestamp())
-                .then_some(
-                    L1BlockInfo::fetch_da_footprint_gas_scalar(builder.evm_mut().db_mut()).expect(
-                        "DA footprint should always be available from the database post jovian",
-                    ),
-                );
 
             if info.is_tx_over_limits(
                 tx_da_size,

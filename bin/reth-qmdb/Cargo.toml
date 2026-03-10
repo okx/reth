@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Reth node with QMDB state backend and parallel execution for benchmarking"
+description = "Reth node with QMDB state backend for benchmarking"
 
 [lints]
 workspace = true
@@ -20,14 +20,15 @@ reth-provider.workspace = true
 reth-cli-util.workspace = true
 reth-engine-primitives.workspace = true
 
-# op-reth
-reth-optimism-cli.workspace = true
-reth-optimism-node.workspace = true
-reth-optimism-chainspec.workspace = true
-reth-optimism-evm.workspace = true
-reth-optimism-payload-builder.workspace = true
-reth-optimism-primitives.workspace = true
-reth-optimism-forks.workspace = true
+# ethereum
+reth-ethereum-cli.workspace = true
+reth-node-ethereum.workspace = true
+reth-ethereum-engine-primitives.workspace = true
+reth-ethereum-payload-builder.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm.workspace = true
+reth-node-api.workspace = true
+reth-transaction-pool.workspace = true
 
 # xlayer
 xlayer-qmdb-provider.workspace = true
@@ -49,39 +50,34 @@ eyre.workspace = true
 tracing.workspace = true
 
 [features]
-default = ["jemalloc", "asm-keccak", "otlp", "otlp-logs", "js-tracer", "keccak-cache-global"]
+default = ["jemalloc", "asm-keccak", "otlp", "js-tracer", "keccak-cache-global"]
 
 otlp = [
-    "reth-optimism-cli/otlp",
+    "reth-ethereum-cli/otlp",
     "reth-node-core/otlp",
-]
-otlp-logs = [
-    "reth-optimism-cli/otlp-logs",
-    "reth-node-core/otlp-logs",
 ]
 
 jemalloc = [
     "reth-cli-util/jemalloc",
     "reth-node-core/jemalloc",
-    "reth-optimism-cli/jemalloc",
+    "reth-ethereum-cli/jemalloc",
 ]
 
 asm-keccak = [
     "reth-node-core/asm-keccak",
-    "reth-optimism-cli/asm-keccak",
-    "reth-optimism-node/asm-keccak",
+    "reth-ethereum-cli/asm-keccak",
+    "reth-node-ethereum/asm-keccak",
 ]
 
 js-tracer = [
-    "reth-optimism-node/js-tracer",
+    "reth-node-ethereum/js-tracer",
 ]
 
 keccak-cache-global = [
-    "reth-optimism-cli/keccak-cache-global",
-    "reth-optimism-node/keccak-cache-global",
+    "reth-node-ethereum/keccak-cache-global",
 ]
 
-dev = ["reth-optimism-cli/dev"]
+dev = ["reth-ethereum-cli/dev"]
 
 [[bin]]
 name = "reth-qmdb"
