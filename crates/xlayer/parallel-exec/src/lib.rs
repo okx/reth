@@ -8,6 +8,8 @@ pub mod builder;
 pub mod crw_sets;
 pub mod dashboard;
 pub mod dispatcher;
+pub mod dispatcher_new;
+pub mod execute;
 pub mod framer;
 pub mod para_bloom;
 pub mod parallel_state_cache;
