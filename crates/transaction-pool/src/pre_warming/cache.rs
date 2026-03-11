@@ -116,6 +116,15 @@ impl PreWarmedCache {
         }
     }
 
+    /// Check if a transaction already has keys in cache
+    ///
+    /// Used to skip redundant simulations for duplicate TX submissions.
+    /// O(1) DashMap lookup.
+    #[inline]
+    pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
+        self.per_tx_keys.contains_key(tx_hash)
+    }
+
     /// Store keys for a transaction (called after simulation)
     ///
     /// This is called by simulation workers after extracting keys from a transaction.

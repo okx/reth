@@ -8,21 +8,18 @@
 //! and pre-populate the existing CachedReads cache.
 //!
 //! ## Performance Optimizations
-//! - Uses AHashSet (ahash) with SIMD-accelerated hashing (AES-NI/ARM Crypto)
-//! - 2-4x faster than FxHash for Address and U256 keys
+//! - Uses AHashSet for fast deduplication with SIMD-accelerated hashing
 //! - Pre-allocates capacity for expected key counts
-//! - Keys are addresses and storage slots which don't need cryptographic hashing
 
 use alloy_primitives::{Address, TxHash, B256, U256};
 use ahash::AHashSet;
 use std::time::Instant;
 
 /// Default capacity for accounts (typical ERC20 transfer touches 2-3 accounts)
-/// Increased from 8 to 16 to reduce rehashing overhead (TPS optimization)
-const DEFAULT_ACCOUNTS_CAPACITY: usize = 16;
+const DEFAULT_ACCOUNTS_CAPACITY: usize = 8;
 /// Default capacity for storage slots (typical ERC20 touches ~6 slots)
-/// Increased from 16 to 32 to reduce rehashing overhead (TPS optimization)
-const DEFAULT_STORAGE_CAPACITY: usize = 32;
+const DEFAULT_STORAGE_CAPACITY: usize = 16;
+
 
 /// Request to simulate a transaction and extract accessed keys
 #[derive(Debug, Clone)]
@@ -66,14 +63,11 @@ impl<T> SimulationRequest<T> {
 /// and pre-populate the existing CachedReads cache before execution.
 ///
 /// ## Performance Notes
-/// Uses AHashSet (ahash) with SIMD-accelerated hashing:
-/// - 2-4x faster than FxHash using AES-NI (x86) or ARM Crypto extensions
-/// - Non-cryptographic hash is safe here (not security-sensitive)
+/// - Uses AHashSet for O(1) deduplication with SIMD-accelerated hashing
 /// - Pre-allocated capacity avoids rehashing during simulation
 #[derive(Debug, Clone)]
 pub struct ExtractedKeys {
     /// Accounts needing basic_account() query
-    /// AHashSet provides O(1) deduplication with SIMD-accelerated hashing
     pub accounts: AHashSet<Address>,
 
     /// Storage slots needing storage() query
@@ -155,8 +149,7 @@ impl ExtractedKeys {
 
     /// Add multiple accounts at once (batch insert)
     ///
-    /// More efficient than calling add_account() in a loop because
-    /// it avoids repeated hash map operations.
+    /// More efficient than calling add_account() in a loop.
     #[inline]
     pub fn add_accounts(&mut self, addresses: impl IntoIterator<Item = Address>) {
         self.accounts.extend(addresses);

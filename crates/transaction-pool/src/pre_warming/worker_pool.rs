@@ -845,7 +845,18 @@ async fn worker_loop<T>(
                     );
                 }
 
-                debug!(
+                // OPTIMIZATION: Skip if TX already simulated (avoid duplicate work)
+                if cache.contains_tx(&req.tx_hash) {
+                    tracing::trace!(
+                        target: "txpool::pre_warming",
+                        worker_id,
+                        tx_hash = ?req.tx_hash,
+                        "Skipping duplicate TX - already in cache"
+                    );
+                    continue;
+                }
+
+                tracing::trace!(
                     target: "txpool::pre_warming",
                     worker_id,
                     tx_hash = ?req.tx_hash,
@@ -991,7 +1002,7 @@ fn simulate_transaction_sync<T: PoolTransaction>(
 /// - Access list entries (EIP-2930)
 /// - Storage slots accessed during execution
 ///
-/// Uses enhanced simulation for comprehensive state discovery.
+/// Uses optimized simulation with fast paths for common transaction types.
 fn simulate_transaction<T: PoolTransaction>(
     simulator: &Simulator,
     tx: &T,
@@ -1001,9 +1012,11 @@ fn simulate_transaction<T: PoolTransaction>(
     let (tx_inner, _signer) = consensus_tx.into_parts();
     let block_env = revm::context::BlockEnv::default();
 
-    // Use enhanced simulation for better coverage
-    // This method queries more storage slots and handles more contract patterns
-    simulator.simulate_with_full_evm(&tx_inner, sender, block_env)
+    // Use optimized simulation with fast paths:
+    // - Simple ETH transfers: Just sender + recipient (no DB queries)
+    // - Known ERC20/DeFi: Heuristic slot prediction (no DB queries)
+    // - Unknown contracts: Full simulation with TrackingDB
+    simulator.simulate(&tx_inner, sender, block_env)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
 

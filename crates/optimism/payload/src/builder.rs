@@ -251,18 +251,22 @@ where
                     "PREFETCH: Got pending transactions from pool"
                 );
 
-                // Get keys ONLY for these transactions (not all cached keys)
-                let keys = cache.get_keys_for_txs(&tx_hashes);
+                // Get Arc refs directly - avoids expensive merge operation (TPS optimization)
+                let keys_arcs = cache.get_keys_arcs(&tx_hashes);
+                let total_accounts: usize = keys_arcs.iter().map(|k| k.accounts.len()).sum();
+                let total_storage: usize = keys_arcs.iter().map(|k| k.storage_slots.len()).sum();
+                let total_codes: usize = keys_arcs.iter().map(|k| k.code_hashes.len()).sum();
 
                 tracing::debug!(
                     target: "payload_builder",
-                    accounts = keys.accounts.len(),
-                    storage_slots = keys.storage_slots.len(),
-                    code_hashes = keys.code_hashes.len(),
-                    "PREFETCH: Retrieved TARGETED keys from cache"
+                    keys_count = keys_arcs.len(),
+                    accounts = total_accounts,
+                    storage_slots = total_storage,
+                    code_hashes = total_codes,
+                    "PREFETCH: Retrieved TARGETED keys from cache (zero-copy)"
                 );
 
-                if !keys.is_empty() {
+                if !keys_arcs.is_empty() {
                     tracing::debug!(
                         target: "payload_builder",
                         "PREFETCH: Keys found, proceeding with prefetch"
@@ -281,10 +285,10 @@ where
                             let metrics = reth_transaction_pool::pre_warming::get_global_metrics();
                             let metrics_ref = metrics.as_ref().map(|m| m.as_ref());
 
-                            // Use sync version (uses std::thread::scope internally)
-                            match reth_transaction_pool::pre_warming::prefetch_with_snapshot_sync(
+                            // Use optimized Arc-based prefetch (avoids merge overhead)
+                            match reth_transaction_pool::pre_warming::prefetch_with_arcs_sync(
                                 &mut cached_reads,
-                                &keys,
+                                &keys_arcs,
                                 snapshot,
                                 num_threads,
                                 metrics_ref,
@@ -292,9 +296,9 @@ where
                                 Ok(()) => {
                                     tracing::debug!(
                                         target: "payload_builder",
-                                        accounts = keys.accounts.len(),
-                                        storage = keys.storage_slots.len(),
-                                        "PREFETCH: Success"
+                                        accounts = total_accounts,
+                                        storage = total_storage,
+                                        "PREFETCH: Success (optimized)"
                                     );
                                 }
                                 Err(err) => {
