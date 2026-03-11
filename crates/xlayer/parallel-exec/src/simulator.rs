@@ -22,8 +22,8 @@ use revm::{
 pub use alloy_evm::EthEvm;
 
 /// Default number of threads for the simulation thread pool.
-/// Kept low to avoid competing with the main execution thread for CPU.
-const DEFAULT_SIM_THREADS: usize = 2;
+/// Matches fafo's sim_tpool (16 threads) for aggressive CrwSets extraction.
+const DEFAULT_SIM_THREADS: usize = 16;
 
 /// Simulates transactions to extract their read/write sets.
 ///
@@ -35,7 +35,7 @@ pub struct Simulator {
     shard_count: usize,
     /// Dedicated rayon thread pool for simulation with limited thread count.
     /// Avoids competing with the main execution thread for CPU resources.
-    pool: rayon::ThreadPool,
+    pub(crate) pool: rayon::ThreadPool,
 }
 
 impl Default for Simulator {
@@ -98,7 +98,7 @@ impl Simulator {
     ///
     /// Builds a revm EVM instance with nonce checking disabled, executes
     /// the transaction, and extracts CrwSets from the resulting state diff.
-    fn simulate_one<DB>(
+    pub fn simulate_one<DB>(
         &self,
         tx: &SimTxEnv,
         original_index: usize,
@@ -109,6 +109,38 @@ impl Simulator {
         DB: revm::DatabaseRef + core::fmt::Debug,
         DB::Error: core::fmt::Debug + core::error::Error + Send + Sync + 'static,
     {
+        // Fast path (matches fafo): if CrwSets are pre-computed, skip EVM simulation.
+        // fafo pre-computes CrwSets for known patterns (ERC-20 transfers, ETH transfers)
+        // at transaction ingestion time, so the simulator only runs EVM for unknown txs.
+        if let Some(crw_sets) = tx.pre_crw_sets.clone() {
+            return SimResult { crw_sets, original_index, success: true };
+        }
+
+        // Simple ETH transfers (empty calldata) also skip EVM — CrwSets are empty
+        // (conflict-free), matching fafo's behavior.
+        if tx.tx_env.data.is_empty() {
+            return SimResult { crw_sets: CrwSets::default(), original_index, success: true };
+        }
+
+        // Pre-execution validation: skip full EVM simulation for obviously invalid txs.
+        // This check is essentially free because WarmingDbRef caches the read anyway.
+        if let Ok(maybe_info) = db.basic_ref(tx.sender) {
+            let skip = match &maybe_info {
+                None => true, // Caller doesn't exist
+                Some(info) => {
+                    // Check if balance covers minimum gas cost
+                    let gas_cost = alloy_primitives::U256::from(tx.tx_env.gas_limit)
+                        .saturating_mul(alloy_primitives::U256::from(tx.tx_env.gas_price));
+                    info.balance < gas_cost
+                }
+            };
+            if skip {
+                let mut crw_sets = CrwSets::default();
+                crw_sets.account_writes.push(short_hash_address(&tx.sender));
+                return SimResult { crw_sets, original_index, success: false };
+            }
+        }
+
         let mut cfg = CfgEnv::default();
         cfg.disable_nonce_check = true;
 
@@ -121,7 +153,7 @@ impl Simulator {
             .with_cfg(evm_env.cfg_env)
             .with_block(evm_env.block_env)
             .build_mainnet_with_inspector(NoOpInspector {})
-            .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::default().precompiles));
+            .with_precompiles(crate::execute::PRECOMPILES.clone());
 
         let mut evm = EthEvm::new(inner, false);
 
@@ -155,6 +187,8 @@ pub struct SimTxEnv {
     pub sender: Address,
     /// revm transaction environment.
     pub tx_env: TxEnv,
+    /// Pre-computed CrwSets. When `Some`, simulation is skipped entirely.
+    pub pre_crw_sets: Option<CrwSets>,
 }
 
 #[cfg(test)]
@@ -191,7 +225,7 @@ mod tests {
             nonce,
             ..Default::default()
         };
-        SimTxEnv { sender, tx_env }
+        SimTxEnv { sender, tx_env, pre_crw_sets: None }
     }
 
     #[test]
@@ -228,12 +262,11 @@ mod tests {
         assert_eq!(results.len(), 1);
         let result = &results[0];
         assert_eq!(result.original_index, 0);
-
-        // The sender should appear in account_writes (nonce bump fallback)
-        let sender_hash = short_hash_address(&sender);
-        let has_sender = result.crw_sets.account_writes.contains(&sender_hash) ||
-            result.crw_sets.account_reads.contains(&sender_hash);
-        assert!(has_sender, "Sender should appear in CrwSets");
+        // Simple ETH transfers (empty calldata) return empty CrwSets (matching fafo).
+        // They are treated as conflict-free for maximum parallelism.
+        assert!(result.success);
+        assert!(result.crw_sets.account_writes.is_empty());
+        assert!(result.crw_sets.account_reads.is_empty());
     }
 
     #[test]
@@ -252,7 +285,7 @@ mod tests {
     fn test_sim_tx_env_creation() {
         let sender = Address::with_last_byte(1);
         let tx_env = TxEnv::default();
-        let sim_tx = SimTxEnv { sender, tx_env };
+        let sim_tx = SimTxEnv { sender, tx_env, pre_crw_sets: None };
         assert_eq!(sim_tx.sender, sender);
     }
 }

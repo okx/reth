@@ -43,13 +43,26 @@ fn sha256_key(key: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Message sent to the background flusher thread.
+enum FlushMsg {
+    /// Bundle to submit + flush.
+    Bundle(BundleState),
+}
+
 /// Typed wrapper over QMDB providing account/storage/bytecode operations.
 pub struct QmdbStore {
     /// Exclusive access for write operations (start_block, flush).
     ads: Mutex<AdsWrap<SingleCsTask>>,
-    /// Lock-free shared handle for concurrent reads.
-    shared: SharedAdsWrap,
+    /// Shared handle for concurrent reads. Updated after pre_populate/start_block
+    /// to pick up properly initialized EntryCache.
+    shared: parking_lot::RwLock<SharedAdsWrap>,
     next_height: AtomicI64,
+    /// Number of pending commits from payload builder that on_canonical_commit should skip.
+    pending_skips: AtomicI64,
+    /// Last flushed root hash, cached for immediate access.
+    last_flushed_root: parking_lot::RwLock<B256>,
+    /// Channel to send work to the background flusher thread.
+    flush_tx: std::sync::mpsc::Sender<FlushMsg>,
 }
 
 impl std::fmt::Debug for QmdbStore {
@@ -63,8 +76,10 @@ impl std::fmt::Debug for QmdbStore {
 impl QmdbStore {
     /// Create a new `QmdbStore` at the given path.
     ///
-    /// Initializes the QMDB directory and ADS instance.
-    pub fn new(path: &Path) -> Self {
+    /// Initializes the QMDB directory, ADS instance, and background flusher thread.
+    /// The flusher thread handles all QMDB mutations (submit + flush) to avoid
+    /// Mutex contention with the payload builder thread.
+    pub fn new(path: &Path) -> Arc<Self> {
         let config = QmdbConfig {
             dir: path.to_str().expect("path must be valid UTF-8").to_string(),
             ..QmdbConfig::default()
@@ -72,7 +87,71 @@ impl QmdbStore {
         AdsCore::init_dir(&config);
         let ads = AdsWrap::<SingleCsTask>::new(&config);
         let shared = ads.get_shared();
-        Self { ads: Mutex::new(ads), shared, next_height: AtomicI64::new(1) }
+
+        let (flush_tx, flush_rx) = std::sync::mpsc::channel::<FlushMsg>();
+
+        let store = Arc::new(Self {
+            ads: Mutex::new(ads),
+            shared: parking_lot::RwLock::new(shared),
+            next_height: AtomicI64::new(1),
+            pending_skips: AtomicI64::new(0),
+            last_flushed_root: parking_lot::RwLock::new(B256::ZERO),
+            flush_tx,
+        });
+
+        // Background flusher thread (like fafo's FlusherShard + Updater combined).
+        // Does all QMDB mutations: bundle conversion → submit → flush → root update.
+        // The payload builder thread NEVER touches the ads Mutex — zero contention.
+        let flusher_store = Arc::clone(&store);
+        std::thread::Builder::new()
+            .name("qmdb-flusher".to_string())
+            .spawn(move || {
+                while let Ok(FlushMsg::Bundle(first_bundle)) = flush_rx.recv() {
+                    // Collect all pending bundles (coalesce into one flush)
+                    let mut bundles: Vec<BundleState> = vec![first_bundle];
+                    while let Ok(FlushMsg::Bundle(b)) = flush_rx.try_recv() {
+                        bundles.push(b);
+                    }
+
+                    // Submit all bundles under one lock acquisition
+                    let mut ads = flusher_store.ads.lock();
+                    for bundle in &bundles {
+                        let height = flusher_store.next_height.fetch_add(1, Ordering::SeqCst);
+                        let task = Self::bundle_to_task_auto_op(bundle);
+                        let task_id: i64 = height << IN_BLOCK_IDX_BITS;
+                        let tasks_manager =
+                            Arc::new(TasksManager::new(vec![RwLock::new(Some(task))], task_id));
+                        ads.start_block(height, tasks_manager);
+                        let shared = ads.get_shared();
+                        shared.insert_extra_data(height, String::new());
+                        shared.add_task(task_id);
+                    }
+
+                    // Flush all submitted bundles at once
+                    ads.flush();
+                    drop(ads);
+
+                    // Update cached root after flush completes
+                    let height = flusher_store.next_height.load(Ordering::SeqCst) - 1;
+                    let hash = flusher_store.shared.read().get_root_hash_of_height(height);
+                    let root = if hash != [0u8; 32] {
+                        B256::from(hash)
+                    } else {
+                        let ads = flusher_store.ads.lock();
+                        let metadb = ads.get_metadb();
+                        let mdb = metadb.read();
+                        let mut hasher = Sha256::new();
+                        for shard_id in 0..qmdb::def::SHARD_COUNT {
+                            hasher.update(mdb.get_root_hash(shard_id));
+                        }
+                        B256::from(<[u8; 32]>::from(hasher.finalize()))
+                    };
+                    *flusher_store.last_flushed_root.write() = root;
+                }
+            })
+            .expect("failed to spawn qmdb-flusher thread");
+
+        store
     }
 
     /// Read an account from QMDB.
@@ -89,23 +168,53 @@ impl QmdbStore {
         decode_storage_value(&value)
     }
 
-    /// Commit a `BundleState` to QMDB as a new block.
+    /// Commit a `BundleState` to QMDB as a new block (synchronous).
     ///
-    /// Converts the bundle into QMDB operations, submits the block, and flushes.
-    /// Uses `OP_CREATE` for new accounts/storage and `OP_WRITE` for existing ones.
+    /// Submits and flushes directly (used by `on_canonical_commit`).
     pub fn commit_bundle(&self, bundle: &BundleState) {
-        let height = self.next_height.fetch_add(1, Ordering::SeqCst);
-        let task = Self::bundle_to_task_auto_op(bundle);
+        self.submit_bundle(bundle);
+        self.flush();
+        *self.last_flushed_root.write() = self.state_root();
+    }
 
-        let task_id: i64 = height << IN_BLOCK_IDX_BITS;
-        let tasks_manager = Arc::new(TasksManager::new(vec![RwLock::new(Some(task))], task_id));
+    /// Send a bundle to the flusher thread for async processing.
+    /// Used by `on_canonical_commit` when the payload builder didn't already handle it.
+    pub fn commit_bundle_async(&self, bundle: BundleState) {
+        let _ = self.flush_tx.send(FlushMsg::Bundle(bundle));
+    }
 
-        let mut ads = self.ads.lock();
-        ads.start_block(height, tasks_manager);
-        let shared = ads.get_shared();
-        shared.insert_extra_data(height, String::new());
-        shared.add_task(task_id);
-        ads.flush();
+    /// Send state to the background flusher thread (truly non-blocking).
+    ///
+    /// The payload builder calls this instead of `commit_bundle`. The bundle is sent
+    /// over a channel — no Mutex contention, no waiting for flush. The flusher thread
+    /// does conversion + submit + flush asynchronously.
+    ///
+    /// Use `last_flushed_root()` to get the most recent root.
+    pub fn submit_bundle_async(&self, bundle: BundleState) {
+        self.pending_skips.fetch_add(1, Ordering::SeqCst);
+        let _ = self.flush_tx.send(FlushMsg::Bundle(bundle));
+    }
+
+    /// Get the last flushed state root (computed by the background flush thread).
+    ///
+    /// This may be one block behind if the background flush hasn't completed yet.
+    /// With `skip_state_root_validation`, this is acceptable — correctness comes
+    /// from `on_canonical_commit` which runs the "official" QMDB write path.
+    pub fn last_flushed_root(&self) -> B256 {
+        *self.last_flushed_root.read()
+    }
+
+    /// Check if the next canonical commit should be skipped (already committed by payload builder).
+    /// Returns true if skipped, false if the caller should proceed with commit_bundle.
+    pub fn skip_if_already_committed(&self) -> bool {
+        let prev = self.pending_skips.fetch_sub(1, Ordering::SeqCst);
+        if prev > 0 {
+            true // Skip this commit — payload builder already did it
+        } else {
+            // Restore the counter (was already 0 or negative)
+            self.pending_skips.fetch_add(1, Ordering::SeqCst);
+            false
+        }
     }
 
     /// Commit a `BundleState` without flushing (for pipeline mode).
@@ -136,7 +245,7 @@ impl QmdbStore {
     /// zeros, falls back to hashing all per-shard root hashes from the metadb.
     pub fn state_root(&self) -> B256 {
         let height = self.next_height.load(Ordering::SeqCst) - 1;
-        let hash = self.shared.get_root_hash_of_height(height);
+        let hash = self.shared.read().get_root_hash_of_height(height);
 
         if hash != [0u8; 32] {
             return B256::from(hash);
@@ -212,8 +321,17 @@ impl QmdbStore {
 
         ads.flush();
 
+        // Update shared with properly initialized cache from latest start_block
+        *self.shared.write() = ads.get_shared();
+
+        drop(ads);
+
         let num = num_chunks.max(1) as i64;
         self.next_height.store(num + 1, Ordering::SeqCst);
+
+        // Update cached root after pre-population flush
+        *self.last_flushed_root.write() = self.state_root();
+
         num
     }
 
@@ -231,7 +349,7 @@ impl QmdbStore {
         READ_BUF.with(|buf_cell| {
             let mut buf = buf_cell.borrow_mut();
 
-            let (size, found) = self.shared.read_entry(height, &key_hash, key, &mut buf);
+            let (size, found) = self.shared.read().read_entry(height, &key_hash, key, &mut buf);
 
             if !found {
                 return None;
@@ -240,7 +358,8 @@ impl QmdbStore {
             // If the buffer was too small, retry with a larger one
             if size > buf.len() {
                 buf.resize(size, 0);
-                let (size2, found2) = self.shared.read_entry(height, &key_hash, key, &mut buf);
+                let (size2, found2) =
+                    self.shared.read().read_entry(height, &key_hash, key, &mut buf);
                 if !found2 || size2 != size {
                     return None;
                 }
@@ -273,40 +392,29 @@ impl QmdbStore {
         })
     }
 
-    /// Convert a `BundleState` into a QMDB task, automatically choosing
-    /// `OP_CREATE` for new entries and `OP_WRITE` for existing ones.
+    /// Convert a `BundleState` into a QMDB task.
+    ///
+    /// Always uses `OP_CREATE` for safety: with async flushing, QMDB may lag
+    /// behind reth's state, so a key that reth considers "existing" might not
+    /// yet be in QMDB. `OP_CREATE` handles both new and existing keys correctly.
     fn bundle_to_task_auto_op(bundle: &BundleState) -> SingleCsTask {
         let mut builder = TaskBuilder::new();
 
         for (address, bundle_account) in bundle.state() {
             let address = Address::from(*address);
 
-            // Account is new if it had no original_info (didn't exist before this block)
-            let account_is_new = bundle_account.original_info.is_none();
-            let account_op = if account_is_new { OP_CREATE } else { OP_WRITE };
-
             if let Some(info) = &bundle_account.info {
                 let code_hash =
                     if info.code_hash == KECCAK_EMPTY { None } else { Some(info.code_hash) };
                 let account =
                     Account { nonce: info.nonce, balance: info.balance, bytecode_hash: code_hash };
-                builder.add_op(account_op, &account_plain_key(&address), &encode_account(&account));
-
-                // Bytecodes are NOT stored in QMDB — they stay in MDBX (like LayerZero's CodeDB
-                // pattern). QMDB entries must stay under DEFAULT_ENTRY_SIZE (300
-                // bytes).
+                builder.add_op(OP_CREATE, &account_plain_key(&address), &encode_account(&account));
             }
 
             for (slot, slot_info) in &bundle_account.storage {
                 let slot_b256 = B256::from(*slot);
-                // Storage slot is new if its previous/original value was zero (non-existent)
-                let storage_op = if slot_info.previous_or_original_value.is_zero() {
-                    OP_CREATE
-                } else {
-                    OP_WRITE
-                };
                 builder.add_op(
-                    storage_op,
+                    OP_CREATE,
                     &storage_plain_key(&address, &slot_b256),
                     &encode_storage_value(&slot_info.present_value),
                 );

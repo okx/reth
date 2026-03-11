@@ -70,5 +70,5 @@ pub(crate) fn tx_to_sim_env(
         nonce: tx.nonce(),
         ..Default::default()
     };
-    SimTxEnv { sender: signer, tx_env }
+    SimTxEnv { sender: signer, tx_env, pre_crw_sets: None }
 }

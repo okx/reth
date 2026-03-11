@@ -285,7 +285,7 @@ mod tests {
             nonce,
             ..Default::default()
         };
-        SimTxEnv { sender, tx_env }
+        SimTxEnv { sender, tx_env, pre_crw_sets: None }
     }
 
     #[test]

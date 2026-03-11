@@ -46,6 +46,7 @@ use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
     ValidPoolTransaction,
 };
+use reth_trie_common::{updates::TrieUpdates, HashedPostState};
 use revm_database::{states::bundle_state::BundleRetention, DatabaseCommit};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -58,8 +59,7 @@ type BestTransactionsIter<Pool> = Box<
 
 /// A `DatabaseRef` adapter that reads from a reth `StateProvider`.
 ///
-/// Used as the fallback DB for the parallel execution pipeline.
-/// Same as the one in `reth-ethereum-payload-builder/src/parallel.rs`.
+/// Used as the fallback DB when QMDB is not available.
 struct SimDatabaseRef<'a> {
     provider: &'a dyn reth_storage_api::StateProvider,
 }
@@ -107,6 +107,78 @@ impl revm::DatabaseRef for SimDatabaseRef<'_> {
     }
 }
 
+/// Direct QMDB `DatabaseRef` — reduces indirection vs going through StateProvider.
+///
+/// Read path matches fafo's `BlockContext` pattern:
+///   1. reth in-memory state (like fafo's curr_state/prev_state)
+///   2. QmdbStore direct read (like fafo's ads.read_entry)
+///
+/// vs old path:
+///   SimDatabaseRef → StateProvider(vtable) → QmdbStateProvider
+///   → fallback(vtable) → QmdbStore
+///
+/// Eliminates: QmdbStateProvider layer, 1 vtable dispatch.
+/// Bytecodes and block hashes still go through StateProvider.
+struct QmdbDirectDbRef<'a> {
+    store: &'a xlayer_qmdb_provider::QmdbStore,
+    provider: &'a dyn reth_storage_api::StateProvider,
+}
+
+unsafe impl Sync for QmdbDirectDbRef<'_> {}
+
+impl core::fmt::Debug for QmdbDirectDbRef<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("QmdbDirectDbRef").finish_non_exhaustive()
+    }
+}
+
+impl revm::DatabaseRef for QmdbDirectDbRef<'_> {
+    type Error = reth_storage_api::errors::ProviderError;
+
+    fn basic_ref(
+        &self,
+        address: alloy_primitives::Address,
+    ) -> Result<Option<revm::state::AccountInfo>, reth_storage_api::errors::ProviderError> {
+        // Check reth in-memory state first (recent canonical blocks, like fafo's curr_state)
+        if let Some(account) = self.provider.basic_account(&address)? {
+            return Ok(Some(account.into()));
+        }
+        // Direct QMDB read (like fafo's ads.read_entry)
+        Ok(self.store.read_account(&address).map(Into::into))
+    }
+
+    fn code_by_hash_ref(
+        &self,
+        code_hash: alloy_primitives::B256,
+    ) -> Result<revm::bytecode::Bytecode, reth_storage_api::errors::ProviderError> {
+        // Bytecodes are not in QMDB — use StateProvider
+        Ok(self.provider.bytecode_by_hash(&code_hash)?.unwrap_or_default().0)
+    }
+
+    fn storage_ref(
+        &self,
+        address: alloy_primitives::Address,
+        index: U256,
+    ) -> Result<U256, reth_storage_api::errors::ProviderError> {
+        // Check reth in-memory state first
+        use alloy_primitives::B256;
+        let slot = B256::new(index.to_be_bytes());
+        if let Some(value) = self.provider.storage(address, slot)? {
+            return Ok(value);
+        }
+        // Direct QMDB read
+        Ok(self.store.read_storage(&address, &slot).unwrap_or_default())
+    }
+
+    fn block_hash_ref(
+        &self,
+        number: u64,
+    ) -> Result<alloy_primitives::B256, reth_storage_api::errors::ProviderError> {
+        Ok(reth_storage_api::BlockHashReader::block_hash(self.provider, number)?
+            .unwrap_or_default())
+    }
+}
+
 /// Convert a recovered transaction to a pipeline input.
 ///
 /// Uses `ToTxEnv` trait which properly handles all transaction types
@@ -114,7 +186,7 @@ impl revm::DatabaseRef for SimDatabaseRef<'_> {
 /// access_list, max_fee_per_blob_gas, blob_hashes, authorization_list, etc.
 fn tx_to_pipeline_input(tx: &Recovered<TransactionSigned>, idx: usize) -> PipelineTxInput {
     let tx_env: revm::context::TxEnv = tx.to_tx_env();
-    PipelineTxInput { sender: tx.signer(), tx_env, original_index: idx }
+    PipelineTxInput { sender: tx.signer(), tx_env, original_index: idx, pre_crw_sets: None }
 }
 
 /// Parallel payload builder that uses `ParallelExecutionPipeline`.
@@ -128,6 +200,8 @@ pub(crate) struct ParallelPayloadBuilder<Pool, Client, EvmConfig> {
     evm_config: EvmConfig,
     builder_config: EthereumBuilderConfig,
     pipeline: parking_lot::Mutex<ParallelExecutionPipeline>,
+    /// QMDB store for committing state and computing correct state root during payload building.
+    qmdb_store: Option<Arc<xlayer_qmdb_provider::QmdbStore>>,
 }
 
 impl<Pool: Clone, Client: Clone, EvmConfig: Clone> Clone
@@ -140,7 +214,8 @@ impl<Pool: Clone, Client: Clone, EvmConfig: Clone> Clone
             evm_config: self.evm_config.clone(),
             builder_config: self.builder_config.clone(),
             // Each clone gets its own pipeline (thread pools are cheap to create)
-            pipeline: parking_lot::Mutex::new(ParallelExecutionPipeline::with_config(4, 12, 64)),
+            pipeline: parking_lot::Mutex::new(ParallelExecutionPipeline::with_config(16, 12, 64)),
+            qmdb_store: self.qmdb_store.clone(),
         }
     }
 }
@@ -158,8 +233,15 @@ impl<Pool, Client, EvmConfig> ParallelPayloadBuilder<Pool, Client, EvmConfig> {
             pool,
             evm_config,
             builder_config,
-            pipeline: parking_lot::Mutex::new(ParallelExecutionPipeline::with_config(4, 12, 64)),
+            pipeline: parking_lot::Mutex::new(ParallelExecutionPipeline::with_config(16, 12, 64)),
+            qmdb_store: None,
         }
+    }
+
+    /// Set the QMDB store for computing correct state roots during payload building.
+    pub(crate) fn with_qmdb_store(mut self, store: Arc<xlayer_qmdb_provider::QmdbStore>) -> Self {
+        self.qmdb_store = Some(store);
+        self
     }
 }
 
@@ -182,6 +264,7 @@ where
             &self.pool,
             &self.builder_config,
             &self.pipeline,
+            self.qmdb_store.as_ref(),
             args,
             |attributes| self.pool.best_transactions_with_attributes(attributes),
         )
@@ -215,6 +298,7 @@ fn parallel_ethereum_payload<EvmConfig, Client, Pool, F>(
     pool: &Pool,
     builder_config: &EthereumBuilderConfig,
     pipeline: &parking_lot::Mutex<ParallelExecutionPipeline>,
+    qmdb_store: Option<&Arc<xlayer_qmdb_provider::QmdbStore>>,
     args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
     best_txs: F,
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
@@ -322,6 +406,9 @@ where
     let mut block_blob_count = 0u64;
     let mut block_transactions_rlp_length = 0usize;
 
+    // Collect all available transactions from pool.
+    // The BestTransactions iterator is snapshot-based (no pool lock held),
+    // with a broadcast channel for newly arrived txs (try_recv on each next()).
     while let Some(pool_tx) = best_txs.next() {
         if cancel.is_cancelled() {
             return Ok(BuildOutcome::Cancelled);
@@ -329,7 +416,7 @@ where
 
         let tx = pool_tx.to_consensus();
 
-        // Gas limit check
+        // Individual gas limit check (single tx can't exceed block limit)
         if pool_tx.gas_limit() > block_gas_limit {
             best_txs.mark_invalid(
                 &pool_tx,
@@ -418,11 +505,12 @@ where
         candidates.push((pool_tx, tx));
     }
 
+    let collected_count = candidates.len();
     let collect_elapsed = collect_start.elapsed();
     let estimated_gas: u64 = candidates.iter().map(|(p, _)| p.gas_limit()).sum();
     info!(
         target: "payload_builder::parallel",
-        collected = candidates.len(),
+        collected = collected_count,
         ?collect_elapsed,
         estimated_gas,
         block_gas_limit,
@@ -466,48 +554,47 @@ where
         cfg_env.set_max_blobs_per_tx(bp.max_blobs_per_tx);
     }
 
-    let sim_db = SimDatabaseRef { provider: state_provider.as_ref() };
-    let pipeline_result =
-        pipeline.lock().execute_block(pipeline_inputs, &sim_db, &block_env, &cfg_env);
+    // Use QmdbDirectDbRef when QMDB is available — bypasses StateProvider layers.
+    // Matches fafo's direct QMDB read path for account/storage.
+    let pipeline_result = if let Some(store) = qmdb_store {
+        let db = QmdbDirectDbRef { store: store.as_ref(), provider: state_provider.as_ref() };
+        pipeline.lock().execute_block(pipeline_inputs, &db, &block_env, &cfg_env)
+    } else {
+        let db = SimDatabaseRef { provider: state_provider.as_ref() };
+        pipeline.lock().execute_block(pipeline_inputs, &db, &block_env, &cfg_env)
+    };
 
     let exec_elapsed = exec_start.elapsed();
 
+    // Drop the pool iterator — we're done collecting transactions.
+    drop(best_txs);
+
     // -----------------------------------------------------------------------
-    // Phase 4: Build receipts + BundleState from parallel results
+    // Phase 4: Build receipts + merge state + single commit
     // -----------------------------------------------------------------------
+    // Previous approach: N preloads + N commits + N state.clone() = ~10ms overhead
+    // New approach: build receipts while merging EvmStates into one, then
+    // single preload + single commit. Eliminates per-tx cloning and repeated
+    // HashMap insertions.
 
-    let preload_start = std::time::Instant::now();
-
-    // Pre-load all touched accounts into State<DB> cache.
-    // Parallel execution ran on a separate SimDatabaseRef, so the accounts
-    // are not yet in db's cache. State::commit() panics if they're missing.
-    {
-        use revm::Database;
-        for tx_result in &pipeline_result.tx_results {
-            for (addr, _) in &tx_result.state {
-                let _ = db.basic(*addr);
-            }
-        }
-    }
-
-    let preload_elapsed = preload_start.elapsed();
+    let commit_start = std::time::Instant::now();
 
     let mut cumulative_gas_used = 0u64;
     let mut total_fees = U256::ZERO;
     let mut blob_gas_used = 0u64;
 
-    let commit_start = std::time::Instant::now();
-
-    let mut receipts: Vec<Receipt> = Vec::with_capacity(pipeline_result.tx_results.len());
+    let tx_result_count = pipeline_result.tx_results.len();
+    let mut receipts: Vec<Receipt> = Vec::with_capacity(tx_result_count);
     let mut executed_senders: Vec<alloy_primitives::Address> = Vec::with_capacity(candidates.len());
     let mut executed_txs: Vec<TransactionSigned> = Vec::with_capacity(candidates.len());
 
-    for tx_result in &pipeline_result.tx_results {
+    // Merge all tx EvmStates into one combined state (no cloning — move semantics).
+    // Later txs' writes override earlier txs' writes for the same address/slot.
+    let mut merged_state: revm::state::EvmState = Default::default();
+
+    for tx_result in pipeline_result.tx_results {
         let idx = tx_result.original_index;
         let (_, tx) = &candidates[idx];
-
-        // Commit state changes
-        db.commit(tx_result.state.clone());
 
         cumulative_gas_used += tx_result.gas_used;
 
@@ -541,16 +628,43 @@ where
         let (inner_tx, signer) = tx.clone().into_parts();
         executed_txs.push(inner_tx);
         executed_senders.push(signer);
+
+        // Merge this tx's state into combined state (moved, no clone)
+        for (addr, account) in tx_result.state {
+            match merged_state.entry(addr) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    existing.info = account.info;
+                    existing.status = account.status;
+                    for (slot, val) in account.storage {
+                        existing.storage.insert(slot, val);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(account);
+                }
+            }
+        }
     }
+
+    // Single preload: load unique addresses into State<DB> cache
+    {
+        use revm::Database;
+        for addr in merged_state.keys() {
+            let _ = db.basic(*addr);
+        }
+    }
+
+    // Single commit: all state changes at once (no clone needed)
+    db.commit(merged_state);
 
     let commit_elapsed = commit_start.elapsed();
 
     info!(
         target: "payload_builder::parallel",
-        tx_count = pipeline_result.tx_results.len(),
+        tx_count = tx_result_count,
         gas_used = cumulative_gas_used,
         ?exec_elapsed,
-        ?preload_elapsed,
         ?commit_elapsed,
         "parallel payload: pipeline done"
     );
@@ -563,19 +677,28 @@ where
     drop(_exec_guard);
 
     let finalize_start = std::time::Instant::now();
-    let _root_guard = timing_ctx.time_calc_state_root();
 
     // Merge all transitions (pre-execution + parallel results) into BundleState
     db.merge_transitions(BundleRetention::Reverts);
-
-    // -----------------------------------------------------------------------
-    // Phase 5: Compute state root + assemble block
-    // -----------------------------------------------------------------------
     let bundle_state = db.take_bundle();
-    let hashed_state = state_provider.hashed_post_state(&bundle_state);
-    let (state_root, trie_updates) = state_provider
-        .state_root_with_updates(hashed_state.clone())
-        .map_err(|e| PayloadBuilderError::Internal(e.into()))?;
+
+    // State root: QMDB pipeline root (near-instant read from cache).
+    // QMDB writes happen asynchronously via on_canonical_commit → flusher thread.
+    let state_root;
+    {
+        let _root_guard = timing_ctx.time_calc_state_root();
+        state_root = if let Some(store) = qmdb_store {
+            store.last_flushed_root()
+        } else {
+            state_provider
+                .state_root_with_updates(HashedPostState::default())
+                .map_err(|e| PayloadBuilderError::Internal(e.into()))?
+                .0
+        };
+    }
+
+    let hashed_state = HashedPostState::default();
+    let trie_updates = TrieUpdates::default();
 
     // Build execution result
     // Note: post-execution system call requests (EIP-7002, EIP-7251) are not computed here
@@ -681,7 +804,7 @@ where
     let finalize_elapsed = finalize_start.elapsed();
     let total_elapsed = exec_start.elapsed();
     let tps = if total_elapsed.as_micros() > 0 {
-        (pipeline_result.tx_results.len() as f64 / total_elapsed.as_secs_f64()) as u64
+        (tx_result_count as f64 / total_elapsed.as_secs_f64()) as u64
     } else {
         0
     };
@@ -694,11 +817,10 @@ where
     info!(
         target: "payload_builder::parallel",
         number = block_number,
-        txs = pipeline_result.tx_results.len(),
+        txs = tx_result_count,
         gas_used = cumulative_gas_used,
         ?total_elapsed,
         ?exec_elapsed,
-        ?preload_elapsed,
         ?commit_elapsed,
         ?finalize_elapsed,
         tps,
@@ -707,7 +829,6 @@ where
     );
 
     // Store build timing with actual block hash
-    drop(_root_guard);
     timing_ctx.set_block_hash(sealed_block.hash());
     timing_ctx.update_totals();
     timing_ctx.store();

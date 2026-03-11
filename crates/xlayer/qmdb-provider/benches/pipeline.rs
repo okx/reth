@@ -50,6 +50,7 @@ const INITIAL_BALANCE: u128 = 1_000_000_000_000_000_000; // 1 ETH
 // InMemoryStateProvider — HashMap-based cache for EVM reads
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct InMemoryCache {
     accounts: HashMap<Address, AccountInfo>,
     storage: HashMap<Address, HashMap<U256, U256>>,
@@ -122,6 +123,58 @@ impl revm::DatabaseRef for InMemoryCache {
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Infallible> {
         Ok(self.storage.get(&address).and_then(|s| s.get(&index)).copied().unwrap_or(U256::ZERO))
     }
+    fn block_hash_ref(&self, _number: u64) -> Result<B256, Infallible> {
+        Ok(B256::ZERO)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QmdbDbRef — DatabaseRef backed by QmdbStore (for parallel pipeline benchmark)
+// ---------------------------------------------------------------------------
+
+/// DatabaseRef that reads from QMDB, with InMemoryCache fallback for bytecodes.
+#[derive(Debug)]
+struct QmdbDbRef<'a> {
+    store: &'a QmdbStore,
+    code_cache: &'a InMemoryCache,
+}
+
+impl revm::DatabaseRef for QmdbDbRef<'_> {
+    type Error = Infallible;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Infallible> {
+        // Try QMDB first, fall back to InMemoryCache (for contract code_hash)
+        if let Some(acc) = self.store.read_account(&address) {
+            // Check if InMemoryCache has code info for this address
+            let (code_hash, code) = if let Some(mem_info) = self.code_cache.accounts.get(&address) {
+                (mem_info.code_hash, mem_info.code.clone())
+            } else {
+                (KECCAK_EMPTY, None)
+            };
+            Ok(Some(AccountInfo {
+                nonce: acc.nonce,
+                balance: acc.balance,
+                code_hash,
+                code,
+                account_id: None,
+            }))
+        } else {
+            // Not in QMDB — check InMemoryCache (for contracts deployed in memory)
+            Ok(self.code_cache.accounts.get(&address).cloned())
+        }
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::bytecode::Bytecode, Infallible> {
+        // QMDB doesn't store bytecodes — use InMemoryCache
+        Ok(self.code_cache.code_by_hash.get(&code_hash).cloned().unwrap_or_default())
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Infallible> {
+        // Read from QMDB
+        let slot = B256::new(index.to_be_bytes());
+        Ok(self.store.read_storage(&address, &slot).unwrap_or(U256::ZERO))
+    }
+
     fn block_hash_ref(&self, _number: u64) -> Result<B256, Infallible> {
         Ok(B256::ZERO)
     }
@@ -338,6 +391,73 @@ fn generate_erc20_block_txs(
     blocks
 }
 
+/// Generate ERC-20 block transactions with pre-computed CrwSets (matching fafo).
+///
+/// fafo pre-computes CrwSets for 99% of ERC-20 transfers: the storage write set
+/// contains the sender's and receiver's balance slots in the contract. Only 1%
+/// of transactions require EVM simulation (for warmup/validation).
+fn generate_erc20_with_crw_sets(
+    addresses: &[Address],
+    num_blocks: usize,
+    rng: &mut StdRng,
+) -> Vec<Vec<(TxEnv, Option<xlayer_parallel_exec::crw_sets::CrwSets>)>> {
+    use xlayer_parallel_exec::crw_sets::{short_hash_slot, CrwSets};
+
+    let mut nonces: HashMap<Address, u64> = HashMap::new();
+    let transfer_amount = U256::from(100u64);
+    let mut blocks = Vec::with_capacity(num_blocks);
+    for _ in 0..num_blocks {
+        let mut used = std::collections::HashSet::new();
+        let mut txs = Vec::with_capacity(TXS_PER_BLOCK);
+        let mut tx_idx = 0usize;
+        while txs.len() < TXS_PER_BLOCK {
+            let sender_idx = rng.random_range(0..addresses.len());
+            if !used.insert(sender_idx) {
+                continue;
+            }
+            let sender = addresses[sender_idx];
+            let receiver = addresses[rng.random_range(0..addresses.len())];
+            let nonce = nonces.get(&sender).copied().unwrap_or(0);
+            let tx = TxEnv {
+                caller: sender,
+                kind: TxKind::Call(ERC20_CONTRACT),
+                data: encode_transfer(receiver, transfer_amount),
+                gas_limit: 100_000,
+                gas_price: 0,
+                nonce,
+                chain_id: Some(1),
+                ..Default::default()
+            };
+
+            // Match fafo: 99% of txs get pre-computed CrwSets, 1% need EVM simulation.
+            // CrwSets contain the storage slots that the ERC-20 transfer writes:
+            //   - balances[sender] (slot = keccak256(sender, 0))
+            //   - balances[receiver] (slot = keccak256(receiver, 0))
+            let crw_sets = if tx_idx % 100 != 0 {
+                let sender_slot = erc20_balance_slot(sender);
+                let receiver_slot = erc20_balance_slot(receiver);
+                Some(CrwSets {
+                    account_reads: vec![],
+                    account_writes: vec![],
+                    storage_reads: vec![],
+                    storage_writes: vec![
+                        short_hash_slot(&ERC20_CONTRACT, &sender_slot),
+                        short_hash_slot(&ERC20_CONTRACT, &receiver_slot),
+                    ],
+                })
+            } else {
+                None // This 1% will go through full EVM simulation
+            };
+
+            txs.push((tx, crw_sets));
+            *nonces.entry(sender).or_insert(0) += 1;
+            tx_idx += 1;
+        }
+        blocks.push(txs);
+    }
+    blocks
+}
+
 // ---------------------------------------------------------------------------
 // Stats reporting
 // ---------------------------------------------------------------------------
@@ -510,7 +630,7 @@ fn run_qmdb_pipeline_bench(
 /// The TempDir is returned to keep it alive for the store's lifetime.
 fn create_prepopulated_store(cache: &InMemoryCache) -> (Arc<QmdbStore>, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
-    let store = Arc::new(QmdbStore::new(dir.path()));
+    let store = QmdbStore::new(dir.path());
     let bundle = cache_to_bundle(cache);
     store.pre_populate(&bundle);
     (store, dir)
@@ -591,5 +711,329 @@ fn bench_qmdb_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_qmdb_sync, bench_qmdb_pipeline);
+// ---------------------------------------------------------------------------
+// Parallel pipeline benchmark: simulate → frame → execute (like fafo)
+// ---------------------------------------------------------------------------
+
+/// Run parallel pipeline benchmark with optional pre-computed CrwSets.
+/// When `crw_blocks` is Some, uses pre-computed CrwSets (matching fafo).
+/// When None, all txs go through full EVM simulation.
+fn run_parallel_bench(
+    cache: &InMemoryCache,
+    block_txs: &[Vec<TxEnv>],
+    crw_blocks: Option<&[Vec<(TxEnv, Option<xlayer_parallel_exec::crw_sets::CrwSets>)>]>,
+    qmdb_store: Option<&Arc<QmdbStore>>,
+    label: &str,
+) {
+    use xlayer_parallel_exec::pipeline::{ParallelExecutionPipeline, PipelineTxInput};
+
+    let mut pipeline = ParallelExecutionPipeline::with_config(16, 12, 64);
+
+    let cfg_env = {
+        let mut c = revm::context::CfgEnv::default();
+        c.disable_nonce_check = true;
+        c
+    };
+
+    let num_blocks = if crw_blocks.is_some() { crw_blocks.unwrap().len() } else { block_txs.len() };
+    let total_txs = num_blocks * TXS_PER_BLOCK;
+
+    // Warmup: run first block
+    {
+        let be = revm::context::BlockEnv {
+            number: U256::from(0u64),
+            gas_limit: u64::MAX,
+            basefee: 0,
+            ..Default::default()
+        };
+        let inputs: Vec<PipelineTxInput> = if let Some(crw) = crw_blocks {
+            crw[0]
+                .iter()
+                .enumerate()
+                .map(|(i, (tx, crw_sets))| PipelineTxInput {
+                    sender: tx.caller,
+                    tx_env: tx.clone(),
+                    original_index: i,
+                    pre_crw_sets: crw_sets.clone(),
+                })
+                .collect()
+        } else {
+            block_txs[0]
+                .iter()
+                .enumerate()
+                .map(|(i, tx)| PipelineTxInput {
+                    sender: tx.caller,
+                    tx_env: tx.clone(),
+                    original_index: i,
+                    pre_crw_sets: None,
+                })
+                .collect()
+        };
+        if let Some(store) = qmdb_store {
+            let db = QmdbDbRef { store, code_cache: cache };
+            let _ = pipeline.execute_block(inputs, &db, &be, &cfg_env);
+        } else {
+            let _ = pipeline.execute_block(inputs, cache, &be, &cfg_env);
+        }
+    }
+
+    // Measure
+    let start = Instant::now();
+
+    for blk_idx in 0..num_blocks {
+        let be = revm::context::BlockEnv {
+            number: U256::from(blk_idx as u64 + 1),
+            gas_limit: u64::MAX,
+            basefee: 0,
+            ..Default::default()
+        };
+
+        let inputs: Vec<PipelineTxInput> = if let Some(crw) = crw_blocks {
+            crw[blk_idx]
+                .iter()
+                .enumerate()
+                .map(|(i, (tx, crw_sets))| PipelineTxInput {
+                    sender: tx.caller,
+                    tx_env: tx.clone(),
+                    original_index: i,
+                    pre_crw_sets: crw_sets.clone(),
+                })
+                .collect()
+        } else {
+            block_txs[blk_idx]
+                .iter()
+                .enumerate()
+                .map(|(i, tx)| PipelineTxInput {
+                    sender: tx.caller,
+                    tx_env: tx.clone(),
+                    original_index: i,
+                    pre_crw_sets: None,
+                })
+                .collect()
+        };
+
+        if let Some(store) = qmdb_store {
+            let db = QmdbDbRef { store, code_cache: cache };
+            let result = pipeline.execute_block(inputs, &db, &be, &cfg_env);
+            assert!(!result.tx_results.is_empty(), "block {} produced no results", blk_idx);
+        } else {
+            let result = pipeline.execute_block(inputs, cache, &be, &cfg_env);
+            assert!(!result.tx_results.is_empty(), "block {} produced no results", blk_idx);
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let tps = total_txs as f64 / elapsed.as_secs_f64();
+    eprintln!("─── {} ───", label);
+    eprintln!("  {} blocks, {} tx/block, {} total txs", num_blocks, TXS_PER_BLOCK, total_txs,);
+    eprintln!("  elapsed: {:.2?}  |  {:.0} tx/s", elapsed, tps);
+    eprintln!(
+        "  avg block: {:.2?}  |  per-tx: {:.2?}",
+        elapsed / num_blocks as u32,
+        elapsed / total_txs as u32,
+    );
+}
+
+fn run_serial_bench(
+    cache: &InMemoryCache,
+    block_txs: &[Vec<TxEnv>],
+    qmdb_store: Option<&Arc<QmdbStore>>,
+    label: &str,
+) {
+    let total_txs: usize = block_txs.iter().map(|b| b.len()).sum();
+
+    let start = Instant::now();
+    if let Some(store) = qmdb_store {
+        // Serial with QMDB backend
+        let qmdb_db = QmdbDbRef { store, code_cache: cache };
+        for (blk_idx, txs) in block_txs.iter().enumerate() {
+            let evm_start = Instant::now();
+            let state_db =
+                State::builder().with_database_ref(&qmdb_db).with_bundle_update().build();
+            let block_env = revm::context::BlockEnv {
+                number: U256::from(blk_idx as u64 + 1),
+                gas_limit: u64::MAX,
+                basefee: 0,
+                ..Default::default()
+            };
+            let mut ctx: revm::handler::MainnetContext<_> =
+                revm::context::Context::new(state_db, revm::primitives::hardfork::SpecId::CANCUN);
+            ctx.cfg.disable_nonce_check = true;
+            let ctx = ctx.with_block(block_env);
+            let mut evm = ctx.build_mainnet();
+            evm.transact_many_commit(txs.clone().into_iter()).expect("EVM execution failed");
+            let state_db = &mut evm.ctx.journaled_state.database;
+            state_db
+                .merge_transitions(revm::database::states::bundle_state::BundleRetention::Reverts);
+            let bundle = state_db.take_bundle();
+            // Commit to QMDB
+            store.commit_bundle(&bundle);
+        }
+    } else {
+        // Serial with InMemoryCache
+        let mut evm_cache = InMemoryCache {
+            accounts: cache.accounts.clone(),
+            storage: cache.storage.clone(),
+            code_by_hash: cache.code_by_hash.clone(),
+        };
+        for (blk_idx, txs) in block_txs.iter().enumerate() {
+            let (bundle, _) =
+                execute_block_evm(&evm_cache, txs.clone().into_iter(), blk_idx as u64 + 1);
+            evm_cache.apply_bundle(&bundle);
+        }
+    }
+    let elapsed = start.elapsed();
+    let tps = total_txs as f64 / elapsed.as_secs_f64();
+    eprintln!("─── {} ───", label);
+    eprintln!("  {} blocks, {} tx/block, {} total txs", block_txs.len(), TXS_PER_BLOCK, total_txs,);
+    eprintln!("  elapsed: {:.2?}  |  {:.0} tx/s", elapsed, tps);
+    eprintln!(
+        "  avg block: {:.2?}  |  per-tx: {:.2?}",
+        elapsed / block_txs.len() as u32,
+        elapsed / total_txs as u32,
+    );
+}
+
+fn bench_parallel_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Parallel pipeline");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(120));
+
+    let label = format!("pre{PRE_POP_ACCOUNTS}_{NUM_BLOCKS}blk_{TXS_PER_BLOCK}tx");
+
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut cache = InMemoryCache::new();
+    let addresses = setup_accounts(&mut cache, &mut rng);
+
+    // ETH transfers
+    let mut rng_eth = StdRng::seed_from_u64(43);
+    let eth_blocks = generate_eth_block_txs(&addresses, &cache, NUM_BLOCKS, &mut rng_eth);
+
+    // ERC20 transfers
+    setup_erc20(&mut cache, &addresses);
+    let mut rng_erc20 = StdRng::seed_from_u64(44);
+    let erc20_blocks = generate_erc20_block_txs(&addresses, NUM_BLOCKS, &mut rng_erc20);
+
+    // ERC20 with pre-computed CrwSets (matching fafo — 99% skip simulation)
+    let mut rng_erc20_crw = StdRng::seed_from_u64(44); // same seed for comparable workload
+    let erc20_crw_blocks = generate_erc20_with_crw_sets(&addresses, NUM_BLOCKS, &mut rng_erc20_crw);
+
+    // --- Quick one-shot benchmarks (printed to stderr) ---
+    eprintln!("\n========== Quick Benchmarks ==========");
+    eprintln!(
+        "Config: {} accounts, {} blocks, {} tx/block\n",
+        PRE_POP_ACCOUNTS, NUM_BLOCKS, TXS_PER_BLOCK
+    );
+
+    // Create QMDB store for QMDB-backed benchmarks
+    let (qmdb_store, _qmdb_dir) = create_prepopulated_store(&cache);
+
+    // InMemory benchmarks (for reference)
+    run_serial_bench(&cache, &eth_blocks, None, "Serial ETH (InMemory)");
+    run_serial_bench(&cache, &erc20_blocks, None, "Serial ERC20 (InMemory)");
+    run_parallel_bench(&cache, &eth_blocks, None, None, "Parallel ETH (InMemory)");
+    run_parallel_bench(
+        &cache,
+        &erc20_blocks,
+        Some(&erc20_crw_blocks),
+        None,
+        "Parallel ERC20 fafo-style (InMemory)",
+    );
+
+    // QMDB benchmarks (matches fafo's setup)
+    run_serial_bench(&cache, &eth_blocks, Some(&qmdb_store), "Serial ETH (QMDB)");
+    run_parallel_bench(&cache, &eth_blocks, None, Some(&qmdb_store), "Parallel ETH (QMDB)");
+    run_serial_bench(&cache, &erc20_blocks, Some(&qmdb_store), "Serial ERC20 (QMDB)");
+    run_parallel_bench(
+        &cache,
+        &erc20_blocks,
+        Some(&erc20_crw_blocks),
+        Some(&qmdb_store),
+        "Parallel ERC20 fafo-style (QMDB)",
+    );
+
+    eprintln!("======================================\n");
+
+    // --- Criterion-measured benchmarks ---
+
+    // Parallel ERC20 with fafo-style pre-computed CrwSets
+    group.bench_function(BenchmarkId::new("parallel_erc20_fafo", &label), |b| {
+        use xlayer_parallel_exec::pipeline::{ParallelExecutionPipeline, PipelineTxInput};
+        let mut pipeline = ParallelExecutionPipeline::with_config(16, 12, 64);
+        let cfg_env = {
+            let mut c = revm::context::CfgEnv::default();
+            c.disable_nonce_check = true;
+            c
+        };
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let start = Instant::now();
+                for (blk_idx, txs) in erc20_crw_blocks.iter().enumerate() {
+                    let be = revm::context::BlockEnv {
+                        number: U256::from(blk_idx as u64 + 1),
+                        gas_limit: u64::MAX,
+                        basefee: 0,
+                        ..Default::default()
+                    };
+                    let inputs: Vec<PipelineTxInput> = txs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (tx, crw_sets))| PipelineTxInput {
+                            sender: tx.caller,
+                            tx_env: tx.clone(),
+                            original_index: i,
+                            pre_crw_sets: crw_sets.clone(),
+                        })
+                        .collect();
+                    let _ = pipeline.execute_block(inputs, &cache, &be, &cfg_env);
+                }
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    // Parallel ERC20 without pre-computed CrwSets (full EVM simulation)
+    group.bench_function(BenchmarkId::new("parallel_erc20_full_sim", &label), |b| {
+        use xlayer_parallel_exec::pipeline::{ParallelExecutionPipeline, PipelineTxInput};
+        let mut pipeline = ParallelExecutionPipeline::with_config(16, 12, 64);
+        let cfg_env = {
+            let mut c = revm::context::CfgEnv::default();
+            c.disable_nonce_check = true;
+            c
+        };
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let start = Instant::now();
+                for (blk_idx, txs) in erc20_blocks.iter().enumerate() {
+                    let be = revm::context::BlockEnv {
+                        number: U256::from(blk_idx as u64 + 1),
+                        gas_limit: u64::MAX,
+                        basefee: 0,
+                        ..Default::default()
+                    };
+                    let inputs: Vec<PipelineTxInput> = txs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, tx)| PipelineTxInput {
+                            sender: tx.caller,
+                            tx_env: tx.clone(),
+                            original_index: i,
+                            pre_crw_sets: None,
+                        })
+                        .collect();
+                    let _ = pipeline.execute_block(inputs, &cache, &be, &cfg_env);
+                }
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_qmdb_sync, bench_qmdb_pipeline, bench_parallel_pipeline);
 criterion_main!(benches);

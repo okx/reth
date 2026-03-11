@@ -35,6 +35,12 @@ pub struct Framer {
     max_frames: usize,
     /// Completed (flushed) frames, in order.
     completed_frames: Vec<Frame>,
+    /// Optional auto-flush threshold: flush a frame when it reaches this many tasks.
+    flush_threshold: Option<usize>,
+    /// Whether the first flush has occurred.
+    first_flushed: bool,
+    /// Threshold for the first frame flush.
+    first_flush_threshold: Option<usize>,
 }
 
 impl Framer {
@@ -54,6 +60,42 @@ impl Framer {
             frame_tasks: (0..max_frames).map(|_| Vec::new()).collect(),
             max_frames,
             completed_frames: Vec::new(),
+            flush_threshold: None,
+            first_flushed: false,
+            first_flush_threshold: None,
+        }
+    }
+
+    /// Create a new `Framer` with a flush threshold.
+    ///
+    /// When a frame accumulates `threshold` tasks, it is automatically flushed.
+    /// This enables pipeline overlap: flushed frames are returned immediately
+    /// (via `add_returning_flushed`) and can be dispatched for execution while
+    /// the Framer continues processing new transactions.
+    pub fn with_flush_threshold(threshold: usize) -> Self {
+        let max_frames = para_bloom::MAX_FRAMES;
+        Self {
+            bloom: ParaBloom::new(),
+            frame_tasks: (0..max_frames).map(|_| Vec::new()).collect(),
+            max_frames,
+            completed_frames: Vec::new(),
+            flush_threshold: Some(threshold),
+            first_flushed: false,
+            first_flush_threshold: None,
+        }
+    }
+
+    /// Create a new `Framer` with early first-frame dispatch.
+    pub fn with_early_dispatch(first_threshold: usize, threshold: usize) -> Self {
+        let max_frames = para_bloom::MAX_FRAMES;
+        Self {
+            bloom: ParaBloom::new(),
+            frame_tasks: (0..max_frames).map(|_| Vec::new()).collect(),
+            max_frames,
+            completed_frames: Vec::new(),
+            flush_threshold: Some(threshold),
+            first_flushed: false,
+            first_flush_threshold: Some(first_threshold),
         }
     }
 
@@ -85,6 +127,71 @@ impl Framer {
         self.frame_tasks[frame_id].push(task);
     }
 
+    /// Add a `SimResult` and return any frames that were flushed.
+    ///
+    /// Unlike `add()`, flushed frames are returned directly instead of being
+    /// stored in `self.completed_frames`. This enables the async pipeline:
+    /// the caller can dispatch flushed frames for execution immediately while
+    /// continuing to frame new transactions.
+    ///
+    /// Auto-flush: if `flush_threshold` is set, a frame is also flushed when
+    /// it accumulates that many tasks (similar to fafo's `can_flush()`).
+    /// Add a **pre-built ExeTask** (may contain multiple txs) to the framer.
+    pub fn add_task_returning_flushed(&mut self, task: ExeTask) -> Vec<Frame> {
+        let mut flushed = Vec::new();
+        let (all_reads, all_writes) = collect_read_write_hashes(&task.merged_crw_sets);
+
+        let mask = self.bloom.get_dep_mask(&all_reads, &all_writes);
+
+        let all_frames_mask =
+            if self.max_frames >= 64 { u64::MAX } else { (1u64 << self.max_frames) - 1 };
+
+        let frame_id = if mask & all_frames_mask == all_frames_mask {
+            let tasks = std::mem::take(&mut self.frame_tasks[0]);
+            if !tasks.is_empty() {
+                flushed.push(Frame { tasks });
+                self.first_flushed = true;
+            }
+            self.bloom.clear(0);
+            0
+        } else {
+            mask.trailing_ones() as usize
+        };
+
+        if !self.first_flushed && frame_id > 0 && !self.frame_tasks[0].is_empty() {
+            let tasks = std::mem::take(&mut self.frame_tasks[0]);
+            flushed.push(Frame { tasks });
+            self.bloom.clear(0);
+            self.first_flushed = true;
+        }
+
+        self.bloom.add(frame_id, &all_reads, &all_writes);
+        self.frame_tasks[frame_id].push(task);
+
+        let effective_threshold = if !self.first_flushed {
+            self.first_flush_threshold.or(self.flush_threshold)
+        } else {
+            self.flush_threshold
+        };
+
+        let should_flush = if let Some(threshold) = effective_threshold {
+            self.frame_tasks[frame_id].len() >= threshold
+        } else {
+            false
+        } || self.bloom.is_oversized(frame_id);
+
+        if should_flush {
+            let tasks = std::mem::take(&mut self.frame_tasks[frame_id]);
+            if !tasks.is_empty() {
+                flushed.push(Frame { tasks });
+                self.first_flushed = true;
+            }
+            self.bloom.clear(frame_id);
+        }
+
+        flushed
+    }
+
     /// Flush a specific frame, moving its tasks to `completed_frames`.
     fn flush_frame(&mut self, frame_id: usize) {
         let tasks = std::mem::take(&mut self.frame_tasks[frame_id]);
@@ -100,6 +207,11 @@ impl Framer {
             self.flush_frame(i);
         }
         self.completed_frames
+    }
+
+    /// Add a single SimResult as its own ExeTask (backwards-compatible).
+    pub fn add_returning_flushed(&mut self, sim_result: SimResult) -> Vec<Frame> {
+        self.add_task_returning_flushed(ExeTask::new(sim_result))
     }
 
     /// Number of currently active (non-empty) frames.
@@ -240,6 +352,64 @@ mod tests {
         assert!(!frames.is_empty());
         let total_tasks: usize = frames.iter().map(|f| f.tasks.len()).sum();
         assert_eq!(total_tasks, 2);
+    }
+
+    #[test]
+    fn test_framer_early_dispatch_on_conflict() {
+        // When a conflict causes a task to go to frame 1, frame 0 should be
+        // flushed immediately (early dispatch) even before reaching threshold.
+        let mut framer = Framer::with_early_dispatch(8, 64);
+
+        let hash = [0xAAu8; 10];
+        // tx 0: writes hash → frame 0
+        let flushed = framer.add_returning_flushed(make_sim(0, vec![], vec![hash]));
+        assert!(flushed.is_empty(), "no flush yet, only 1 task in frame 0");
+
+        // tx 1: reads hash → conflict, goes to frame 1 → triggers early flush of frame 0
+        let flushed = framer.add_returning_flushed(make_sim(1, vec![hash], vec![]));
+        assert_eq!(flushed.len(), 1, "frame 0 should be flushed on conflict");
+        assert_eq!(flushed[0].tasks.len(), 1);
+        assert_eq!(flushed[0].tasks[0].sim_results[0].original_index, 0);
+    }
+
+    #[test]
+    fn test_framer_first_flush_threshold() {
+        // First frame should flush at first_threshold (2), not the normal threshold (64).
+        let mut framer = Framer::with_early_dispatch(2, 64);
+
+        // Add 2 non-conflicting tasks (different hashes) → both go to frame 0
+        let flushed = framer.add_returning_flushed(make_sim(0, vec![], vec![[1u8; 10]]));
+        assert!(flushed.is_empty());
+        let flushed = framer.add_returning_flushed(make_sim(1, vec![], vec![[2u8; 10]]));
+        assert_eq!(flushed.len(), 1, "should flush at first_threshold=2");
+        assert_eq!(flushed[0].tasks.len(), 2);
+
+        // After first flush, normal threshold (64) applies
+        for i in 2..10 {
+            let flushed =
+                framer.add_returning_flushed(make_sim(i, vec![], vec![[(i as u8) + 10; 10]]));
+            assert!(flushed.is_empty(), "should not flush at {i}, normal threshold is 64");
+        }
+    }
+
+    #[test]
+    fn test_framer_early_dispatch_only_once() {
+        // After the first flush (conflict-triggered), subsequent frames use normal threshold.
+        let mut framer = Framer::with_early_dispatch(8, 64);
+
+        let hash = [0xBBu8; 10];
+        // tx 0 writes hash → frame 0
+        framer.add_returning_flushed(make_sim(0, vec![], vec![hash]));
+        // tx 1 reads hash → conflict → frame 0 flushed early
+        let flushed = framer.add_returning_flushed(make_sim(1, vec![hash], vec![]));
+        assert_eq!(flushed.len(), 1);
+
+        // Now add more non-conflicting tasks. They should NOT flush until reaching 64.
+        for i in 2..10 {
+            let flushed =
+                framer.add_returning_flushed(make_sim(i, vec![], vec![[(i as u8) + 20; 10]]));
+            assert!(flushed.is_empty(), "should not flush, first_flushed is true, threshold=64");
+        }
     }
 
     #[test]

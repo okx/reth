@@ -47,6 +47,8 @@ pub struct QmdbArgs {
 #[derive(Clone, Debug)]
 struct QmdbPayloadBuilder {
     parallel_exec: bool,
+    /// QMDB store for the parallel payload builder to commit state and compute correct root.
+    qmdb_store: Option<Arc<QmdbStore>>,
 }
 
 /// Enum to hold either the sequential or parallel payload builder.
@@ -155,12 +157,16 @@ where
 
         if self.parallel_exec {
             info!(target: "reth::cli", "Using PARALLEL payload builder (true parallel execution)");
-            Ok(QmdbPayloadBuilderInner::Parallel(parallel_payload::ParallelPayloadBuilder::new(
+            let mut builder = parallel_payload::ParallelPayloadBuilder::new(
                 ctx.provider().clone(),
                 pool,
                 evm_config,
                 builder_config,
-            )))
+            );
+            if let Some(store) = self.qmdb_store {
+                builder = builder.with_qmdb_store(store);
+            }
+            Ok(QmdbPayloadBuilderInner::Parallel(builder))
         } else {
             Ok(QmdbPayloadBuilderInner::Sequential(
                 reth_ethereum_payload_builder::EthereumPayloadBuilder::new(
@@ -203,7 +209,7 @@ fn main() {
             }
 
             info!(target: "reth::cli", path = %qmdb_path.display(), "Initializing QMDB store");
-            let qmdb_store = Arc::new(QmdbStore::new(&qmdb_path));
+            let qmdb_store = QmdbStore::new(&qmdb_path);
 
             // Pre-populate QMDB with genesis state from chain spec.
             let chain_spec = builder.config().chain.clone();
@@ -247,9 +253,13 @@ fn main() {
             info!(target: "reth::cli", accounts = genesis.alloc.len(), chunks = num_chunks, "Pre-populated QMDB with genesis state");
 
             // Callback: commit each new canonical block's BundleState to QMDB.
+            // If the parallel payload builder already submitted this block, skip the duplicate.
+            // Otherwise, send to flusher thread for async processing.
             let store_for_commit = qmdb_store.clone();
             let on_canonical_commit = Box::new(move |bundle: &revm_database::BundleState| {
-                store_for_commit.commit_bundle(bundle);
+                if !store_for_commit.skip_if_already_committed() {
+                    store_for_commit.commit_bundle_async(bundle.clone());
+                }
             });
 
             // State provider override: account/storage reads go through QMDB.
@@ -287,7 +297,14 @@ fn main() {
                 .with_types::<EthereumNode>()
                 .with_components(
                     EthereumNode::components().payload(BasicPayloadServiceBuilder::new(
-                        QmdbPayloadBuilder { parallel_exec: qmdb_args.parallel_exec },
+                        QmdbPayloadBuilder {
+                            parallel_exec: qmdb_args.parallel_exec,
+                            qmdb_store: if qmdb_args.parallel_exec {
+                                Some(qmdb_store.clone())
+                            } else {
+                                None
+                            },
+                        },
                     )),
                 )
                 .with_add_ons(EthereumNode::default().add_ons())

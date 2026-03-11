@@ -41,6 +41,7 @@ criterion.workspace = true
 tempfile.workspace = true
 rand.workspace = true
 revm = { workspace = true, features = ["std"] }
+xlayer-parallel-exec.workspace = true
 
 [[bench]]
 name = "pipeline"

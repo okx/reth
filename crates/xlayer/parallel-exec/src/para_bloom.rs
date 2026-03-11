@@ -75,12 +75,21 @@ impl BloomFilter {
 /// Maintains per-frame read and write bloom filters. Conflict detection follows
 /// the rule that read-read is safe, but any read-write or write-write overlap
 /// between frames signals a dependency.
+/// Maximum number of hashes per set before bloom false-positive rate degrades.
+/// With 2048-bit bloom and 5 hash functions, ~200 insertions gives ~50% fill rate.
+/// Beyond this, false positives increase rapidly, causing unnecessary frame separation.
+pub const SET_MAX_SIZE: usize = 200;
+
 #[derive(Debug)]
 pub struct ParaBloom {
     /// Read-set bloom filter for each frame.
     read_blooms: Vec<BloomFilter>,
     /// Write-set bloom filter for each frame.
     write_blooms: Vec<BloomFilter>,
+    /// Number of hashes inserted into each frame's read bloom.
+    read_counts: Vec<usize>,
+    /// Number of hashes inserted into each frame's write bloom.
+    write_counts: Vec<usize>,
 }
 
 impl ParaBloom {
@@ -89,6 +98,8 @@ impl ParaBloom {
         Self {
             read_blooms: vec![BloomFilter::new(); MAX_FRAMES],
             write_blooms: vec![BloomFilter::new(); MAX_FRAMES],
+            read_counts: vec![0; MAX_FRAMES],
+            write_counts: vec![0; MAX_FRAMES],
         }
     }
 
@@ -100,6 +111,8 @@ impl ParaBloom {
         for hash in writes {
             self.write_blooms[frame_id].insert(hash);
         }
+        self.read_counts[frame_id] += reads.len();
+        self.write_counts[frame_id] += writes.len();
     }
 
     /// Returns a bitmask where bit `i` is set if frame `i` conflicts with the given sets.
@@ -123,6 +136,14 @@ impl ParaBloom {
     pub fn clear(&mut self, frame_id: usize) {
         self.read_blooms[frame_id].clear();
         self.write_blooms[frame_id].clear();
+        self.read_counts[frame_id] = 0;
+        self.write_counts[frame_id] = 0;
+    }
+
+    /// Check if a frame's bloom filter sets have exceeded the safe size.
+    /// When exceeded, false-positive rate degrades and the frame should be flushed.
+    pub fn is_oversized(&self, frame_id: usize) -> bool {
+        self.read_counts[frame_id] > SET_MAX_SIZE || self.write_counts[frame_id] > SET_MAX_SIZE
     }
 
     /// Clear all frames.

@@ -214,6 +214,23 @@ impl Dashboard {
         self.all_done_index.load(Ordering::Acquire)
     }
 
+    /// Check if a task has NOT been dispatched (safeguard check).
+    ///
+    /// A task is "dispatched" when its ignite list has been consumed
+    /// (DISPATCH_MASK bit set on to_ignite). If not dispatched, the
+    /// safeguard can force-dispatch it to prevent deadlock.
+    pub fn not_dispatched(&self, idx: i32) -> bool {
+        let val = self.ignite_ll[idx as usize].to_ignite.load(Ordering::Acquire);
+        val & DISPATCH_MASK == 0
+    }
+
+    /// Atomically mark a task as dispatched. Returns true if this thread
+    /// successfully set the dispatch bit (won the race).
+    pub fn set_dispatched(&self, idx: i32) -> bool {
+        let old = self.ignite_ll[idx as usize].to_ignite.fetch_or(DISPATCH_MASK, Ordering::AcqRel);
+        old & DISPATCH_MASK == 0
+    }
+
     /// Reset the dashboard for a new block.
     pub fn reset(&self, max_tasks: usize) {
         self.all_done_index.store(-1, Ordering::Release);

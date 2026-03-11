@@ -1,19 +1,25 @@
 //! Parallel transaction execution using revm.
 //!
 //! Provides functions for executing individual transactions in a parallel
-//! context, where each executor thread has its own CacheDB wrapping a
-//! shared concurrent state cache.
+//! context. Uses `WrapDatabaseRef` instead of `CacheDB` to avoid redundant
+//! caching — revm's `JournaledState` already caches per-transaction reads,
+//! and the `ParallelStateCache` layer provides cross-transaction caching.
 
 use alloy_evm::{precompiles::PrecompilesMap, Evm, EvmEnv};
 use revm::{
     context::{BlockEnv, CfgEnv, Context, TxEnv},
-    database::CacheDB,
+    database::WrapDatabaseRef,
     handler::EthPrecompiles,
     inspector::NoOpInspector,
     MainBuilder, MainContext,
 };
 
 pub use alloy_evm::EthEvm;
+
+/// Cached precompiles map — built once and reused for all executions.
+/// Avoids the overhead of recreating `PrecompilesMap::from_static(...)` per transaction.
+pub static PRECOMPILES: std::sync::LazyLock<PrecompilesMap> =
+    std::sync::LazyLock::new(|| PrecompilesMap::from_static(EthPrecompiles::default().precompiles));
 
 /// Result of executing a single transaction in parallel.
 #[derive(Debug)]
@@ -51,20 +57,15 @@ where
     DB: revm::Database + std::fmt::Debug,
     DB::Error: std::fmt::Debug + std::error::Error + Send + Sync + 'static,
 {
-    // Disable nonce check: in parallel execution, same-sender transactions
-    // execute against CachedDbRef which provides updated nonces from predecessors
-    // via the Dashboard cascade. The tx pool already guarantees nonce ordering.
     let mut cfg = cfg_env.clone();
     cfg.disable_nonce_check = true;
 
-    let evm_env = EvmEnv { cfg_env: cfg, block_env: block_env.clone() };
-
     let inner = Context::mainnet()
         .with_db(db)
-        .with_cfg(evm_env.cfg_env)
-        .with_block(evm_env.block_env)
+        .with_cfg(cfg)
+        .with_block(block_env.clone())
         .build_mainnet_with_inspector(NoOpInspector {})
-        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::default().precompiles));
+        .with_precompiles(PRECOMPILES.clone());
 
     let mut evm = EthEvm::new(inner, false);
 
@@ -98,10 +99,11 @@ where
     }
 }
 
-/// Execute a transaction with a DatabaseRef (wraps in CacheDB automatically).
+/// Execute a transaction with a DatabaseRef.
 ///
-/// Convenience function that creates a CacheDB wrapper around the DatabaseRef.
-/// Each call gets its own CacheDB, ensuring no cross-transaction cache pollution.
+/// Uses `WrapDatabaseRef` to adapt DatabaseRef → Database without the overhead
+/// of CacheDB's intermediate HashMap. revm's JournaledState already caches
+/// per-transaction reads, and ParallelStateCache handles cross-tx caching.
 pub fn execute_tx_with_ref<DB>(
     db: &DB,
     block_env: &BlockEnv,
@@ -112,8 +114,68 @@ where
     DB: revm::DatabaseRef + std::fmt::Debug,
     DB::Error: std::fmt::Debug + std::error::Error + Send + Sync + 'static,
 {
-    let cache_db = CacheDB::new(db);
-    execute_tx(cache_db, block_env, cfg_env, tx_env)
+    let wrapped = WrapDatabaseRef(db);
+    execute_tx(wrapped, block_env, cfg_env, tx_env)
+}
+
+/// Execute multiple transactions with a single EVM instance (batched).
+///
+/// Creates one EVM and reuses it for all txs in the batch. This amortizes
+/// EVM creation overhead across multiple transactions, matching fafo's
+/// approach where each task (4 txs) shares one EVM session.
+pub fn execute_batch_with_ref<DB>(
+    db: &DB,
+    block_env: &BlockEnv,
+    cfg_env: &CfgEnv,
+    txs: impl IntoIterator<Item = TxEnv>,
+) -> Vec<ParallelTxResult>
+where
+    DB: revm::DatabaseRef + std::fmt::Debug,
+    DB::Error: std::fmt::Debug + std::error::Error + Send + Sync + 'static,
+{
+    let wrapped = WrapDatabaseRef(db);
+
+    let mut cfg = cfg_env.clone();
+    cfg.disable_nonce_check = true;
+
+    let inner = Context::mainnet()
+        .with_db(wrapped)
+        .with_cfg(cfg)
+        .with_block(block_env.clone())
+        .build_mainnet_with_inspector(NoOpInspector {})
+        .with_precompiles(PRECOMPILES.clone());
+
+    let mut evm = EthEvm::new(inner, false);
+    let mut results = Vec::new();
+
+    for tx_env in txs {
+        let result = match evm.transact(tx_env) {
+            Ok(result_and_state) => {
+                let gas_used = result_and_state.result.gas_used();
+                let success = result_and_state.result.is_success();
+                ParallelTxResult {
+                    result: result_and_state.result,
+                    state: result_and_state.state,
+                    gas_used,
+                    success,
+                }
+            }
+            Err(err) => {
+                tracing::warn!(target: "xlayer::parallel::execute", ?err, "batch tx failed");
+                ParallelTxResult {
+                    result: revm::context::result::ExecutionResult::Halt {
+                        reason: revm::context::result::HaltReason::NotActivated,
+                        gas_used: 0,
+                    },
+                    state: Default::default(),
+                    gas_used: 0,
+                    success: false,
+                }
+            }
+        };
+        results.push(result);
+    }
+    results
 }
 
 #[cfg(test)]

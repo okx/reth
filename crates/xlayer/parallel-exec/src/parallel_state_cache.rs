@@ -103,6 +103,35 @@ impl ParallelStateCache {
     }
 
     // -----------------------------------------------------------------------
+    // Warmup: insert-if-absent (used by WarmingDbRef during simulation)
+    // -----------------------------------------------------------------------
+    // These methods only insert if the key is NOT already present.
+    // This is critical for safety: during the async pipeline, simulation and
+    // execution overlap. If simulation wrote base state unconditionally, it
+    // could overwrite execution results with stale data. "Insert if absent"
+    // ensures execution's writes always take priority.
+
+    /// Insert account info only if the address is not already cached.
+    pub fn insert_account_if_absent(&self, address: Address, info: Option<AccountInfo>) {
+        self.accounts.entry(address).or_insert(info);
+    }
+
+    /// Insert storage value only if the (address, slot) is not already cached.
+    pub fn insert_storage_if_absent(&self, address: Address, slot: U256, value: U256) {
+        self.storage.entry((address, slot)).or_insert(value);
+    }
+
+    /// Insert bytecode only if the code_hash is not already cached.
+    pub fn insert_bytecode_if_absent(&self, hash: B256, code: revm_bytecode::Bytecode) {
+        self.bytecodes.entry(hash).or_insert(code);
+    }
+
+    /// Insert block hash only if the block number is not already cached.
+    pub fn insert_block_hash_if_absent(&self, number: u64, hash: B256) {
+        self.block_hashes.entry(number).or_insert(hash);
+    }
+
+    // -----------------------------------------------------------------------
     // Batch apply (from revm execution results)
     // -----------------------------------------------------------------------
 
