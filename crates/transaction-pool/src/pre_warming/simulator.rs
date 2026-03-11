@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::cell::RefCell;
 use parking_lot::Mutex;
-use rustc_hash::FxHashSet;
+use ahash::AHashSet;
 use std::sync::LazyLock;
 
 
@@ -42,7 +42,7 @@ use reth_evm as _;
 
 /// Pre-computed set of known selectors for O(1) lookup
 /// Uses FxHashSet for faster hashing of small fixed-size keys
-static KNOWN_SELECTORS: LazyLock<FxHashSet<[u8; 4]>> = LazyLock::new(|| {
+static KNOWN_SELECTORS: LazyLock<AHashSet<[u8; 4]>> = LazyLock::new(|| {
     [
         // ERC20 Core
         [0xa9, 0x05, 0x9c, 0xbb], // transfer
@@ -376,7 +376,8 @@ impl Simulator {
     where
         Tx: alloy_consensus::Transaction,
     {
-        let mut keys = ExtractedKeys::new();
+        // Pre-allocate for typical transaction (1 tx worth of capacity)
+        let mut keys = ExtractedKeys::with_capacity_for_txs(1);
 
         // Always track sender
         keys.add_account(sender);
@@ -1084,8 +1085,10 @@ impl TrackingDatabaseMut {
     }
 
     /// Extract all keys that were accessed during simulation
+    /// Takes ownership of the keys to avoid cloning
+    #[inline]
     fn extract_keys(&self) -> ExtractedKeys {
-        self.accessed_keys.borrow().clone()
+        self.accessed_keys.take()
     }
 }
 

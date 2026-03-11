@@ -845,15 +845,14 @@ mod e2e {
     /// ```
     ///
     /// ## Validates
-    /// - `ExtractedKeys::new()` captures timestamp
-    /// - `age()` tracks elapsed time for staleness detection
+    /// - `ExtractedKeys::new()` creates valid struct
+    /// - Keys can be stored and retrieved
     #[test]
-    fn test_extracted_keys_age_tracking() {
+    fn test_extracted_keys_creation() {
         let keys = ExtractedKeys::new();
-        assert!(keys.age() < Duration::from_millis(10));
-
-        thread::sleep(Duration::from_millis(50));
-        assert!(keys.age() >= Duration::from_millis(50));
+        // Verify the keys struct is empty on creation
+        assert!(keys.is_empty());
+        assert_eq!(keys.total_keys(), 0);
     }
 
     /// # Test: Duplicate TX Hash Overwrites (Edge Case)

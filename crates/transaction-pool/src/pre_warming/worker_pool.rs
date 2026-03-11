@@ -1011,8 +1011,10 @@ fn simulate_transaction<T: PoolTransaction>(
 ///
 /// Used when real simulation fails (timeout, panic, error).
 /// Better than nothing - at least sender/recipient get prefetched.
+#[inline]
 fn dummy_simulate<T: PoolTransaction>(tx: &T) -> ExtractedKeys {
-    let mut keys = ExtractedKeys::new();
+    // Use minimal capacity since we only add 2 accounts max
+    let mut keys = ExtractedKeys::with_capacity_for_txs(1);
     keys.add_account(tx.sender());
     if let Some(to) = tx.to() {
         keys.add_account(to);
