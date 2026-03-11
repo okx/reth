@@ -320,6 +320,7 @@
 use crate::pre_warming::{ExtractedKeys, PreWarmedCache, PreWarmingConfig, SimulationRequest, Simulator, SnapshotState};
 use crate::pre_warming::metrics::PreWarmingMetrics;
 use crate::PoolTransaction;
+use alloy_primitives::TxHash;
 use parking_lot::RwLock;
 use reth_chainspec::ChainSpec;
 use std::sync::Arc;
@@ -820,6 +821,12 @@ async fn worker_loop<T>(
     const BASE_SLEEP_MICROS: u64 = 100;
     const MAX_SLEEP_MICROS: u64 = 10_000; // Cap at 10ms
 
+    // OPTIMIZATION: Batch cache writes to reduce DashMap lock acquisitions
+    // Instead of writing each key individually, we accumulate and flush in batches
+    const BATCH_SIZE: usize = 16;
+    let mut write_batch: Vec<(TxHash, ExtractedKeys)> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch_keys_count: usize = 0;
+
     loop {
         // Try to receive from channel (non-blocking)
         // CRITICAL: We must NOT hold the lock while waiting for items!
@@ -833,18 +840,6 @@ async fn worker_loop<T>(
                 // Reset empty counter on successful receive
                 consecutive_empty = 0;
 
-                // Log if request is old
-                let age = req.age();
-                if age > config.simulation_timeout {
-                    debug!(
-                        target: "txpool::pre_warming",
-                        worker_id,
-                        tx_hash = ?req.tx_hash,
-                        age_ms = age.as_millis(),
-                        "Processing delayed simulation request"
-                    );
-                }
-
                 // OPTIMIZATION: Skip if TX already simulated (avoid duplicate work)
                 if cache.contains_tx(&req.tx_hash) {
                     tracing::trace!(
@@ -856,6 +851,7 @@ async fn worker_loop<T>(
                     continue;
                 }
 
+                let age = req.age();
                 tracing::trace!(
                     target: "txpool::pre_warming",
                     worker_id,
@@ -933,6 +929,7 @@ async fn worker_loop<T>(
                 let storage_count = keys.storage_slots.len();
                 let code_count = keys.code_hashes.len();
 
+
                 // Log simulation timing at INFO level with full details for per-TX tracking
                 // Format: TX_TIMING|SIMULATION|<tx_hash>|<duration_us>|<keys_count>
                 // Use trace level to avoid per-TX logging overhead in production
@@ -949,14 +946,30 @@ async fn worker_loop<T>(
                     "TX_TIMING: Simulation complete"
                 );
 
-                cache.store_tx_keys(req.tx_hash, keys);
+                // OPTIMIZATION: Accumulate in batch instead of individual writes
+                // This reduces DashMap lock acquisitions by ~16x
+                write_batch.push((req.tx_hash, keys));
+                batch_keys_count += keys_count;
 
-                // Update cache metrics
-                metrics.cache_entries.increment(1);
-                metrics.cache_keys_total.increment(keys_count as f64);
+                // Flush batch when full
+                if write_batch.len() >= BATCH_SIZE {
+                    cache.store_tx_keys_batch(write_batch.drain(..));
+                    metrics.cache_entries.increment(BATCH_SIZE as f64);
+                    metrics.cache_keys_total.increment(batch_keys_count as f64);
+                    batch_keys_count = 0;
+                }
             }
             Err(mpsc::error::TryRecvError::Empty) => {
-                // Channel empty - adaptive sleep
+                // Channel empty - flush any pending batch before sleeping
+                if !write_batch.is_empty() {
+                    let batch_len = write_batch.len();
+                    cache.store_tx_keys_batch(write_batch.drain(..));
+                    metrics.cache_entries.increment(batch_len as f64);
+                    metrics.cache_keys_total.increment(batch_keys_count as f64);
+                    batch_keys_count = 0;
+                }
+
+                // Adaptive sleep
                 consecutive_empty = consecutive_empty.saturating_add(1);
 
                 let sleep_micros = if consecutive_empty > MAX_CONSECUTIVE_EMPTY {
