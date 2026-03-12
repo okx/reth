@@ -1,0 +1,802 @@
+[
+  {
+    "block": 1,
+    "version": 1,
+    "store_hashes": {
+      "bank": "ac53e0aeebff22f6663d6ec96809ec99667b596520fcee9e29c7e65d43e021ea",
+      "staking": "6502b72c69015598794f5dba40ccb96106783794d11d9926437d4b5ecd6964a5"
+    }
+  },
+  {
+    "block": 2,
+    "version": 2,
+    "store_hashes": {
+      "bank": "1eb34e7f41de054eb3d05167e965ec5cb49c822cec63f74d0728556f042d8bec",
+      "staking": "efb2fc786f9e162d0e528f15d5a98313c7f21e7556d1a3b53e3e9e8ec886554e"
+    }
+  },
+  {
+    "block": 3,
+    "version": 3,
+    "store_hashes": {
+      "bank": "0b6a66c2706a184c1096dc3b78345dd19faee08cbabd3ea300d7455036f94377",
+      "staking": "34205dc0e35123e68a9d33c41ffa1e87c4125d5359e46d314e4f87dca3a8c1a4"
+    }
+  },
+  {
+    "block": 4,
+    "version": 4,
+    "store_hashes": {
+      "bank": "acdbc686869c2a2fc58e2e6141821e5e9816fe0d66f6cc32d0cd763a1b0c9533",
+      "staking": "97e17e25374b51ae1c9c9e27d27f120668ed3027fc7e4ed64cdcc855fac48a72"
+    }
+  },
+  {
+    "block": 5,
+    "version": 5,
+    "store_hashes": {
+      "bank": "430b183a692bc692e21ef2e4c0f05ae7d2f59deda14c195cf1169897c4e6559b",
+      "staking": "ad4d9225c1d06cc27a303e9cfee822abb63136abfd0a81204f2dc717dd4ea0cd"
+    }
+  },
+  {
+    "block": 6,
+    "version": 6,
+    "store_hashes": {
+      "bank": "1abc4063fdd28544ee8be522ab3ef97ed6cf03244db5c215e98198262248bfd7",
+      "staking": "c22fbdf644b13f37fec0db8accc11a46c5e7dbbb252a952c53a5e61558ab53a8"
+    }
+  },
+  {
+    "block": 7,
+    "version": 7,
+    "store_hashes": {
+      "bank": "808b077169016031cdc49d069c8f0f38f098b65942d3e36e4e94f5e31188980d",
+      "staking": "d1654b04f4e68a8fa1a6ca6d2d3cc2616fc93a5082cadc8703d850a2585072fa"
+    }
+  },
+  {
+    "block": 8,
+    "version": 8,
+    "store_hashes": {
+      "bank": "906c14cbd2cbe2456d7459e69febb066c7f6e28627b1daa1a4480f79cd3ca7a4",
+      "staking": "3e58e8466451f8d5dcd44c8179c3a4f1d2ae86851bee879c878693b3c04a1320"
+    }
+  },
+  {
+    "block": 9,
+    "version": 9,
+    "store_hashes": {
+      "bank": "d41998d9a3ee000bc6b24230f44719cef4975fb50f806f8039287a0c894141b7",
+      "staking": "c2017ab40844a136e799c91df235b69d2e769a3a4ab30f641a6d63b99d5dab5d"
+    }
+  },
+  {
+    "block": 10,
+    "version": 10,
+    "store_hashes": {
+      "bank": "deff2ca7cd0b31629019bdd3ef551344f674bc378d5bf3331305f3e202c59c05",
+      "staking": "99d79d6c100f35c3b426bdcfc22579eff4ad960fbcd0afc400704102f440d619"
+    }
+  },
+  {
+    "block": 11,
+    "version": 11,
+    "store_hashes": {
+      "bank": "9cc204cf926b5b4fdfece46bfcbe44adbef45d20be88feef414d74bbee0afbc3",
+      "staking": "26b02a0a775cf5c67854ffaf8e68a986ca0401e52fd7116d7f1d21be1d046653"
+    }
+  },
+  {
+    "block": 12,
+    "version": 12,
+    "store_hashes": {
+      "bank": "887ec5cd154ee7acd442950c9c2ea9f212e822d288393f90e9987a4b35a62fd2",
+      "staking": "64e0b5957892bb468b53089c078d1c5d0c9df9783bc0de5bab29505f45308f12"
+    }
+  },
+  {
+    "block": 13,
+    "version": 13,
+    "store_hashes": {
+      "bank": "f4fd8ecac5afecb0eb5b33ad79a5bbc19ea5888aa38a95feb5f1d2ba6f1ff2e7",
+      "staking": "0c7d2a4acd65f417b1b59306f264c1e8161c6f019c1f60060b49204dbfeb3d6e"
+    }
+  },
+  {
+    "block": 14,
+    "version": 14,
+    "store_hashes": {
+      "bank": "828cb23b6d80b19009a9822dbdbf4aa49a15fc8cdac12345aca43dfd762a5f33",
+      "staking": "b429a325f070c7a29d980d38169b280ce2fc73e3a07996d67de7a05bba0309dc"
+    }
+  },
+  {
+    "block": 15,
+    "version": 15,
+    "store_hashes": {
+      "bank": "8620c48cd30f6df60ac068e4dad1a4898141348891087de991939aa735182128",
+      "staking": "bfa9e02c9e1b04964a5335d7feb041a8115901573f782fabd16ea74859c2e8c7"
+    }
+  },
+  {
+    "block": 16,
+    "version": 16,
+    "store_hashes": {
+      "bank": "71c75b383b0b7a9e541bbbdb9d6859d42ab9f45cb4ed3425b27255c95e2d901f",
+      "staking": "77a980d36938d27f9aeedf183ce179bdc430b165107c84f29e4f248957b5c99f"
+    }
+  },
+  {
+    "block": 17,
+    "version": 17,
+    "store_hashes": {
+      "bank": "3a24894f70daaa3aa9e3f89e283953822ca27e0c2e6fad04fb5e4f7f4227094a",
+      "staking": "a02aa354c7fcec8ec4134b1bd7ef947121a328cd1beee6068d13d9201f1eaa8a"
+    }
+  },
+  {
+    "block": 18,
+    "version": 18,
+    "store_hashes": {
+      "bank": "388bcd9e22af7e5d4557049e2ffea25c73dd8d71f145c7156abf3400547d3d67",
+      "staking": "661c5b272413d9453cc4efd48f4cc14e59498dfb8b30c18f8bf50e227eccc8c6"
+    }
+  },
+  {
+    "block": 19,
+    "version": 19,
+    "store_hashes": {
+      "bank": "6614372d14886e973af5dac697239632934a1ed64798680369d9a9a36a9f3e9d",
+      "staking": "c8e8abea9f24042a37512752795545870f2feeb5758bc70cf0cb630120cc1c86"
+    }
+  },
+  {
+    "block": 20,
+    "version": 20,
+    "store_hashes": {
+      "bank": "2b46437947fa2ae9c07f88aa69bcd998838a290066daa1c306e40bc56277eb09",
+      "staking": "d6964c010253e19e046e505472f81766904be6cf683ee589c93bc792635897bd"
+    }
+  },
+  {
+    "block": 21,
+    "version": 21,
+    "store_hashes": {
+      "bank": "cadb4e58fd163691a89e05f13511871059d1a413eb1b4e47c68b7696d9e1dec9",
+      "staking": "5020617140b25b4da238c4da87e578e31b4ccc06e96d33bda7e2e9f0ef50f9b4"
+    }
+  },
+  {
+    "block": 22,
+    "version": 22,
+    "store_hashes": {
+      "bank": "ab281294129b23e328ff4bcd342b2d8e6c0211e29502e1d934a2e4af22ed1db2",
+      "staking": "826abf334608cb73c5889430e8f1baca0bb111717d8a928bf64e66be3bdc0cfb"
+    }
+  },
+  {
+    "block": 23,
+    "version": 23,
+    "store_hashes": {
+      "bank": "efb4169188864cf66b6c429a504e8b553179975f8c9360217bd57d533ddd9fee",
+      "staking": "1756075a7be611552e0badcb32b5953fc2a51b33056f6a3797edaf98a794f900"
+    }
+  },
+  {
+    "block": 24,
+    "version": 24,
+    "store_hashes": {
+      "bank": "3fecfdf3a963fbf5b97f52ca43e9f45335cbbb18e0c6db3705adf5484f886dd4",
+      "staking": "c006eead5efc1817f8d0f1e536df6afacbee3820b413ad74e91ac53f63deadd3"
+    }
+  },
+  {
+    "block": 25,
+    "version": 25,
+    "store_hashes": {
+      "bank": "814b7b4652e83753258104dba5988b591986e524205d93989f44cf1389c0e14e",
+      "staking": "4cd74df256d0c69454d714059ce4273a1d183939128839db90d26ce36551ae2a"
+    }
+  },
+  {
+    "block": 26,
+    "version": 26,
+    "store_hashes": {
+      "bank": "b5a77379baf1052c270aefd180a2a3307515e2b86d36cddedc542493a38b5133",
+      "staking": "47dac9c7d05038927919d73c8ed5791886e383959d60b08877f67ab99b67c130"
+    }
+  },
+  {
+    "block": 27,
+    "version": 27,
+    "store_hashes": {
+      "bank": "9d6c62cf7a13188819b6247dce0877dcf14aab2c7c810f8c78ef46c8cd0cdd6f",
+      "staking": "d69eee2c9b339d62cac6ba091a7d7e2db629e723b2e04956680d40c92f27244a"
+    }
+  },
+  {
+    "block": 28,
+    "version": 28,
+    "store_hashes": {
+      "bank": "04b568aedc01388dc9356ebda0913d4d97a26c0fc893cefc963325e3d34e951f",
+      "staking": "19e134b97007f44bf9cb2627c9402d620f98ec5f1e20055744b750356c19487a"
+    }
+  },
+  {
+    "block": 29,
+    "version": 29,
+    "store_hashes": {
+      "bank": "1eec2949387b118d40d439678cad8ae487c6ea6d9f3a5e5ae81c8c356aea93e2",
+      "staking": "97c27d4a096b0a04cd54cb80e9014ddcc84d9112f87af2bb94488ef8af7607b1"
+    }
+  },
+  {
+    "block": 30,
+    "version": 30,
+    "store_hashes": {
+      "bank": "3b3c784eca75055e5285e2f49a74b87922b858e27803f85c8d96183655763226",
+      "staking": "9fb863a3947df6ac989519369402e0430951d8d59c9e34bb02e3caf11048d45c"
+    }
+  },
+  {
+    "block": 31,
+    "version": 31,
+    "store_hashes": {
+      "bank": "a348d469ee97bc1b0fd209096f704a0fa8a67e7f5043213568d81b123b32ac06",
+      "staking": "baac2872e6365587e2d8f614d40eb46faa40957485dad726e09b9da5d3ce1aa0"
+    }
+  },
+  {
+    "block": 32,
+    "version": 32,
+    "store_hashes": {
+      "bank": "47a9184867e79f30615728b458aad85dc6d2131a17ab93c5501ea968549b6c1b",
+      "staking": "3ce551017befad4e5400e568e6602c5de74c55356ab960cab45f94d837f0b781"
+    }
+  },
+  {
+    "block": 33,
+    "version": 33,
+    "store_hashes": {
+      "bank": "ab81eb21a9d33c5b951ccdd24c8a25797fc441974de53e50eb16481f1f84b7ca",
+      "staking": "49026e0527d2a0773afb6c34a7248bcab2a2f541f951160c3b325b2800397b05"
+    }
+  },
+  {
+    "block": 34,
+    "version": 34,
+    "store_hashes": {
+      "bank": "f1df9b9b2bb40a22266dcb03cf419d46aeda16d4fcda10a491c5f2433ab84e13",
+      "staking": "9d5e67ab718ba9d908cd828a9957bb52225a4e9e8839041d68fa30b4c57f9829"
+    }
+  },
+  {
+    "block": 35,
+    "version": 35,
+    "store_hashes": {
+      "bank": "6ba7ab68ca7d37dbbe786b9097e38564898e97027173982443b670e574bae140",
+      "staking": "9e3fe036a96b302c895e618a70f126830273e9466431c376bfd3edaf160a0995"
+    }
+  },
+  {
+    "block": 36,
+    "version": 36,
+    "store_hashes": {
+      "bank": "687fd44143b9b6f6b8e0e766e8b6588befc00be83f90e682d69253257fdd214b",
+      "staking": "86c796fed9e564bd2c1e4cff8d86454c7a661b550ea1cb020483f69a0ee60c76"
+    }
+  },
+  {
+    "block": 37,
+    "version": 37,
+    "store_hashes": {
+      "bank": "8bc9a784c0f9c2cc72b9430faa518055145780518fc20cf9b95017cc909a27f7",
+      "staking": "58ca60386861dc500f441e097b2d897c57092eb8c1faa628b03742cb29e60b03"
+    }
+  },
+  {
+    "block": 38,
+    "version": 38,
+    "store_hashes": {
+      "bank": "7207c04e2a2f7ad87c7d94eaf67705731ec77931257cca174144536898ecf153",
+      "staking": "07cfe243cfae90daba0417f39d8b5786080796f8fa454a0b377912a551cc6b66"
+    }
+  },
+  {
+    "block": 39,
+    "version": 39,
+    "store_hashes": {
+      "bank": "bc02b6a91e8ae6bae449753370373c01c1ae75dd768d546032cc6dc631c2b015",
+      "staking": "1267c5dd46f3cdd725e7bb3d1f8aa0ca6f4392f7aa21f7c354162070b59ae601"
+    }
+  },
+  {
+    "block": 40,
+    "version": 40,
+    "store_hashes": {
+      "bank": "d1f0c05040682c7954d82d4d774c5d1c1959095316db7dc21512b2ced50ec519",
+      "staking": "c856385e0a048be6a27ce6f5ae724aab13e4c2642b854607e59283b4d9990513"
+    }
+  },
+  {
+    "block": 41,
+    "version": 41,
+    "store_hashes": {
+      "bank": "7172157f41880ea6b38cb7a4185094bd8bb291c38f54b253e31242105bff7714",
+      "staking": "afef8f941b318955f80793ced4cd746c33630a993c9b53e3cc5780d3daab10fd"
+    }
+  },
+  {
+    "block": 42,
+    "version": 42,
+    "store_hashes": {
+      "bank": "4a962a22c24cc454ac29bcf0840098f1122325c0582af010e3c73b8317d15f2a",
+      "staking": "3d3a0a3cd5e1544420136f41866ce40c4de4ef1459f8010d24ed2cafc14bc500"
+    }
+  },
+  {
+    "block": 43,
+    "version": 43,
+    "store_hashes": {
+      "bank": "cf81c49e1fc941e8678001d11f068a42b672d8dddf322eda12d3ba426dbb7c07",
+      "staking": "c626ae644b3e76a4d923418a2056204c6a0b9dfefd5bb2b882c3cc29b6befb6c"
+    }
+  },
+  {
+    "block": 44,
+    "version": 44,
+    "store_hashes": {
+      "bank": "71acd5b418530e0cb55e2973fb7746ab2b6352ed98ab1055cd0f5a10ff605af0",
+      "staking": "739df21186f8500d918d67981a80a032f3c1b5405ac33b737b02bfdd937c4a04"
+    }
+  },
+  {
+    "block": 45,
+    "version": 45,
+    "store_hashes": {
+      "bank": "014b88f0f65eeae5c2a68dc40611e6d407b410f790e44bde8c5df2d737317837",
+      "staking": "e57fbbe1fd313de0b5f7dda6a3d7e9db37ed783b9e23af0eefe9c7f312fac45e"
+    }
+  },
+  {
+    "block": 46,
+    "version": 46,
+    "store_hashes": {
+      "bank": "8a11bbb6d93c61f28d11487a51e4dced0b4cb6f6763703005eeea4f1fcb43ad1",
+      "staking": "f0129656ea84e1b06054d45093553544dcb0d4823a49ca4ef91ad95c6a39b27e"
+    }
+  },
+  {
+    "block": 47,
+    "version": 47,
+    "store_hashes": {
+      "bank": "a7039a4d9076a9a070b2cb8e0015c6e8ec88ae6d21876acaf9be3e80f1672f93",
+      "staking": "13509f3ce05119f9f0885ae78429dd09eb042bb59953d24d332e9123e3d3ede2"
+    }
+  },
+  {
+    "block": 48,
+    "version": 48,
+    "store_hashes": {
+      "bank": "e915ea4563fc4d7aaee4df0bc678e2728db174d07a2c339e1387767ca287d6b3",
+      "staking": "e01ab0ecb472a9e6c0285b3349996ff7c5d03f83d2b899d943efac80e564c224"
+    }
+  },
+  {
+    "block": 49,
+    "version": 49,
+    "store_hashes": {
+      "bank": "91e704fe64e09ba56c87db559a3d8813443797bde8047b0a76320c7b32dd38e3",
+      "staking": "52a04289de73e20842006adfffb2ff2158c8f99f577e2973d987148b136325b0"
+    }
+  },
+  {
+    "block": 50,
+    "version": 50,
+    "store_hashes": {
+      "bank": "c96069b10706f7e5d9cbf2f434e039fd60d6ffde1abf8e767db597ced38c0067",
+      "staking": "5770dd4f5c91cb8fac3f38e63176f0451cec680670061abc375322febcb2878c"
+    }
+  },
+  {
+    "block": 51,
+    "version": 51,
+    "store_hashes": {
+      "bank": "b0ea517f41c81e87efd9c3ab41d63027d8c42d15116c66e1ec09b0fcadf481d8",
+      "staking": "f59bef392c0a0311602ef12ca762a598bee7b88167619dabec6fe3ec95775497"
+    }
+  },
+  {
+    "block": 52,
+    "version": 52,
+    "store_hashes": {
+      "bank": "7005e8f7371cfe38e3661d1ba726d990b64a266cda24e647e10bb62abcf885f3",
+      "staking": "27f64323b1b90173b4e66a36360024e168f4c38520ce7bb8045371745ce5eca0"
+    }
+  },
+  {
+    "block": 53,
+    "version": 53,
+    "store_hashes": {
+      "bank": "999b93657d5bbfc02e086eccbff301225f9f5111137d7daf905be145f30121c0",
+      "staking": "d9b0e3a0a0aee564ad079ce11df2319a5226d90e7d5d23c24fe096bdd645549c"
+    }
+  },
+  {
+    "block": 54,
+    "version": 54,
+    "store_hashes": {
+      "bank": "b6aa0493952045c8c00cde47a958f9cc6fd40a2228346718ad1094585140b05e",
+      "staking": "2dba03c2c0cf27fae54b5b1a4eb0d0bf8ea3936f65eab6e43418cf1f68be5c13"
+    }
+  },
+  {
+    "block": 55,
+    "version": 55,
+    "store_hashes": {
+      "bank": "6337bbaf637c6aeaecfa28000d3929e01f57f0bedf36b33287f22a75d5dffb10",
+      "staking": "96acb1be1299c2b41075c5af51b07ef0cea795ee6a85add2fcd639fc96564002"
+    }
+  },
+  {
+    "block": 56,
+    "version": 56,
+    "store_hashes": {
+      "bank": "1d57bdf6bc97a1d984c818bb9bb4c668f775e58693bd49153019be2b98b6de2a",
+      "staking": "5d770074fd624f07471457266174aff33ed444d2b88d87eb31c780ce20713098"
+    }
+  },
+  {
+    "block": 57,
+    "version": 57,
+    "store_hashes": {
+      "bank": "f2d61a22839693fa3afade4aaf9cb58ac23aaae053bcb839eab247560f960210",
+      "staking": "e13bd24f8024b98843ad3d9bdc407da7098518f08d53f1a4f069832107faf1a7"
+    }
+  },
+  {
+    "block": 58,
+    "version": 58,
+    "store_hashes": {
+      "bank": "2aae318bfec575cd4d65dba840e14abdafd293be4fe081f813116dd9b087ea4e",
+      "staking": "b64b077b94d0e50694cbf23b9ecfa148621545829bf09355a40becb37166a54f"
+    }
+  },
+  {
+    "block": 59,
+    "version": 59,
+    "store_hashes": {
+      "bank": "dc221663d2eac754805e42fba7a6f3fa88c411ee0ee007d03a6f1df5232cee11",
+      "staking": "30f0c0c49d0ac1a0a9738d8650bac3d95f28cc986b08a30652b8f52b62418f1c"
+    }
+  },
+  {
+    "block": 60,
+    "version": 60,
+    "store_hashes": {
+      "bank": "26f7fdd442a725b051329e9cdd2b58baea2a478409a602d4113816534400f6ce",
+      "staking": "9170585af52e3f454f92ac4a95888628119a176ded242561487c8d2d25cd4fa3"
+    }
+  },
+  {
+    "block": 61,
+    "version": 61,
+    "store_hashes": {
+      "bank": "279304adc311287e14b9ca2ca086c5fa81f3dec4712914c742b73f0940095eff",
+      "staking": "fe1e154f8c79de16d9a6b24d27d1fd856cb354b4091cec7d3ab8f1c1f0f93632"
+    }
+  },
+  {
+    "block": 62,
+    "version": 62,
+    "store_hashes": {
+      "bank": "e23d312207688124a32aed0a631ec0742590041d4854a548f6bbb8fa13533062",
+      "staking": "fb6320ae9c5680bf0da6eeeebde1421d58d18be1e03b0a67453b828c0592df4c"
+    }
+  },
+  {
+    "block": 63,
+    "version": 63,
+    "store_hashes": {
+      "bank": "da7bf64354464295257598ff532e65d36af9df03a0013a9662dd733c774e366a",
+      "staking": "a611ca60f2b4737ccf75f14530798d583ae705ea84f1bb71653a83ab4ee11c59"
+    }
+  },
+  {
+    "block": 64,
+    "version": 64,
+    "store_hashes": {
+      "bank": "8a4f9513b2fa5b749451b84d4d7c335020d769af7b9f990ad1201d7aa4523ac9",
+      "staking": "e8c4fef19f927351572f9c2779f734f9a5ff25c0ade460ed68efc4e0b7d9a84b"
+    }
+  },
+  {
+    "block": 65,
+    "version": 65,
+    "store_hashes": {
+      "bank": "a8fbde0cdd0502136f6672ba56a7acda683de605ebde5d9dbd840767465e45cf",
+      "staking": "ac4c4c6cf8515ec96e6eb0f2e9cfba4e29e498b3d8f2125b812565f45aa89a82"
+    }
+  },
+  {
+    "block": 66,
+    "version": 66,
+    "store_hashes": {
+      "bank": "dc97c20004c5f0b0f6999a60da0df6a7c8398e06ca0a735dd6319ba8deba2ad3",
+      "staking": "a09faa6749b3c4f604d90d9a55c8be89d64974490b182a8ccf8c827a0b618338"
+    }
+  },
+  {
+    "block": 67,
+    "version": 67,
+    "store_hashes": {
+      "bank": "927bc679ddb7db9371fa678682356ee984136182967f9c4d404a06d6768f7734",
+      "staking": "3659cc0df2870bdde5a674c45b9c7e422ba25fad78d9850ac85587d953b5dcea"
+    }
+  },
+  {
+    "block": 68,
+    "version": 68,
+    "store_hashes": {
+      "bank": "f9b22aad93cd5070356dbcedb423ab700f7fb9aeeb9bf5898f19eabab04fa7c8",
+      "staking": "98d760ab2aae0f9827273c9512dad963c55c488109042d9984eab54a5bf35c30"
+    }
+  },
+  {
+    "block": 69,
+    "version": 69,
+    "store_hashes": {
+      "bank": "15e4b371641907f2595122c96f7038707499821d230413396913a4cf0d49c7f7",
+      "staking": "c68b43af490234807cba47985db6e42b837056d3f398ed69d05ead247b1a7674"
+    }
+  },
+  {
+    "block": 70,
+    "version": 70,
+    "store_hashes": {
+      "bank": "be04fb47f1c20b0ecad9d09a75cbe975d0b8b9c0d670a915472568f1b2235014",
+      "staking": "0803861be0dc9b81692a0125c61245131af29bc606250b1e6e94a6ccb971009c"
+    }
+  },
+  {
+    "block": 71,
+    "version": 71,
+    "store_hashes": {
+      "bank": "40483f128ed65dbb8316b82bda3b96a392a9c05b6b2fbaff9a9c75ff081b694d",
+      "staking": "1737024f8db42d7ebab35788431442bb36fb7a5475b2d9a75545c018960fc090"
+    }
+  },
+  {
+    "block": 72,
+    "version": 72,
+    "store_hashes": {
+      "bank": "fa8c228cf81141aadeab2c5cf286f6385ed97f12a9eb7088e80ac89b93b65417",
+      "staking": "defc7d4d60a851890bde10ac6be3821c196303fecd96fc8e06e52d7b2ab97027"
+    }
+  },
+  {
+    "block": 73,
+    "version": 73,
+    "store_hashes": {
+      "bank": "2a623f79088bdec58f1637ab6e5e0d7a38f2c90a04add120e8732de86ceac75f",
+      "staking": "67549e6813661752b2f490a520f3141ab7ba45f77eee2035efed957238e937e7"
+    }
+  },
+  {
+    "block": 74,
+    "version": 74,
+    "store_hashes": {
+      "bank": "456f5136868039039a4f8b5d51c1270db56d372566db29827bbf3f5a7243fcf1",
+      "staking": "d0949358f7d101eb53325ada008605f6549a998e8f5a49274988059cd8548d75"
+    }
+  },
+  {
+    "block": 75,
+    "version": 75,
+    "store_hashes": {
+      "bank": "a0713bca7ed8f442d63acac6b42361f4a8e12bae4de791f321c84a0f9cfd20ef",
+      "staking": "4bd206dd73a87959a27b23afe4c9e4abb049064df40b1e414153d78f973db558"
+    }
+  },
+  {
+    "block": 76,
+    "version": 76,
+    "store_hashes": {
+      "bank": "ffd47c330c67729e7f5bd0d7c7bec2a01f5f31bef812e1e22de37f7ff4b84b86",
+      "staking": "16d215fcf3300b93630a149a498005fe64604d8f063b80d61bd392b893a6e9e1"
+    }
+  },
+  {
+    "block": 77,
+    "version": 77,
+    "store_hashes": {
+      "bank": "9de3784203743202b37ae8b6da08942960c24fc04cf9d313bc3a3fbc95bd9ec4",
+      "staking": "8fcf5de326aa0822ea5eeb54431e50dab782c2d8af1ce75854727dc3fdca64b2"
+    }
+  },
+  {
+    "block": 78,
+    "version": 78,
+    "store_hashes": {
+      "bank": "77bc98fad44f235cfadfe250de3ab4a1676ff0dc5cf156bc49e2440637e6f4d3",
+      "staking": "8118a7bd34732117d5ba861fce2a24960c5979877f96b46611d5ea9b7032e41f"
+    }
+  },
+  {
+    "block": 79,
+    "version": 79,
+    "store_hashes": {
+      "bank": "101112b149355f3682cfe33a648121b0ea2e4770a186eef977bff0097529afc1",
+      "staking": "63ce1c32b3bcc2c886e11794839a8074642b751e5a3f37db1d5e01d32a2b78d6"
+    }
+  },
+  {
+    "block": 80,
+    "version": 80,
+    "store_hashes": {
+      "bank": "e7e0ad38dd786d6a8fa3c1415d94bd6eb5f769aa17fe648ec13c34b59ba87462",
+      "staking": "3824a6ad547c7f966d413123ed64ef9b352a728648d1650fc692e857f14c0f59"
+    }
+  },
+  {
+    "block": 81,
+    "version": 81,
+    "store_hashes": {
+      "bank": "7e998e5493394dd976396b635b2131c6d3a4f930524e5935292755d680f01a00",
+      "staking": "a8d59dcce64ae48b2e4ec678f1ef5de0f85738e2b6e249f2f068a1287dad8991"
+    }
+  },
+  {
+    "block": 82,
+    "version": 82,
+    "store_hashes": {
+      "bank": "bbb49d868b8ebef71639516654539c0ca6de4da7cc412a254694fae34692edd7",
+      "staking": "35dcab86d932c4e6218869085c362cc5f2f86db47e5044f0cc752231d5ee3384"
+    }
+  },
+  {
+    "block": 83,
+    "version": 83,
+    "store_hashes": {
+      "bank": "a3920dd5e03ad598da0ae5b62947f8323068284c3e3a2fc2a8e7a772ff399598",
+      "staking": "56e550fc880c73477f0f49258a4cde0878a2d32616ad4df0adc64b9bf3a4bfc3"
+    }
+  },
+  {
+    "block": 84,
+    "version": 84,
+    "store_hashes": {
+      "bank": "3953c3b8d14fc2e3d974d7c7241429e60ca0b7201b29242c79121521325b626b",
+      "staking": "53f433d2e97caf7f00aeb49f118f889c7ce365be68139c2352fce902340ad43d"
+    }
+  },
+  {
+    "block": 85,
+    "version": 85,
+    "store_hashes": {
+      "bank": "8ab47b79450126d98862a39979b35efef7b9614414a95af76b843e3e4e22a472",
+      "staking": "f39144729e0fb17e5cf41ae6cd68d6abcd8521af2f01c414557596ea735f2458"
+    }
+  },
+  {
+    "block": 86,
+    "version": 86,
+    "store_hashes": {
+      "bank": "7eac128860c4b24693bfc97cf45c4eb7276828467aed54679633d995636e306a",
+      "staking": "fd8edb1594476f071a78b8b94e2699c738a9bf7168eb8df6193b10b0aba57228"
+    }
+  },
+  {
+    "block": 87,
+    "version": 87,
+    "store_hashes": {
+      "bank": "b4a977cfaa66ae53c6acde1b30db84dc0d799c0c9d1177221bdd307a44f4428d",
+      "staking": "7c06ea9d86b6595cdac15aadb066d65969afcaab1bfed97839cbde1130362cb5"
+    }
+  },
+  {
+    "block": 88,
+    "version": 88,
+    "store_hashes": {
+      "bank": "3106c70a5cb10516bd86fd181617964dbad06767d503463988b2cfc4ae03249c",
+      "staking": "5f2b4cd4be986271d45790a1046fc1de4930e0156ecb22b87023e79632ab5fec"
+    }
+  },
+  {
+    "block": 89,
+    "version": 89,
+    "store_hashes": {
+      "bank": "b9cd47487988d719aa08d15a9fd6cfb1f7dee6a3cfbd8808e8d49a5f2c325231",
+      "staking": "21b69ea2ebdb8c38a44072d7159af3d7ddfd96285a1676f0455fab5bc1f0d69a"
+    }
+  },
+  {
+    "block": 90,
+    "version": 90,
+    "store_hashes": {
+      "bank": "38abafa028000a3a9cb99cbd6464173d509f82cb667f0849d01d505ecc59d451",
+      "staking": "524d135d73683b11d315d0148ab0a7f7ea74a629ac6683c34f8d20f1d56aaf52"
+    }
+  },
+  {
+    "block": 91,
+    "version": 91,
+    "store_hashes": {
+      "bank": "130d977c89884929234dbb426b2ba0772095aa2fc5da1b4a1ae321412cb37d79",
+      "staking": "f1b7d986e0f9b2cf2cf17cdcdc047d0889f5bf3e3d025f59129f2d44d25c77e7"
+    }
+  },
+  {
+    "block": 92,
+    "version": 92,
+    "store_hashes": {
+      "bank": "edde609c940894e66764872615fdfd287607b7019e1b3e206a77c9b49ba92a12",
+      "staking": "8badc97c223fec29f2d3ca849c6ada424e632e708c9df8d70eb963760b2130b1"
+    }
+  },
+  {
+    "block": 93,
+    "version": 93,
+    "store_hashes": {
+      "bank": "5d62cbe8fe9ce1854731d5e49b58255ba0ca8494c90c323e4aa4c38345c3a66a",
+      "staking": "941e88d8713ee5dc250c9188dde366cef2efb225a01790a81cba0fc320d4a0a3"
+    }
+  },
+  {
+    "block": 94,
+    "version": 94,
+    "store_hashes": {
+      "bank": "46baf39c3bb3ca55e4007ecff2f09d1ce7645182f2bd5456bdf08abef87a8579",
+      "staking": "bfa2a51f139fd174dd37d7b13f7f610bda42c6c9d1eeebf5c595ad4509bbb78b"
+    }
+  },
+  {
+    "block": 95,
+    "version": 95,
+    "store_hashes": {
+      "bank": "261015434a20713afc2966ca40feec4cb94fe647a1dea7a3ad3e478ba753119c",
+      "staking": "d0f4ed2776df0bbb117bd54b0ca5ff5121998409c90607177ec908330a4bcbd9"
+    }
+  },
+  {
+    "block": 96,
+    "version": 96,
+    "store_hashes": {
+      "bank": "b661ef3b49dc22d94c4f22a9029a5777a93143f360e5e8a474d5ab573a6d56d0",
+      "staking": "a1b3632a081a426216fb2e8847a0cdba04bc736f50a3e2241cf04f8358f8ac63"
+    }
+  },
+  {
+    "block": 97,
+    "version": 97,
+    "store_hashes": {
+      "bank": "319858b80a3823a72d49271498346babb987f6f680a8abba8598172ecc65fb13",
+      "staking": "2af2eaf9c27cfd177465835a4028d7acb72bcd0dfd7154ced98e9129760465aa"
+    }
+  },
+  {
+    "block": 98,
+    "version": 98,
+    "store_hashes": {
+      "bank": "d9b86ef7a7da0ed3bd03e28d0f090269e70b84000e22cdbd352540759c3fdbd5",
+      "staking": "8912fd5322a15b16bff58c968c14c8603d1c93ab4ffab5b7efff0715e27d13fe"
+    }
+  },
+  {
+    "block": 99,
+    "version": 99,
+    "store_hashes": {
+      "bank": "d7efbc40fbde4ab6e9ffdae2626065894ac679937bbb67d834a096fee54d3440",
+      "staking": "f0b18f84ae8a0b9256b48f12b9c056ab92167444b3448743d8730c8207767a0d"
+    }
+  },
+  {
+    "block": 100,
+    "version": 100,
+    "store_hashes": {
+      "bank": "3a02a3b04cc7247b11ca8da50d5e1f957b86d4be4ceef466c1d7c6b65479df28",
+      "staking": "8bd4773dae52116c73f36dcdbbb0e21914853269e6d17435329466563be6ed1d"
+    }
+  }
+]

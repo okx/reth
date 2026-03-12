@@ -185,6 +185,15 @@ members = [
     "crates/xlayer/qmdb-provider",
     "crates/xlayer/rpc",
     "crates/xlayer/salt",
+    "crates/xlayer/sei-db/seidb-common",
+    "crates/xlayer/sei-db/seidb-traits",
+    "crates/xlayer/sei-db/seidb-proto",
+    "crates/xlayer/sei-db/seidb-wal",
+    "crates/xlayer/sei-db/seidb-engine",
+    "crates/xlayer/sei-db/seidb-ss",
+    "crates/xlayer/sei-db/seidb-sc",
+    "crates/xlayer/sei-db/seidb-ledger",
+    "crates/xlayer/sei-db/seidb",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]
@@ -761,6 +770,26 @@ xlayer-parallel-exec = { path = "crates/xlayer/parallel-exec" }
 xlayer-qmdb-provider = { path = "crates/xlayer/qmdb-provider" }
 xlayer-rpc = { path = "crates/xlayer/rpc" }
 xlayer-salt = { path = "crates/xlayer/salt" }
+
+# sei-db
+seidb-common = { path = "crates/xlayer/sei-db/seidb-common" }
+seidb-traits = { path = "crates/xlayer/sei-db/seidb-traits" }
+seidb-proto = { path = "crates/xlayer/sei-db/seidb-proto" }
+seidb-wal = { path = "crates/xlayer/sei-db/seidb-wal" }
+seidb-engine = { path = "crates/xlayer/sei-db/seidb-engine" }
+seidb-ss = { path = "crates/xlayer/sei-db/seidb-ss" }
+seidb-sc = { path = "crates/xlayer/sei-db/seidb-sc" }
+seidb-ledger = { path = "crates/xlayer/sei-db/seidb-ledger" }
+seidb = { path = "crates/xlayer/sei-db/seidb" }
+
+# sei-db specific deps
+prost = "0.13"
+prost-build = "0.13"
+blake3 = "1"
+bytemuck = { version = "1", features = ["derive"] }
+ics23 = "0.12"
+crc32fast = "1"
+fs4 = "0.12"
 
 # salt (megaETH state tree)
 salt = { path = "../salt/salt" }

@@ -1,0 +1,22 @@
+[package]
+name = "seidb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+seidb-common = { workspace = true }
+seidb-traits = { workspace = true }
+seidb-proto = { workspace = true }
+seidb-sc = { workspace = true }
+seidb-ss = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+seidb-common = { workspace = true }
+seidb-traits = { workspace = true }
+seidb-proto = { workspace = true }
+seidb-ss = { workspace = true }
+seidb-wal = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

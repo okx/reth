@@ -1,0 +1,18 @@
+[package]
+name = "seidb-ss"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+seidb-common = { workspace = true }
+seidb-traits = { workspace = true }
+seidb-proto = { workspace = true }
+seidb-engine = { workspace = true }
+seidb-wal = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
