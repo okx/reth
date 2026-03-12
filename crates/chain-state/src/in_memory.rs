@@ -20,9 +20,10 @@ use reth_storage_api::StateProviderBox;
 use reth_trie::{updates::TrieUpdates, HashedPostState};
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use tokio::sync::{broadcast, watch};
+use tracing::info;
 
 /// Size of the broadcast channel used to notify canonical state events.
-const CANON_STATE_NOTIFICATION_CHANNEL_SIZE: usize = 256;
+const CANON_STATE_NOTIFICATION_CHANNEL_SIZE: usize = 2028;
 
 /// Metrics for the in-memory state.
 #[derive(Metrics)]
@@ -188,6 +189,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
         let chain_info_tracker = ChainInfoTracker::new(header, finalized, safe);
         let (canon_state_notification_sender, _) =
             broadcast::channel(CANON_STATE_NOTIFICATION_CHANNEL_SIZE);
+        info!(target: "reth::cli", "CanonicalInMemoryState::new CANON_STATE_NOTIFICATION_CHANNEL_SIZE={}", CANON_STATE_NOTIFICATION_CHANNEL_SIZE);
 
         Self {
             inner: Arc::new(CanonicalInMemoryStateInner {
@@ -214,6 +216,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
         let in_memory_state = InMemoryState::default();
         let (canon_state_notification_sender, _) =
             broadcast::channel(CANON_STATE_NOTIFICATION_CHANNEL_SIZE);
+        info!(target: "reth::cli", "CanonicalInMemoryState::with_head CANON_STATE_NOTIFICATION_CHANNEL_SIZE={}", CANON_STATE_NOTIFICATION_CHANNEL_SIZE);
         let inner = CanonicalInMemoryStateInner {
             chain_info_tracker,
             in_memory_state,
