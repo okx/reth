@@ -177,26 +177,52 @@ fn print_stats(label: &str, stats: &[BlockStats]) {
 // sei-db helpers
 // ---------------------------------------------------------------------------
 
+/// Cosmos module names matching sei-chain's real module set.
+const COSMOS_MODULES: &[&str] =
+    &["acc", "bank", "distribution", "evm", "feegrant", "gov", "mint", "slashing", "staking"];
+
 /// Open a SeiDb with the given WriteMode, initialize stores, and pre-populate.
 fn setup_seidb(dir: &std::path::Path, write_mode: WriteMode, pre_pop: &BundleState) -> SeiDb {
+    setup_seidb_inner(dir, write_mode, pre_pop, false)
+}
+
+/// Open a SeiDb with multi-module + async apply enabled.
+fn setup_seidb_parallel(
+    dir: &std::path::Path,
+    write_mode: WriteMode,
+    pre_pop: &BundleState,
+) -> SeiDb {
+    setup_seidb_inner(dir, write_mode, pre_pop, true)
+}
+
+fn setup_seidb_inner(
+    dir: &std::path::Path,
+    write_mode: WriteMode,
+    pre_pop: &BundleState,
+    async_apply: bool,
+) -> SeiDb {
     let home = dir.to_string_lossy().to_string();
     let sc_config = StateCommitConfig {
         write_mode,
         memiavl: MemIavlConfig {
-            snapshot_interval: 0,   // disable auto-snapshot for benchmarks
-            async_commit_buffer: 0, // synchronous commits for accurate timing
+            snapshot_interval: 0, // disable auto-snapshot for benchmarks
+            async_commit_buffer: if async_apply { 100 } else { 0 },
             ..Default::default()
         },
         ..Default::default()
     };
 
     let mut db = SeiDb::open(&home, sc_config, None).unwrap();
-    let stores = vec!["bank".to_string(), "evm".to_string()];
+    let stores: Vec<String> = COSMOS_MODULES.iter().map(|s| s.to_string()).collect();
     db.initialize(&stores);
     db.load_version(0).unwrap();
 
-    // Pre-populate in chunks
-    let chunks = seidb_adapter::bundle_to_pre_populate_changesets(pre_pop, PRE_POP_CHUNK_SIZE);
+    // Pre-populate in chunks (use multimodule distribution when async)
+    let chunks = if async_apply {
+        seidb_adapter::bundle_to_multimodule_pre_populate_changesets(pre_pop, PRE_POP_CHUNK_SIZE)
+    } else {
+        seidb_adapter::bundle_to_pre_populate_changesets(pre_pop, PRE_POP_CHUNK_SIZE)
+    };
     for chunk in &chunks {
         db.sc_mut().apply_change_sets(chunk).unwrap();
         db.sc_mut().commit().unwrap();
@@ -207,6 +233,22 @@ fn setup_seidb(dir: &std::path::Path, write_mode: WriteMode, pre_pop: &BundleSta
 
 /// Run benchmark blocks through sei-db, returning total duration and per-block stats.
 fn run_seidb_blocks(db: &mut SeiDb, block_bundles: &[BundleState]) -> (Duration, Vec<BlockStats>) {
+    run_seidb_blocks_inner(db, block_bundles, false)
+}
+
+/// Run benchmark blocks using multi-module changeset distribution.
+fn run_seidb_blocks_multimodule(
+    db: &mut SeiDb,
+    block_bundles: &[BundleState],
+) -> (Duration, Vec<BlockStats>) {
+    run_seidb_blocks_inner(db, block_bundles, true)
+}
+
+fn run_seidb_blocks_inner(
+    db: &mut SeiDb,
+    block_bundles: &[BundleState],
+    multimodule: bool,
+) -> (Duration, Vec<BlockStats>) {
     let mut block_stats = Vec::with_capacity(block_bundles.len());
     let total_start = Instant::now();
 
@@ -214,7 +256,11 @@ fn run_seidb_blocks(db: &mut SeiDb, block_bundles: &[BundleState]) -> (Duration,
         let block_start = Instant::now();
 
         // Convert BundleState to sei-db changesets
-        let changesets = seidb_adapter::bundle_to_changesets(bundle);
+        let changesets = if multimodule {
+            seidb_adapter::bundle_to_multimodule_changesets(bundle)
+        } else {
+            seidb_adapter::bundle_to_changesets(bundle)
+        };
         let state_changes = bundle_state_changes(bundle);
 
         // Apply changesets
@@ -614,6 +660,65 @@ fn bench_seidb_go_equivalent(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Parallel multi-module benchmark (matches Go async_commit)
+// ---------------------------------------------------------------------------
+
+fn bench_seidb_parallel(c: &mut Criterion) {
+    let mut group = c.benchmark_group("SeiDB parallel");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    let state_changes_per_block = ACCOUNTS_PER_BLOCK * (1 + SLOTS_PER_ACCOUNT);
+    let label = format!("pre{PRE_POP_ACCOUNTS}_{NUM_BLOCKS}blk_{ACCOUNTS_PER_BLOCK}accts");
+
+    let mut rng = StdRng::seed_from_u64(42);
+    let pre_pop = generate_bundle_state_random(PRE_POP_ACCOUNTS, SLOTS_PER_ACCOUNT, &mut rng);
+    let pre_pop_addresses: Vec<Address> = pre_pop.state().keys().copied().collect();
+
+    let mut rng_blocks = StdRng::seed_from_u64(43);
+    let block_bundles: Vec<_> = (0..NUM_BLOCKS)
+        .map(|i| {
+            generate_block_updates_from_addresses(
+                &pre_pop_addresses,
+                SLOTS_PER_ACCOUNT,
+                i,
+                &mut rng_blocks,
+            )
+        })
+        .collect();
+
+    eprintln!(
+        "SeiDB parallel setup: {} accounts, {} state changes/block, {} modules",
+        PRE_POP_ACCOUNTS,
+        state_changes_per_block,
+        COSMOS_MODULES.len(),
+    );
+
+    // --- CosmosOnly parallel ---
+    let mut cosmos_state: Option<(SeiDb, tempfile::TempDir)> = None;
+    group.bench_function(BenchmarkId::new("cosmos_only_parallel", &label), |b| {
+        let (db, _dir) = cosmos_state.get_or_insert_with(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = setup_seidb_parallel(dir.path(), WriteMode::CosmosOnly, &pre_pop);
+            (db, dir)
+        });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                let (elapsed, stats) = run_seidb_blocks_multimodule(db, &block_bundles);
+                total += elapsed;
+                if i == 0 {
+                    print_stats("SeiDB CosmosOnly Parallel (9 modules)", &stats);
+                }
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion main
 // ---------------------------------------------------------------------------
 
@@ -623,5 +728,6 @@ criterion_group!(
     bench_seidb_dual_write,
     bench_mpt_mdbx,
     bench_seidb_go_equivalent,
+    bench_seidb_parallel,
 );
 criterion_main!(benches);

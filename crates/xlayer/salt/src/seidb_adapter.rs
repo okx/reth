@@ -11,6 +11,10 @@ use seidb_proto::{ChangeSet, KvPair, NamedChangeSet};
 const BANK_STORE: &str = "bank";
 const EVM_STORE: &str = "evm";
 
+/// Cosmos module names used for multi-module distribution.
+const COSMOS_MODULES: &[&str] =
+    &["acc", "bank", "distribution", "feegrant", "gov", "mint", "slashing", "staking"];
+
 /// Prefix byte for storage keys in the EVM store, matching sei-chain convention.
 const STATE_KEY_PREFIX: u8 = 0x03;
 
@@ -78,6 +82,138 @@ pub fn bundle_to_changesets(bundle: &BundleState) -> Vec<NamedChangeSet> {
         });
     }
     result
+}
+
+/// Convert a `BundleState` into multi-module `NamedChangeSet`s, distributing
+/// account data across multiple cosmos modules (not just "bank") to simulate
+/// sei-chain's real workload. Storage slots still go to "evm".
+///
+/// Distribution: accounts are round-robin'd across `COSMOS_MODULES` by index,
+/// so each tree gets roughly equal work, enabling parallel tree apply.
+pub fn bundle_to_multimodule_changesets(bundle: &BundleState) -> Vec<NamedChangeSet> {
+    let num_modules = COSMOS_MODULES.len();
+    let mut module_pairs: Vec<Vec<KvPair>> = vec![Vec::new(); num_modules];
+    let mut evm_pairs = Vec::new();
+
+    for (i, (addr, account)) in bundle.state().iter().enumerate() {
+        let addr = Address::from(*addr);
+        let module_idx = i % num_modules;
+
+        if let Some(info) = &account.info {
+            let key = addr.as_slice().to_vec();
+            let mut value = Vec::with_capacity(40);
+            value.extend_from_slice(&info.balance.to_be_bytes::<32>());
+            value.extend_from_slice(&info.nonce.to_be_bytes());
+
+            let is_destroyed = account.was_destroyed();
+            module_pairs[module_idx].push(KvPair {
+                delete: is_destroyed,
+                key,
+                value: if is_destroyed { vec![] } else { value },
+            });
+        }
+
+        for (slot, slot_info) in &account.storage {
+            let mut key = Vec::with_capacity(1 + 20 + 32);
+            key.push(STATE_KEY_PREFIX);
+            key.extend_from_slice(addr.as_slice());
+            key.extend_from_slice(&slot.to_be_bytes::<32>());
+
+            let is_zero = slot_info.present_value.is_zero();
+            evm_pairs.push(KvPair {
+                delete: is_zero,
+                key,
+                value: if is_zero {
+                    vec![]
+                } else {
+                    slot_info.present_value.to_be_bytes::<32>().to_vec()
+                },
+            });
+        }
+    }
+
+    let mut result = Vec::new();
+    for (idx, pairs) in module_pairs.into_iter().enumerate() {
+        if !pairs.is_empty() {
+            result.push(NamedChangeSet {
+                name: COSMOS_MODULES[idx].to_string(),
+                changeset: Some(ChangeSet { pairs }),
+            });
+        }
+    }
+    if !evm_pairs.is_empty() {
+        result.push(NamedChangeSet {
+            name: EVM_STORE.into(),
+            changeset: Some(ChangeSet { pairs: evm_pairs }),
+        });
+    }
+    result
+}
+
+/// Multi-module version of pre-populate: distributes across cosmos modules.
+pub fn bundle_to_multimodule_pre_populate_changesets(
+    bundle: &BundleState,
+    chunk_size: usize,
+) -> Vec<Vec<NamedChangeSet>> {
+    let accounts: Vec<_> = bundle.state().iter().collect();
+    let num_modules = COSMOS_MODULES.len();
+    let mut chunks = Vec::new();
+
+    for chunk in accounts.chunks(chunk_size) {
+        let mut module_pairs: Vec<Vec<KvPair>> = vec![Vec::new(); num_modules];
+        let mut evm_pairs = Vec::new();
+
+        for (i, (addr, account)) in chunk.iter().enumerate() {
+            let addr = Address::from(**addr);
+            let module_idx = i % num_modules;
+
+            if let Some(info) = &account.info {
+                let key = addr.as_slice().to_vec();
+                let mut value = Vec::with_capacity(40);
+                value.extend_from_slice(&info.balance.to_be_bytes::<32>());
+                value.extend_from_slice(&info.nonce.to_be_bytes());
+                module_pairs[module_idx].push(KvPair { delete: false, key, value });
+            }
+
+            for (slot, slot_info) in &account.storage {
+                let mut key = Vec::with_capacity(1 + 20 + 32);
+                key.push(STATE_KEY_PREFIX);
+                key.extend_from_slice(addr.as_slice());
+                key.extend_from_slice(&slot.to_be_bytes::<32>());
+
+                let is_zero = slot_info.present_value.is_zero();
+                evm_pairs.push(KvPair {
+                    delete: is_zero,
+                    key,
+                    value: if is_zero {
+                        vec![]
+                    } else {
+                        slot_info.present_value.to_be_bytes::<32>().to_vec()
+                    },
+                });
+            }
+        }
+
+        let mut changesets = Vec::new();
+        for (idx, pairs) in module_pairs.into_iter().enumerate() {
+            if !pairs.is_empty() {
+                changesets.push(NamedChangeSet {
+                    name: COSMOS_MODULES[idx].to_string(),
+                    changeset: Some(ChangeSet { pairs }),
+                });
+            }
+        }
+        if !evm_pairs.is_empty() {
+            changesets.push(NamedChangeSet {
+                name: EVM_STORE.into(),
+                changeset: Some(ChangeSet { pairs: evm_pairs }),
+            });
+        }
+        if !changesets.is_empty() {
+            chunks.push(changesets);
+        }
+    }
+    chunks
 }
 
 /// Pre-populate sei-db with account data from a BundleState using OP_CREATE semantics.

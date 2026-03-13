@@ -37,6 +37,11 @@ pub struct MultiTree {
     /// Optional global rate limiter shared across all snapshot file writers
     /// to prevent page cache eviction.
     snapshot_rate_limiter: Option<RateLimiter>,
+    /// When true, apply_change_sets dispatches each tree's changeset to its
+    /// own background thread (via `Tree::apply_change_set_async`), matching
+    /// Go's `asyncCommit` behaviour. Callers must call `save_version` to
+    /// join all workers before reading tree state.
+    async_apply: bool,
 }
 
 impl MultiTree {
@@ -50,6 +55,7 @@ impl MultiTree {
             last_commit_info: CommitInfo { version: 0, store_infos: Vec::new() },
             snapshot_writer_limit: DEFAULT_SNAPSHOT_WRITER_LIMIT,
             snapshot_rate_limiter: None,
+            async_apply: false,
         }
     }
 
@@ -101,6 +107,7 @@ impl MultiTree {
             last_commit_info: commit_info,
             snapshot_writer_limit: DEFAULT_SNAPSHOT_WRITER_LIMIT,
             snapshot_rate_limiter: None,
+            async_apply: false,
         };
         mt.set_initial_version_internal(initial_version);
         Ok(mt)
@@ -131,12 +138,48 @@ impl MultiTree {
     /// Each `NamedChangeSet` targets a tree by name. If the tree is not found,
     /// the change set is silently skipped (non-existent module).
     pub fn apply_change_sets(&mut self, change_sets: &[NamedChangeSet]) -> Result<()> {
-        for cs in change_sets {
-            let Some(&idx) = self.trees_by_name.get(&cs.name) else {
-                continue;
-            };
-            if let Some(changeset) = &cs.changeset {
-                self.trees[idx].tree.apply_kvpairs(&changeset.pairs);
+        if self.async_apply {
+            // Parallel mode: group changesets by tree index, then use
+            // std::thread::scope to apply each tree's work in parallel.
+            // This matches Go's per-tree goroutine dispatch.
+            let mut per_tree: Vec<Vec<&seidb_proto::KvPair>> = vec![Vec::new(); self.trees.len()];
+            for cs in change_sets {
+                let Some(&idx) = self.trees_by_name.get(&cs.name) else {
+                    continue;
+                };
+                if let Some(changeset) = &cs.changeset {
+                    per_tree[idx].extend(changeset.pairs.iter());
+                }
+            }
+
+            // Only spawn threads if there are multiple non-empty trees.
+            let non_empty: usize = per_tree.iter().filter(|v| !v.is_empty()).count();
+            if non_empty <= 1 {
+                // Single tree — no benefit from parallelism.
+                for (idx, pairs) in per_tree.iter().enumerate() {
+                    if !pairs.is_empty() {
+                        self.trees[idx].tree.apply_kvpair_refs(pairs);
+                    }
+                }
+            } else {
+                // Use rayon for parallel tree apply. Each tree gets its own
+                // set of KvPair references to apply independently.
+                let trees = &mut self.trees;
+                per_tree.par_iter().zip(trees.par_iter_mut()).for_each(|(pairs, entry)| {
+                    if !pairs.is_empty() {
+                        entry.tree.apply_kvpair_refs(pairs);
+                    }
+                });
+            }
+        } else {
+            // Sync mode: apply directly on the calling thread.
+            for cs in change_sets {
+                let Some(&idx) = self.trees_by_name.get(&cs.name) else {
+                    continue;
+                };
+                if let Some(changeset) = &cs.changeset {
+                    self.trees[idx].tree.apply_kvpairs(&changeset.pairs);
+                }
             }
         }
         Ok(())
@@ -244,6 +287,7 @@ impl MultiTree {
             last_commit_info: self.last_commit_info.clone(),
             snapshot_writer_limit: self.snapshot_writer_limit,
             snapshot_rate_limiter: self.snapshot_rate_limiter.clone(),
+            async_apply: self.async_apply,
         }
     }
 
@@ -294,6 +338,15 @@ impl MultiTree {
     /// Must be at least 1. Values of 0 are clamped to 1.
     pub fn set_snapshot_writer_limit(&mut self, limit: usize) {
         self.snapshot_writer_limit = limit.max(1);
+    }
+
+    /// Enable or disable per-tree async apply, matching Go's `asyncCommit`.
+    ///
+    /// When enabled, [`apply_change_sets`] dispatches each tree's changeset to
+    /// its own background thread. [`save_version`] joins all workers before
+    /// computing hashes. This parallelises the AVL insertion work across trees.
+    pub fn set_async_apply(&mut self, enabled: bool) {
+        self.async_apply = enabled;
     }
 
     /// Set the global snapshot write rate limiter.

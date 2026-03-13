@@ -165,6 +165,12 @@ impl DB {
             wal_index_delta
         };
 
+        // Enable per-tree async apply when async_commit_buffer > 0,
+        // matching Go's asyncCommit behaviour.
+        if config.async_commit_buffer > 0 {
+            multi_tree.set_async_apply(true);
+        }
+
         let mut db = DB {
             multi_tree,
             dir: dir.to_path_buf(),
@@ -289,8 +295,12 @@ impl DB {
         if cs.is_empty() {
             return Ok(());
         }
-        // Accumulate into pending log entry
-        self.pending_log_entry.changesets = cs.to_vec();
+        // Accumulate into pending log entry only when WAL is enabled, and reuse the
+        // allocation to avoid copying 10–20K kv pairs every block.
+        if self.stream_handler.is_some() {
+            self.pending_log_entry.changesets.clear();
+            self.pending_log_entry.changesets.extend_from_slice(cs);
+        }
         self.multi_tree.apply_change_sets(cs)
     }
 
@@ -301,7 +311,7 @@ impl DB {
         if self.read_only {
             return Err(SeiDbError::Other("db is read-only".into()));
         }
-        if !upgrades.is_empty() {
+        if !upgrades.is_empty() && self.stream_handler.is_some() {
             self.pending_log_entry.upgrades.extend(upgrades.iter().cloned());
         }
         self.multi_tree.apply_upgrades(upgrades)

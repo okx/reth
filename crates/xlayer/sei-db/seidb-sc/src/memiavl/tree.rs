@@ -138,6 +138,18 @@ impl Tree {
         }
     }
 
+    /// Like [`apply_kvpairs`] but accepts a slice of references (used by
+    /// parallel multi-tree apply where pairs are grouped by tree).
+    pub fn apply_kvpair_refs(&mut self, pairs: &[&seidb_proto::KvPair]) {
+        for pair in pairs {
+            if pair.delete {
+                self.remove(&pair.key);
+            } else {
+                self.set(&pair.key, &pair.value);
+            }
+        }
+    }
+
     /// Send a changeset to the background worker thread for concurrent processing.
     ///
     /// On the first call, a background thread is spawned (via
