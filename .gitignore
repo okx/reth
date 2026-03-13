@@ -75,3 +75,55 @@ __pycache__/
 # direnv
 .envrc
 .direnv/
+
+# Pre-warming benchmark and test artifacts
+.devnet-sim-v2-*/
+.devnet-simulation-*/
+.benchmark-*/
+.high-load-benchmark-*/
+.realistic-benchmark-*/
+.reliable-bench-*/
+.prod-bench-*/
+.tps-test-*/
+.quick-test-*/
+.max-workers-test*/
+.worker-test/
+.chain-id-test/
+.eoa-debug/
+.final-test/
+.test-*/
+.load_test_results
+.multi_sender_benchmark_results
+.prod_benchmark_results
+.reliable_benchmark_results
+.sustained_benchmark_results
+.tps_results
+
+# Benchmark/test log files
+*.log
+benchmark_*.txt
+benchmark_report*.txt
+benchmark_summary.txt
+build_final.log
+build_output.txt
+debug_output.txt
+prod_bench_output.txt
+test_output.txt
+test_final_result.txt
+validation_results.txt
+op-reth.pid
+
+# Test capture files
+test_capture*.json
+
+# Misc test scripts not meant for repo
+diagnose-prewarming.sh
+test-prewarming-*.sh
+test-prewarming-*.py
+.devnet-test/
+JIRA_FULL_EVM_SIMULATION.md
+benchmark_report.md
+continuous_benchmark_report.md
+docs/profiling-prewarming/
+my-docs/
+run-docs/
