@@ -35,6 +35,8 @@ pub struct Snapshot {
     version: u32,
     node_count: u32,
     leaf_count: u32,
+    /// Cached SnapshotData for arena-based access to persisted nodes.
+    cached_data: std::sync::OnceLock<Arc<SnapshotData>>,
 }
 
 impl std::fmt::Debug for Snapshot {
@@ -115,7 +117,15 @@ impl Snapshot {
             )));
         }
 
-        Ok(Arc::new(Self { nodes_mmap, leaves_mmap, kvs_mmap, version, node_count, leaf_count }))
+        Ok(Arc::new(Self {
+            nodes_mmap,
+            leaves_mmap,
+            kvs_mmap,
+            version,
+            node_count,
+            leaf_count,
+            cached_data: std::sync::OnceLock::new(),
+        }))
     }
 
     /// Creates an empty snapshot (no nodes, leaves, or key-value data) with the
@@ -128,6 +138,7 @@ impl Snapshot {
             version,
             node_count: 0,
             leaf_count: 0,
+            cached_data: std::sync::OnceLock::new(),
         })
     }
 
@@ -147,6 +158,30 @@ impl Snapshot {
     #[inline]
     pub fn leaf(&self, index: u32) -> LeafLayout<'_> {
         Leaves(self.leaves_mmap.data()).get(index)
+    }
+
+    /// Construct a PersistedNode at the given index.
+    ///
+    /// Uses a lazily-initialized shared `SnapshotData` to avoid copying
+    /// the mmap buffers on every access.
+    pub fn node_at(&self, index: u32, is_leaf: bool) -> PersistedNode {
+        let data = self.snapshot_data();
+        PersistedNode::new(data, is_leaf, index)
+    }
+
+    /// Returns a shared `Arc<SnapshotData>` for constructing PersistedNodes.
+    ///
+    /// Lazily creates and caches the SnapshotData on first call.
+    fn snapshot_data(&self) -> Arc<SnapshotData> {
+        self.cached_data
+            .get_or_init(|| {
+                Arc::new(SnapshotData::new(
+                    self.nodes_mmap.data().to_vec(),
+                    self.leaves_mmap.data().to_vec(),
+                    self.kvs_mmap.data().to_vec(),
+                ))
+            })
+            .clone()
     }
 
     /// Returns the root `PersistedNode`, or `None` for an empty snapshot.

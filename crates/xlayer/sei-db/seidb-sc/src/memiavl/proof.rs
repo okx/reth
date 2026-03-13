@@ -207,8 +207,9 @@ impl Tree {
     ///
     /// Returns an error if the key is not found or the tree is empty.
     pub fn get_membership_proof(&self, key: &[u8]) -> Result<CommitmentProof> {
-        let root = self.root_ref().ok_or_else(|| SeiDbError::Other("tree is empty".to_string()))?;
-        let exist = create_existence_proof(root, key).map_err(SeiDbError::Other)?;
+        let root =
+            self.ensure_root_ref().ok_or_else(|| SeiDbError::Other("tree is empty".to_string()))?;
+        let exist = create_existence_proof(&root, key).map_err(SeiDbError::Other)?;
         Ok(CommitmentProof { proof: Some(Proof::Exist(exist)) })
     }
 
@@ -216,9 +217,10 @@ impl Tree {
     ///
     /// Returns an error if the key actually exists or the tree is empty.
     pub fn get_non_membership_proof(&self, key: &[u8]) -> Result<CommitmentProof> {
-        let root = self.root_ref().ok_or_else(|| SeiDbError::Other("tree is empty".to_string()))?;
+        let root =
+            self.ensure_root_ref().ok_or_else(|| SeiDbError::Other("tree is empty".to_string()))?;
 
-        let (val, idx) = get_with_index_node(root, key);
+        let (val, idx) = get_with_index_node(&root, key);
         if val.is_some() {
             return Err(SeiDbError::Other(
                 "cannot create NonExistenceProof when key is in state".to_string(),
@@ -231,14 +233,14 @@ impl Tree {
         if idx >= 1 &&
             let Some((left_key, _)) = root.get_by_index((idx as i64) - 1)
         {
-            let left_proof = create_existence_proof(root, &left_key).map_err(SeiDbError::Other)?;
+            let left_proof = create_existence_proof(&root, &left_key).map_err(SeiDbError::Other)?;
             nonexist.left = Some(left_proof);
         }
 
         // Right neighbor: the key at index `idx` (if it exists).
         if let Some((right_key, _)) = root.get_by_index(idx as i64) {
             let right_proof =
-                create_existence_proof(root, &right_key).map_err(SeiDbError::Other)?;
+                create_existence_proof(&root, &right_key).map_err(SeiDbError::Other)?;
             nonexist.right = Some(right_proof);
         }
 

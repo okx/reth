@@ -105,7 +105,6 @@ impl MutableArena {
         self.nodes.len()
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -155,8 +154,10 @@ impl FrozenArena {
 /// index). Otherwise, the node data is copied to a new slot in the mutable
 /// arena.
 ///
-/// Returns `(arena_index, reused)` where `reused` means the original slot
-/// can be mutated in place (no copy was needed).
+/// For persisted nodes (gen==0), the caller must use `cow_persisted_to_mutable`
+/// instead.
+///
+/// Returns the arena index in the mutable arena.
 pub fn cow_to_mutable(
     arena: &mut MutableArena,
     current_gen: u16,
@@ -170,8 +171,10 @@ pub fn cow_to_mutable(
         if node.version > cow_version {
             // Safe to mutate in place — this node was created in a version
             // after the last copy(), so no snapshot shares it.
-            // Still need to clear the hash since we'll modify children.
-            arena.get_mut(idx.index).hash = OnceLock::new();
+            // Clear hash and update version (version is part of the hash input).
+            let node = arena.get_mut(idx.index);
+            node.hash = OnceLock::new();
+            node.version = version;
             return idx.index;
         }
         // Same generation but protected by cow_version — must copy.
@@ -187,6 +190,25 @@ pub fn cow_to_mutable(
         cloned.hash = OnceLock::new();
         cloned.version = version;
         arena.alloc(cloned)
+    }
+}
+
+/// Resolve a NodeIdx to a reference to a MemNode.
+///
+/// Panics if the index is persisted (gen==0). Use `resolve_node` for a
+/// safe variant that also handles persisted nodes via snapshot.
+pub fn resolve_mem_node<'a>(
+    arena: &'a MutableArena,
+    frozen: &'a [std::sync::Arc<FrozenArena>],
+    current_gen: u16,
+    idx: NodeIdx,
+) -> &'a MemNode {
+    debug_assert!(!idx.is_persisted(), "cannot resolve persisted node as MemNode");
+    if idx.generation == current_gen {
+        arena.get(idx.index)
+    } else {
+        let frozen_arena = &frozen[(idx.generation - 1) as usize];
+        frozen_arena.get(idx.index)
     }
 }
 

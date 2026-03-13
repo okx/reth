@@ -555,7 +555,8 @@ mod tests {
         // Export each tree and collect nodes
         let mut tree_exports: Vec<(String, Vec<ExportNode>)> = Vec::new();
         for nt in mt.trees() {
-            let exporter = Exporter::new(nt.tree.root_ref());
+            let root_ref = nt.tree.ensure_root_ref();
+            let exporter = Exporter::new(root_ref.as_ref());
             let nodes: Vec<_> = exporter.collect();
             tree_exports.push((nt.name.clone(), nodes));
         }

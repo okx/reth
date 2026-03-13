@@ -60,7 +60,7 @@ fn test_large_insertions_balanced() {
 
     // For an AVL tree with 1000 nodes, height should be <= 1.44 * log2(1000) ~ 14.4 => 15.
     // We verify by checking the root node's height.
-    let root = tree.root_ref().expect("tree should have a root");
+    let root = tree.ensure_root_ref().expect("tree should have a root");
     let height = root.height();
     assert!(height <= 15, "tree height {} exceeds AVL bound of 15 for 1000 nodes", height);
 }
@@ -308,8 +308,8 @@ fn test_iterator_full_range() {
         tree.set(&make_key(i), &make_value(i));
     }
 
-    let root = tree.root_ref().unwrap();
-    let mut iter = TreeIterator::new(None, None, true, Some(root));
+    let root = tree.ensure_root_ref().unwrap();
+    let mut iter = TreeIterator::new(None, None, true, Some(&root));
 
     let mut keys: Vec<Vec<u8>> = Vec::new();
     while iter.valid() {
@@ -342,8 +342,8 @@ fn test_iterator_reverse_full() {
         tree.set(&make_key(i), &make_value(i));
     }
 
-    let root = tree.root_ref().unwrap();
-    let mut iter = TreeIterator::new(None, None, false, Some(root));
+    let root = tree.ensure_root_ref().unwrap();
+    let mut iter = TreeIterator::new(None, None, false, Some(&root));
 
     let mut keys: Vec<Vec<u8>> = Vec::new();
     while iter.valid() {
@@ -379,8 +379,8 @@ fn test_import_export_large() {
     let original_hash = tree.root_hash();
 
     // Export.
-    let root = tree.root_ref().unwrap();
-    let export_nodes: Vec<ExportNode> = Exporter::new(Some(root)).collect();
+    let root = tree.ensure_root_ref().unwrap();
+    let export_nodes: Vec<ExportNode> = Exporter::new(Some(&root)).collect();
     assert!(!export_nodes.is_empty(), "exporter should produce nodes for a 500-key tree");
 
     // Import into a new snapshot.

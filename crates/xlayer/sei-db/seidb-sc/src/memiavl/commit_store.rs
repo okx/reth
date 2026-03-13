@@ -224,7 +224,10 @@ impl MemiavlCommitStore {
         let tree_exporters: Vec<(String, TreeExporter)> = db
             .trees()
             .iter()
-            .map(|nt| (nt.name.clone(), TreeExporter::new(nt.tree.root_ref())))
+            .map(|nt| {
+                let root_ref = nt.tree.ensure_root_ref();
+                (nt.name.clone(), TreeExporter::new(root_ref.as_ref()))
+            })
             .collect();
         Ok(Box::new(CommitterExporter { tree_exporters, current_tree: 0 }))
     }

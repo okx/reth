@@ -38,7 +38,9 @@ impl CommitKvStore for Tree {
     fn iterator(&self, start: &[u8], end: &[u8], ascending: bool) -> Box<dyn DbIterator> {
         let start_opt = if start.is_empty() { None } else { Some(start) };
         let end_opt = if end.is_empty() { None } else { Some(end) };
-        let iter = TreeIterator::new(start_opt, end_opt, ascending, self.root_ref());
+        // Build a NodeRef from arena for backward compatibility with TreeIterator
+        let root_ref = self.ensure_root_ref();
+        let iter = TreeIterator::new(start_opt, end_opt, ascending, root_ref.as_ref());
         Box::new(TreeIteratorAdapter { inner: iter })
     }
 

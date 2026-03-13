@@ -1,4 +1,4 @@
-use crate::memiavl::persisted_node::PersistedNode;
+use crate::memiavl::{arena::NodeIdx, persisted_node::PersistedNode};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
 
@@ -16,10 +16,14 @@ pub enum Node {
 ///
 /// Leaf nodes have `height == 0`, `size == 1`, and store a key-value pair.
 /// Branch nodes have `height > 0`, store only a key (the first key of the right subtree),
-/// and point to left/right children via `Arc<Node>` for copy-on-write sharing.
+/// and point to left/right children.
+///
+/// Children are stored as `Option<NodeIdx>` (arena index) for the hot path.
+/// The legacy `Option<NodeRef>` fields are kept for backward compatibility with
+/// consumers (iterator, proof, snapshot_writer) that haven't been migrated yet.
 ///
 /// The hash is computed lazily on first access via `OnceLock` and is cleared
-/// whenever the node is mutated (via `into_mem_node`).
+/// whenever the node is mutated.
 #[derive(Clone)]
 pub struct MemNode {
     pub height: u8,
@@ -27,6 +31,11 @@ pub struct MemNode {
     pub size: i64,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
+    /// Arena-based child references (hot path for set/remove/rebalance).
+    pub left_idx: Option<NodeIdx>,
+    pub right_idx: Option<NodeIdx>,
+    /// Legacy Arc-based child references (used by iterator, proof, snapshot_writer).
+    /// Populated lazily when needed by consumers that haven't migrated.
     pub left: Option<NodeRef>,
     pub right: Option<NodeRef>,
     pub(crate) hash: OnceLock<[u8; 32]>,
@@ -45,13 +54,15 @@ impl MemNode {
             size: 1,
             key,
             value,
+            left_idx: None,
+            right_idx: None,
             left: None,
             right: None,
             hash: OnceLock::new(),
         }
     }
 
-    /// Create a new branch node from two children.
+    /// Create a new branch node from two children (legacy Arc-based API).
     ///
     /// Height, size, and key are derived from the children:
     /// - height = max(left.height, right.height) + 1
@@ -67,13 +78,43 @@ impl MemNode {
             size,
             key,
             value: Vec::new(),
+            left_idx: None,
+            right_idx: None,
             left: Some(left),
             right: Some(right),
             hash: OnceLock::new(),
         }
     }
 
-    /// Recompute height and size from children.
+    /// Create a new branch node from arena indices with pre-fetched metadata.
+    ///
+    /// This avoids dereferencing arena nodes to read height/size/key, which
+    /// would require holding borrows across potential arena mutations.
+    pub fn new_branch_node_idx(
+        left: NodeIdx,
+        right: NodeIdx,
+        left_h: u8,
+        right_h: u8,
+        left_s: i64,
+        right_s: i64,
+        right_key: Vec<u8>,
+        version: u32,
+    ) -> Self {
+        Self {
+            height: left_h.max(right_h) + 1,
+            version,
+            size: left_s + right_s,
+            key: right_key,
+            value: Vec::new(),
+            left_idx: Some(left),
+            right_idx: Some(right),
+            left: None,
+            right: None,
+            hash: OnceLock::new(),
+        }
+    }
+
+    /// Recompute height and size from children (legacy Arc-based).
     pub fn update_height_size(&mut self) {
         let lh = self.left.as_ref().map_or(0, |n| n.height());
         let rh = self.right.as_ref().map_or(0, |n| n.height());
@@ -84,11 +125,24 @@ impl MemNode {
         self.size = ls + rs;
     }
 
-    /// Calculate the balance factor: left.height - right.height.
+    /// Recompute height and size from pre-fetched child metadata.
+    ///
+    /// Used by arena-based algorithms where children are accessed by index.
+    pub fn update_height_size_with(&mut self, lh: u8, rh: u8, ls: i64, rs: i64) {
+        self.height = lh.max(rh) + 1;
+        self.size = ls + rs;
+    }
+
+    /// Calculate the balance factor: left.height - right.height (legacy Arc-based).
     pub fn calc_balance(&self) -> i8 {
         let lh = self.left.as_ref().map_or(0, |n| n.height()) as i8;
         let rh = self.right.as_ref().map_or(0, |n| n.height()) as i8;
         lh - rh
+    }
+
+    /// Calculate the balance factor from pre-fetched child heights.
+    pub fn calc_balance_with(lh: u8, rh: u8) -> i8 {
+        lh as i8 - rh as i8
     }
 }
 
@@ -273,7 +327,7 @@ impl Node {
 /// Branch nodes copy key and create lazy `Node::Persisted` children so that
 /// deeper subtrees are only converted on demand (CoW).
 #[allow(clippy::arc_with_non_send_sync)]
-fn persisted_to_mem(pn: &PersistedNode) -> MemNode {
+pub fn persisted_to_mem(pn: &PersistedNode) -> MemNode {
     if pn.is_leaf() {
         MemNode {
             height: 0,
@@ -281,6 +335,8 @@ fn persisted_to_mem(pn: &PersistedNode) -> MemNode {
             size: 1,
             key: pn.key().to_vec(),
             value: pn.value().unwrap_or(&[]).to_vec(),
+            left_idx: None,
+            right_idx: None,
             left: None,
             right: None,
             hash: OnceLock::new(),
@@ -292,10 +348,54 @@ fn persisted_to_mem(pn: &PersistedNode) -> MemNode {
             size: pn.size(),
             key: pn.key().to_vec(),
             value: Vec::new(),
+            left_idx: None,
+            right_idx: None,
             left: Some(Arc::new(Node::Persisted(pn.left()))),
             right: Some(Arc::new(Node::Persisted(pn.right()))),
             hash: OnceLock::new(),
         }
+    }
+}
+
+/// Convert a `PersistedNode` into a `MemNode` for arena usage.
+///
+/// Returns the MemNode along with NodeIdx references for children that
+/// need to be materialized into the arena by the caller.
+/// For leaf nodes, no children are returned.
+/// For branch nodes, returns (MemNode, Some(left_pn), Some(right_pn)).
+pub fn persisted_to_mem_arena(
+    pn: &PersistedNode,
+) -> (MemNode, Option<PersistedNode>, Option<PersistedNode>) {
+    if pn.is_leaf() {
+        let mem = MemNode {
+            height: 0,
+            version: pn.version(),
+            size: 1,
+            key: pn.key().to_vec(),
+            value: pn.value().unwrap_or(&[]).to_vec(),
+            left_idx: None,
+            right_idx: None,
+            left: None,
+            right: None,
+            hash: OnceLock::new(),
+        };
+        (mem, None, None)
+    } else {
+        let left_pn = pn.left();
+        let right_pn = pn.right();
+        let mem = MemNode {
+            height: pn.height(),
+            version: pn.version(),
+            size: pn.size(),
+            key: pn.key().to_vec(),
+            value: Vec::new(),
+            left_idx: None,
+            right_idx: None,
+            left: None,
+            right: None,
+            hash: OnceLock::new(),
+        };
+        (mem, Some(left_pn), Some(right_pn))
     }
 }
 
@@ -354,6 +454,36 @@ fn compute_hash(node: &Node) -> [u8; 32] {
     Sha256::digest(&data).into()
 }
 
+/// Compute the hash of a MemNode using a resolver function to get children's hashes.
+///
+/// The resolver takes a NodeIdx and returns the 32-byte hash.
+/// For leaf nodes, the resolver is not called.
+pub fn compute_hash_arena<F>(node: &MemNode, resolve_hash: F) -> [u8; 32]
+where
+    F: Fn(NodeIdx) -> [u8; 32],
+{
+    let mut data = Vec::with_capacity(128);
+
+    encode_varint_signed(node.height as i64, &mut data);
+    encode_varint_signed(node.size, &mut data);
+    encode_varint_signed(node.version as i64, &mut data);
+
+    if node.height == 0 {
+        // Leaf
+        encode_bytes(&node.key, &mut data);
+        let value_hash = Sha256::digest(&node.value);
+        encode_bytes(&value_hash, &mut data);
+    } else {
+        // Branch — resolve children's hashes via arena
+        let left_hash = node.left_idx.map(|idx| resolve_hash(idx));
+        let right_hash = node.right_idx.map(|idx| resolve_hash(idx));
+        encode_bytes(left_hash.as_ref().map_or(&[][..], |h| h.as_slice()), &mut data);
+        encode_bytes(right_hash.as_ref().map_or(&[][..], |h| h.as_slice()), &mut data);
+    }
+
+    Sha256::digest(&data).into()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -372,6 +502,8 @@ mod tests {
         assert_eq!(leaf.value, b"val1");
         assert!(leaf.left.is_none());
         assert!(leaf.right.is_none());
+        assert!(leaf.left_idx.is_none());
+        assert!(leaf.right_idx.is_none());
     }
 
     #[test]
