@@ -232,7 +232,7 @@ pub fn prefetch_with_snapshot_sync(
                             .push((address, CachedAccount { info, storage: HashMap::default() }));
                     }
                 }
-                account_results.lock().unwrap().extend(local_results);
+                account_results.lock().unwrap_or_else(|p| p.into_inner()).extend(local_results);
             });
         }
 
@@ -248,7 +248,7 @@ pub fn prefetch_with_snapshot_sync(
                         local_results.push((address, slot, value));
                     }
                 }
-                storage_results.lock().unwrap().extend(local_results);
+                storage_results.lock().unwrap_or_else(|p| p.into_inner()).extend(local_results);
             });
         }
 
@@ -267,7 +267,7 @@ pub fn prefetch_with_snapshot_sync(
                         local_results.push((code_hash, bytecode));
                     }
                 }
-                bytecode_results.lock().unwrap().extend(local_results);
+                bytecode_results.lock().unwrap_or_else(|p| p.into_inner()).extend(local_results);
             });
         }
     });
@@ -276,9 +276,9 @@ pub fn prefetch_with_snapshot_sync(
     let mdbx_query_duration = mdbx_query_start.elapsed();
 
     // Merge results into cached_reads
-    let account_results_vec = account_results.into_inner().unwrap();
-    let storage_results_vec = storage_results.into_inner().unwrap();
-    let bytecode_results_vec = bytecode_results.into_inner().unwrap();
+    let account_results_vec = account_results.into_inner().unwrap_or_else(|p| p.into_inner());
+    let storage_results_vec = storage_results.into_inner().unwrap_or_else(|p| p.into_inner());
+    let bytecode_results_vec = bytecode_results.into_inner().unwrap_or_else(|p| p.into_inner());
 
     // Log MDBX timing at TRACE level (hot path - use debug/trace to avoid overhead)
     tracing::trace!(
@@ -477,7 +477,7 @@ pub fn prefetch_with_arcs_sync(
                     }
                 }
                 if !local_results.is_empty() {
-                    account_results.lock().unwrap().extend(local_results);
+                    account_results.lock().unwrap_or_else(|p| p.into_inner()).extend(local_results);
                 }
             });
         }
@@ -496,7 +496,7 @@ pub fn prefetch_with_arcs_sync(
                     }
                 }
                 if !local_results.is_empty() {
-                    storage_results.lock().unwrap().extend(local_results);
+                    storage_results.lock().unwrap_or_else(|p| p.into_inner()).extend(local_results);
                 }
             });
         }
@@ -515,7 +515,7 @@ pub fn prefetch_with_arcs_sync(
                     }
                 }
                 if !local_results.is_empty() {
-                    bytecode_results.lock().unwrap().extend(local_results);
+                    bytecode_results.lock().unwrap_or_else(|p| p.into_inner()).extend(local_results);
                 }
             });
         }
@@ -524,9 +524,9 @@ pub fn prefetch_with_arcs_sync(
     let mdbx_query_duration = mdbx_query_start.elapsed();
 
     // Populate CachedReads with results
-    let account_results = account_results.into_inner().unwrap();
-    let storage_results = storage_results.into_inner().unwrap();
-    let bytecode_results = bytecode_results.into_inner().unwrap();
+    let account_results = account_results.into_inner().unwrap_or_else(|p| p.into_inner());
+    let storage_results = storage_results.into_inner().unwrap_or_else(|p| p.into_inner());
+    let bytecode_results = bytecode_results.into_inner().unwrap_or_else(|p| p.into_inner());
 
     for (address, cached_account) in account_results {
         cached_reads.accounts.insert(address, cached_account);

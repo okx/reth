@@ -409,7 +409,7 @@ impl SnapshotState {
 
         // Cache miss - query state provider (mutex lock for Send-only provider)
         let account = {
-            let provider = self.state_provider.lock().unwrap();
+            let provider = self.state_provider.lock().unwrap_or_else(|p| p.into_inner());
             provider.basic_account(&address)?
         };
 
@@ -452,7 +452,7 @@ impl SnapshotState {
 
         // Cache miss - query MDBX (mutex lock for Send-only provider)
         let value = {
-            let provider = self.state_provider.lock().unwrap();
+            let provider = self.state_provider.lock().unwrap_or_else(|p| p.into_inner());
             let slot = B256::from(index);
             provider.storage(address, slot)?.unwrap_or_default()
         };
@@ -481,7 +481,7 @@ impl SnapshotState {
 
         // Query state provider using bytecode_by_hash (mutex lock)
         let code = {
-            let provider = self.state_provider.lock().unwrap();
+            let provider = self.state_provider.lock().unwrap_or_else(|p| p.into_inner());
             provider
                 .bytecode_by_hash(&code_hash)?
                 .map(|bytes| Bytecode::new_raw(bytes.original_bytes().clone()))

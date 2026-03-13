@@ -16,7 +16,7 @@ use crate::pre_warming::{ExtractedKeys, SnapshotState};
 use ahash::AHashSet;
 use alloy_primitives::{Address, B256, U256};
 use parking_lot::Mutex;
-use reth_chainspec::ChainSpec;
+use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_provider::ProviderError;
 use revm::{
     bytecode::Bytecode,
@@ -116,10 +116,27 @@ impl std::fmt::Debug for Simulator {
 impl Simulator {
     /// Create a new simulator with the given snapshot and chain spec
     pub fn new(snapshot: Arc<SnapshotState>, chain_spec: Arc<ChainSpec>) -> Self {
-        // Create CfgEnv with proper chain_id and spec
+        // Determine active hardfork using current time as proxy for the upcoming
+        // block timestamp. Simulations run right before block building, so system
+        // time is a good approximation. All deployed hardfork timestamps are in
+        // the past, so this gives the correct SpecId without needing block context.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let spec_id = if chain_spec.is_prague_active_at_timestamp(now) {
+            SpecId::PRAGUE
+        } else if chain_spec.is_cancun_active_at_timestamp(now) {
+            SpecId::CANCUN
+        } else if chain_spec.is_shanghai_active_at_timestamp(now) {
+            SpecId::SHANGHAI
+        } else {
+            SpecId::MERGE
+        };
+
         let cfg_env = CfgEnv::new()
             .with_chain_id(chain_spec.chain.id())
-            .with_spec_and_mainnet_gas_params(SpecId::CANCUN); // TODO: Get from chain_spec
+            .with_spec_and_mainnet_gas_params(spec_id);
 
         Self { snapshot, cfg_env, timeout: Duration::from_secs(2) }
     }
