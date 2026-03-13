@@ -18,7 +18,7 @@ pub enum Node {
 /// Branch nodes have `height > 0`, store only a key (the first key of the right subtree),
 /// and point to left/right children via `Arc<Node>` for copy-on-write sharing.
 ///
-/// The hash is computed lazily on first access via `OnceCell` and is cleared
+/// The hash is computed lazily on first access via `OnceLock` and is cleared
 /// whenever the node is mutated (via `into_mem_node`).
 #[derive(Clone)]
 pub struct MemNode {

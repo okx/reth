@@ -384,6 +384,7 @@ impl CommitStore {
     }
 
     /// Clears all pending write buffers and change sets.
+    /// Retains allocated capacity for reuse in the next block.
     pub(crate) fn clear_pending_writes(&mut self) {
         self.account_writes.clear();
         self.code_writes.clear();

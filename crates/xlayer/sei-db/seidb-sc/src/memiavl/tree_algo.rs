@@ -10,7 +10,7 @@ use std::{cmp::Ordering, sync::Arc};
 /// leaf was inserted.
 ///
 /// Uses borrowed key/value throughout recursion; only clones at the leaf
-/// where data is actually stored, saving ~18 levels of Vec allocation per insert.
+/// where data is actually stored.
 ///
 /// Mirrors Go `setRecursive` in `node.go`.
 pub fn set_recursive(
@@ -49,7 +49,6 @@ pub fn set_recursive(
                 return (Arc::new(Node::Mem(branch)), false);
             }
             Ordering::Equal => {
-                // Update existing leaf value.
                 let mut mem = Node::into_mem_node(node_ref, version);
                 mem.value = value.to_vec();
                 return (Arc::new(Node::Mem(mem)), true);
@@ -90,10 +89,6 @@ pub fn set_recursive_owned(
     version: u32,
     cow_version: u32,
 ) -> (NodeRef, bool) {
-    // Delegate to the borrow-based version. The owned data is only consumed
-    // at the leaf level where to_vec() is a no-op on already-owned data.
-    // For the common update case, key/value are compared but not stored in
-    // branch nodes, so borrowing avoids intermediate allocations.
     set_recursive(node, &key, &value, version, cow_version)
 }
 

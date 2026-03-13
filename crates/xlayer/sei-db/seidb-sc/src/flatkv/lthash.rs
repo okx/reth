@@ -49,19 +49,15 @@ impl LtHash {
 
     /// Serializes to 2048 bytes (each u16 as 2 little-endian bytes).
     pub fn marshal(&self) -> Vec<u8> {
-        let mut buf = vec![0u8; LT_HASH_BYTES];
-        self.marshal_to(&mut buf);
-        buf
+        bytemuck::cast_slice(&self.limbs).to_vec()
     }
 
     /// Writes the serialization into a pre-allocated buffer (must be >= 2048 bytes).
     pub fn marshal_to(&self, buf: &mut [u8]) {
         assert!(buf.len() >= LT_HASH_BYTES, "buffer too small");
-        for i in 0..LT_HASH_SIZE {
-            let bytes = self.limbs[i].to_le_bytes();
-            buf[i * 2] = bytes[0];
-            buf[i * 2 + 1] = bytes[1];
-        }
+        // Use bytemuck for zero-copy cast on little-endian platforms.
+        let src: &[u8] = bytemuck::cast_slice(&self.limbs);
+        buf[..LT_HASH_BYTES].copy_from_slice(src);
     }
 
     /// Deserializes 2048 bytes into an LtHash.
@@ -74,9 +70,9 @@ impl LtHash {
             )));
         }
         let mut limbs = [0u16; LT_HASH_SIZE];
-        for i in 0..LT_HASH_SIZE {
-            limbs[i] = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
-        }
+        // Zero-copy cast on little-endian.
+        let src: &[u16] = bytemuck::cast_slice(data);
+        limbs.copy_from_slice(src);
         Ok(Self { limbs })
     }
 
@@ -89,9 +85,9 @@ impl LtHash {
         let mut buf = [0u8; LT_HASH_BYTES];
         reader.fill(&mut buf);
         let mut limbs = [0u16; LT_HASH_SIZE];
-        for i in 0..LT_HASH_SIZE {
-            limbs[i] = u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
-        }
+        // Zero-copy cast on little-endian.
+        let src: &[u16] = bytemuck::cast_slice(&buf);
+        limbs.copy_from_slice(src);
         LtHash { limbs }
     }
 
