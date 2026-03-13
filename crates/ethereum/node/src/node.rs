@@ -525,8 +525,8 @@ where
         // Initialize pre-warming if feature is enabled
         #[cfg(feature = "pre-warming")]
         {
-            use reth_provider::StateProviderFactory;
             use reth_chainspec::EthChainSpec;
+            use reth_provider::StateProviderFactory;
             if let Ok(state_provider) = ctx.provider().latest() {
                 transaction_pool.initialize_pre_warming(
                     state_provider,

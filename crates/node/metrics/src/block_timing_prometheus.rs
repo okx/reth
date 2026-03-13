@@ -11,7 +11,6 @@ pub struct BlockTimingPrometheusMetrics {
     /// Time spent applying pre-execution changes during block building
     pub build_apply_pre_execution_changes: Histogram,
 
-
     /// Time spent executing sequencer transactions during block building
     pub build_exec_sequencer_transactions: Histogram,
 

@@ -743,7 +743,8 @@ where
         let saved_cache = saved_cache.expect("BAL prewarm should only run with cache");
         let caches = saved_cache.cache().clone();
         let cache_metrics = saved_cache.metrics().clone();
-        let state_provider = CachedStateProvider::new(state_provider, caches, cache_metrics).prewarm();
+        let state_provider =
+            CachedStateProvider::new(state_provider, caches, cache_metrics).prewarm();
 
         let start = Instant::now();
 

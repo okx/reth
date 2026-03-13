@@ -1047,8 +1047,8 @@ where
         #[cfg(feature = "pre-warming")]
         {
             warn!(target: "reth::cli", ">>> PRE-WARMING FEATURE BLOCK REACHED");
-            use reth_provider::StateProviderFactory;
             use reth_chainspec::EthChainSpec;
+            use reth_provider::StateProviderFactory;
             if let Ok(state_provider) = ctx.provider().latest() {
                 warn!(target: "reth::cli", ">>> State provider obtained, initializing pre-warming");
                 // Create a basic ChainSpec from genesis for pre-warming
@@ -1056,7 +1056,7 @@ where
                     reth_chainspec::ChainSpec::builder()
                         .chain(ctx.chain_spec().chain())
                         .genesis(ctx.chain_spec().genesis().clone())
-                        .build()
+                        .build(),
                 );
                 transaction_pool.initialize_pre_warming(state_provider, chain_spec);
                 warn!(target: "reth::cli", ">>> Pre-warming initialization completed");

@@ -644,7 +644,9 @@ impl RethTransactionPoolConfig for TxPoolArgs {
                 enabled: self.pre_warming_enabled,
                 num_workers: self.pre_warming_num_workers,
                 prefetch_num_workers: self.pre_fetch_num_workers,
-                simulation_timeout: std::time::Duration::from_millis(self.pre_warming_simulation_timeout_ms),
+                simulation_timeout: std::time::Duration::from_millis(
+                    self.pre_warming_simulation_timeout_ms,
+                ),
                 cache_ttl: std::time::Duration::from_secs(self.pre_warming_cache_ttl_secs),
                 cache_max_entries: self.pre_warming_cache_max_entries,
                 enable_metrics: true, // Always enable metrics when pre-warming is configured
@@ -826,31 +828,29 @@ mod tests {
         let args = CommandParser::<TxPoolArgs>::parse_from(["reth"]).args;
 
         // Calculate expected default workers (same logic as in DefaultTxPoolValues::default())
-        let expected_workers = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
+        let expected_workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
 
         assert!(!args.pre_warming_enabled, "Pre-warming should be disabled by default");
-        assert_eq!(args.pre_warming_num_workers, expected_workers, "Default workers should be all CPUs");
+        assert_eq!(
+            args.pre_warming_num_workers, expected_workers,
+            "Default workers should be all CPUs"
+        );
         assert_eq!(args.pre_warming_simulation_timeout_ms, 100, "Default timeout should be 100ms");
         assert_eq!(args.pre_warming_cache_ttl_secs, 60, "Default TTL should be 60 seconds");
-        assert_eq!(args.pre_warming_cache_max_entries, 10_000, "Default max entries should be 10000");
+        assert_eq!(
+            args.pre_warming_cache_max_entries, 10_000,
+            "Default max entries should be 10000"
+        );
     }
 
     #[test]
     fn txpool_pre_warming_enable_only() {
         // Test enabling pre-warming without changing other defaults
-        let args = CommandParser::<TxPoolArgs>::parse_from([
-            "reth",
-            "--txpool.pre-warming",
-            "true",
-        ])
-        .args;
+        let args =
+            CommandParser::<TxPoolArgs>::parse_from(["reth", "--txpool.pre-warming", "true"]).args;
 
         // Calculate expected default workers
-        let expected_workers = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
+        let expected_workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
 
         assert!(args.pre_warming_enabled);
         // Other values should remain at defaults
@@ -863,12 +863,9 @@ mod tests {
 
     #[test]
     fn txpool_pre_warming_custom_workers() {
-        let args = CommandParser::<TxPoolArgs>::parse_from([
-            "reth",
-            "--txpool.pre-warming-workers",
-            "16",
-        ])
-        .args;
+        let args =
+            CommandParser::<TxPoolArgs>::parse_from(["reth", "--txpool.pre-warming-workers", "16"])
+                .args;
 
         assert_eq!(args.pre_warming_num_workers, 16);
     }
@@ -940,12 +937,9 @@ mod tests {
     #[test]
     fn txpool_pre_warming_edge_case_zero_workers() {
         // Zero workers - should parse but may be handled specially by the pool
-        let args = CommandParser::<TxPoolArgs>::parse_from([
-            "reth",
-            "--txpool.pre-warming-workers",
-            "0",
-        ])
-        .args;
+        let args =
+            CommandParser::<TxPoolArgs>::parse_from(["reth", "--txpool.pre-warming-workers", "0"])
+                .args;
 
         assert_eq!(args.pre_warming_num_workers, 0);
     }
@@ -1077,9 +1071,7 @@ mod tests {
         let pool_config = args.pool_config();
 
         // Calculate expected default workers
-        let expected_workers = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
+        let expected_workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
 
         assert!(!pool_config.pre_warming.enabled);
         assert_eq!(pool_config.pre_warming.num_workers, expected_workers);

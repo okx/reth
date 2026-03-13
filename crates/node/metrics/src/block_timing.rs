@@ -317,7 +317,6 @@ impl BlockTimingContext {
         }
     }
 
-
     /// Create a timing guard for recording build phase: execute sequencer transactions.
     pub fn time_exec_sequencer_transactions(&mut self) -> TimingGuard<'_> {
         match &self.prometheus_metrics {

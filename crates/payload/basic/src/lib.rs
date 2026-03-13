@@ -255,23 +255,29 @@ where
                         "Pre-warming: Found keys, starting prefetch"
                     );
                     // Get state provider for prefetching
-                    if let Ok(state_provider) = self.client.state_by_block_hash(parent_header.hash()) {
+                    if let Ok(state_provider) =
+                        self.client.state_by_block_hash(parent_header.hash())
+                    {
                         // Wrap in Arc<SnapshotState> for parallel prefetch
                         let snapshot = std::sync::Arc::new(
-                            reth_transaction_pool::pre_warming::SnapshotState::new(state_provider)
+                            reth_transaction_pool::pre_warming::SnapshotState::new(state_provider),
                         );
 
-                        // Use globally configured prefetch threads (from --txpool.pre-warming-workers)
-                        let num_threads = reth_transaction_pool::pre_warming::get_global_prefetch_threads();
+                        // Use globally configured prefetch threads (from
+                        // --txpool.pre-warming-workers)
+                        let num_threads =
+                            reth_transaction_pool::pre_warming::get_global_prefetch_threads();
 
                         // Use sync version (uses std::thread::scope internally)
-                        if let Err(err) = reth_transaction_pool::pre_warming::prefetch_with_snapshot_sync(
-                            &mut cached_reads,
-                            &keys,
-                            snapshot,
-                            num_threads,
-                            None,  // No metrics for basic payload builder
-                        ) {
+                        if let Err(err) =
+                            reth_transaction_pool::pre_warming::prefetch_with_snapshot_sync(
+                                &mut cached_reads,
+                                &keys,
+                                snapshot,
+                                num_threads,
+                                None, // No metrics for basic payload builder
+                            )
+                        {
                             tracing::warn!(
                                 target: "payload_builder",
                                 ?err,

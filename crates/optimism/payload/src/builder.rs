@@ -240,10 +240,8 @@ where
                 let pending_txs = self.pool.pending_transactions_max(MAX_TXS_TO_PREFETCH);
 
                 // Extract transaction hashes
-                let tx_hashes: Vec<alloy_primitives::B256> = pending_txs
-                    .iter()
-                    .map(|tx| *tx.hash())
-                    .collect();
+                let tx_hashes: Vec<alloy_primitives::B256> =
+                    pending_txs.iter().map(|tx| *tx.hash()).collect();
 
                 tracing::debug!(
                     target: "payload_builder",
@@ -277,9 +275,12 @@ where
                         Ok(state_provider) => {
                             // Wrap in Arc<SnapshotState> for parallel prefetch
                             let snapshot = std::sync::Arc::new(
-                                reth_transaction_pool::pre_warming::SnapshotState::new(state_provider)
+                                reth_transaction_pool::pre_warming::SnapshotState::new(
+                                    state_provider,
+                                ),
                             );
-                            let num_threads = reth_transaction_pool::pre_warming::get_global_prefetch_threads();
+                            let num_threads =
+                                reth_transaction_pool::pre_warming::get_global_prefetch_threads();
 
                             // Get global metrics to pass to prefetch
                             let metrics = reth_transaction_pool::pre_warming::get_global_metrics();
