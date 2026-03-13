@@ -496,6 +496,10 @@ where
         let (sender, receiver) = mpsc::unbounded_channel();
         let channel_capacity = "unbounded";
 
+        // Register initial snapshot globally — payload builder can reuse the warm
+        // DashMap cache immediately instead of opening a fresh cold MDBX transaction.
+        crate::pre_warming::registry::set_global_simulation_snapshot(Arc::clone(&snapshot));
+
         // Wrap snapshot in RwLock so the drain task can see block updates.
         let snapshot_holder: SharedSnapshot = Arc::new(RwLock::new(snapshot));
 
@@ -649,7 +653,15 @@ where
             let old = self.snapshot_holder.read();
             new_snapshot.inherit_code_cache(&old);
         }
+
+        // Clone before move — registry and snapshot_holder both need ownership.
+        let snapshot_for_registry = Arc::clone(&new_snapshot);
         *self.snapshot_holder.write() = new_snapshot;
+
+        // Update global registry so the payload builder reuses this warm snapshot.
+        // The snapshot's DashMap cache already contains state queried by simulation
+        // workers, turning most prefetch MDBX queries into cheap in-memory hits.
+        crate::pre_warming::registry::set_global_simulation_snapshot(snapshot_for_registry);
 
         // Record snapshot update
         self.metrics.snapshot_updates.increment(1);

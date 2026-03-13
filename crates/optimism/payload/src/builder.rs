@@ -224,121 +224,70 @@ where
             cached_reads.set_metrics_callbacks(on_hit, on_miss);
         }
 
-        // Pre-warming: Prefetch state using keys discovered by simulation
-        // TARGETED PREFETCH: Only fetch keys for transactions likely to be in this block
+        // Pre-warming: Prefetch state using keys discovered by background simulation.
+        //
+        // build_payload is called every ~200ms per slot. We skip duplicate prefetch
+        // for the same parent block — subsequent calls already have warm CachedReads.
+        // We also reuse the simulation workers' warm SnapshotState instead of opening
+        // a fresh cold MDBX transaction: the DashMap cache already holds state queried
+        // during simulation, so prefetch queries become cheap in-memory hits.
         #[cfg(feature = "pre-warming")]
         {
-            tracing::debug!(
-                target: "payload_builder",
-                ">>> PREFETCH: Starting targeted prefetch for pending transactions"
-            );
+            let parent_hash = config.parent_header.hash();
 
-            if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
-                // Get top pending transactions from pool (these are most likely to be selected)
-                // Limit to 500 to avoid fetching too many keys
-                const MAX_TXS_TO_PREFETCH: usize = 500;
-                let pending_txs = self.pool.pending_transactions_max(MAX_TXS_TO_PREFETCH);
+            if reth_transaction_pool::pre_warming::should_prefetch_for_parent(parent_hash) {
+                if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
+                    const MAX_TXS_TO_PREFETCH: usize = 500;
+                    let pending_txs = self.pool.pending_transactions_max(MAX_TXS_TO_PREFETCH);
+                    let tx_hashes: Vec<alloy_primitives::B256> =
+                        pending_txs.iter().map(|tx| *tx.hash()).collect();
 
-                // Extract transaction hashes
-                let tx_hashes: Vec<alloy_primitives::B256> =
-                    pending_txs.iter().map(|tx| *tx.hash()).collect();
+                    let keys_arcs = cache.get_keys_arcs(&tx_hashes);
 
-                tracing::debug!(
-                    target: "payload_builder",
-                    pending_count = tx_hashes.len(),
-                    "PREFETCH: Got pending transactions from pool"
-                );
+                    if !keys_arcs.is_empty() {
+                        // Prefer the simulation workers' warm snapshot over a fresh cold one.
+                        // Simulation workers have already cached common state (USDC, Uniswap,
+                        // etc.) in the DashMap, so prefetch queries return in-memory hits
+                        // instead of going to MDBX. Fall back to a fresh snapshot only if the
+                        // registry has not been populated yet (startup race).
+                        let snapshot =
+                            reth_transaction_pool::pre_warming::get_global_simulation_snapshot()
+                                .or_else(|| {
+                                    self.client.state_by_block_hash(parent_hash).ok().map(|sp| {
+                                        std::sync::Arc::new(
+                                            reth_transaction_pool::pre_warming::SnapshotState::new(
+                                                sp,
+                                            ),
+                                        )
+                                    })
+                                });
 
-                // Get Arc refs directly - avoids expensive merge operation (TPS optimization)
-                let keys_arcs = cache.get_keys_arcs(&tx_hashes);
-                let total_accounts: usize = keys_arcs.iter().map(|k| k.accounts.len()).sum();
-                let total_storage: usize = keys_arcs.iter().map(|k| k.storage_slots.len()).sum();
-                let total_codes: usize = keys_arcs.iter().map(|k| k.code_hashes.len()).sum();
-
-                tracing::debug!(
-                    target: "payload_builder",
-                    keys_count = keys_arcs.len(),
-                    accounts = total_accounts,
-                    storage_slots = total_storage,
-                    code_hashes = total_codes,
-                    "PREFETCH: Retrieved TARGETED keys from cache (zero-copy)"
-                );
-
-                if !keys_arcs.is_empty() {
-                    tracing::debug!(
-                        target: "payload_builder",
-                        "PREFETCH: Keys found, proceeding with prefetch"
-                    );
-
-                    // Get state provider for prefetching
-                    match self.client.state_by_block_hash(config.parent_header.hash()) {
-                        Ok(state_provider) => {
-                            // Wrap in Arc<SnapshotState> for parallel prefetch
-                            let snapshot = std::sync::Arc::new(
-                                reth_transaction_pool::pre_warming::SnapshotState::new(
-                                    state_provider,
-                                ),
-                            );
+                        if let Some(snapshot) = snapshot {
                             let num_threads =
                                 reth_transaction_pool::pre_warming::get_global_prefetch_threads();
-
-                            // Get global metrics to pass to prefetch
-                            let metrics = reth_transaction_pool::pre_warming::get_global_metrics();
+                            let metrics =
+                                reth_transaction_pool::pre_warming::get_global_metrics();
                             let metrics_ref = metrics.as_ref().map(|m| m.as_ref());
 
-                            // Use optimized Arc-based prefetch (avoids merge overhead)
-                            match reth_transaction_pool::pre_warming::prefetch_with_arcs_sync(
-                                &mut cached_reads,
-                                &keys_arcs,
-                                snapshot,
-                                num_threads,
-                                metrics_ref,
-                            ) {
-                                Ok(()) => {
-                                    tracing::debug!(
-                                        target: "payload_builder",
-                                        accounts = total_accounts,
-                                        storage = total_storage,
-                                        "PREFETCH: Success (optimized)"
-                                    );
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        target: "payload_builder",
-                                        ?err,
-                                        "PREFETCH: Failed"
-                                    );
-                                }
+                            if let Err(err) =
+                                reth_transaction_pool::pre_warming::prefetch_with_arcs_sync(
+                                    &mut cached_reads,
+                                    &keys_arcs,
+                                    snapshot,
+                                    num_threads,
+                                    metrics_ref,
+                                )
+                            {
+                                tracing::warn!(
+                                    target: "payload_builder",
+                                    ?err,
+                                    "PREFETCH: Failed"
+                                );
                             }
                         }
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "payload_builder",
-                                ?err,
-                                "PREFETCH: Failed to get state provider"
-                            );
-                        }
                     }
-                } else {
-                    tracing::debug!(
-                        target: "payload_builder",
-                        ">>> PREFETCH Step 5: Keys ARE empty, skipping prefetch"
-                    );
                 }
-            } else {
-                tracing::debug!(
-                    target: "payload_builder",
-                    ">>> PREFETCH Step 3: Global cache is None"
-                );
             }
-        }
-
-        #[cfg(not(feature = "pre-warming"))]
-        {
-            tracing::debug!(
-                target: "payload_builder",
-                ">>> PREFETCH: pre-warming feature NOT COMPILED"
-            );
         }
 
         let ctx = OpPayloadBuilderCtx {

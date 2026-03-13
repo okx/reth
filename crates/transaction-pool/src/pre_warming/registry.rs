@@ -21,11 +21,14 @@
 //! ```
 
 use crate::pre_warming::{PreWarmedCache, PreWarmingMetrics};
+use alloy_primitives::B256;
 use parking_lot::RwLock;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+
+use super::snapshot_state::SnapshotState;
 
 /// Global cache holder
 static GLOBAL_CACHE: RwLock<Option<Arc<PreWarmedCache>>> = RwLock::new(None);
@@ -35,6 +38,19 @@ static GLOBAL_METRICS: RwLock<Option<Arc<PreWarmingMetrics>>> = RwLock::new(None
 
 /// Global prefetch threads count (defaults to available CPUs)
 static GLOBAL_PREFETCH_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Warm simulation snapshot shared with the payload builder.
+///
+/// Simulation workers populate this snapshot's DashMap cache as they process
+/// mempool transactions. The payload builder reuses it instead of creating a
+/// fresh cold SnapshotState, converting MDBX queries into in-memory DashMap hits.
+static GLOBAL_SIMULATION_SNAPSHOT: RwLock<Option<Arc<SnapshotState>>> = RwLock::new(None);
+
+/// Parent block hash for which prefetch was last run.
+///
+/// `build_payload` is called every ~200ms per slot. We only prefetch once per
+/// parent block — subsequent calls reuse the already-warm CachedReads.
+static LAST_PREFETCHED_PARENT: RwLock<Option<B256>> = RwLock::new(None);
 
 /// Set the global pre-warmed cache
 ///
@@ -107,6 +123,42 @@ pub fn is_pre_warming_active() -> bool {
 /// Clear the global cache (for testing or shutdown)
 pub fn clear_global_cache() {
     *GLOBAL_CACHE.write() = None;
+}
+
+/// Register the simulation workers' warm snapshot for payload builder reuse.
+///
+/// Called by `SimulationWorkerPool::update_snapshot` on every canonical block change.
+/// The snapshot's DashMap cache accumulates queried state across simulations,
+/// so the payload builder can reuse it instead of opening a fresh cold MDBX transaction.
+pub fn set_global_simulation_snapshot(snapshot: Arc<SnapshotState>) {
+    *GLOBAL_SIMULATION_SNAPSHOT.write() = Some(snapshot);
+}
+
+/// Get the simulation workers' warm snapshot (if registered).
+///
+/// Returns `None` if the worker pool has not initialized yet.
+pub fn get_global_simulation_snapshot() -> Option<Arc<SnapshotState>> {
+    GLOBAL_SIMULATION_SNAPSHOT.read().clone()
+}
+
+/// Returns true if `build_payload` should run prefetch for `parent_hash`.
+///
+/// The payload builder is called every ~200ms per slot with the same parent hash.
+/// Only the first call needs to prefetch — subsequent calls already have warm
+/// CachedReads from the first call. Returns false on repeated calls for the same
+/// parent, skipping redundant MDBX queries and thread creation.
+pub fn should_prefetch_for_parent(parent_hash: B256) -> bool {
+    // Fast path: read lock only (no write needed on repeated calls for same parent).
+    if LAST_PREFETCHED_PARENT.read().as_ref() == Some(&parent_hash) {
+        return false;
+    }
+    // Parent changed — acquire write lock to update.
+    let mut last = LAST_PREFETCHED_PARENT.write();
+    if *last == Some(parent_hash) {
+        return false; // Another thread raced and already set it
+    }
+    *last = Some(parent_hash);
+    true
 }
 
 #[cfg(test)]
