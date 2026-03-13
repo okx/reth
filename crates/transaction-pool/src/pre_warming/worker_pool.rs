@@ -317,15 +317,18 @@
 //! | `simulation_timeout` | Too many timeouts | Slow workers | 50-100ms |
 //! | Channel capacity | Drops requests | Memory waste | workers × 10 |
 
-use crate::pre_warming::{ExtractedKeys, PreWarmedCache, PreWarmingConfig, SimulationRequest, Simulator, SnapshotState};
-use crate::pre_warming::metrics::PreWarmingMetrics;
-use crate::PoolTransaction;
+use crate::{
+    pre_warming::{
+        metrics::PreWarmingMetrics, ExtractedKeys, PreWarmedCache, PreWarmingConfig,
+        SimulationRequest, Simulator, SnapshotState,
+    },
+    PoolTransaction,
+};
 use alloy_primitives::TxHash;
 use parking_lot::RwLock;
 use reth_chainspec::ChainSpec;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 
 /// Shared snapshot holder that workers can read from.
@@ -509,7 +512,16 @@ where
             let metrics = Arc::clone(&metrics);
 
             let handle = tokio::spawn(async move {
-                worker_loop(worker_id, receiver, cache, snapshot_holder, chain_spec, config, metrics).await;
+                worker_loop(
+                    worker_id,
+                    receiver,
+                    cache,
+                    snapshot_holder,
+                    chain_spec,
+                    config,
+                    metrics,
+                )
+                .await;
             });
 
             workers.push(handle);
@@ -885,8 +897,10 @@ async fn worker_loop<T>(
                     tokio::task::spawn_blocking({
                         let tx = req.transaction.clone();
                         move || simulate_transaction_sync(&simulator, &tx)
-                    })
-                ).await {
+                    }),
+                )
+                .await
+                {
                     Ok(Ok(Ok(keys))) => {
                         // Record successful simulation
                         metrics.simulations_completed.increment(1);
@@ -935,11 +949,13 @@ async fn worker_loop<T>(
                 metrics.simulation_duration.record(simulation_duration.as_secs_f64());
 
                 // Store keys per transaction (thread-safe)
-                let keys_count = keys.accounts.len() + keys.storage_slots.len() + keys.code_hashes.len() + keys.block_hashes.len();
+                let keys_count = keys.accounts.len() +
+                    keys.storage_slots.len() +
+                    keys.code_hashes.len() +
+                    keys.block_hashes.len();
                 let accounts_count = keys.accounts.len();
                 let storage_count = keys.storage_slots.len();
                 let code_count = keys.code_hashes.len();
-
 
                 // Log simulation timing at INFO level with full details for per-TX tracking
                 // Format: TX_TIMING|SIMULATION|<tx_hash>|<duration_us>|<keys_count>
@@ -986,7 +1002,8 @@ async fn worker_loop<T>(
                 let sleep_micros = if consecutive_empty > MAX_CONSECUTIVE_EMPTY {
                     MAX_SLEEP_MICROS
                 } else {
-                    BASE_SLEEP_MICROS.saturating_mul(1 + (consecutive_empty as u64 / 10))
+                    BASE_SLEEP_MICROS
+                        .saturating_mul(1 + (consecutive_empty as u64 / 10))
                         .min(MAX_SLEEP_MICROS)
                 };
 
@@ -1036,43 +1053,13 @@ fn simulate_transaction<T: PoolTransaction>(
     let (tx_inner, _signer) = consensus_tx.into_parts();
     let block_env = revm::context::BlockEnv::default();
 
-    // Log that we're about to simulate
-    tracing::warn!(
-        target: "txpool::pre_warming",
-        sender = %sender,
-        to = ?tx.to(),
-        ">>> SIMULATE_TRANSACTION called"
-    );
-
     // Use optimized simulation with fast paths:
     // - Simple ETH transfers: Just sender + recipient (no DB queries)
     // - Known ERC20/DeFi: Heuristic slot prediction (no DB queries)
     // - Unknown contracts: Full simulation with TrackingDB
-    let result = simulator.simulate(&tx_inner, sender, block_env)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
-
-    // Log the result
-    match &result {
-        Ok(keys) => {
-            tracing::warn!(
-                target: "txpool::pre_warming",
-                sender = %sender,
-                accounts = keys.accounts.len(),
-                storage_slots = keys.storage_slots.len(),
-                ">>> SIMULATE_TRANSACTION completed successfully"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "txpool::pre_warming",
-                sender = %sender,
-                error = %e,
-                ">>> SIMULATE_TRANSACTION failed"
-            );
-        }
-    }
-
-    result
+    simulator
+        .simulate(&tx_inner, sender, block_env)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
 
 /// Fallback simulator - extracts minimal keys (sender + recipient).

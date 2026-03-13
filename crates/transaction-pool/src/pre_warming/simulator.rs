@@ -13,21 +13,23 @@
 //! - Pre-computed selector lookup table
 
 use crate::pre_warming::{ExtractedKeys, SnapshotState};
-use alloy_primitives::{Address, U256, B256};
+use ahash::AHashSet;
+use alloy_primitives::{Address, B256, U256};
+use parking_lot::Mutex;
 use reth_chainspec::ChainSpec;
 use reth_provider::ProviderError;
-use revm::bytecode::Bytecode;
-use revm::context::{BlockEnv, CfgEnv};
-use revm::database::DatabaseRef;
-use revm::primitives::hardfork::SpecId;
-use revm::state::AccountInfo;
-use std::sync::Arc;
-use std::time::Duration;
-use std::cell::RefCell;
-use parking_lot::Mutex;
-use ahash::AHashSet;
-use std::sync::LazyLock;
-
+use revm::{
+    bytecode::Bytecode,
+    context::{BlockEnv, CfgEnv},
+    database::DatabaseRef,
+    primitives::hardfork::SpecId,
+    state::AccountInfo,
+};
+use std::{
+    cell::RefCell,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 // Use alloy_evm and reth_evm to suppress unused crate warnings
 #[allow(unused_imports)]
@@ -80,7 +82,9 @@ static KNOWN_SELECTORS: LazyLock<AHashSet<[u8; 4]>> = LazyLock::new(|| {
         // WETH
         [0xd0, 0xe3, 0x0d, 0xb0], // deposit
         [0x2e, 0x1a, 0x7d, 0x4d], // withdraw
-    ].into_iter().collect()
+    ]
+    .into_iter()
+    .collect()
 });
 ///
 /// Each worker thread creates its own Simulator instance.
@@ -115,13 +119,9 @@ impl Simulator {
         // Create CfgEnv with proper chain_id and spec
         let cfg_env = CfgEnv::new()
             .with_chain_id(chain_spec.chain.id())
-            .with_spec_and_mainnet_gas_params(SpecId::CANCUN);  // TODO: Get from chain_spec
+            .with_spec_and_mainnet_gas_params(SpecId::CANCUN); // TODO: Get from chain_spec
 
-        Self {
-            snapshot,
-            cfg_env,
-            timeout: Duration::from_secs(2),
-        }
+        Self { snapshot, cfg_env, timeout: Duration::from_secs(2) }
     }
 
     /// Simulate a transaction using FULL EVM execution.
@@ -181,7 +181,7 @@ impl Simulator {
                     }
                 }
 
-                tracing::info!(
+                tracing::trace!(
                     target: "txpool::pre_warming",
                     accounts = keys.accounts.len(),
                     storage_slots = keys.storage_slots.len(),
@@ -213,7 +213,7 @@ impl Simulator {
         // Log simulation result
         match &result {
             Ok(()) => {
-                tracing::info!(
+                tracing::trace!(
                     target: "txpool::pre_warming",
                     accounts = keys.accounts.len(),
                     storage_slots = keys.storage_slots.len(),
@@ -222,7 +222,7 @@ impl Simulator {
                 );
             }
             Err(e) => {
-                tracing::info!(
+                tracing::trace!(
                     target: "txpool::pre_warming",
                     error = ?e,
                     accounts = keys.accounts.len(),
@@ -232,10 +232,8 @@ impl Simulator {
             }
         }
 
-
         Ok(keys)
     }
-
 
     /// Execute a transaction simulation using enhanced state queries.
     ///
@@ -317,7 +315,8 @@ impl Simulator {
 
             // OPTIMIZATION: Only query allowance if sender != addr
             if *addr != sender {
-                let allowance_slot = Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, *addr, sender);
+                let allowance_slot =
+                    Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, *addr, sender);
                 let _ = db.storage(contract, allowance_slot);
             }
         }
@@ -338,7 +337,8 @@ impl Simulator {
                 let potential_token_id = U256::from_be_slice(&input[68..100]);
                 if potential_token_id < U256::from(1_000_000u64) {
                     // Likely a token ID
-                    let owner_slot = Self::compute_mapping_slot_u256(U256::ZERO, potential_token_id);
+                    let owner_slot =
+                        Self::compute_mapping_slot_u256(U256::ZERO, potential_token_id);
                     let _ = db.storage(contract, owner_slot);
                 }
             }
@@ -346,7 +346,11 @@ impl Simulator {
     }
 
     /// Extract addresses from calldata with a limit to avoid overhead
-    fn extract_all_addresses_from_calldata_limited(input: &[u8], sender: Address, max_addresses: usize) -> Vec<Address> {
+    fn extract_all_addresses_from_calldata_limited(
+        input: &[u8],
+        sender: Address,
+        max_addresses: usize,
+    ) -> Vec<Address> {
         let mut addresses = vec![sender];
 
         // Skip selector (first 4 bytes)
@@ -424,41 +428,16 @@ impl Simulator {
 
         if let Some(access_list) = tx.access_list() {
             if !access_list.0.is_empty() {
-                let access_list_len = access_list.0.len();
-                let mut total_storage_keys = 0usize;
-
                 for item in access_list.0.iter() {
                     keys.add_account(item.address);
-                    total_storage_keys += item.storage_keys.len();
-
                     for slot in &item.storage_keys {
                         let slot_u256 = U256::from_be_bytes(slot.0);
                         keys.add_storage_slot(item.address, slot_u256);
                     }
                 }
-
-                tracing::trace!(
-                    target: "txpool::pre_warming",
-                    sender = %sender,
-                    access_list_entries = access_list_len,
-                    total_storage_keys = total_storage_keys,
-                    accounts_extracted = keys.accounts.len(),
-                    storage_slots_extracted = keys.storage_slots.len(),
-                    ">>> EIP-2930 ACCESS LIST FOUND - using directly, skipping heuristics"
-                );
-
                 return Ok(keys);
             }
         }
-
-        // No access list present - will use heuristic extraction
-        tracing::trace!(
-            target: "txpool::pre_warming",
-            sender = %sender,
-            to = ?tx.to(),
-            input_len = tx.input().len(),
-            ">>> NO ACCESS LIST in transaction - using heuristic extraction"
-        );
 
         // No access list - continue with heuristic-based extraction
         if let Some(to) = tx.to() {
@@ -494,7 +473,6 @@ impl Simulator {
                 keys.merge(tracked);
             }
         }
-
 
         Ok(keys)
     }
@@ -574,7 +552,8 @@ impl Simulator {
         const ALLOWANCES_SLOT: U256 = U256::from_limbs([1, 0, 0, 0]);
         const TOTAL_SUPPLY_SLOT: U256 = U256::from_limbs([2, 0, 0, 0]);
 
-        // ERC721: slot 0 = owners, slot 1 = balances, slot 2 = approvals, slot 3 = operatorApprovals
+        // ERC721: slot 0 = owners, slot 1 = balances, slot 2 = approvals, slot 3 =
+        // operatorApprovals
         const ERC721_OWNERS_SLOT: U256 = U256::ZERO;
         const ERC721_BALANCES_SLOT: U256 = U256::from_limbs([1, 0, 0, 0]);
         const ERC721_TOKEN_APPROVALS_SLOT: U256 = U256::from_limbs([2, 0, 0, 0]);
@@ -614,7 +593,10 @@ impl Simulator {
                     keys.add_storage_slots([
                         (contract, Self::compute_mapping_slot(BALANCES_SLOT, from)),
                         (contract, Self::compute_mapping_slot(BALANCES_SLOT, to)),
-                        (contract, Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, from, sender)),
+                        (
+                            contract,
+                            Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, from, sender),
+                        ),
                     ]);
                     // Batch insert accounts
                     keys.add_accounts([from, to]);
@@ -623,14 +605,20 @@ impl Simulator {
             s if s == APPROVE || s == INCREASE_ALLOWANCE || s == DECREASE_ALLOWANCE => {
                 if input.len() >= 36 {
                     let spender = Address::from_slice(&input[16..36]);
-                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, sender, spender));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, sender, spender),
+                    );
                     keys.add_account(spender);
                 }
             }
             s if s == BALANCE_OF => {
                 if input.len() >= 36 {
                     let account = Address::from_slice(&input[16..36]);
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, account));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_mapping_slot(BALANCES_SLOT, account),
+                    );
                 }
             }
             s if s == MINT => {
@@ -648,8 +636,14 @@ impl Simulator {
             s if s == BURN_FROM => {
                 if input.len() >= 36 {
                     let from = Address::from_slice(&input[16..36]);
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, from));
-                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, from, sender));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_mapping_slot(BALANCES_SLOT, from),
+                    );
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, from, sender),
+                    );
                     keys.add_storage_slot(contract, TOTAL_SUPPLY_SLOT);
                     keys.add_account(from);
                 }
@@ -665,12 +659,31 @@ impl Simulator {
                     // tokenId is in bytes 68-100
                     if input.len() >= 100 {
                         let token_id = U256::from_be_slice(&input[68..100]);
-                        keys.add_storage_slot(contract, Self::compute_mapping_slot_u256(ERC721_OWNERS_SLOT, token_id));
-                        keys.add_storage_slot(contract, Self::compute_mapping_slot_u256(ERC721_TOKEN_APPROVALS_SLOT, token_id));
+                        keys.add_storage_slot(
+                            contract,
+                            Self::compute_mapping_slot_u256(ERC721_OWNERS_SLOT, token_id),
+                        );
+                        keys.add_storage_slot(
+                            contract,
+                            Self::compute_mapping_slot_u256(ERC721_TOKEN_APPROVALS_SLOT, token_id),
+                        );
                     }
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot(ERC721_BALANCES_SLOT, from));
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot(ERC721_BALANCES_SLOT, to));
-                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ERC721_OPERATOR_APPROVALS_SLOT, from, sender));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_mapping_slot(ERC721_BALANCES_SLOT, from),
+                    );
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_mapping_slot(ERC721_BALANCES_SLOT, to),
+                    );
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_nested_mapping_slot(
+                            ERC721_OPERATOR_APPROVALS_SLOT,
+                            from,
+                            sender,
+                        ),
+                    );
                     keys.add_account(from);
                     keys.add_account(to);
                 }
@@ -678,27 +691,47 @@ impl Simulator {
             s if s == SET_APPROVAL_FOR_ALL => {
                 if input.len() >= 36 {
                     let operator = Address::from_slice(&input[16..36]);
-                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ERC721_OPERATOR_APPROVALS_SLOT, sender, operator));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_nested_mapping_slot(
+                            ERC721_OPERATOR_APPROVALS_SLOT,
+                            sender,
+                            operator,
+                        ),
+                    );
                     keys.add_account(operator);
                 }
             }
             s if s == GET_APPROVED => {
                 if input.len() >= 36 {
                     let token_id = U256::from_be_slice(&input[4..36]);
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot_u256(ERC721_TOKEN_APPROVALS_SLOT, token_id));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_mapping_slot_u256(ERC721_TOKEN_APPROVALS_SLOT, token_id),
+                    );
                 }
             }
             s if s == IS_APPROVED_FOR_ALL => {
                 if input.len() >= 68 {
                     let owner = Address::from_slice(&input[16..36]);
                     let operator = Address::from_slice(&input[48..68]);
-                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ERC721_OPERATOR_APPROVALS_SLOT, owner, operator));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_nested_mapping_slot(
+                            ERC721_OPERATOR_APPROVALS_SLOT,
+                            owner,
+                            operator,
+                        ),
+                    );
                 }
             }
             s if s == OWNER_OF => {
                 if input.len() >= 36 {
                     let token_id = U256::from_be_slice(&input[4..36]);
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot_u256(ERC721_OWNERS_SLOT, token_id));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_mapping_slot_u256(ERC721_OWNERS_SLOT, token_id),
+                    );
                 }
             }
 
@@ -711,9 +744,22 @@ impl Simulator {
                     let to = Address::from_slice(&input[48..68]);
                     let token_id = U256::from_be_slice(&input[68..100]);
                     // ERC1155 balances: mapping(uint256 => mapping(address => uint256))
-                    keys.add_storage_slot(contract, Self::compute_erc1155_balance_slot(ERC1155_BALANCES_SLOT, token_id, from));
-                    keys.add_storage_slot(contract, Self::compute_erc1155_balance_slot(ERC1155_BALANCES_SLOT, token_id, to));
-                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ERC1155_OPERATOR_APPROVALS_SLOT, from, sender));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_erc1155_balance_slot(ERC1155_BALANCES_SLOT, token_id, from),
+                    );
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_erc1155_balance_slot(ERC1155_BALANCES_SLOT, token_id, to),
+                    );
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_nested_mapping_slot(
+                            ERC1155_OPERATOR_APPROVALS_SLOT,
+                            from,
+                            sender,
+                        ),
+                    );
                     keys.add_account(from);
                     keys.add_account(to);
                 }
@@ -723,7 +769,14 @@ impl Simulator {
                 if input.len() >= 68 {
                     let from = Address::from_slice(&input[16..36]);
                     let to = Address::from_slice(&input[48..68]);
-                    keys.add_storage_slot(contract, Self::compute_nested_mapping_slot(ERC1155_OPERATOR_APPROVALS_SLOT, from, sender));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_nested_mapping_slot(
+                            ERC1155_OPERATOR_APPROVALS_SLOT,
+                            from,
+                            sender,
+                        ),
+                    );
                     keys.add_account(from);
                     keys.add_account(to);
                     // Note: Full batch parsing would require dynamic array decoding
@@ -747,10 +800,7 @@ impl Simulator {
                 }
             }
             s if s == SYNC || s == GET_RESERVES => {
-                keys.add_storage_slots([
-                    (contract, RESERVE0_SLOT),
-                    (contract, RESERVE1_SLOT),
-                ]);
+                keys.add_storage_slots([(contract, RESERVE0_SLOT), (contract, RESERVE1_SLOT)]);
             }
             s if s == MINT_LP => {
                 // Batch all common slots
@@ -819,7 +869,10 @@ impl Simulator {
                 let addr = Address::from_slice(&chunk[12..32]);
                 if !addr.is_zero() {
                     keys.add_account(addr);
-                    keys.add_storage_slot(contract, Self::compute_mapping_slot(BALANCES_SLOT, addr));
+                    keys.add_storage_slot(
+                        contract,
+                        Self::compute_mapping_slot(BALANCES_SLOT, addr),
+                    );
                 }
             }
             offset += 32;
@@ -917,11 +970,11 @@ impl Simulator {
         let selector = &input[0..4];
 
         // ERC20 function selectors
-        const TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];           // transfer(address,uint256)
-        const TRANSFER_FROM: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd];      // transferFrom(address,address,uint256)
-        const APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];            // approve(address,uint256)
-        const BALANCE_OF: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];         // balanceOf(address)
-        const ALLOWANCE: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];          // allowance(address,address)
+        const TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb]; // transfer(address,uint256)
+        const TRANSFER_FROM: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd]; // transferFrom(address,address,uint256)
+        const APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3]; // approve(address,uint256)
+        const BALANCE_OF: [u8; 4] = [0x70, 0xa0, 0x82, 0x31]; // balanceOf(address)
+        const ALLOWANCE: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e]; // allowance(address,address)
 
         // Common ERC20 storage layout:
         // Slot 0: balances mapping (mapping(address => uint256))
@@ -943,7 +996,12 @@ impl Simulator {
                     let to = Address::from_slice(&input[16..36]);
 
                     // Query sender balance (multiple possible slots)
-                    for base_slot in [BALANCES_SLOT, ALT_BALANCES_SLOT_1, ALT_BALANCES_SLOT_2, ALT_BALANCES_SLOT_3] {
+                    for base_slot in [
+                        BALANCES_SLOT,
+                        ALT_BALANCES_SLOT_1,
+                        ALT_BALANCES_SLOT_2,
+                        ALT_BALANCES_SLOT_3,
+                    ] {
                         let sender_slot = Self::compute_mapping_slot(base_slot, sender);
                         let _ = tracking_db.storage(contract, sender_slot);
 
@@ -972,7 +1030,8 @@ impl Simulator {
                     }
 
                     // Allowance: allowances[from][sender]
-                    let allowance_slot = Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, from, sender);
+                    let allowance_slot =
+                        Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, from, sender);
                     let _ = tracking_db.storage(contract, allowance_slot);
 
                     // Track accounts
@@ -986,7 +1045,8 @@ impl Simulator {
                     let spender = Address::from_slice(&input[16..36]);
 
                     // Allowance: allowances[sender][spender]
-                    let allowance_slot = Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, sender, spender);
+                    let allowance_slot =
+                        Self::compute_nested_mapping_slot(ALLOWANCES_SLOT, sender, spender);
                     let _ = tracking_db.storage(contract, allowance_slot);
 
                     let _ = tracking_db.basic(spender);
@@ -1031,13 +1091,8 @@ impl Simulator {
         use revm::database::Database;
 
         // Common mapping slots to try
-        let mapping_slots = [
-            U256::ZERO,
-            U256::from(1u64),
-            U256::from(2u64),
-            U256::from(3u64),
-            U256::from(5u64),
-        ];
+        let mapping_slots =
+            [U256::ZERO, U256::from(1u64), U256::from(2u64), U256::from(3u64), U256::from(5u64)];
 
         // Always query sender's slots
         for base_slot in &mapping_slots {
@@ -1144,10 +1199,7 @@ struct TrackingDatabaseMut {
 
 impl TrackingDatabaseMut {
     fn new(snapshot: Arc<SnapshotState>) -> Self {
-        Self {
-            snapshot,
-            accessed_keys: RefCell::new(ExtractedKeys::default()),
-        }
+        Self { snapshot, accessed_keys: RefCell::new(ExtractedKeys::default()) }
     }
 
     /// Extract all keys that were accessed during simulation
@@ -1230,10 +1282,7 @@ struct TrackingDatabase {
 
 impl TrackingDatabase {
     fn new(snapshot: Arc<SnapshotState>) -> Self {
-        Self {
-            snapshot,
-            accessed_keys: Mutex::new(ExtractedKeys::default()),
-        }
+        Self { snapshot, accessed_keys: Mutex::new(ExtractedKeys::default()) }
     }
 
     /// Extract all keys that were accessed during simulation
@@ -1340,7 +1389,3 @@ mod tests {
         // TODO: Implement with real transaction
     }
 }
-
-
-
-
