@@ -24,7 +24,7 @@ use crate::pre_warming::{PreWarmedCache, PreWarmingMetrics};
 use alloy_primitives::B256;
 use parking_lot::RwLock;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -45,6 +45,50 @@ static GLOBAL_PREFETCH_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// mempool transactions. The payload builder reuses it instead of creating a
 /// fresh cold SnapshotState, converting MDBX queries into in-memory DashMap hits.
 static GLOBAL_SIMULATION_SNAPSHOT: RwLock<Option<Arc<SnapshotState>>> = RwLock::new(None);
+
+/// Set to `true` while the payload builder is running prefetch + EVM execution.
+///
+/// Simulation workers poll this flag and back off when it is set, freeing CPU cores
+/// for block execution. Without this, `pre-warm-sim-*` rayon threads compete with the
+/// EVM executor during the critical ~400ms block-build window, fragmenting CPU and
+/// slowing both transaction execution and state-root computation.
+static BLOCK_BUILDING_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Signal that the payload builder has entered (or exited) the block-build window.
+///
+/// Called by `BlockBuildingGuard::new()` (true) and its `Drop` impl (false).
+pub fn set_block_building(active: bool) {
+    BLOCK_BUILDING_IN_PROGRESS.store(active, Ordering::Relaxed);
+}
+
+/// Returns `true` if the payload builder is currently building a block.
+///
+/// Simulation workers check this before acquiring simulation permits so they yield
+/// CPUs to the EVM executor during the block-build window.
+pub fn is_block_building() -> bool {
+    BLOCK_BUILDING_IN_PROGRESS.load(Ordering::Relaxed)
+}
+
+/// RAII guard that marks block-building in progress for its lifetime.
+///
+/// Construct with `BlockBuildingGuard::new()` immediately before starting prefetch.
+/// The guard automatically clears the flag — even on early returns or panics —
+/// so simulation workers resume as soon as block building finishes.
+pub struct BlockBuildingGuard;
+
+impl BlockBuildingGuard {
+    /// Mark block building as started and return a guard that will clear the flag on drop.
+    pub fn new() -> Self {
+        set_block_building(true);
+        Self
+    }
+}
+
+impl Drop for BlockBuildingGuard {
+    fn drop(&mut self) {
+        set_block_building(false);
+    }
+}
 
 /// Parent block hash and cache size at the time of the last prefetch.
 ///

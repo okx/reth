@@ -844,6 +844,15 @@ async fn drain_loop<T>(
             continue;
         }
 
+        // Back off while the payload builder is executing a block. The builder sets
+        // BLOCK_BUILDING_IN_PROGRESS via BlockBuildingGuard for the entire window
+        // (prefetch + EVM execution + state root). Yielding here frees the simulation
+        // rayon threads' CPU cores for the EVM executor, removing the main source of
+        // CPU competition that causes pre-warming to regress TPS vs the OFF baseline.
+        while crate::pre_warming::registry::is_block_building() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
         // Acquire a simulation slot. Blocks only when num_workers simulations
         // are already running; the channel continues to buffer items in the meantime.
         let permit = match Arc::clone(&semaphore).acquire_owned().await {

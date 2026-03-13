@@ -231,6 +231,14 @@ where
         // We also reuse the simulation workers' warm SnapshotState instead of opening
         // a fresh cold MDBX transaction: the DashMap cache already holds state queried
         // during simulation, so prefetch queries become cheap in-memory hits.
+        //
+        // The guard signals simulation workers to pause for the entire block-build window
+        // (prefetch + EVM execution + state root). Without this, simulation rayon threads
+        // compete for CPU with the EVM executor and degrade TPS vs the OFF baseline.
+        // The guard is RAII: it clears the flag even on early return or panic.
+        #[cfg(feature = "pre-warming")]
+        let _block_build_guard =
+            reth_transaction_pool::pre_warming::BlockBuildingGuard::new();
         #[cfg(feature = "pre-warming")]
         {
             let parent_hash = config.parent_header.hash();
