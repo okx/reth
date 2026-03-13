@@ -18,7 +18,8 @@ use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use revm_database::{states::StorageSlot, AccountStatus, BundleState, StorageWithOriginalValues};
 use revm_state::AccountInfo;
 use seidb::db::SeiDb;
-use seidb_common::config::{MemIavlConfig, StateCommitConfig, WriteMode};
+use seidb_common::config::{MemIavlConfig, StateCommitConfig, StateStoreConfig, WriteMode};
+use seidb_traits::ss::StateStore;
 use std::time::{Duration, Instant};
 use xlayer_salt::seidb_adapter;
 
@@ -740,6 +741,203 @@ fn bench_seidb_parallel(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// SC + SS full-stack benchmark (includes RocksDB MVCC write)
+// ---------------------------------------------------------------------------
+
+/// Open SeiDb with both SC and SS layers enabled.
+fn setup_seidb_full_stack(
+    dir: &std::path::Path,
+    write_mode: WriteMode,
+    pre_pop: &BundleState,
+    async_apply: bool,
+) -> SeiDb {
+    let home = dir.to_string_lossy().to_string();
+    let sc_config = StateCommitConfig {
+        write_mode,
+        memiavl: MemIavlConfig {
+            snapshot_interval: 0,
+            async_commit_buffer: if async_apply { 100 } else { 0 },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let ss_config = StateStoreConfig {
+        enable: true,
+        db_directory: dir.join("cosmos_ss").to_string_lossy().to_string(),
+        evm_db_directory: dir.join("evm_ss").to_string_lossy().to_string(),
+        keep_last_version: true,
+        ..Default::default()
+    };
+
+    let mut db = SeiDb::open(&home, sc_config, Some(ss_config)).unwrap();
+    let stores: Vec<String> = COSMOS_MODULES.iter().map(|s| s.to_string()).collect();
+    db.initialize(&stores);
+    db.load_version(0).unwrap();
+
+    // Pre-populate SC (SS pre-population skipped for brevity — benchmark
+    // measures steady-state write throughput, not first-block cold start)
+    let chunks = if async_apply {
+        seidb_adapter::bundle_to_multimodule_pre_populate_changesets(pre_pop, PRE_POP_CHUNK_SIZE)
+    } else {
+        seidb_adapter::bundle_to_pre_populate_changesets(pre_pop, PRE_POP_CHUNK_SIZE)
+    };
+    for (i, chunk) in chunks.iter().enumerate() {
+        db.sc_mut().apply_change_sets(chunk).unwrap();
+        let ver = db.sc_mut().commit().unwrap();
+        // Also write to SS
+        if let Some(ss) = db.ss() {
+            ss.apply_changeset_sync(ver, chunk).unwrap();
+        }
+        if i == 0 {
+            eprintln!("  Pre-populating SC+SS...");
+        }
+    }
+    eprintln!("  Pre-pop done ({} chunks)", chunks.len());
+
+    db
+}
+
+/// Run blocks through SC + SS, measuring total time including RocksDB writes.
+fn run_seidb_full_stack(
+    db: &mut SeiDb,
+    block_bundles: &[BundleState],
+    multimodule: bool,
+) -> (Duration, Vec<BlockStats>) {
+    let mut block_stats = Vec::with_capacity(block_bundles.len());
+    let total_start = Instant::now();
+
+    for bundle in block_bundles {
+        let block_start = Instant::now();
+
+        let changesets = if multimodule {
+            seidb_adapter::bundle_to_multimodule_changesets(bundle)
+        } else {
+            seidb_adapter::bundle_to_changesets(bundle)
+        };
+        let state_changes = bundle_state_changes(bundle);
+
+        // SC apply
+        let apply_start = Instant::now();
+        db.sc_mut().apply_change_sets(&changesets).unwrap();
+        let apply_time = apply_start.elapsed();
+
+        // SC commit (hash computation)
+        let commit_start = Instant::now();
+        let ver = db.sc_mut().commit().unwrap();
+
+        // SS write (RocksDB MVCC — the real disk I/O)
+        if let Some(ss) = db.ss() {
+            ss.apply_changeset_sync(ver, &changesets).unwrap();
+        }
+        let commit_time = commit_start.elapsed();
+
+        block_stats.push(BlockStats {
+            wall_time: block_start.elapsed(),
+            apply_time,
+            commit_time, // includes both SC commit + SS write
+            state_changes,
+        });
+    }
+
+    (total_start.elapsed(), block_stats)
+}
+
+fn bench_seidb_full_stack(c: &mut Criterion) {
+    let mut group = c.benchmark_group("SeiDB full-stack SC+SS");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    let state_changes_per_block = ACCOUNTS_PER_BLOCK * (1 + SLOTS_PER_ACCOUNT);
+    let label = format!("pre{PRE_POP_ACCOUNTS}_{NUM_BLOCKS}blk_{ACCOUNTS_PER_BLOCK}accts");
+
+    let mut rng = StdRng::seed_from_u64(42);
+    let pre_pop = generate_bundle_state_random(PRE_POP_ACCOUNTS, SLOTS_PER_ACCOUNT, &mut rng);
+    let pre_pop_addresses: Vec<Address> = pre_pop.state().keys().copied().collect();
+
+    let mut rng_blocks = StdRng::seed_from_u64(43);
+    let block_bundles: Vec<_> = (0..NUM_BLOCKS)
+        .map(|i| {
+            generate_block_updates_from_addresses(
+                &pre_pop_addresses,
+                SLOTS_PER_ACCOUNT,
+                i,
+                &mut rng_blocks,
+            )
+        })
+        .collect();
+
+    eprintln!(
+        "SeiDB full-stack setup: {} accounts, {} state changes/block (SC+SS)",
+        PRE_POP_ACCOUNTS, state_changes_per_block,
+    );
+
+    // --- SC-only (no SS, for comparison baseline within same group) ---
+    let mut sc_only_state: Option<(SeiDb, tempfile::TempDir)> = None;
+    group.bench_function(BenchmarkId::new("sc_only", &label), |b| {
+        let (db, _dir) = sc_only_state.get_or_insert_with(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = setup_seidb(dir.path(), WriteMode::CosmosOnly, &pre_pop);
+            (db, dir)
+        });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                let (elapsed, stats) = run_seidb_blocks(db, &block_bundles);
+                total += elapsed;
+                if i == 0 {
+                    print_stats("SC-only (no SS)", &stats);
+                }
+            }
+            total
+        })
+    });
+
+    // --- SC + SS full stack ---
+    let mut full_state: Option<(SeiDb, tempfile::TempDir)> = None;
+    group.bench_function(BenchmarkId::new("sc_plus_ss", &label), |b| {
+        let (db, _dir) = full_state.get_or_insert_with(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = setup_seidb_full_stack(dir.path(), WriteMode::CosmosOnly, &pre_pop, false);
+            (db, dir)
+        });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                let (elapsed, stats) = run_seidb_full_stack(db, &block_bundles, false);
+                total += elapsed;
+                if i == 0 {
+                    print_stats("SC + SS (RocksDB MVCC)", &stats);
+                }
+            }
+            total
+        })
+    });
+
+    // --- SC + SS full stack parallel (9 modules) ---
+    let mut full_par_state: Option<(SeiDb, tempfile::TempDir)> = None;
+    group.bench_function(BenchmarkId::new("sc_plus_ss_parallel", &label), |b| {
+        let (db, _dir) = full_par_state.get_or_insert_with(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = setup_seidb_full_stack(dir.path(), WriteMode::CosmosOnly, &pre_pop, true);
+            (db, dir)
+        });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                let (elapsed, stats) = run_seidb_full_stack(db, &block_bundles, true);
+                total += elapsed;
+                if i == 0 {
+                    print_stats("SC + SS Parallel (9 modules)", &stats);
+                }
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion main
 // ---------------------------------------------------------------------------
 
@@ -750,5 +948,6 @@ criterion_group!(
     bench_mpt_mdbx,
     bench_seidb_go_equivalent,
     bench_seidb_parallel,
+    bench_seidb_full_stack,
 );
 criterion_main!(benches);
