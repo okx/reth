@@ -26,7 +26,10 @@
 //! ```
 
 use crate::pre_warming::ExtractedKeys;
-use alloy_primitives::{map::HashMap, Address, B256, U256};
+use alloy_primitives::{
+    map::{HashMap, HashSet},
+    Address, B256, U256,
+};
 use reth_revm::cached::{CachedAccount, CachedReads};
 
 /// Prefetch and populate CachedReads using SnapshotState (PARALLEL - TOKIO)
@@ -376,22 +379,45 @@ pub fn prefetch_with_arcs_sync(
     let prefetch_start = Instant::now();
     let num_threads = num_threads.max(1);
 
-    // Collect all keys from Arc refs into flat Vecs (no merge/dedup overhead).
-    // Include simple ETH transfers — their sender/recipient accounts are cold and
-    // must be prefetched like any other transaction.
+    // Deduplicate keys across all transactions before querying.
+    //
+    // Hot contracts (USDC, WETH, Uniswap V3 pools) appear in every transaction
+    // in a busy mempool. Without deduplication, a mempool with 8,000 ERC20
+    // transfers would submit 8,000 identical USDC account queries — each taking
+    // ~1µs from DashMap — adding 8ms of redundant work for that single address
+    // alone. Across all shared contracts and storage slots the total can exceed
+    // 100ms even on a warm DashMap, which is why the pre-warming ON case was
+    // still regressing vs OFF after Fix B.
+    //
+    // Note: an earlier version used plain Vec to "save ~5-8% TPS by avoiding
+    // HashSet merge operations" — that was measured with a 500-TX cap. With full
+    // mempool prefetch the deduplication savings dwarf the HashSet overhead.
     let total_accounts: usize = keys_list.iter().map(|k| k.accounts.len()).sum();
     let total_storage: usize = keys_list.iter().map(|k| k.storage_slots.len()).sum();
     let total_codes: usize = keys_list.iter().map(|k| k.code_hashes.len()).sum();
 
-    let mut accounts: Vec<Address> = Vec::with_capacity(total_accounts);
-    let mut storage_slots: Vec<(Address, U256)> = Vec::with_capacity(total_storage);
-    let mut code_hashes: Vec<B256> = Vec::with_capacity(total_codes);
+    let mut accounts_set: HashSet<Address> = HashSet::with_capacity_and_hasher(
+        total_accounts,
+        Default::default(),
+    );
+    let mut storage_set: HashSet<(Address, U256)> = HashSet::with_capacity_and_hasher(
+        total_storage,
+        Default::default(),
+    );
+    let mut codes_set: HashSet<B256> = HashSet::with_capacity_and_hasher(
+        total_codes,
+        Default::default(),
+    );
 
     for keys in keys_list {
-        accounts.extend(keys.accounts.iter().copied());
-        storage_slots.extend(keys.storage_slots.iter().copied());
-        code_hashes.extend(keys.code_hashes.iter().copied());
+        accounts_set.extend(keys.accounts.iter().copied());
+        storage_set.extend(keys.storage_slots.iter().copied());
+        codes_set.extend(keys.code_hashes.iter().copied());
     }
+
+    let accounts: Vec<Address> = accounts_set.into_iter().collect();
+    let storage_slots: Vec<(Address, U256)> = storage_set.into_iter().collect();
+    let code_hashes: Vec<B256> = codes_set.into_iter().collect();
 
     if accounts.is_empty() && storage_slots.is_empty() && code_hashes.is_empty() {
         return Ok(());
