@@ -1,6 +1,9 @@
 use crate::memiavl::{
+    arena::{resolve_mem_node, FrozenArena, MutableArena, NodeIdx},
     node::{Node, NodeRef},
+    snapshot::Snapshot,
     tree::Tree,
+    tree_algo::compute_hash_recursive,
 };
 use ics23::{
     commitment_proof::Proof, CommitmentProof, ExistenceProof, HashOp, InnerOp, LeafOp, LengthOp,
@@ -73,6 +76,217 @@ fn path_to_leaf(
             current = current.right().expect("branch node must have right child").clone();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Arena-based path-to-leaf
+// ---------------------------------------------------------------------------
+
+/// Arena-based version of [`path_to_leaf`].
+fn path_to_leaf_arena(
+    arena: &MutableArena,
+    frozen: &[std::sync::Arc<FrozenArena>],
+    snapshot: &Option<std::sync::Arc<Snapshot>>,
+    current_gen: u16,
+    start: NodeIdx,
+    key: &[u8],
+) -> std::result::Result<(Vec<PathNode>, NodeIdx), String> {
+    let mut path = Vec::new();
+    let mut current = start;
+
+    loop {
+        if current.is_persisted() {
+            // Fall back to PersistedNode traversal
+            let snap = snapshot.as_ref().expect("snapshot required");
+            let pn = snap.node_at(current.persisted_index(), current.persisted_is_leaf());
+            if pn.is_leaf() {
+                if pn.key() == key {
+                    return Ok((path, current));
+                }
+                return Err("key does not exist".to_string());
+            }
+            let h = pn.height() as i8;
+            if key < pn.key() {
+                let right_pn = pn.right();
+                let right_hash_bytes = right_pn.hash();
+                path.push(PathNode {
+                    height: h,
+                    size: pn.size(),
+                    version: pn.version() as i64,
+                    left: Vec::new(),
+                    right: right_hash_bytes.to_vec(),
+                });
+                let left_pn = pn.left();
+                current = NodeIdx::persisted(left_pn.index, left_pn.is_leaf);
+            } else {
+                let left_pn = pn.left();
+                let left_hash_bytes = left_pn.hash();
+                path.push(PathNode {
+                    height: h,
+                    size: pn.size(),
+                    version: pn.version() as i64,
+                    left: left_hash_bytes.to_vec(),
+                    right: Vec::new(),
+                });
+                let right_pn = pn.right();
+                current = NodeIdx::persisted(right_pn.index, right_pn.is_leaf);
+            }
+            continue;
+        }
+
+        let n = resolve_mem_node(arena, frozen, current_gen, current);
+
+        if n.height == 0 {
+            if n.key.as_slice() == key {
+                return Ok((path, current));
+            }
+            return Err("key does not exist".to_string());
+        }
+
+        let h = n.height as i8;
+        if key < n.key.as_slice() {
+            // Go left; record right sibling hash
+            let right_idx = n.right_idx.expect("branch must have right child");
+            let right_hash =
+                compute_hash_recursive(arena, frozen, snapshot, current_gen, right_idx);
+            path.push(PathNode {
+                height: h,
+                size: n.size,
+                version: n.version as i64,
+                left: Vec::new(),
+                right: right_hash.to_vec(),
+            });
+            current = n.left_idx.expect("branch must have left child");
+        } else {
+            // Go right; record left sibling hash
+            let left_idx = n.left_idx.expect("branch must have left child");
+            let left_hash = compute_hash_recursive(arena, frozen, snapshot, current_gen, left_idx);
+            path.push(PathNode {
+                height: h,
+                size: n.size,
+                version: n.version as i64,
+                left: left_hash.to_vec(),
+                right: Vec::new(),
+            });
+            current = n.right_idx.expect("branch must have right child");
+        }
+    }
+}
+
+/// Arena-based existence proof creation.
+fn create_existence_proof_arena(
+    arena: &MutableArena,
+    frozen: &[std::sync::Arc<FrozenArena>],
+    snapshot: &Option<std::sync::Arc<Snapshot>>,
+    current_gen: u16,
+    root: NodeIdx,
+    key: &[u8],
+) -> std::result::Result<ExistenceProof, String> {
+    let (path, leaf_idx) = path_to_leaf_arena(arena, frozen, snapshot, current_gen, root, key)?;
+
+    // Read leaf data
+    let (leaf_key, leaf_value, leaf_version) = if leaf_idx.is_persisted() {
+        let snap = snapshot.as_ref().expect("snapshot required");
+        let pn = snap.node_at(leaf_idx.persisted_index(), leaf_idx.persisted_is_leaf());
+        (pn.key().to_vec(), pn.value().unwrap_or(&[]).to_vec(), pn.version() as i64)
+    } else {
+        let n = resolve_mem_node(arena, frozen, current_gen, leaf_idx);
+        (n.key.clone(), n.value.clone(), n.version as i64)
+    };
+
+    Ok(ExistenceProof {
+        key: leaf_key,
+        value: leaf_value,
+        leaf: Some(convert_leaf_op(leaf_version)),
+        path: convert_inner_ops(&path),
+    })
+}
+
+/// Arena-based get_with_index (returns insertion-point index for missing keys).
+fn get_with_index_arena(
+    arena: &MutableArena,
+    frozen: &[std::sync::Arc<FrozenArena>],
+    snapshot: &Option<std::sync::Arc<Snapshot>>,
+    current_gen: u16,
+    idx: NodeIdx,
+    key: &[u8],
+) -> (Option<Vec<u8>>, u32) {
+    if idx.is_persisted() {
+        let snap = snapshot.as_ref().expect("snapshot required");
+        let pn = snap.node_at(idx.persisted_index(), idx.persisted_is_leaf());
+        // Delegate to PersistedNode which has its own get logic
+        let node = Node::Persisted(pn);
+        return get_with_index_node(&node, key);
+    }
+
+    let n = resolve_mem_node(arena, frozen, current_gen, idx);
+
+    if n.height == 0 {
+        return match n.key.as_slice().cmp(key) {
+            std::cmp::Ordering::Less => (None, 1),
+            std::cmp::Ordering::Greater => (None, 0),
+            std::cmp::Ordering::Equal => (Some(n.value.clone()), 0),
+        };
+    }
+
+    if key < n.key.as_slice() {
+        if let Some(left) = n.left_idx {
+            return get_with_index_arena(arena, frozen, snapshot, current_gen, left, key);
+        }
+        return (None, 0);
+    }
+
+    if let Some(right) = n.right_idx {
+        let (value, i) = get_with_index_arena(arena, frozen, snapshot, current_gen, right, key);
+        let right_n = resolve_mem_node(arena, frozen, current_gen, right);
+        let left_size = n.size - right_n.size;
+        return (value, i + left_size as u32);
+    }
+    (None, 0)
+}
+
+/// Arena-based get_by_index.
+pub(crate) fn get_by_index_arena(
+    arena: &MutableArena,
+    frozen: &[std::sync::Arc<FrozenArena>],
+    snapshot: &Option<std::sync::Arc<Snapshot>>,
+    current_gen: u16,
+    idx: NodeIdx,
+    index: i64,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    if idx.is_persisted() {
+        let snap = snapshot.as_ref()?;
+        let pn = snap.node_at(idx.persisted_index(), idx.persisted_is_leaf());
+        if index < 0 {
+            return None;
+        }
+        return pn.get_by_index(index as u32);
+    }
+
+    let n = resolve_mem_node(arena, frozen, current_gen, idx);
+
+    if n.height == 0 {
+        return if index == 0 { Some((n.key.clone(), n.value.clone())) } else { None };
+    }
+
+    if let Some(left) = n.left_idx {
+        let left_n = resolve_mem_node(arena, frozen, current_gen, left);
+        let left_size = left_n.size;
+        if index < left_size {
+            return get_by_index_arena(arena, frozen, snapshot, current_gen, left, index);
+        }
+        if let Some(right) = n.right_idx {
+            return get_by_index_arena(
+                arena,
+                frozen,
+                snapshot,
+                current_gen,
+                right,
+                index - left_size,
+            );
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -207,9 +421,17 @@ impl Tree {
     ///
     /// Returns an error if the key is not found or the tree is empty.
     pub fn get_membership_proof(&self, key: &[u8]) -> Result<CommitmentProof> {
-        let root =
-            self.ensure_root_ref().ok_or_else(|| SeiDbError::Other("tree is empty".to_string()))?;
-        let exist = create_existence_proof(&root, key).map_err(SeiDbError::Other)?;
+        let root_idx =
+            self.root_idx.ok_or_else(|| SeiDbError::Other("tree is empty".to_string()))?;
+        let exist = create_existence_proof_arena(
+            &self.arena,
+            &self.frozen_arenas,
+            &self.snapshot,
+            self.current_gen,
+            root_idx,
+            key,
+        )
+        .map_err(SeiDbError::Other)?;
         Ok(CommitmentProof { proof: Some(Proof::Exist(exist)) })
     }
 
@@ -217,10 +439,17 @@ impl Tree {
     ///
     /// Returns an error if the key actually exists or the tree is empty.
     pub fn get_non_membership_proof(&self, key: &[u8]) -> Result<CommitmentProof> {
-        let root =
-            self.ensure_root_ref().ok_or_else(|| SeiDbError::Other("tree is empty".to_string()))?;
+        let root_idx =
+            self.root_idx.ok_or_else(|| SeiDbError::Other("tree is empty".to_string()))?;
 
-        let (val, idx) = get_with_index_node(&root, key);
+        let (val, idx) = get_with_index_arena(
+            &self.arena,
+            &self.frozen_arenas,
+            &self.snapshot,
+            self.current_gen,
+            root_idx,
+            key,
+        );
         if val.is_some() {
             return Err(SeiDbError::Other(
                 "cannot create NonExistenceProof when key is in state".to_string(),
@@ -231,16 +460,45 @@ impl Tree {
 
         // Left neighbor: the key at index-1 (if it exists).
         if idx >= 1 &&
-            let Some((left_key, _)) = root.get_by_index((idx as i64) - 1)
+            let Some((left_key, _)) = get_by_index_arena(
+                &self.arena,
+                &self.frozen_arenas,
+                &self.snapshot,
+                self.current_gen,
+                root_idx,
+                (idx as i64) - 1,
+            )
         {
-            let left_proof = create_existence_proof(&root, &left_key).map_err(SeiDbError::Other)?;
+            let left_proof = create_existence_proof_arena(
+                &self.arena,
+                &self.frozen_arenas,
+                &self.snapshot,
+                self.current_gen,
+                root_idx,
+                &left_key,
+            )
+            .map_err(SeiDbError::Other)?;
             nonexist.left = Some(left_proof);
         }
 
         // Right neighbor: the key at index `idx` (if it exists).
-        if let Some((right_key, _)) = root.get_by_index(idx as i64) {
-            let right_proof =
-                create_existence_proof(&root, &right_key).map_err(SeiDbError::Other)?;
+        if let Some((right_key, _)) = get_by_index_arena(
+            &self.arena,
+            &self.frozen_arenas,
+            &self.snapshot,
+            self.current_gen,
+            root_idx,
+            idx as i64,
+        ) {
+            let right_proof = create_existence_proof_arena(
+                &self.arena,
+                &self.frozen_arenas,
+                &self.snapshot,
+                self.current_gen,
+                root_idx,
+                &right_key,
+            )
+            .map_err(SeiDbError::Other)?;
             nonexist.right = Some(right_proof);
         }
 

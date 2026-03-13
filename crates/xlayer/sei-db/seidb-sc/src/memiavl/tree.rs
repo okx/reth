@@ -27,16 +27,16 @@ pub type ChangeSet = Vec<Change>;
 pub struct Tree {
     version: u32,
     /// Arena-based root index (primary, used for set/remove/get).
-    root_idx: Option<NodeIdx>,
+    pub(crate) root_idx: Option<NodeIdx>,
     /// Legacy root (populated lazily for consumers needing NodeRef).
     root: Option<NodeRef>,
-    snapshot: Option<Arc<Snapshot>>,
+    pub(crate) snapshot: Option<Arc<Snapshot>>,
     /// Frozen arenas from previous copy() calls, shared via Arc.
-    frozen_arenas: Vec<Arc<FrozenArena>>,
+    pub(crate) frozen_arenas: Vec<Arc<FrozenArena>>,
     /// Mutable arena for the current block's allocations.
-    arena: MutableArena,
+    pub(crate) arena: MutableArena,
     /// Current generation counter for arena indexing.
-    current_gen: u16,
+    pub(crate) current_gen: u16,
     initial_version: u32,
     cow_version: u32,
     zero_copy: bool,
@@ -389,9 +389,15 @@ impl Tree {
 
     /// Look up a key-value pair by its in-order index.
     pub fn get_by_index(&self, index: i64) -> Option<(Vec<u8>, Vec<u8>)> {
-        // Delegate to legacy NodeRef for now (index-based lookup is complex)
-        let root_ref = self.ensure_root_ref()?;
-        root_ref.get_by_index(index)
+        let root = self.root_idx?;
+        crate::memiavl::proof::get_by_index_arena(
+            &self.arena,
+            &self.frozen_arenas,
+            &self.snapshot,
+            self.current_gen,
+            root,
+            index,
+        )
     }
 
     /// Compute and return the root hash.
