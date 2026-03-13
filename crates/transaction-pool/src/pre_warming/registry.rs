@@ -46,11 +46,13 @@ static GLOBAL_PREFETCH_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// fresh cold SnapshotState, converting MDBX queries into in-memory DashMap hits.
 static GLOBAL_SIMULATION_SNAPSHOT: RwLock<Option<Arc<SnapshotState>>> = RwLock::new(None);
 
-/// Parent block hash for which prefetch was last run.
+/// Parent block hash and cache size at the time of the last prefetch.
 ///
-/// `build_payload` is called every ~200ms per slot. We only prefetch once per
-/// parent block — subsequent calls reuse the already-warm CachedReads.
-static LAST_PREFETCHED_PARENT: RwLock<Option<B256>> = RwLock::new(None);
+/// `build_payload` is called every ~200ms per slot. We skip re-prefetch if
+/// the parent block has not changed AND the cache has not grown significantly
+/// since the last run. This avoids redundant work while still re-prefetching
+/// when simulation workers have finished processing a new batch of transactions.
+static LAST_PREFETCH_STATE: RwLock<Option<(B256, usize)>> = RwLock::new(None);
 
 /// Set the global pre-warmed cache
 ///
@@ -141,23 +143,45 @@ pub fn get_global_simulation_snapshot() -> Option<Arc<SnapshotState>> {
     GLOBAL_SIMULATION_SNAPSHOT.read().clone()
 }
 
+/// Number of new cache entries required before re-running prefetch for the same block.
+///
+/// When `build_payload` first fires for a new parent, simulation workers may have
+/// processed only a handful of pending transactions. Setting this threshold allows
+/// the payload builder to re-prefetch as more simulations complete, ensuring
+/// CachedReads is warm before the block deadline.
+const REPREFETCH_GROWTH_THRESHOLD: usize = 200;
+
 /// Returns true if `build_payload` should run prefetch for `parent_hash`.
 ///
-/// The payload builder is called every ~200ms per slot with the same parent hash.
-/// Only the first call needs to prefetch — subsequent calls already have warm
-/// CachedReads from the first call. Returns false on repeated calls for the same
-/// parent, skipping redundant MDBX queries and thread creation.
-pub fn should_prefetch_for_parent(parent_hash: B256) -> bool {
-    // Fast path: read lock only (no write needed on repeated calls for same parent).
-    if LAST_PREFETCHED_PARENT.read().as_ref() == Some(&parent_hash) {
-        return false;
+/// Prefetch runs on the first call for a new parent block. It also re-runs for
+/// the same parent if the PreWarmedCache has grown by at least
+/// `REPREFETCH_GROWTH_THRESHOLD` entries since the last prefetch, which happens
+/// as simulation workers finish processing the incoming transaction stream.
+pub fn should_prefetch_for_parent(parent_hash: B256, current_cache_size: usize) -> bool {
+    // Fast path: read lock only.
+    {
+        let state = LAST_PREFETCH_STATE.read();
+        if let Some((last_hash, last_size)) = *state {
+            if last_hash == parent_hash {
+                let growth = current_cache_size.saturating_sub(last_size);
+                if growth < REPREFETCH_GROWTH_THRESHOLD {
+                    return false; // Same block, not enough new entries simulated yet
+                }
+            }
+        }
     }
-    // Parent changed — acquire write lock to update.
-    let mut last = LAST_PREFETCHED_PARENT.write();
-    if *last == Some(parent_hash) {
-        return false; // Another thread raced and already set it
+    // Parent changed or cache grew enough — acquire write lock to update.
+    let mut state = LAST_PREFETCH_STATE.write();
+    // Double-check after acquiring write lock.
+    if let Some((last_hash, last_size)) = *state {
+        if last_hash == parent_hash {
+            let growth = current_cache_size.saturating_sub(last_size);
+            if growth < REPREFETCH_GROWTH_THRESHOLD {
+                return false;
+            }
+        }
     }
-    *last = Some(parent_hash);
+    *state = Some((parent_hash, current_cache_size));
     true
 }
 

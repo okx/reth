@@ -976,8 +976,11 @@ where
     fn update_pre_warming_snapshot(
         &self,
         state_provider: Box<dyn reth_provider::StateProvider + Send>,
+        block_hash: alloy_primitives::B256,
     ) {
-        let snapshot = std::sync::Arc::new(crate::pre_warming::SnapshotState::new(state_provider));
+        let snapshot = std::sync::Arc::new(
+            crate::pre_warming::SnapshotState::new_at_block(state_provider, block_hash),
+        );
         self.pool.update_pre_warming_snapshot(snapshot);
     }
 }

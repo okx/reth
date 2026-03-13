@@ -376,67 +376,23 @@ pub fn prefetch_with_arcs_sync(
     let prefetch_start = Instant::now();
     let num_threads = num_threads.max(1);
 
-    // Collect all keys from Arc refs WITHOUT merging into new HashSet
-    // We iterate and collect into Vecs which is faster than HashSet merge
-    let mut accounts: Vec<Address> = Vec::new();
-    let mut storage_slots: Vec<(Address, U256)> = Vec::new();
-    let mut code_hashes: Vec<B256> = Vec::new();
+    // Collect all keys from Arc refs into flat Vecs (no merge/dedup overhead).
+    // Include simple ETH transfers — their sender/recipient accounts are cold and
+    // must be prefetched like any other transaction.
+    let total_accounts: usize = keys_list.iter().map(|k| k.accounts.len()).sum();
+    let total_storage: usize = keys_list.iter().map(|k| k.storage_slots.len()).sum();
+    let total_codes: usize = keys_list.iter().map(|k| k.code_hashes.len()).sum();
 
-    // Pre-calculate total capacity, SKIPPING simple ETH transfers
-    // Simple transfers (≤2 accounts, 0 storage, 0 code) don't benefit from prefetch
-    // because sender/recipient accounts are typically already in CachedReads
-    let mut total_accounts: usize = 0;
-    let mut total_storage: usize = 0;
-    let mut total_codes: usize = 0;
-    let mut skipped_simple: usize = 0;
+    let mut accounts: Vec<Address> = Vec::with_capacity(total_accounts);
+    let mut storage_slots: Vec<(Address, U256)> = Vec::with_capacity(total_storage);
+    let mut code_hashes: Vec<B256> = Vec::with_capacity(total_codes);
 
     for keys in keys_list {
-        // Skip simple ETH transfers: ≤2 accounts, no storage, no code
-        let is_simple_transfer = keys.accounts.len() <= 2 &&
-            keys.storage_slots.is_empty() &&
-            keys.code_hashes.is_empty();
-
-        if is_simple_transfer {
-            skipped_simple += 1;
-            continue;
-        }
-
-        total_accounts += keys.accounts.len();
-        total_storage += keys.storage_slots.len();
-        total_codes += keys.code_hashes.len();
-    }
-
-    // Log skipped simple transfers at trace level
-    if skipped_simple > 0 {
-        tracing::trace!(
-            target: "txpool::pre_warming",
-            skipped = skipped_simple,
-            total = keys_list.len(),
-            "PREFETCH: Skipped simple ETH transfers"
-        );
-    }
-
-    accounts.reserve(total_accounts);
-    storage_slots.reserve(total_storage);
-    code_hashes.reserve(total_codes);
-
-    // Iterate Arc refs directly, skipping simple transfers
-    for keys in keys_list {
-        // Skip simple ETH transfers (same check as above)
-        let is_simple_transfer = keys.accounts.len() <= 2 &&
-            keys.storage_slots.is_empty() &&
-            keys.code_hashes.is_empty();
-
-        if is_simple_transfer {
-            continue;
-        }
-
         accounts.extend(keys.accounts.iter().copied());
         storage_slots.extend(keys.storage_slots.iter().copied());
         code_hashes.extend(keys.code_hashes.iter().copied());
     }
 
-    // Skip if nothing to prefetch (all were simple transfers)
     if accounts.is_empty() && storage_slots.is_empty() && code_hashes.is_empty() {
         return Ok(());
     }

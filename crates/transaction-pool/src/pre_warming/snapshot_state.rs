@@ -344,6 +344,14 @@ pub struct SnapshotState {
     /// DashMap: sharded concurrent map — reads and writes on different keys
     /// never contend. Replaces RwLock<AHashMap> which serialized all writers.
     cache: DashMap<StateKey, StateValue>,
+
+    /// Hash of the block this snapshot is anchored at.
+    ///
+    /// Set when the snapshot is created via `new_at_block`. The payload builder
+    /// uses this to verify the simulation snapshot is at the correct parent block
+    /// before using it for prefetch, avoiding a race where `update_snapshot` fires
+    /// after `build_payload` starts but before it completes.
+    pub parent_block_hash: Option<B256>,
 }
 
 // SnapshotState is Sync because:
@@ -384,6 +392,19 @@ impl SnapshotState {
         Self {
             state_provider: Mutex::new(state_provider),
             cache: DashMap::with_capacity(DEFAULT_STATE_CACHE_CAPACITY),
+            parent_block_hash: None,
+        }
+    }
+
+    /// Create snapshot anchored at a specific parent block hash.
+    ///
+    /// The payload builder uses this to validate that the global simulation
+    /// snapshot is from the correct parent before reusing it for prefetch.
+    pub fn new_at_block(state_provider: Box<dyn StateProvider + Send>, block_hash: B256) -> Self {
+        Self {
+            state_provider: Mutex::new(state_provider),
+            cache: DashMap::with_capacity(DEFAULT_STATE_CACHE_CAPACITY),
+            parent_block_hash: Some(block_hash),
         }
     }
 
@@ -392,6 +413,7 @@ impl SnapshotState {
         Self {
             state_provider: Mutex::new(state_provider),
             cache: DashMap::with_capacity(capacity),
+            parent_block_hash: None,
         }
     }
 

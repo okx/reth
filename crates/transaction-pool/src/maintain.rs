@@ -435,7 +435,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                 // ============================================================
                 #[cfg(feature = "pre-warming")]
                 if let Ok(state_provider) = client.latest() {
-                    pool.update_pre_warming_snapshot(state_provider);
+                    pool.update_pre_warming_snapshot(state_provider, new_tip.hash());
                     trace!(target: "txpool", "Updated pre-warming snapshot after reorg");
                 }
 
@@ -539,7 +539,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                 // ============================================================
                 #[cfg(feature = "pre-warming")]
                 if let Ok(state_provider) = client.latest() {
-                    pool.update_pre_warming_snapshot(state_provider);
+                    pool.update_pre_warming_snapshot(state_provider, tip.hash());
                     trace!(target: "txpool", "Updated pre-warming snapshot after commit");
                 }
 

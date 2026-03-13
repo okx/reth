@@ -741,6 +741,7 @@ pub trait TransactionPoolExt: TransactionPool {
     fn update_pre_warming_snapshot(
         &self,
         state_provider: Box<dyn reth_provider::StateProvider + Send>,
+        block_hash: alloy_primitives::B256,
     );
 
     /// No-op when pre-warming feature is disabled.
@@ -748,6 +749,7 @@ pub trait TransactionPoolExt: TransactionPool {
     fn update_pre_warming_snapshot(
         &self,
         _state_provider: Box<dyn reth_provider::StateProvider + Send>,
+        _block_hash: alloy_primitives::B256,
     ) {
     }
 }
