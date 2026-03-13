@@ -85,19 +85,17 @@ pub fn bundle_to_changesets(bundle: &BundleState) -> Vec<NamedChangeSet> {
 }
 
 /// Convert a `BundleState` into multi-module `NamedChangeSet`s, distributing
-/// account data across multiple cosmos modules (not just "bank") to simulate
-/// sei-chain's real workload. Storage slots still go to "evm".
+/// ALL changes (accounts + storage) **uniformly** across modules.
 ///
-/// Distribution: accounts are round-robin'd across `COSMOS_MODULES` by index,
-/// so each tree gets roughly equal work, enabling parallel tree apply.
+/// This gives each tree roughly equal work, enabling effective parallel apply.
+/// Round-robin by a global counter so every KV pair is evenly spread.
 pub fn bundle_to_multimodule_changesets(bundle: &BundleState) -> Vec<NamedChangeSet> {
     let num_modules = COSMOS_MODULES.len();
     let mut module_pairs: Vec<Vec<KvPair>> = vec![Vec::new(); num_modules];
-    let mut evm_pairs = Vec::new();
+    let mut counter: usize = 0;
 
-    for (i, (addr, account)) in bundle.state().iter().enumerate() {
+    for (addr, account) in bundle.state() {
         let addr = Address::from(*addr);
-        let module_idx = i % num_modules;
 
         if let Some(info) = &account.info {
             let key = addr.as_slice().to_vec();
@@ -106,11 +104,12 @@ pub fn bundle_to_multimodule_changesets(bundle: &BundleState) -> Vec<NamedChange
             value.extend_from_slice(&info.nonce.to_be_bytes());
 
             let is_destroyed = account.was_destroyed();
-            module_pairs[module_idx].push(KvPair {
+            module_pairs[counter % num_modules].push(KvPair {
                 delete: is_destroyed,
                 key,
                 value: if is_destroyed { vec![] } else { value },
             });
+            counter += 1;
         }
 
         for (slot, slot_info) in &account.storage {
@@ -120,7 +119,7 @@ pub fn bundle_to_multimodule_changesets(bundle: &BundleState) -> Vec<NamedChange
             key.extend_from_slice(&slot.to_be_bytes::<32>());
 
             let is_zero = slot_info.present_value.is_zero();
-            evm_pairs.push(KvPair {
+            module_pairs[counter % num_modules].push(KvPair {
                 delete: is_zero,
                 key,
                 value: if is_zero {
@@ -129,6 +128,7 @@ pub fn bundle_to_multimodule_changesets(bundle: &BundleState) -> Vec<NamedChange
                     slot_info.present_value.to_be_bytes::<32>().to_vec()
                 },
             });
+            counter += 1;
         }
     }
 
@@ -141,16 +141,10 @@ pub fn bundle_to_multimodule_changesets(bundle: &BundleState) -> Vec<NamedChange
             });
         }
     }
-    if !evm_pairs.is_empty() {
-        result.push(NamedChangeSet {
-            name: EVM_STORE.into(),
-            changeset: Some(ChangeSet { pairs: evm_pairs }),
-        });
-    }
     result
 }
 
-/// Multi-module version of pre-populate: distributes across cosmos modules.
+/// Multi-module version of pre-populate: distributes ALL changes uniformly.
 pub fn bundle_to_multimodule_pre_populate_changesets(
     bundle: &BundleState,
     chunk_size: usize,
@@ -161,18 +155,18 @@ pub fn bundle_to_multimodule_pre_populate_changesets(
 
     for chunk in accounts.chunks(chunk_size) {
         let mut module_pairs: Vec<Vec<KvPair>> = vec![Vec::new(); num_modules];
-        let mut evm_pairs = Vec::new();
+        let mut counter: usize = 0;
 
-        for (i, (addr, account)) in chunk.iter().enumerate() {
+        for (addr, account) in chunk.iter() {
             let addr = Address::from(**addr);
-            let module_idx = i % num_modules;
 
             if let Some(info) = &account.info {
                 let key = addr.as_slice().to_vec();
                 let mut value = Vec::with_capacity(40);
                 value.extend_from_slice(&info.balance.to_be_bytes::<32>());
                 value.extend_from_slice(&info.nonce.to_be_bytes());
-                module_pairs[module_idx].push(KvPair { delete: false, key, value });
+                module_pairs[counter % num_modules].push(KvPair { delete: false, key, value });
+                counter += 1;
             }
 
             for (slot, slot_info) in &account.storage {
@@ -182,7 +176,7 @@ pub fn bundle_to_multimodule_pre_populate_changesets(
                 key.extend_from_slice(&slot.to_be_bytes::<32>());
 
                 let is_zero = slot_info.present_value.is_zero();
-                evm_pairs.push(KvPair {
+                module_pairs[counter % num_modules].push(KvPair {
                     delete: is_zero,
                     key,
                     value: if is_zero {
@@ -191,6 +185,7 @@ pub fn bundle_to_multimodule_pre_populate_changesets(
                         slot_info.present_value.to_be_bytes::<32>().to_vec()
                     },
                 });
+                counter += 1;
             }
         }
 
@@ -202,12 +197,6 @@ pub fn bundle_to_multimodule_pre_populate_changesets(
                     changeset: Some(ChangeSet { pairs }),
                 });
             }
-        }
-        if !evm_pairs.is_empty() {
-            changesets.push(NamedChangeSet {
-                name: EVM_STORE.into(),
-                changeset: Some(ChangeSet { pairs: evm_pairs }),
-            });
         }
         if !changesets.is_empty() {
             chunks.push(changesets);

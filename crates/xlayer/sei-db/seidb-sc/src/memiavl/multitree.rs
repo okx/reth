@@ -256,8 +256,20 @@ impl MultiTree {
         self.last_commit_info.version =
             next_version(self.last_commit_info.version, self.initial_version);
 
-        for entry in &mut self.trees {
-            entry.tree.save_version(update_commit_info)?;
+        if self.async_apply && self.trees.len() > 1 {
+            // Parallel save_version: each tree computes its hash independently.
+            let errors: Vec<_> = self
+                .trees
+                .par_iter_mut()
+                .filter_map(|entry| entry.tree.save_version(update_commit_info).err())
+                .collect();
+            if let Some(err) = errors.into_iter().next() {
+                return Err(err);
+            }
+        } else {
+            for entry in &mut self.trees {
+                entry.tree.save_version(update_commit_info)?;
+            }
         }
 
         if update_commit_info {
