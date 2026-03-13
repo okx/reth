@@ -715,6 +715,27 @@ fn bench_seidb_parallel(c: &mut Criterion) {
         })
     });
 
+    // --- DualWrite parallel ---
+    let mut dual_state: Option<(SeiDb, tempfile::TempDir)> = None;
+    group.bench_function(BenchmarkId::new("dual_write_parallel", &label), |b| {
+        let (db, _dir) = dual_state.get_or_insert_with(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = setup_seidb_parallel(dir.path(), WriteMode::DualWrite, &pre_pop);
+            (db, dir)
+        });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                let (elapsed, stats) = run_seidb_blocks_multimodule(db, &block_bundles);
+                total += elapsed;
+                if i == 0 {
+                    print_stats("SeiDB DualWrite Parallel (9 modules)", &stats);
+                }
+            }
+            total
+        })
+    });
+
     group.finish();
 }
 
