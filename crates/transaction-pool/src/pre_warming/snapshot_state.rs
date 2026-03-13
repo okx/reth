@@ -299,12 +299,12 @@
 //! | **When MDBX queried?** | On cache miss, then cached for future |
 //! | **What data cached?** | MDBX data (accounts, storage, bytecode) |
 
-use ahash::AHashMap;
 use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256};
-use parking_lot::RwLock;
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use reth_provider::{AccountReader, ProviderError, StateProvider};
 use revm::{bytecode::Bytecode, state::AccountInfo};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Default cache capacity for typical block simulation.
 /// Set high enough to hold a full block's worth of unique accounts/storage
@@ -336,24 +336,25 @@ const DEFAULT_STATE_CACHE_CAPACITY: usize = 4096;
 /// - Use `Arc<SnapshotState>` for sharing across threads instead
 pub struct SnapshotState {
     /// Underlying state provider (points to Block N in MDBX)
-    /// Wrapped in Mutex to allow Send-only providers to be used in parallel context
+    /// parking_lot::Mutex: 3x faster than std::sync::Mutex under contention,
+    /// and no poison tracking overhead.
     state_provider: Mutex<Box<dyn StateProvider + Send>>,
 
     /// Internal cache for deduplication (CRITICAL - reduces MDBX queries 6x!)
-    /// Uses AHashMap for SIMD-accelerated hashing, RwLock for concurrent reads
-    cache: RwLock<AHashMap<StateKey, StateValue>>,
+    /// DashMap: sharded concurrent map — reads and writes on different keys
+    /// never contend. Replaces RwLock<AHashMap> which serialized all writers.
+    cache: DashMap<StateKey, StateValue>,
 }
 
 // SnapshotState is Sync because:
-// - state_provider is behind Mutex (provides Sync for Send-only types)
-// - cache is behind RwLock (provides Sync)
-// This is safe because Mutex serializes all access to state_provider
+// - state_provider is behind parking_lot::Mutex (Sync)
+// - cache is DashMap (Sync by design)
 unsafe impl Sync for SnapshotState {}
 
-// Manual Debug implementation since Mutex and RwLock don't derive Debug nicely
+// Manual Debug implementation since Mutex doesn't derive Debug
 impl std::fmt::Debug for SnapshotState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let cache_size = self.cache.read().len();
+        let cache_size = self.cache.len();
         f.debug_struct("SnapshotState")
             .field("cache_size", &cache_size)
             .field("state_provider", &"<Mutex<Box<dyn StateProvider>>>")
@@ -382,7 +383,7 @@ impl SnapshotState {
     pub fn new(state_provider: Box<dyn StateProvider + Send>) -> Self {
         Self {
             state_provider: Mutex::new(state_provider),
-            cache: RwLock::new(AHashMap::with_capacity(DEFAULT_STATE_CACHE_CAPACITY)),
+            cache: DashMap::with_capacity(DEFAULT_STATE_CACHE_CAPACITY),
         }
     }
 
@@ -390,7 +391,7 @@ impl SnapshotState {
     pub fn with_capacity(state_provider: Box<dyn StateProvider + Send>, capacity: usize) -> Self {
         Self {
             state_provider: Mutex::new(state_provider),
-            cache: RwLock::new(AHashMap::with_capacity(capacity)),
+            cache: DashMap::with_capacity(capacity),
         }
     }
 
@@ -398,22 +399,27 @@ impl SnapshotState {
     pub fn basic_account(&self, address: Address) -> Result<Option<AccountInfo>, ProviderError> {
         let key = StateKey::Account(address);
 
-        // Check cache (read lock - multiple workers can read concurrently)
-        {
-            let cache = self.cache.read();
-            if let Some(StateValue::Account(info)) = cache.get(&key) {
-                // Arc clone is just a ref count increment, not data copy
+        // Fast path: DashMap shard lookup, no global lock
+        if let Some(entry) = self.cache.get(&key) {
+            if let StateValue::Account(info) = entry.value() {
                 return Ok(info.as_ref().map(|arc| (**arc).clone()));
             }
         }
 
-        // Cache miss - query state provider (mutex lock for Send-only provider)
-        let account = {
-            let provider = self.state_provider.lock().unwrap_or_else(|p| p.into_inner());
-            provider.basic_account(&address)?
-        };
+        // Cache miss — acquire provider Mutex (parking_lot: no poison, no unwrap)
+        let provider = self.state_provider.lock();
 
-        // Convert Account to AccountInfo for REVM compatibility
+        // Double-check: another worker may have filled the cache while we waited
+        // for the Mutex. Prevents redundant MDBX queries (thundering herd).
+        if let Some(entry) = self.cache.get(&key) {
+            if let StateValue::Account(info) = entry.value() {
+                return Ok(info.as_ref().map(|arc| (**arc).clone()));
+            }
+        }
+
+        let account = provider.basic_account(&address)?;
+        drop(provider); // Release Mutex before writing to cache
+
         // IMPORTANT: Use KECCAK_EMPTY for accounts with no bytecode, not B256::default()!
         // B256::default() (all zeros) is NOT considered "empty" by REVM's is_empty_code_hash(),
         // which would cause accounts to be incorrectly flagged as having bytecode.
@@ -422,19 +428,13 @@ impl SnapshotState {
                 balance: acc.balance,
                 nonce: acc.nonce,
                 code_hash: acc.bytecode_hash.unwrap_or(KECCAK256_EMPTY),
-                code: None,       // Code loaded separately via code_by_hash
-                account_id: None, // Not needed for simulation
+                code: None,
+                account_id: None,
             })
         });
 
-        // Cache it (write lock - exclusive access)
-        // Store Arc-wrapped AccountInfo for efficient reads later
         let result = info.as_ref().map(|arc| (**arc).clone());
-        {
-            let mut cache = self.cache.write();
-            cache.insert(key, StateValue::Account(info));
-        }
-
+        self.cache.insert(key, StateValue::Account(info));
         Ok(result)
     }
 
@@ -442,27 +442,28 @@ impl SnapshotState {
     pub fn storage(&self, address: Address, index: U256) -> Result<U256, ProviderError> {
         let key = StateKey::Storage(address, index);
 
-        // Check cache FIRST (avoids duplicate MDBX queries!)
-        {
-            let cache = self.cache.read();
-            if let Some(StateValue::Storage(value)) = cache.get(&key) {
-                return Ok(*value); // Cache hit - no MDBX query (10ns vs 50μs)
+        // Fast path: DashMap shard lookup
+        if let Some(entry) = self.cache.get(&key) {
+            if let StateValue::Storage(value) = entry.value() {
+                return Ok(*value);
             }
         }
 
-        // Cache miss - query MDBX (mutex lock for Send-only provider)
-        let value = {
-            let provider = self.state_provider.lock().unwrap_or_else(|p| p.into_inner());
-            let slot = B256::from(index);
-            provider.storage(address, slot)?.unwrap_or_default()
-        };
+        // Cache miss — acquire provider Mutex
+        let provider = self.state_provider.lock();
 
-        // Cache for next TX that needs this (critical!)
-        {
-            let mut cache = self.cache.write();
-            cache.insert(key, StateValue::Storage(value));
+        // Double-check before querying MDBX
+        if let Some(entry) = self.cache.get(&key) {
+            if let StateValue::Storage(value) = entry.value() {
+                return Ok(*value);
+            }
         }
 
+        let slot = B256::from(index);
+        let value = provider.storage(address, slot)?.unwrap_or_default();
+        drop(provider);
+
+        self.cache.insert(key, StateValue::Storage(value));
         Ok(value)
     }
 
@@ -470,31 +471,31 @@ impl SnapshotState {
     pub fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, ProviderError> {
         let key = StateKey::Code(code_hash);
 
-        // Check cache - Arc clone is just ref count increment
-        {
-            let cache = self.cache.read();
-            if let Some(StateValue::Code(code)) = cache.get(&key) {
-                // Deref Arc and clone the Bytecode
+        // Fast path: DashMap shard lookup
+        if let Some(entry) = self.cache.get(&key) {
+            if let StateValue::Code(code) = entry.value() {
                 return Ok((**code).clone());
             }
         }
 
-        // Query state provider using bytecode_by_hash (mutex lock)
-        let code = {
-            let provider = self.state_provider.lock().unwrap_or_else(|p| p.into_inner());
-            provider
-                .bytecode_by_hash(&code_hash)?
-                .map(|bytes| Bytecode::new_raw(bytes.original_bytes().clone()))
-                .unwrap_or_default()
-        };
+        // Cache miss — acquire provider Mutex
+        let provider = self.state_provider.lock();
 
-        // Cache it wrapped in Arc for efficient reads later
-        let result = code.clone();
-        {
-            let mut cache = self.cache.write();
-            cache.insert(key, StateValue::Code(Arc::new(code)));
+        // Double-check before querying MDBX
+        if let Some(entry) = self.cache.get(&key) {
+            if let StateValue::Code(code) = entry.value() {
+                return Ok((**code).clone());
+            }
         }
 
+        let code = provider
+            .bytecode_by_hash(&code_hash)?
+            .map(|bytes| Bytecode::new_raw(bytes.original_bytes().clone()))
+            .unwrap_or_default();
+        drop(provider);
+
+        let result = code.clone();
+        self.cache.insert(key, StateValue::Code(Arc::new(code)));
         Ok(result)
     }
 
@@ -509,21 +510,20 @@ impl SnapshotState {
     /// Account and storage entries are intentionally NOT inherited because they
     /// can change with every transaction.
     pub fn inherit_code_cache(&self, old: &SnapshotState) {
-        let old_cache = old.cache.read();
-        if old_cache.is_empty() {
+        if old.cache.is_empty() {
             return;
         }
-        let mut new_cache = self.cache.write();
-        for (key, value) in old_cache.iter() {
-            if matches!(key, StateKey::Code(_)) {
-                new_cache.insert(key.clone(), value.clone());
+        // DashMap iteration: no global lock, shards iterated one at a time
+        for entry in old.cache.iter() {
+            if matches!(entry.key(), StateKey::Code(_)) {
+                self.cache.insert(entry.key().clone(), entry.value().clone());
             }
         }
     }
 
     /// Get cache statistics (for monitoring)
     pub fn cache_size(&self) -> usize {
-        self.cache.read().len()
+        self.cache.len()
     }
 }
 
