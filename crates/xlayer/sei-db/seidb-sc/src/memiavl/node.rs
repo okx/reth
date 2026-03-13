@@ -428,6 +428,31 @@ fn encode_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
     buf.extend_from_slice(bytes);
 }
 
+/// Encode a signed varint into a fixed buffer. Returns bytes written.
+fn encode_varint_signed_buf(value: i64, buf: &mut [u8]) -> usize {
+    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+    encode_varint_unsigned_buf(zigzag, buf)
+}
+
+/// Encode an unsigned varint into a fixed buffer. Returns bytes written.
+fn encode_varint_unsigned_buf(mut value: u64, buf: &mut [u8]) -> usize {
+    let mut i = 0;
+    while value >= 0x80 {
+        buf[i] = (value as u8) | 0x80;
+        value >>= 7;
+        i += 1;
+    }
+    buf[i] = value as u8;
+    i + 1
+}
+
+/// Encode length-prefixed bytes into a fixed buffer. Returns bytes written.
+fn encode_bytes_buf(bytes: &[u8], buf: &mut [u8]) -> usize {
+    let n = encode_varint_unsigned_buf(bytes.len() as u64, buf);
+    buf[n..n + bytes.len()].copy_from_slice(bytes);
+    n + bytes.len()
+}
+
 /// Compute the SHA256 hash of a node matching the Go IAVL format.
 ///
 /// Branch: `SHA256(varint(height) || varint(size) || varint(version) || encode_bytes(left_hash) ||
@@ -462,26 +487,42 @@ pub fn compute_hash_arena<F>(node: &MemNode, resolve_hash: F) -> [u8; 32]
 where
     F: Fn(NodeIdx) -> [u8; 32],
 {
-    let mut data = Vec::with_capacity(128);
+    // Use stack buffer to avoid heap allocation. Branch hashes need at most
+    // ~76 bytes (3 varints + 2 length-prefixed 32-byte hashes). Leaf hashes
+    // need 3 varints + length-prefixed key + length-prefixed 32-byte value
+    // hash. For keys up to ~200 bytes, 256 is enough.
+    let mut buf = [0u8; 256];
+    let mut pos = 0;
 
-    encode_varint_signed(node.height as i64, &mut data);
-    encode_varint_signed(node.size, &mut data);
-    encode_varint_signed(node.version as i64, &mut data);
+    pos += encode_varint_signed_buf(node.height as i64, &mut buf[pos..]);
+    pos += encode_varint_signed_buf(node.size, &mut buf[pos..]);
+    pos += encode_varint_signed_buf(node.version as i64, &mut buf[pos..]);
 
     if node.height == 0 {
         // Leaf
-        encode_bytes(&node.key, &mut data);
+        if pos + 10 + node.key.len() + 33 > 256 {
+            // Key too large for stack buffer, fall back to Vec
+            let mut data = Vec::with_capacity(pos + 10 + node.key.len() + 33);
+            data.extend_from_slice(&buf[..pos]);
+            encode_bytes(&node.key, &mut data);
+            let value_hash = Sha256::digest(&node.value);
+            encode_bytes(&value_hash, &mut data);
+            return Sha256::digest(&data).into();
+        }
+        pos += encode_bytes_buf(&node.key, &mut buf[pos..]);
         let value_hash = Sha256::digest(&node.value);
-        encode_bytes(&value_hash, &mut data);
+        pos += encode_bytes_buf(&value_hash, &mut buf[pos..]);
     } else {
         // Branch — resolve children's hashes via arena
         let left_hash = node.left_idx.map(|idx| resolve_hash(idx));
         let right_hash = node.right_idx.map(|idx| resolve_hash(idx));
-        encode_bytes(left_hash.as_ref().map_or(&[][..], |h| h.as_slice()), &mut data);
-        encode_bytes(right_hash.as_ref().map_or(&[][..], |h| h.as_slice()), &mut data);
+        let lh = left_hash.as_ref().map_or(&[][..], |h| h.as_slice());
+        let rh = right_hash.as_ref().map_or(&[][..], |h| h.as_slice());
+        pos += encode_bytes_buf(lh, &mut buf[pos..]);
+        pos += encode_bytes_buf(rh, &mut buf[pos..]);
     }
 
-    Sha256::digest(&data).into()
+    Sha256::digest(&buf[..pos]).into()
 }
 
 // ---------------------------------------------------------------------------
