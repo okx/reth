@@ -823,9 +823,13 @@ async fn worker_loop<T>(
 
     // OPTIMIZATION: Batch cache writes to reduce DashMap lock acquisitions
     // Instead of writing each key individually, we accumulate and flush in batches
-    const BATCH_SIZE: usize = 16;
+    const BATCH_SIZE: usize = 32;
     let mut write_batch: Vec<(TxHash, ExtractedKeys)> = Vec::with_capacity(BATCH_SIZE);
     let mut batch_keys_count: usize = 0;
+
+    // OPTIMIZATION: Cache snapshot per batch to avoid repeated Arc clones
+    // Snapshot only changes on new blocks, so reusing within a batch is safe
+    let mut cached_snapshot: Option<Arc<SnapshotState>> = None;
 
     loop {
         // Try to receive from channel (non-blocking)
@@ -860,8 +864,15 @@ async fn worker_loop<T>(
                     "Processing simulation request"
                 );
 
-                // Read fresh snapshot for this simulation
-                let snapshot = snapshot_holder.read().clone();
+                // OPTIMIZATION: Reuse cached snapshot within batch
+                // Only refresh when batch is empty (start of new batch) or on first use
+                let snapshot = if write_batch.is_empty() || cached_snapshot.is_none() {
+                    let fresh = snapshot_holder.read().clone();
+                    cached_snapshot = Some(Arc::clone(&fresh));
+                    fresh
+                } else {
+                    Arc::clone(cached_snapshot.as_ref().unwrap())
+                };
                 let simulator = Simulator::new(snapshot, Arc::clone(&chain_spec));
 
                 // Start timing the simulation
@@ -884,7 +895,7 @@ async fn worker_loop<T>(
                     Ok(Ok(Err(e))) => {
                         // Record failed simulation
                         metrics.simulations_failed.increment(1);
-                        warn!(
+                        tracing::trace!(
                             target: "txpool::pre_warming",
                             worker_id,
                             tx_hash = ?req.tx_hash,
@@ -896,7 +907,7 @@ async fn worker_loop<T>(
                     Ok(Err(join_err)) => {
                         // Record failed simulation (panic)
                         metrics.simulations_failed.increment(1);
-                        error!(
+                        tracing::trace!(
                             target: "txpool::pre_warming",
                             worker_id,
                             tx_hash = ?req.tx_hash,
@@ -908,7 +919,7 @@ async fn worker_loop<T>(
                     Err(_timeout) => {
                         // Record failed simulation (timeout)
                         metrics.simulations_failed.increment(1);
-                        warn!(
+                        tracing::trace!(
                             target: "txpool::pre_warming",
                             worker_id,
                             tx_hash = ?req.tx_hash,
@@ -1025,12 +1036,43 @@ fn simulate_transaction<T: PoolTransaction>(
     let (tx_inner, _signer) = consensus_tx.into_parts();
     let block_env = revm::context::BlockEnv::default();
 
+    // Log that we're about to simulate
+    tracing::warn!(
+        target: "txpool::pre_warming",
+        sender = %sender,
+        to = ?tx.to(),
+        ">>> SIMULATE_TRANSACTION called"
+    );
+
     // Use optimized simulation with fast paths:
     // - Simple ETH transfers: Just sender + recipient (no DB queries)
     // - Known ERC20/DeFi: Heuristic slot prediction (no DB queries)
     // - Unknown contracts: Full simulation with TrackingDB
-    simulator.simulate(&tx_inner, sender, block_env)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    let result = simulator.simulate(&tx_inner, sender, block_env)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+
+    // Log the result
+    match &result {
+        Ok(keys) => {
+            tracing::warn!(
+                target: "txpool::pre_warming",
+                sender = %sender,
+                accounts = keys.accounts.len(),
+                storage_slots = keys.storage_slots.len(),
+                ">>> SIMULATE_TRANSACTION completed successfully"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "txpool::pre_warming",
+                sender = %sender,
+                error = %e,
+                ">>> SIMULATE_TRANSACTION failed"
+            );
+        }
+    }
+
+    result
 }
 
 /// Fallback simulator - extracts minimal keys (sender + recipient).

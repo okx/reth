@@ -1,6 +1,6 @@
-//! Transaction batching for `Pool` insertion for high-throughput scenarios
+//! Transaction pre-warming for `Pool` insertion for high-throughput scenarios
 //!
-//! This module provides transaction batching logic to reduce lock contention when processing
+//! This module provides transaction pre-warming logic to reduce lock contention when processing
 //! many concurrent transaction pool insertions.
 
 use crate::{

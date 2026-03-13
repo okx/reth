@@ -155,6 +155,44 @@ impl Simulator {
     where
         Tx: alloy_consensus::Transaction,
     {
+        // Pre-allocate keys
+        let mut keys = ExtractedKeys::with_capacity_for_txs(1);
+
+        // Always track sender
+        keys.add_account(sender);
+
+        // Track recipient if present
+        if let Some(to) = tx.to() {
+            keys.add_account(to);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // PRIORITY 0: ACCESS LIST PATH (EIP-2930)
+        // If transaction has explicit access list, use it directly - most accurate!
+        // Skip simulation as access list is the authoritative source.
+        // ═══════════════════════════════════════════════════════════════════
+        if let Some(access_list) = tx.access_list() {
+            if !access_list.0.is_empty() {
+                for item in access_list.0.iter() {
+                    keys.add_account(item.address);
+                    for slot in &item.storage_keys {
+                        let slot_u256 = U256::from_be_bytes(slot.0);
+                        keys.add_storage_slot(item.address, slot_u256);
+                    }
+                }
+
+                tracing::info!(
+                    target: "txpool::pre_warming",
+                    accounts = keys.accounts.len(),
+                    storage_slots = keys.storage_slots.len(),
+                    "Using EIP-2930 access list directly (skipping full EVM simulation)"
+                );
+
+                return Ok(keys);
+            }
+        }
+
+        // No access list - run full simulation
         // Create tracking database to record all state accesses
         let mut tracking_db = TrackingDatabaseMut::new(Arc::clone(&self.snapshot));
 
@@ -168,13 +206,14 @@ impl Simulator {
             &block_env,
         );
 
-        // Extract keys regardless of execution result
-        let mut keys = tracking_db.extract_keys();
+        // Extract keys from tracking and merge with initial keys
+        let tracked_keys = tracking_db.extract_keys();
+        keys.merge(tracked_keys);
 
         // Log simulation result
         match &result {
             Ok(()) => {
-                tracing::debug!(
+                tracing::info!(
                     target: "txpool::pre_warming",
                     accounts = keys.accounts.len(),
                     storage_slots = keys.storage_slots.len(),
@@ -183,7 +222,7 @@ impl Simulator {
                 );
             }
             Err(e) => {
-                tracing::debug!(
+                tracing::info!(
                     target: "txpool::pre_warming",
                     error = ?e,
                     accounts = keys.accounts.len(),
@@ -193,16 +232,6 @@ impl Simulator {
             }
         }
 
-        // Process access list (EIP-2930) - explicit hints from transaction
-        if let Some(access_list) = tx.access_list() {
-            for item in access_list.0.iter() {
-                keys.add_account(item.address);
-                for slot in &item.storage_keys {
-                    let slot_u256 = U256::from_be_bytes(slot.0);
-                    keys.add_storage_slot(item.address, slot_u256);
-                }
-            }
-        }
 
         Ok(keys)
     }
@@ -385,7 +414,54 @@ impl Simulator {
         // Track recipient if present
         if let Some(to) = tx.to() {
             keys.add_account(to);
+        }
 
+        // ═══════════════════════════════════════════════════════════════════
+        // PRIORITY 0: ACCESS LIST PATH (EIP-2930)
+        // If transaction has explicit access list, use it directly - most accurate!
+        // Skip all heuristics as access list is the authoritative source.
+        // ═══════════════════════════════════════════════════════════════════
+
+        if let Some(access_list) = tx.access_list() {
+            if !access_list.0.is_empty() {
+                let access_list_len = access_list.0.len();
+                let mut total_storage_keys = 0usize;
+
+                for item in access_list.0.iter() {
+                    keys.add_account(item.address);
+                    total_storage_keys += item.storage_keys.len();
+
+                    for slot in &item.storage_keys {
+                        let slot_u256 = U256::from_be_bytes(slot.0);
+                        keys.add_storage_slot(item.address, slot_u256);
+                    }
+                }
+
+                tracing::trace!(
+                    target: "txpool::pre_warming",
+                    sender = %sender,
+                    access_list_entries = access_list_len,
+                    total_storage_keys = total_storage_keys,
+                    accounts_extracted = keys.accounts.len(),
+                    storage_slots_extracted = keys.storage_slots.len(),
+                    ">>> EIP-2930 ACCESS LIST FOUND - using directly, skipping heuristics"
+                );
+
+                return Ok(keys);
+            }
+        }
+
+        // No access list present - will use heuristic extraction
+        tracing::trace!(
+            target: "txpool::pre_warming",
+            sender = %sender,
+            to = ?tx.to(),
+            input_len = tx.input().len(),
+            ">>> NO ACCESS LIST in transaction - using heuristic extraction"
+        );
+
+        // No access list - continue with heuristic-based extraction
+        if let Some(to) = tx.to() {
             // ═══════════════════════════════════════════════════════════════
             // FAST PATH: Simple ETH transfers (no calldata)
             // ═══════════════════════════════════════════════════════════════
@@ -419,16 +495,6 @@ impl Simulator {
             }
         }
 
-        // Process access list (EIP-2930) - explicit hints from transaction
-        if let Some(access_list) = tx.access_list() {
-            for item in access_list.0.iter() {
-                keys.add_account(item.address);
-                for slot in &item.storage_keys {
-                    let slot_u256 = U256::from_be_bytes(slot.0);
-                    keys.add_storage_slot(item.address, slot_u256);
-                }
-            }
-        }
 
         Ok(keys)
     }

@@ -883,15 +883,31 @@ where
         // Trigger pre-warming simulation (fire-and-forget, non-blocking)
         #[cfg(feature = "pre-warming")]
         if let Some(worker_pool) = self.worker_pool.read().as_ref() {
-            let tx_hash = *meta.added.hash();
-            let transaction = match &meta.added {
-                AddedTransaction::Pending(tx) => tx.transaction.transaction.clone(),
-                AddedTransaction::Parked { transaction, .. } => transaction.transaction.clone(),
+            // OPTIMIZATION: Check for simple ETH transfer BEFORE cloning transaction
+            // Only skip ETH transfers (empty input) - they have no storage slots
+            // Keep ERC20 simulation to maintain high cache hit rate for storage slots
+            use alloy_consensus::Transaction;
+
+            let tx_ref = match &meta.added {
+                AddedTransaction::Pending(tx) => &tx.transaction.transaction,
+                AddedTransaction::Parked { transaction, .. } => &transaction.transaction,
             };
-            worker_pool.trigger_simulation(crate::pre_warming::SimulationRequest::new(
-                tx_hash,
-                transaction,
-            ));
+
+            // Only skip simple ETH transfers (empty input, not create, has recipient)
+            // ERC20 transfers still need simulation for storage slot prefetch
+            let is_simple_eth_transfer = tx_ref.input().is_empty()
+                && !tx_ref.is_create()
+                && tx_ref.to().is_some();
+
+            // Only clone and simulate for non-ETH transfers
+            if !is_simple_eth_transfer {
+                let tx_hash = *meta.added.hash();
+                let transaction = tx_ref.clone();
+                worker_pool.trigger_simulation(crate::pre_warming::SimulationRequest::new(
+                    tx_hash,
+                    transaction,
+                ));
+            }
         }
 
         // Handle blob sidecar storage and notifications for EIP-4844 transactions

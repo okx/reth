@@ -320,7 +320,7 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     /// Builder for pending block environment.
     next_env_builder: Box<dyn PendingEnvBuilder<N::Evm>>,
 
-    /// Transaction batch sender for batching tx insertions
+    /// Transaction batch sender for pre-warming tx insertions
     tx_batch_sender:
         mpsc::UnboundedSender<BatchTxRequest<<N::Pool as TransactionPool>::Transaction>>,
 

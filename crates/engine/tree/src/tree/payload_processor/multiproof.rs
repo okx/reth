@@ -48,13 +48,13 @@ impl From<StateChangeSource> for Source {
     }
 }
 
-/// Maximum number of targets to batch together for prefetch batching.
+/// Maximum number of targets to batch together for prefetch pre-warming.
 /// Prefetches are just proof requests (no state merging), so we allow a higher cap than state
 /// updates
 const PREFETCH_MAX_BATCH_TARGETS: usize = 512;
 
 /// Maximum number of prefetch messages to batch together.
-/// Prevents excessive batching even with small messages.
+/// Prevents excessive pre-warming even with small messages.
 const PREFETCH_MAX_BATCH_MESSAGES: usize = 16;
 
 /// The default max targets, for limiting the number of account and storage proof targets to be
@@ -815,11 +815,11 @@ impl MultiProofTask {
             .filter(|proof| !proof.is_empty())
     }
 
-    /// Processes a multiproof message, batching consecutive prefetch messages.
+    /// Processes a multiproof message, pre-warming consecutive prefetch messages.
     ///
     /// For prefetch messages, drains queued prefetch messages and merges them into one batch before
     /// processing, storing one pending message (different type or over-cap) to handle on the next
-    /// iteration. State updates are processed directly without batching.
+    /// iteration. State updates are processed directly without pre-warming.
     ///
     /// Returns `true` if done, `false` to continue.
     fn process_multiproof_message<P>(
@@ -851,7 +851,7 @@ impl MultiProofTask {
 
                 // Batch consecutive prefetch messages up to limits.
                 // EmptyProof messages are handled inline since they're very fast (~100ns)
-                // and shouldn't interrupt batching.
+                // and shouldn't interrupt pre-warming.
                 while accumulated_count < PREFETCH_MAX_BATCH_TARGETS &&
                     ctx.accumulated_prefetch_targets.len() < PREFETCH_MAX_BATCH_MESSAGES
                 {
@@ -867,7 +867,7 @@ impl MultiProofTask {
                             ctx.accumulated_prefetch_targets.push(next_targets);
                         }
                         Ok(MultiProofMessage::EmptyProof { sequence_number, state }) => {
-                            // Handle inline - very fast, don't break batching
+                            // Handle inline - very fast, don't break pre-warming
                             batch_metrics.proofs_processed += 1;
                             if let Some(combined_update) = self.on_proof(
                                 sequence_number,
@@ -1177,14 +1177,14 @@ impl MultiProofTask {
     }
 }
 
-/// Context for multiproof message batching loop.
+/// Context for multiproof message pre-warming loop.
 ///
 /// Contains processing state that persists across loop iterations.
 ///
 /// Used by `process_multiproof_message` to batch consecutive prefetch messages received via
 /// `try_recv` for efficient processing.
 struct MultiproofBatchCtx {
-    /// Buffers a non-matching message type encountered during batching.
+    /// Buffers a non-matching message type encountered during pre-warming.
     /// Processed first in next iteration to preserve ordering while allowing same-type
     /// messages to batch.
     pending_msg: Option<MultiProofMessage>,
@@ -1195,7 +1195,7 @@ struct MultiproofBatchCtx {
     /// Timestamp when state updates finished. `Some` indicates all state updates have been
     /// received.
     updates_finished_time: Option<Instant>,
-    /// Reusable buffer for accumulating prefetch targets during batching.
+    /// Reusable buffer for accumulating prefetch targets during pre-warming.
     accumulated_prefetch_targets: Vec<MultiProofTargets>,
 }
 
@@ -1759,7 +1759,7 @@ mod tests {
 
         let proofs_requested =
             if let Ok(MultiProofMessage::PrefetchProofs(targets)) = task.rx.recv() {
-                // simulate the batching logic
+                // simulate the pre-warming logic
                 let mut merged_targets = targets;
                 let mut num_batched = 1;
                 while let Ok(MultiProofMessage::PrefetchProofs(next_targets)) = task.rx.try_recv() {
@@ -1971,7 +1971,7 @@ mod tests {
         assert!(matches!(pending, MultiProofMessage::StateUpdate(_, _)));
 
         // Pending message should be handled before the next select loop.
-        // StateUpdate is processed directly without batching.
+        // StateUpdate is processed directly without pre-warming.
         assert!(!task.process_multiproof_message(
             pending,
             &mut ctx,

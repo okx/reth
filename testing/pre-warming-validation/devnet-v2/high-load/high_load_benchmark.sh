@@ -442,7 +442,24 @@ PYEOF
     local SIMS=$(get_metric "reth_txpool_pre_warming_simulations_completed")
     local PREFETCH_ACCTS=$(get_metric "reth_txpool_pre_warming_prefetch_accounts")
     local PREFETCH_OPS=$(get_metric "reth_txpool_pre_warming_prefetch_operations")
+    local PREFETCH_STORAGE=$(get_metric "reth_txpool_pre_warming_prefetch_storage_slots")
     local BLOCK=$(curl -s "http://localhost:8545" -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' 2>/dev/null | python3 -c "import sys,json; print(int(json.load(sys.stdin).get('result','0x0'),16))" 2>/dev/null || echo "0")
+
+    # Simulation timing metrics (per transaction)
+    local SIM_DURATION_SUM=$(get_metric "reth_txpool_pre_warming_simulation_duration_sum")
+    local SIM_DURATION_COUNT=$(get_metric "reth_txpool_pre_warming_simulation_duration_count")
+    local SIM_DURATION_AVG_MS=0
+    if [ -n "${SIM_DURATION_COUNT}" ] && [ "${SIM_DURATION_COUNT}" != "0" ]; then
+        SIM_DURATION_AVG_MS=$(python3 -c "print(round(float('${SIM_DURATION_SUM:-0}') / float('${SIM_DURATION_COUNT}') * 1000, 4))" 2>/dev/null || echo "0")
+    fi
+
+    # Prefetch timing metrics (per block/batch)
+    local PREFETCH_DURATION_SUM=$(get_metric "reth_txpool_pre_warming_prefetch_duration_sum")
+    local PREFETCH_DURATION_COUNT=$(get_metric "reth_txpool_pre_warming_prefetch_duration_count")
+    local PREFETCH_DURATION_AVG_MS=0
+    if [ -n "${PREFETCH_DURATION_COUNT}" ] && [ "${PREFETCH_DURATION_COUNT}" != "0" ]; then
+        PREFETCH_DURATION_AVG_MS=$(python3 -c "print(round(float('${PREFETCH_DURATION_SUM:-0}') / float('${PREFETCH_DURATION_COUNT}') * 1000, 4))" 2>/dev/null || echo "0")
+    fi
 
     # Block timing metrics
     local BUILD_EXEC_SUM=$(get_metric "reth_block_timing_build_exec_mempool_transactions_sum")
@@ -495,9 +512,12 @@ results = {
     "cache_hit_rate": ${HIT_RATE:-0},
     "block_execution_ms": ${BLOCK_EXEC_MS:-0},
     "state_root_ms": ${STATE_ROOT_MS:-0},
+    "simulation_duration_avg_ms": ${SIM_DURATION_AVG_MS:-0},
+    "prefetch_duration_avg_ms": ${PREFETCH_DURATION_AVG_MS:-0},
     "simulations": ${SIMS:-0},
     "prefetch_ops": ${PREFETCH_OPS:-0},
-    "prefetch_accounts": ${PREFETCH_ACCTS:-0}
+    "prefetch_accounts": ${PREFETCH_ACCTS:-0},
+    "prefetch_storage_slots": ${PREFETCH_STORAGE:-0}
 }
 
 with open("${RESULTS_FILE}", "w") as f:
@@ -505,7 +525,7 @@ with open("${RESULTS_FILE}", "w") as f:
 PYEOF
 
     echo -e "    Cache: ${HITS} hits / ${MISSES} misses (${HIT_RATE}%)"
-    echo -e "    Block Exec: ${BLOCK_EXEC_MS}ms | State Root: ${STATE_ROOT_MS}ms"
+    echo -e "    Prefetch: ${PREFETCH_DURATION_AVG_MS}ms | Block Exec: ${BLOCK_EXEC_MS}ms | State Root: ${STATE_ROOT_MS}ms"
 
     # Return contract address for reuse (only if set)
     if [ -n "$CONTRACT_ADDR" ]; then
