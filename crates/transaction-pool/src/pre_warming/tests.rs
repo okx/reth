@@ -1,6 +1,7 @@
 //! # Pre-Warming Module Test Suite
 //!
-//! This comprehensive test suite validates the cache pre-warming system for X-Layer (Optimism-based L2).
+//! This comprehensive test suite validates the cache pre-warming system for X-Layer (Optimism-based
+//! L2).
 //!
 //! ## What This Module Does
 //!
@@ -53,10 +54,12 @@
 #![cfg(test)]
 
 use super::*;
-use alloy_primitives::{address, Address, B256, TxHash, U256};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use alloy_primitives::{address, Address, TxHash, B256, U256};
+use std::{
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 // ============================================================================
 // REALISTIC TEST DATA - Mimics real-world blockchain addresses and values
@@ -115,9 +118,9 @@ mod amounts {
     pub const THOUSAND_USDC: U256 = U256::from_limbs([1_000_000_000u64, 0, 0, 0]);
 }
 
+use amounts::*;
 use known_addresses::*;
 use storage_slots::*;
-use amounts::*;
 
 // ============================================================================
 // MODULE EXPORTS TESTS
@@ -184,16 +187,16 @@ fn test_end_to_end_aggregated_flow() {
     // TX1: Alice swaps on Uniswap
     let tx1_hash = TxHash::random();
     let mut keys1 = ExtractedKeys::new();
-    keys1.add_account(ALICE);             // Sender
+    keys1.add_account(ALICE); // Sender
     keys1.add_account(UNISWAP_V2_ROUTER); // Contract called
-    keys1.add_account(WETH);              // Token in
-    keys1.add_account(USDC);              // Token out
+    keys1.add_account(WETH); // Token in
+    keys1.add_account(USDC); // Token out
 
     // TX2: Bob transfers USDC
     let tx2_hash = TxHash::random();
     let mut keys2 = ExtractedKeys::new();
-    keys2.add_account(BOB);               // Sender
-    keys2.add_account(USDC);              // Token contract (shared with TX1)
+    keys2.add_account(BOB); // Sender
+    keys2.add_account(USDC); // Token contract (shared with TX1)
     keys2.add_storage_slot(USDC, BALANCE_SLOT); // Bob's balance
 
     cache.store_tx_keys(tx1_hash, keys1);
@@ -243,9 +246,7 @@ mod integration {
     /// - Basic store operations work
     #[test]
     fn test_config_to_cache_integration() {
-        let config = PreWarmingConfig::default()
-            .with_workers(4)
-            .with_cache_max_entries(100);
+        let config = PreWarmingConfig::default().with_workers(4).with_cache_max_entries(100);
 
         let cache = PreWarmedCache::new(config);
 
@@ -344,15 +345,18 @@ mod integration {
         let cache = PreWarmedCache::new(config);
 
         let senders = [ALICE, BOB, CHARLIE, DAVE, EVE];
-        let tx_hashes: Vec<TxHash> = senders.iter().map(|sender| {
-            let tx_hash = TxHash::random();
-            let mut keys = ExtractedKeys::new();
-            keys.add_account(*sender);
-            keys.add_account(USDC);
-            keys.add_storage_slot(USDC, BALANCE_SLOT);
-            cache.store_tx_keys(tx_hash, keys);
-            tx_hash
-        }).collect();
+        let tx_hashes: Vec<TxHash> = senders
+            .iter()
+            .map(|sender| {
+                let tx_hash = TxHash::random();
+                let mut keys = ExtractedKeys::new();
+                keys.add_account(*sender);
+                keys.add_account(USDC);
+                keys.add_storage_slot(USDC, BALANCE_SLOT);
+                cache.store_tx_keys(tx_hash, keys);
+                tx_hash
+            })
+            .collect();
 
         // Retrieve keys for first 3 transactions
         let selected = &tx_hashes[0..3];
@@ -661,20 +665,23 @@ mod e2e {
         let cache = PreWarmedCache::new(config);
 
         let users = [ALICE, BOB, CHARLIE, DAVE, EVE];
-        let tx_hashes: Vec<TxHash> = users.iter().map(|user| {
-            let tx_hash = TxHash::random();
-            let mut keys = ExtractedKeys::new();
+        let tx_hashes: Vec<TxHash> = users
+            .iter()
+            .map(|user| {
+                let tx_hash = TxHash::random();
+                let mut keys = ExtractedKeys::new();
 
-            keys.add_account(*user);
-            keys.add_account(UNISWAP_V2_ROUTER);
-            keys.add_account(WETH);
-            keys.add_account(USDC);
-            keys.add_storage_slot(WETH, BALANCE_SLOT);
-            keys.add_storage_slot(USDC, BALANCE_SLOT);
+                keys.add_account(*user);
+                keys.add_account(UNISWAP_V2_ROUTER);
+                keys.add_account(WETH);
+                keys.add_account(USDC);
+                keys.add_storage_slot(WETH, BALANCE_SLOT);
+                keys.add_storage_slot(USDC, BALANCE_SLOT);
 
-            cache.store_tx_keys(tx_hash, keys);
-            tx_hash
-        }).collect();
+                cache.store_tx_keys(tx_hash, keys);
+                tx_hash
+            })
+            .collect();
 
         let merged = cache.get_keys_for_txs(&tx_hashes);
 
@@ -783,11 +790,7 @@ mod e2e {
         keys.add_account(WETH);
         cache.store_tx_keys(alice_tx, keys);
 
-        let selection = vec![
-            alice_tx,
-            TxHash::random(),
-            TxHash::random(),
-        ];
+        let selection = vec![alice_tx, TxHash::random(), TxHash::random()];
 
         let merged = cache.get_keys_for_txs(&selection);
         assert_eq!(merged.accounts.len(), 2);
@@ -1323,14 +1326,18 @@ mod benchmarks {
                 let cache = PreWarmedCache::new(config);
                 let users = generate_user_addresses(1000);
 
-                let tx_hashes: Vec<TxHash> = users.iter().enumerate().map(|(i, user)| {
-                    let tx_hash = TxHash::random();
-                    let mut keys = ExtractedKeys::new();
-                    keys.add_account(*user);
-                    keys.add_account(USDC);
-                    cache.store_tx_keys(tx_hash, keys);
-                    tx_hash
-                }).collect();
+                let tx_hashes: Vec<TxHash> = users
+                    .iter()
+                    .enumerate()
+                    .map(|(i, user)| {
+                        let tx_hash = TxHash::random();
+                        let mut keys = ExtractedKeys::new();
+                        keys.add_account(*user);
+                        keys.add_account(USDC);
+                        cache.store_tx_keys(tx_hash, keys);
+                        tx_hash
+                    })
+                    .collect();
 
                 measure(|| {
                     cache.remove_txs(&tx_hashes[0..500]);
@@ -1340,10 +1347,7 @@ mod benchmarks {
 
         let avg_duration = total_duration / iterations;
 
-        println!(
-            "bench_cache_remove_txs (500 txs): avg {:?} per operation",
-            avg_duration
-        );
+        println!("bench_cache_remove_txs (500 txs): avg {:?} per operation", avg_duration);
 
         assert!(avg_duration < Duration::from_millis(10));
     }
@@ -1446,10 +1450,7 @@ mod benchmarks {
             }
         });
 
-        println!(
-            "bench_large_keys_merge: {} TX keys merged in {:?}",
-            num_txs, duration
-        );
+        println!("bench_large_keys_merge: {} TX keys merged in {:?}", num_txs, duration);
 
         assert!(duration < Duration::from_millis(100));
     }
@@ -1642,15 +1643,19 @@ mod stress {
         let cache = PreWarmedCache::new(config);
         let users = generate_user_addresses(10_000);
 
-        let tx_hashes: Vec<TxHash> = users.iter().enumerate().map(|(i, user)| {
-            let tx_hash = TxHash::random();
-            let mut keys = ExtractedKeys::new();
-            keys.add_account(*user);
-            keys.add_account(USDC);
-            keys.add_storage_slot(USDC, U256::from(i));
-            cache.store_tx_keys(tx_hash, keys);
-            tx_hash
-        }).collect();
+        let tx_hashes: Vec<TxHash> = users
+            .iter()
+            .enumerate()
+            .map(|(i, user)| {
+                let tx_hash = TxHash::random();
+                let mut keys = ExtractedKeys::new();
+                keys.add_account(*user);
+                keys.add_account(USDC);
+                keys.add_storage_slot(USDC, U256::from(i));
+                cache.store_tx_keys(tx_hash, keys);
+                tx_hash
+            })
+            .collect();
 
         assert_eq!(cache.len(), 10_000);
 
@@ -1795,15 +1800,19 @@ mod stress {
         for block_num in 0..100 {
             let users = generate_user_addresses(100);
 
-            let tx_hashes: Vec<TxHash> = users.iter().enumerate().map(|(_i, user)| {
-                let tx_hash = TxHash::random();
-                let mut keys = ExtractedKeys::new();
-                keys.add_account(*user);
-                keys.add_account(USDC);
-                keys.add_storage_slot(USDC, U256::from(block_num * 100 + _i));
-                cache.store_tx_keys(tx_hash, keys);
-                tx_hash
-            }).collect();
+            let tx_hashes: Vec<TxHash> = users
+                .iter()
+                .enumerate()
+                .map(|(_i, user)| {
+                    let tx_hash = TxHash::random();
+                    let mut keys = ExtractedKeys::new();
+                    keys.add_account(*user);
+                    keys.add_account(USDC);
+                    keys.add_storage_slot(USDC, U256::from(block_num * 100 + _i));
+                    cache.store_tx_keys(tx_hash, keys);
+                    tx_hash
+                })
+                .collect();
 
             // With eviction disabled, cache keeps growing
             // After block 0: 100 entries, after block 1: 200, etc.
@@ -1945,4 +1954,3 @@ mod stress {
         // Test passes if no panics/deadlocks occurred
     }
 }
-

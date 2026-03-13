@@ -36,12 +36,13 @@
 /// Block finalized:
 ///   cache.remove_txs(mined_tx_hashes)  // Cleanup
 /// ```
-
 use crate::pre_warming::{ExtractedKeys, PreWarmingConfig};
 use alloy_primitives::TxHash;
 use dashmap::DashMap;
-use std::sync::Arc;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::{
+    hash::{BuildHasherDefault, Hasher},
+    sync::Arc,
+};
 
 /// Default capacity for transaction cache (typical mempool batch)
 const DEFAULT_CACHE_CAPACITY: usize = 256;
@@ -111,7 +112,10 @@ impl PreWarmedCache {
     /// Create new cache with given configuration
     pub fn new(config: PreWarmingConfig) -> Self {
         Self {
-            per_tx_keys: DashMap::with_capacity_and_hasher(DEFAULT_CACHE_CAPACITY, TxHashBuildHasher::default()),
+            per_tx_keys: DashMap::with_capacity_and_hasher(
+                DEFAULT_CACHE_CAPACITY,
+                TxHashBuildHasher::default(),
+            ),
             config,
         }
     }
@@ -186,10 +190,8 @@ impl PreWarmedCache {
 
         // Collect Arc refs first to minimize lock time on DashMap
         // This is faster than holding locks during merge operations
-        let refs: Vec<_> = tx_hashes
-            .iter()
-            .filter_map(|tx_hash| self.per_tx_keys.get(tx_hash))
-            .collect();
+        let refs: Vec<_> =
+            tx_hashes.iter().filter_map(|tx_hash| self.per_tx_keys.get(tx_hash)).collect();
 
         // Fast path: no matches
         if refs.is_empty() {
@@ -258,7 +260,6 @@ impl PreWarmedCache {
         for entry in self.per_tx_keys.iter() {
             merged.merge_ref(entry.value());
         }
-
 
         merged
     }
@@ -345,7 +346,7 @@ pub struct CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256, TxHash, U256};
+    use alloy_primitives::{Address, TxHash, B256, U256};
 
     fn test_config() -> PreWarmingConfig {
         PreWarmingConfig::default()
@@ -409,8 +410,8 @@ mod tests {
         // Get keys for only tx1 and tx3 (selected for block)
         let merged = cache.get_keys_for_txs(&[tx1, tx3]);
 
-        assert_eq!(merged.accounts.len(), 2);  // Only accounts 1 and 3
-        assert_eq!(merged.storage_slots.len(), 4);  // 1 + 3 slots
+        assert_eq!(merged.accounts.len(), 2); // Only accounts 1 and 3
+        assert_eq!(merged.storage_slots.len(), 4); // 1 + 3 slots
     }
 
     #[test]
@@ -460,8 +461,8 @@ mod tests {
         // Get merged keys
         let merged = cache.get_keys_for_txs(&[tx1, tx2]);
 
-        assert_eq!(merged.accounts.len(), 1);  // Deduplicated
-        assert_eq!(merged.storage_slots.len(), 2);  // Both slots
+        assert_eq!(merged.accounts.len(), 1); // Deduplicated
+        assert_eq!(merged.storage_slots.len(), 2); // Both slots
     }
 
     // ============================================================================
@@ -574,10 +575,10 @@ mod tests {
 
         let stats = cache.stats();
         assert_eq!(stats.total_transactions, 2);
-        assert_eq!(stats.total_accounts, 3);  // 1 + 2
-        assert_eq!(stats.total_storage_slots, 3);  // 2 + 1
+        assert_eq!(stats.total_accounts, 3); // 1 + 2
+        assert_eq!(stats.total_storage_slots, 3); // 2 + 1
         assert_eq!(stats.total_code_hashes, 1);
-        assert_eq!(stats.total_keys, 7);  // 3 accounts + 3 storage + 1 code
+        assert_eq!(stats.total_keys, 7); // 3 accounts + 3 storage + 1 code
     }
 
     // ============================================================================
@@ -602,7 +603,7 @@ mod tests {
 
         // Should have keys from tx0, tx2, tx4
         assert_eq!(merged.accounts.len(), 3);
-        assert_eq!(merged.storage_slots.len(), 1 + 3 + 5);  // 0+1, 2+1, 4+1
+        assert_eq!(merged.storage_slots.len(), 1 + 3 + 5); // 0+1, 2+1, 4+1
 
         // Block finalized, remove mined transactions - NOTE: Eviction is disabled
         cache.remove_txs(&selected);
@@ -630,6 +631,6 @@ mod tests {
         cache.store_tx_keys(tx_hash, create_test_keys(1, 5));
 
         let merged = cache.get_keys_for_txs(&[tx_hash]);
-        assert_eq!(merged.storage_slots.len(), 5);  // Updated
+        assert_eq!(merged.storage_slots.len(), 5); // Updated
     }
 }

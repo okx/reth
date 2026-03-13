@@ -493,7 +493,10 @@ where
     /// This is the preferred method for payload builders - pass the hashes of
     /// transactions selected for the block to get only the relevant keys.
     #[cfg(feature = "pre-warming")]
-    pub fn get_keys_for_txs(&self, tx_hashes: &[alloy_primitives::TxHash]) -> Option<crate::pre_warming::ExtractedKeys> {
+    pub fn get_keys_for_txs(
+        &self,
+        tx_hashes: &[alloy_primitives::TxHash],
+    ) -> Option<crate::pre_warming::ExtractedKeys> {
         self.pool.get_keys_for_txs(tx_hashes)
     }
 
@@ -970,7 +973,10 @@ where
     /// - Pre-warming is not enabled in config
     /// - Worker pool is not initialized (call `initialize_pre_warming()` first)
     #[cfg(feature = "pre-warming")]
-    fn update_pre_warming_snapshot(&self, state_provider: Box<dyn reth_provider::StateProvider + Send>) {
+    fn update_pre_warming_snapshot(
+        &self,
+        state_provider: Box<dyn reth_provider::StateProvider + Send>,
+    ) {
         let snapshot = std::sync::Arc::new(crate::pre_warming::SnapshotState::new(state_provider));
         self.pool.update_pre_warming_snapshot(snapshot);
     }

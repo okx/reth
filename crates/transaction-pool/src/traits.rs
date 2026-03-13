@@ -721,8 +721,8 @@ pub trait TransactionPoolExt: TransactionPool {
     ///
     /// # Arguments
     ///
-    /// * `state_provider` - A boxed state provider representing the latest canonical state.
-    ///   This is typically obtained from `StateProviderFactory::latest()` after a new block.
+    /// * `state_provider` - A boxed state provider representing the latest canonical state. This is
+    ///   typically obtained from `StateProviderFactory::latest()` after a new block.
     ///
     /// # Feature Flag
     ///
@@ -738,11 +738,18 @@ pub trait TransactionPoolExt: TransactionPool {
     /// }
     /// ```
     #[cfg(feature = "pre-warming")]
-    fn update_pre_warming_snapshot(&self, state_provider: Box<dyn reth_provider::StateProvider + Send>);
+    fn update_pre_warming_snapshot(
+        &self,
+        state_provider: Box<dyn reth_provider::StateProvider + Send>,
+    );
 
     /// No-op when pre-warming feature is disabled.
     #[cfg(not(feature = "pre-warming"))]
-    fn update_pre_warming_snapshot(&self, _state_provider: Box<dyn reth_provider::StateProvider + Send>) {}
+    fn update_pre_warming_snapshot(
+        &self,
+        _state_provider: Box<dyn reth_provider::StateProvider + Send>,
+    ) {
+    }
 }
 
 /// A Helper type that bundles all transactions in the pool.

@@ -89,29 +89,23 @@ impl Default for PreWarmingConfig {
 impl PreWarmingConfig {
     /// Create config with pre-warming enabled
     pub fn enabled() -> Self {
-        Self {
-            enabled: true,
-            ..Default::default()
-        }
+        Self { enabled: true, ..Default::default() }
     }
 
     /// Create config with pre-warming disabled
     pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            ..Default::default()
-        }
+        Self { enabled: false, ..Default::default() }
     }
 
     /// Set number of workers
     pub fn with_workers(mut self, num_workers: usize) -> Self {
-        self.num_workers = num_workers.max(1);  // At least 1 worker
+        self.num_workers = num_workers.max(1); // At least 1 worker
         self
     }
 
     /// Set number of prefetch workers
     pub fn with_prefetch_workers(mut self, num_workers: usize) -> Self {
-        self.prefetch_num_workers = num_workers.max(1);  // At least 1 worker
+        self.prefetch_num_workers = num_workers.max(1); // At least 1 worker
         self
     }
 
@@ -235,9 +229,8 @@ mod tests {
 
     #[test]
     fn test_builder_chaining() {
-        let config = PreWarmingConfig::disabled()
-            .with_workers(16)
-            .with_timeout(Duration::from_millis(500));
+        let config =
+            PreWarmingConfig::disabled().with_workers(16).with_timeout(Duration::from_millis(500));
 
         assert!(!config.enabled);
         assert_eq!(config.num_workers, 16);
@@ -246,8 +239,7 @@ mod tests {
 
     #[test]
     fn test_builder_partial_configuration() {
-        let config = PreWarmingConfig::enabled()
-            .with_workers(2);
+        let config = PreWarmingConfig::enabled().with_workers(2);
 
         // Other fields should remain default
         assert_eq!(config.simulation_timeout, Duration::from_millis(100));
@@ -260,10 +252,7 @@ mod tests {
 
     #[test]
     fn test_validation_zero_workers() {
-        let config = PreWarmingConfig {
-            num_workers: 0,
-            ..PreWarmingConfig::default()
-        };
+        let config = PreWarmingConfig { num_workers: 0, ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_err());
         assert!(config.validate().unwrap_err().contains("num_workers"));
@@ -271,20 +260,14 @@ mod tests {
 
     #[test]
     fn test_validation_one_worker() {
-        let config = PreWarmingConfig {
-            num_workers: 1,
-            ..PreWarmingConfig::default()
-        };
+        let config = PreWarmingConfig { num_workers: 1, ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_validation_too_many_workers() {
-        let config = PreWarmingConfig {
-            num_workers: 100,
-            ..PreWarmingConfig::default()
-        };
+        let config = PreWarmingConfig { num_workers: 100, ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_err());
         assert!(config.validate().unwrap_err().contains("num_workers"));
@@ -292,20 +275,14 @@ mod tests {
 
     #[test]
     fn test_validation_exactly_32_workers() {
-        let config = PreWarmingConfig {
-            num_workers: 32,
-            ..PreWarmingConfig::default()
-        };
+        let config = PreWarmingConfig { num_workers: 32, ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_validation_33_workers() {
-        let config = PreWarmingConfig {
-            num_workers: 33,
-            ..PreWarmingConfig::default()
-        };
+        let config = PreWarmingConfig { num_workers: 33, ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_err());
     }
@@ -391,10 +368,8 @@ mod tests {
 
     #[test]
     fn test_validation_zero_ttl() {
-        let config = PreWarmingConfig {
-            cache_ttl: Duration::from_secs(0),
-            ..PreWarmingConfig::default()
-        };
+        let config =
+            PreWarmingConfig { cache_ttl: Duration::from_secs(0), ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_err());
         assert!(config.validate().unwrap_err().contains("cache_ttl"));
@@ -402,10 +377,8 @@ mod tests {
 
     #[test]
     fn test_validation_one_second_ttl() {
-        let config = PreWarmingConfig {
-            cache_ttl: Duration::from_secs(1),
-            ..PreWarmingConfig::default()
-        };
+        let config =
+            PreWarmingConfig { cache_ttl: Duration::from_secs(1), ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_ok());
     }
@@ -437,10 +410,7 @@ mod tests {
 
     #[test]
     fn test_validation_zero_cache_entries() {
-        let config = PreWarmingConfig {
-            cache_max_entries: 0,
-            ..PreWarmingConfig::default()
-        };
+        let config = PreWarmingConfig { cache_max_entries: 0, ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_err());
         assert!(config.validate().unwrap_err().contains("cache_max_entries"));
@@ -448,30 +418,23 @@ mod tests {
 
     #[test]
     fn test_validation_one_cache_entry() {
-        let config = PreWarmingConfig {
-            cache_max_entries: 1,
-            ..PreWarmingConfig::default()
-        };
+        let config = PreWarmingConfig { cache_max_entries: 1, ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_validation_very_large_cache() {
-        let config = PreWarmingConfig {
-            cache_max_entries: 1_000_000,
-            ..PreWarmingConfig::default()
-        };
+        let config =
+            PreWarmingConfig { cache_max_entries: 1_000_000, ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_validation_max_usize_cache() {
-        let config = PreWarmingConfig {
-            cache_max_entries: usize::MAX,
-            ..PreWarmingConfig::default()
-        };
+        let config =
+            PreWarmingConfig { cache_max_entries: usize::MAX, ..PreWarmingConfig::default() };
 
         assert!(config.validate().is_ok());
     }
@@ -547,8 +510,8 @@ mod tests {
     fn test_multiple_validation_errors_first_reported() {
         // Multiple errors, but only first is reported
         let config = PreWarmingConfig {
-            num_workers: 0,  // Error 1
-            simulation_timeout: Duration::from_millis(0),  // Error 2
+            num_workers: 0,                               // Error 1
+            simulation_timeout: Duration::from_millis(0), // Error 2
             ..PreWarmingConfig::default()
         };
 
@@ -574,29 +537,25 @@ mod tests {
 
     #[test]
     fn test_boundary_10ms_timeout() {
-        let config = PreWarmingConfig::enabled()
-            .with_timeout(Duration::from_millis(10));
+        let config = PreWarmingConfig::enabled().with_timeout(Duration::from_millis(10));
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_boundary_60s_timeout() {
-        let config = PreWarmingConfig::enabled()
-            .with_timeout(Duration::from_secs(60));
+        let config = PreWarmingConfig::enabled().with_timeout(Duration::from_secs(60));
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_boundary_1s_ttl() {
-        let config = PreWarmingConfig::enabled()
-            .with_cache_ttl(Duration::from_secs(1));
+        let config = PreWarmingConfig::enabled().with_cache_ttl(Duration::from_secs(1));
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_boundary_1_cache_entry() {
-        let config = PreWarmingConfig::enabled()
-            .with_cache_max_entries(1);
+        let config = PreWarmingConfig::enabled().with_cache_max_entries(1);
         assert!(config.validate().is_ok());
     }
 
@@ -606,8 +565,7 @@ mod tests {
 
     #[test]
     fn test_config_clone() {
-        let config1 = PreWarmingConfig::enabled()
-            .with_workers(8);
+        let config1 = PreWarmingConfig::enabled().with_workers(8);
 
         let config2 = config1.clone();
 
@@ -681,8 +639,7 @@ mod tests {
 
     #[test]
     fn test_extreme_timeout_max_duration() {
-        let config = PreWarmingConfig::enabled()
-            .with_timeout(Duration::MAX);
+        let config = PreWarmingConfig::enabled().with_timeout(Duration::MAX);
 
         // Should fail validation (> 60s)
         assert!(config.validate().is_err());
@@ -690,11 +647,9 @@ mod tests {
 
     #[test]
     fn test_extreme_cache_entries_max() {
-        let config = PreWarmingConfig::enabled()
-            .with_cache_max_entries(usize::MAX);
+        let config = PreWarmingConfig::enabled().with_cache_max_entries(usize::MAX);
 
         // Should pass validation (no upper limit on cache entries)
         assert!(config.validate().is_ok());
     }
 }
-

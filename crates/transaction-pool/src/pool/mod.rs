@@ -167,7 +167,8 @@ where
     /// Wrapped in RwLock to allow late initialization after pool creation,
     /// when StateProvider becomes available.
     #[cfg(feature = "pre-warming")]
-    worker_pool: RwLock<Option<std::sync::Arc<crate::pre_warming::SimulationWorkerPool<T::Transaction>>>>,
+    worker_pool:
+        RwLock<Option<std::sync::Arc<crate::pre_warming::SimulationWorkerPool<T::Transaction>>>>,
 }
 
 // === impl PoolInner ===
@@ -228,13 +229,15 @@ where
         Some(crate::pre_warming::ExtractedKeys::new())
     }
 
-
     /// Returns merged pre-warmed keys for selected transactions.
     ///
     /// This is called by the payload builder with the list of selected transaction hashes.
     /// Returns merged ExtractedKeys for only those transactions.
     #[cfg(feature = "pre-warming")]
-    pub fn get_keys_for_txs(&self, tx_hashes: &[alloy_primitives::TxHash]) -> Option<crate::pre_warming::ExtractedKeys> {
+    pub fn get_keys_for_txs(
+        &self,
+        tx_hashes: &[alloy_primitives::TxHash],
+    ) -> Option<crate::pre_warming::ExtractedKeys> {
         self.worker_pool.read().as_ref().map(|wp| wp.cache().get_keys_for_txs(tx_hashes))
     }
 
@@ -325,7 +328,7 @@ where
 
         // Create cache
         let cache = std::sync::Arc::new(crate::pre_warming::PreWarmedCache::new(
-            self.config.pre_warming.clone()
+            self.config.pre_warming.clone(),
         ));
 
         // Create worker pool
@@ -706,7 +709,6 @@ where
             update_kind,
         );
 
-
         // This will discard outdated transactions based on the account's nonce
         self.delete_discarded_blobs(outcome.discarded.iter());
 
@@ -895,9 +897,8 @@ where
 
             // Only skip simple ETH transfers (empty input, not create, has recipient)
             // ERC20 transfers still need simulation for storage slot prefetch
-            let is_simple_eth_transfer = tx_ref.input().is_empty()
-                && !tx_ref.is_create()
-                && tx_ref.to().is_some();
+            let is_simple_eth_transfer =
+                tx_ref.input().is_empty() && !tx_ref.is_create() && tx_ref.to().is_some();
 
             // Only clone and simulate for non-ETH transfers
             if !is_simple_eth_transfer {
@@ -1921,10 +1922,7 @@ mod tests {
     #[cfg(all(feature = "pre-warming", feature = "disabled-for-refactoring"))]
     mod pre_warming_integration_tests {
         use super::*;
-        use crate::{
-            pre_warming::PreWarmingConfig,
-            test_utils::TestPoolBuilder,
-        };
+        use crate::{pre_warming::PreWarmingConfig, test_utils::TestPoolBuilder};
         use std::time::Duration;
 
         #[test]
@@ -2113,7 +2111,10 @@ mod tests {
 
             // Verify simulation triggered for Parked variant
             let stats = test_pool.pool.pre_warming_stats().unwrap();
-            assert_eq!(stats.simulation_count, 1, "Parked transaction should also trigger simulation");
+            assert_eq!(
+                stats.simulation_count, 1,
+                "Parked transaction should also trigger simulation"
+            );
         }
 
         #[test]

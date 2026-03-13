@@ -10,7 +10,8 @@
 //!
 //! Two-cache system:
 //! - **PreWarmedCache** (NEW): Stores keys only (what we build here)
-//! - **CachedReads** (EXISTING): Stores actual data (already in Reth at `crates/revm/src/cached.rs`)
+//! - **CachedReads** (EXISTING): Stores actual data (already in Reth at
+//!   `crates/revm/src/cached.rs`)
 //!
 //! ## Flow
 //!
@@ -38,28 +39,33 @@
 //! Execute (all cache hits!)
 //! ```
 
+pub mod bridge;
 pub mod cache;
 pub mod config;
-pub mod types;
-pub mod worker_pool;
-mod simulator;
-mod snapshot_state;
-pub mod bridge;
 pub mod metrics;
 pub mod registry;
+mod simulator;
+mod snapshot_state;
+pub mod types;
+pub mod worker_pool;
 
 #[cfg(test)]
 mod tests;
 
+pub use bridge::{
+    get_cache_stats, prefetch_with_arcs_sync, prefetch_with_snapshot, prefetch_with_snapshot_sync,
+};
 pub use cache::{CacheStats, PreWarmedCache};
 pub use config::PreWarmingConfig;
-pub use types::{ExtractedKeys, SimulationRequest};
-pub use worker_pool::SimulationWorkerPool;
+pub use metrics::PreWarmingMetrics;
+pub use registry::{
+    clear_global_cache, get_global_cache, get_global_metrics, get_global_prefetch_threads,
+    is_pre_warming_active, set_global_cache, set_global_metrics, set_global_prefetch_threads,
+};
 pub use simulator::Simulator;
 pub use snapshot_state::SnapshotState;
-pub use bridge::{prefetch_with_snapshot, prefetch_with_snapshot_sync, prefetch_with_arcs_sync, get_cache_stats};
-pub use metrics::PreWarmingMetrics;
-pub use registry::{set_global_cache, get_global_cache, set_global_metrics, get_global_metrics, is_pre_warming_active, clear_global_cache, set_global_prefetch_threads, get_global_prefetch_threads};
+pub use types::{ExtractedKeys, SimulationRequest};
+pub use worker_pool::SimulationWorkerPool;
 
 /// Trait for transaction pools that support pre-warming via simulation.
 ///
@@ -97,5 +103,3 @@ impl PreWarmingPool for () {
         4
     }
 }
-
-

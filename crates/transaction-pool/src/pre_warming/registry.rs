@@ -20,11 +20,12 @@
 //! }
 //! ```
 
-use crate::pre_warming::PreWarmedCache;
-use crate::pre_warming::PreWarmingMetrics;
+use crate::pre_warming::{PreWarmedCache, PreWarmingMetrics};
 use parking_lot::RwLock;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 /// Global cache holder
 static GLOBAL_CACHE: RwLock<Option<Arc<PreWarmedCache>>> = RwLock::new(None);
@@ -92,9 +93,7 @@ pub fn get_global_prefetch_threads() -> usize {
     let stored = GLOBAL_PREFETCH_THREADS.load(Ordering::Relaxed);
     if stored == 0 {
         // Default to available CPUs if not set
-        std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4)
+        std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4)
     } else {
         stored
     }
@@ -135,4 +134,3 @@ mod tests {
         assert!(!is_pre_warming_active());
     }
 }
-

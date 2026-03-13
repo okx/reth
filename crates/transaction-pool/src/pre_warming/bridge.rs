@@ -26,9 +26,8 @@
 //! ```
 
 use crate::pre_warming::ExtractedKeys;
-use reth_revm::cached::{CachedReads, CachedAccount};
-use alloy_primitives::{Address, B256, U256, map::HashMap};
-
+use alloy_primitives::{map::HashMap, Address, B256, U256};
+use reth_revm::cached::{CachedAccount, CachedReads};
 
 /// Prefetch and populate CachedReads using SnapshotState (PARALLEL - TOKIO)
 ///
@@ -65,8 +64,8 @@ pub async fn prefetch_with_snapshot(
     snapshot: std::sync::Arc<crate::pre_warming::SnapshotState>,
     num_tasks: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::sync::Mutex as TokioMutex;
     use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
 
     let num_tasks = num_tasks.max(1);
 
@@ -89,9 +88,9 @@ pub async fn prefetch_with_snapshot(
         Arc::new(TokioMutex::new(Vec::with_capacity(code_hashes.len())));
 
     // Pre-allocate handles vector
-    let total_chunks = (accounts.len() / num_tasks.max(1)).max(1)
-        + (storage_slots.len() / num_tasks.max(1)).max(1)
-        + (code_hashes.len() / num_tasks.max(1)).max(1);
+    let total_chunks = (accounts.len() / num_tasks.max(1)).max(1) +
+        (storage_slots.len() / num_tasks.max(1)).max(1) +
+        (code_hashes.len() / num_tasks.max(1)).max(1);
     let mut handles = Vec::with_capacity(total_chunks);
 
     // Spawn account prefetch tasks
@@ -105,10 +104,8 @@ pub async fn prefetch_with_snapshot(
             let mut local_results = Vec::with_capacity(chunk.len());
             for address in chunk {
                 if let Ok(info) = snapshot.basic_account(address) {
-                    local_results.push((address, CachedAccount {
-                        info,
-                        storage: HashMap::default(),
-                    }));
+                    local_results
+                        .push((address, CachedAccount { info, storage: HashMap::default() }));
                 }
             }
             results.lock().await.extend(local_results);
@@ -165,12 +162,10 @@ pub async fn prefetch_with_snapshot(
     }
 
     for (address, slot, value) in storage_results.lock().await.drain(..) {
-        let account = cached_reads.accounts.entry(address).or_insert_with(|| {
-            CachedAccount {
-                info: None,
-                storage: HashMap::default(),
-            }
-        });
+        let account = cached_reads
+            .accounts
+            .entry(address)
+            .or_insert_with(|| CachedAccount { info: None, storage: HashMap::default() });
         account.storage.insert(slot, value);
     }
 
@@ -199,8 +194,7 @@ pub fn prefetch_with_snapshot_sync(
     num_threads: usize,
     metrics: Option<&crate::pre_warming::PreWarmingMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::sync::Mutex;
-    use std::time::Instant;
+    use std::{sync::Mutex, time::Instant};
 
     // Start timing the entire prefetch operation
     let prefetch_start = Instant::now();
@@ -231,9 +225,12 @@ pub fn prefetch_with_snapshot_sync(
     let mdbx_query_start = Instant::now();
 
     // Use Mutex to collect results from threads
-    let account_results: Mutex<Vec<(Address, CachedAccount)>> = Mutex::new(Vec::with_capacity(accounts.len()));
-    let storage_results: Mutex<Vec<(Address, U256, U256)>> = Mutex::new(Vec::with_capacity(storage_slots.len()));
-    let bytecode_results: Mutex<Vec<(B256, revm::bytecode::Bytecode)>> = Mutex::new(Vec::with_capacity(code_hashes.len()));
+    let account_results: Mutex<Vec<(Address, CachedAccount)>> =
+        Mutex::new(Vec::with_capacity(accounts.len()));
+    let storage_results: Mutex<Vec<(Address, U256, U256)>> =
+        Mutex::new(Vec::with_capacity(storage_slots.len()));
+    let bytecode_results: Mutex<Vec<(B256, revm::bytecode::Bytecode)>> =
+        Mutex::new(Vec::with_capacity(code_hashes.len()));
 
     std::thread::scope(|s| {
         // Partition accounts across threads
@@ -246,10 +243,8 @@ pub fn prefetch_with_snapshot_sync(
                 let mut local_results = Vec::with_capacity(chunk.len());
                 for &address in chunk {
                     if let Ok(info) = snapshot.basic_account(address) {
-                        local_results.push((address, CachedAccount {
-                            info,
-                            storage: HashMap::default(),
-                        }));
+                        local_results
+                            .push((address, CachedAccount { info, storage: HashMap::default() }));
                     }
                 }
                 account_results.lock().unwrap().extend(local_results);
@@ -315,12 +310,10 @@ pub fn prefetch_with_snapshot_sync(
     }
 
     for (address, slot, value) in storage_results_vec {
-        let account = cached_reads.accounts.entry(address).or_insert_with(|| {
-            CachedAccount {
-                info: None,
-                storage: HashMap::default(),
-            }
-        });
+        let account = cached_reads
+            .accounts
+            .entry(address)
+            .or_insert_with(|| CachedAccount { info: None, storage: HashMap::default() });
         account.storage.insert(slot, value);
     }
 
@@ -362,7 +355,6 @@ pub fn prefetch_with_snapshot_sync(
         ">>> PREFETCH_SYNC: Complete"
     );
 
-
     Ok(())
 }
 
@@ -389,8 +381,7 @@ pub fn prefetch_with_arcs_sync(
     num_threads: usize,
     metrics: Option<&crate::pre_warming::PreWarmingMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::sync::Mutex;
-    use std::time::Instant;
+    use std::{sync::Mutex, time::Instant};
 
     // Fast path: empty input
     if keys_list.is_empty() {
@@ -416,9 +407,9 @@ pub fn prefetch_with_arcs_sync(
 
     for keys in keys_list {
         // Skip simple ETH transfers: ≤2 accounts, no storage, no code
-        let is_simple_transfer = keys.accounts.len() <= 2
-            && keys.storage_slots.is_empty()
-            && keys.code_hashes.is_empty();
+        let is_simple_transfer = keys.accounts.len() <= 2 &&
+            keys.storage_slots.is_empty() &&
+            keys.code_hashes.is_empty();
 
         if is_simple_transfer {
             skipped_simple += 1;
@@ -447,9 +438,9 @@ pub fn prefetch_with_arcs_sync(
     // Iterate Arc refs directly, skipping simple transfers
     for keys in keys_list {
         // Skip simple ETH transfers (same check as above)
-        let is_simple_transfer = keys.accounts.len() <= 2
-            && keys.storage_slots.is_empty()
-            && keys.code_hashes.is_empty();
+        let is_simple_transfer = keys.accounts.len() <= 2 &&
+            keys.storage_slots.is_empty() &&
+            keys.code_hashes.is_empty();
 
         if is_simple_transfer {
             continue;
@@ -478,9 +469,12 @@ pub fn prefetch_with_arcs_sync(
     let mdbx_query_start = Instant::now();
 
     // Use Mutex to collect results from threads
-    let account_results: Mutex<Vec<(Address, CachedAccount)>> = Mutex::new(Vec::with_capacity(accounts.len()));
-    let storage_results: Mutex<Vec<(Address, U256, U256)>> = Mutex::new(Vec::with_capacity(storage_slots.len()));
-    let bytecode_results: Mutex<Vec<(B256, revm::bytecode::Bytecode)>> = Mutex::new(Vec::with_capacity(code_hashes.len()));
+    let account_results: Mutex<Vec<(Address, CachedAccount)>> =
+        Mutex::new(Vec::with_capacity(accounts.len()));
+    let storage_results: Mutex<Vec<(Address, U256, U256)>> =
+        Mutex::new(Vec::with_capacity(storage_slots.len()));
+    let bytecode_results: Mutex<Vec<(B256, revm::bytecode::Bytecode)>> =
+        Mutex::new(Vec::with_capacity(code_hashes.len()));
 
     std::thread::scope(|s| {
         // Partition accounts across threads
@@ -493,10 +487,8 @@ pub fn prefetch_with_arcs_sync(
                 let mut local_results = Vec::with_capacity(chunk.len());
                 for &address in chunk {
                     if let Ok(info) = snapshot.basic_account(address) {
-                        local_results.push((address, CachedAccount {
-                            info,
-                            storage: HashMap::default(),
-                        }));
+                        local_results
+                            .push((address, CachedAccount { info, storage: HashMap::default() }));
                     }
                 }
                 if !local_results.is_empty() {
@@ -561,10 +553,7 @@ pub fn prefetch_with_arcs_sync(
         } else {
             let mut storage = HashMap::default();
             storage.insert(slot, value);
-            cached_reads.accounts.insert(address, CachedAccount {
-                info: None,
-                storage,
-            });
+            cached_reads.accounts.insert(address, CachedAccount { info: None, storage });
         }
     }
 
@@ -593,13 +582,10 @@ pub fn prefetch_with_arcs_sync(
     Ok(())
 }
 
-
 /// Helper to get cache statistics after population
 pub fn get_cache_stats(cached_reads: &CachedReads) -> CacheStats {
-    let total_storage_slots: usize = cached_reads.accounts
-        .values()
-        .map(|acc| acc.storage.len())
-        .sum();
+    let total_storage_slots: usize =
+        cached_reads.accounts.values().map(|acc| acc.storage.len()).sum();
 
     CacheStats {
         accounts_count: cached_reads.accounts.len(),
@@ -625,8 +611,10 @@ pub struct CacheStats {
 impl CacheStats {
     /// Total number of keys in the cache
     pub fn total_keys(&self) -> usize {
-        self.accounts_count + self.storage_slots_count +
-        self.contracts_count + self.block_hashes_count
+        self.accounts_count +
+            self.storage_slots_count +
+            self.contracts_count +
+            self.block_hashes_count
     }
 }
 
@@ -697,18 +685,12 @@ mod tests {
         let mut storage1 = HashMap::default();
         storage1.insert(U256::from(1), U256::from(100));
         storage1.insert(U256::from(2), U256::from(200));
-        cached_reads.accounts.insert(addr1, CachedAccount {
-            info: None,
-            storage: storage1,
-        });
+        cached_reads.accounts.insert(addr1, CachedAccount { info: None, storage: storage1 });
 
         let addr2 = Address::random();
         let mut storage2 = HashMap::default();
         storage2.insert(U256::from(3), U256::from(300));
-        cached_reads.accounts.insert(addr2, CachedAccount {
-            info: None,
-            storage: storage2,
-        });
+        cached_reads.accounts.insert(addr2, CachedAccount { info: None, storage: storage2 });
 
         // Add contracts
         cached_reads.contracts.insert(B256::random(), Bytecode::new_raw(vec![].into()));
@@ -731,10 +713,10 @@ mod tests {
         let mut cached_reads = CachedReads::default();
 
         for _ in 0..5 {
-            cached_reads.accounts.insert(Address::random(), CachedAccount {
-                info: None,
-                storage: HashMap::default(),
-            });
+            cached_reads.accounts.insert(
+                Address::random(),
+                CachedAccount { info: None, storage: HashMap::default() },
+            );
         }
 
         let stats = get_cache_stats(&cached_reads);
@@ -766,27 +748,20 @@ mod tests {
         storage1.insert(U256::from(1), U256::from(100));
         storage1.insert(U256::from(2), U256::from(200));
         storage1.insert(U256::from(3), U256::from(300));
-        cached_reads.accounts.insert(addr1, CachedAccount {
-            info: None,
-            storage: storage1,
-        });
+        cached_reads.accounts.insert(addr1, CachedAccount { info: None, storage: storage1 });
 
         // Account 2: 2 storage slots
         let addr2 = Address::random();
         let mut storage2 = HashMap::default();
         storage2.insert(U256::from(10), U256::from(1000));
         storage2.insert(U256::from(20), U256::from(2000));
-        cached_reads.accounts.insert(addr2, CachedAccount {
-            info: None,
-            storage: storage2,
-        });
+        cached_reads.accounts.insert(addr2, CachedAccount { info: None, storage: storage2 });
 
         // Account 3: 0 storage slots
         let addr3 = Address::random();
-        cached_reads.accounts.insert(addr3, CachedAccount {
-            info: None,
-            storage: HashMap::default(),
-        });
+        cached_reads
+            .accounts
+            .insert(addr3, CachedAccount { info: None, storage: HashMap::default() });
 
         let stats = get_cache_stats(&cached_reads);
         assert_eq!(stats.accounts_count, 3);
@@ -884,10 +859,7 @@ mod tests {
             account_id: None,
         };
 
-        let cached = CachedAccount {
-            info: Some(info),
-            storage: HashMap::default(),
-        };
+        let cached = CachedAccount { info: Some(info), storage: HashMap::default() };
 
         assert!(cached.info.is_some());
         assert_eq!(cached.info.as_ref().unwrap().balance, U256::from(1000));
@@ -900,10 +872,7 @@ mod tests {
         storage.insert(U256::from(1), U256::from(100));
         storage.insert(U256::from(2), U256::from(200));
 
-        let cached = CachedAccount {
-            info: None,
-            storage,
-        };
+        let cached = CachedAccount { info: None, storage };
 
         assert!(cached.info.is_none());
         assert_eq!(cached.storage.len(), 2);
@@ -927,16 +896,19 @@ mod tests {
         let mut cached = CachedReads::default();
         let addr = Address::random();
 
-        cached.accounts.insert(addr, CachedAccount {
-            info: Some(revm::state::AccountInfo {
-                balance: U256::from(500),
-                nonce: 1,
-                code_hash: B256::ZERO,
-                code: None,
-                account_id: None,
-            }),
-            storage: HashMap::default(),
-        });
+        cached.accounts.insert(
+            addr,
+            CachedAccount {
+                info: Some(revm::state::AccountInfo {
+                    balance: U256::from(500),
+                    nonce: 1,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    account_id: None,
+                }),
+                storage: HashMap::default(),
+            },
+        );
 
         assert!(cached.accounts.contains_key(&addr));
         assert_eq!(cached.accounts.len(), 1);
@@ -1048,4 +1020,3 @@ mod tests {
         assert!(debug_str.contains("storage_slots_count"));
     }
 }
-

@@ -11,15 +11,14 @@
 //! - Uses AHashSet for fast deduplication with SIMD-accelerated hashing
 //! - Pre-allocates capacity for expected key counts
 
-use alloy_primitives::{Address, TxHash, B256, U256};
 use ahash::AHashSet;
+use alloy_primitives::{Address, TxHash, B256, U256};
 use std::time::Instant;
 
 /// Default capacity for accounts (typical ERC20 transfer touches 2-3 accounts)
 const DEFAULT_ACCOUNTS_CAPACITY: usize = 8;
 /// Default capacity for storage slots (typical ERC20 touches ~6 slots)
 const DEFAULT_STORAGE_CAPACITY: usize = 16;
-
 
 /// Request to simulate a transaction and extract accessed keys
 #[derive(Debug, Clone)]
@@ -37,11 +36,7 @@ pub struct SimulationRequest<T> {
 impl<T> SimulationRequest<T> {
     /// Create a new simulation request
     pub fn new(tx_hash: TxHash, transaction: T) -> Self {
-        Self {
-            tx_hash,
-            transaction,
-            timestamp: Instant::now(),
-        }
+        Self { tx_hash, transaction, timestamp: Instant::now() }
     }
 
     /// Age of this request
@@ -168,20 +163,19 @@ impl ExtractedKeys {
     #[inline]
     pub fn total_keys(&self) -> usize {
         self.accounts.len() +
-        self.storage_slots.len() +
-        self.code_hashes.len() +
-        self.block_hashes.len()
+            self.storage_slots.len() +
+            self.code_hashes.len() +
+            self.block_hashes.len()
     }
 
     /// Check if empty (no keys extracted)
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty() &&
-        self.storage_slots.is_empty() &&
-        self.code_hashes.is_empty() &&
-        self.block_hashes.is_empty()
+            self.storage_slots.is_empty() &&
+            self.code_hashes.is_empty() &&
+            self.block_hashes.is_empty()
     }
-
 
     /// Merge another ExtractedKeys into this one
     ///
@@ -699,7 +693,6 @@ mod tests {
         assert_eq!(keys.total_keys(), 1);
     }
 
-
     // ============================================================================
     // Clone and Equality Tests
     // ============================================================================
@@ -769,4 +762,3 @@ mod tests {
         assert_eq!(keys.total_keys(), 400);
     }
 }
-

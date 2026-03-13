@@ -62,7 +62,6 @@ pub struct PreWarmingMetrics {
     // ========================================================================
     // Simulation Worker Pool Metrics
     // ========================================================================
-
     /// Total number of simulations triggered (requested).
     ///
     /// Incremented when `trigger_simulation()` is called, regardless of
@@ -99,7 +98,6 @@ pub struct PreWarmingMetrics {
     // ========================================================================
     // Cache Metrics
     // ========================================================================
-
     /// Current number of transactions in the cache.
     ///
     /// Each transaction has its own set of extracted keys.
@@ -131,7 +129,6 @@ pub struct PreWarmingMetrics {
     // ========================================================================
     // Prefetch Metrics
     // ========================================================================
-
     /// Number of accounts prefetched from MDBX.
     ///
     /// Incremented during the prefetch phase for each account loaded.
@@ -161,7 +158,6 @@ pub struct PreWarmingMetrics {
     // ========================================================================
     // Snapshot Metrics
     // ========================================================================
-
     /// Number of snapshot updates.
     ///
     /// Incremented when `update_pre_warming_snapshot()` is called.
@@ -179,20 +175,19 @@ mod tests {
         // The #[derive(Metrics)] macro creates Default implementation
         // that registers metrics with the global Prometheus registry
         let metrics = PreWarmingMetrics::default();
-        
+
         // Verify we can increment counters
         metrics.simulations_triggered.increment(1);
         metrics.simulations_completed.increment(1);
         metrics.simulations_failed.increment(1);
         metrics.simulations_dropped.increment(1);
-        
+
         // Verify we can record histograms
         metrics.simulation_duration.record(0.015);
         metrics.prefetch_duration.record(0.005);
-        
+
         // Verify we can set gauges
         metrics.cache_entries.set(100);
         metrics.cache_keys_total.set(5000);
     }
 }
-

@@ -39,7 +39,8 @@ pub struct CachedReads {
     pub block_hashes: HashMap<u64, B256>,
     /// Optional callback for tracking cache hits (always available, set via set_metrics_callbacks)
     pub on_cache_hit: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Optional callback for tracking cache misses (always available, set via set_metrics_callbacks)
+    /// Optional callback for tracking cache misses (always available, set via
+    /// set_metrics_callbacks)
     pub on_cache_miss: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -72,7 +73,7 @@ impl CachedReads {
     pub fn set_metrics_callbacks(
         &mut self,
         on_hit: Arc<dyn Fn() + Send + Sync>,
-        on_miss: Arc<dyn Fn() + Send + Sync>
+        on_miss: Arc<dyn Fn() + Send + Sync>,
     ) {
         self.on_cache_hit = Some(on_hit);
         self.on_cache_miss = Some(on_miss);

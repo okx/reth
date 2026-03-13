@@ -299,13 +299,12 @@
 //! | **When MDBX queried?** | On cache miss, then cached for future |
 //! | **What data cached?** | MDBX data (accounts, storage, bytecode) |
 
-use alloy_primitives::{Address, B256, U256, KECCAK256_EMPTY};
-use reth_provider::{AccountReader, StateProvider, ProviderError};
-use revm::bytecode::Bytecode;
-use revm::state::AccountInfo;
 use ahash::AHashMap;
-use std::sync::{Arc, Mutex};
+use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256};
 use parking_lot::RwLock;
+use reth_provider::{AccountReader, ProviderError, StateProvider};
+use revm::{bytecode::Bytecode, state::AccountInfo};
+use std::sync::{Arc, Mutex};
 
 /// Default cache capacity for typical block simulation
 const DEFAULT_STATE_CACHE_CAPACITY: usize = 512;
@@ -415,13 +414,15 @@ impl SnapshotState {
         // IMPORTANT: Use KECCAK_EMPTY for accounts with no bytecode, not B256::default()!
         // B256::default() (all zeros) is NOT considered "empty" by REVM's is_empty_code_hash(),
         // which would cause accounts to be incorrectly flagged as having bytecode.
-        let info = account.map(|acc| Arc::new(AccountInfo {
-            balance: acc.balance,
-            nonce: acc.nonce,
-            code_hash: acc.bytecode_hash.unwrap_or(KECCAK256_EMPTY),
-            code: None,  // Code loaded separately via code_by_hash
-            account_id: None,  // Not needed for simulation
-        }));
+        let info = account.map(|acc| {
+            Arc::new(AccountInfo {
+                balance: acc.balance,
+                nonce: acc.nonce,
+                code_hash: acc.bytecode_hash.unwrap_or(KECCAK256_EMPTY),
+                code: None,       // Code loaded separately via code_by_hash
+                account_id: None, // Not needed for simulation
+            })
+        });
 
         // Cache it (write lock - exclusive access)
         // Store Arc-wrapped AccountInfo for efficient reads later
@@ -442,7 +443,7 @@ impl SnapshotState {
         {
             let cache = self.cache.read();
             if let Some(StateValue::Storage(value)) = cache.get(&key) {
-                return Ok(*value);  // Cache hit - no MDBX query (10ns vs 50μs)
+                return Ok(*value); // Cache hit - no MDBX query (10ns vs 50μs)
             }
         }
 
@@ -478,7 +479,8 @@ impl SnapshotState {
         // Query state provider using bytecode_by_hash (mutex lock)
         let code = {
             let provider = self.state_provider.lock().unwrap();
-            provider.bytecode_by_hash(&code_hash)?
+            provider
+                .bytecode_by_hash(&code_hash)?
                 .map(|bytes| Bytecode::new_raw(bytes.original_bytes().clone()))
                 .unwrap_or_default()
         };
@@ -553,10 +555,9 @@ mod tests {
     //! - Data races (undefined behavior)
 
     use super::*;
-    use alloy_primitives::{address, b256, Address, B256, U256};
     use ahash::AHashMap;
-    use std::sync::Arc;
-    use std::thread;
+    use alloy_primitives::{address, b256, Address, B256, U256};
+    use std::{sync::Arc, thread};
 
     // ============================================================================
     // REALISTIC TEST DATA
@@ -634,22 +635,13 @@ mod tests {
         assert_ne!(StateKey::Account(ALICE), StateKey::Account(BOB));
 
         // Different key types should never be equal
-        assert_ne!(
-            StateKey::Account(ALICE),
-            StateKey::Storage(ALICE, U256::ZERO)
-        );
+        assert_ne!(StateKey::Account(ALICE), StateKey::Storage(ALICE, U256::ZERO));
 
         // Storage keys: same address + slot = equal
-        assert_eq!(
-            StateKey::Storage(USDC, U256::from(1)),
-            StateKey::Storage(USDC, U256::from(1))
-        );
+        assert_eq!(StateKey::Storage(USDC, U256::from(1)), StateKey::Storage(USDC, U256::from(1)));
 
         // Storage keys: different slots = not equal
-        assert_ne!(
-            StateKey::Storage(USDC, U256::from(1)),
-            StateKey::Storage(USDC, U256::from(2))
-        );
+        assert_ne!(StateKey::Storage(USDC, U256::from(1)), StateKey::Storage(USDC, U256::from(2)));
     }
 
     /// # Test: StateKey Hash for HashMap/HashSet
@@ -1269,16 +1261,10 @@ mod tests {
         let mut map: AHashMap<StateKey, StateValue> = AHashMap::default();
 
         // Initial value
-        map.insert(
-            StateKey::Storage(USDC, U256::ZERO),
-            StateValue::Storage(U256::from(100)),
-        );
+        map.insert(StateKey::Storage(USDC, U256::ZERO), StateValue::Storage(U256::from(100)));
 
         // Overwrite with new value
-        map.insert(
-            StateKey::Storage(USDC, U256::ZERO),
-            StateValue::Storage(U256::from(200)),
-        );
+        map.insert(StateKey::Storage(USDC, U256::ZERO), StateValue::Storage(U256::from(200)));
 
         // Size unchanged
         assert_eq!(map.len(), 1);
@@ -1303,14 +1289,8 @@ mod tests {
     fn test_hashmap_remove() {
         let mut map: AHashMap<StateKey, StateValue> = AHashMap::default();
 
-        map.insert(
-            StateKey::Account(ALICE),
-            StateValue::Account(None),
-        );
-        map.insert(
-            StateKey::Account(BOB),
-            StateValue::Account(None),
-        );
+        map.insert(StateKey::Account(ALICE), StateValue::Account(None));
+        map.insert(StateKey::Account(BOB), StateValue::Account(None));
 
         assert_eq!(map.len(), 2);
 
@@ -1393,16 +1373,13 @@ mod tests {
                 let map = Arc::clone(&map);
                 thread::spawn(move || {
                     let addr = Address::from_slice(&[
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i as u8,
                     ]);
 
                     // Write
                     {
                         let mut guard = map.write();
-                        guard.insert(
-                            StateKey::Account(addr),
-                            StateValue::Account(None),
-                        );
+                        guard.insert(StateKey::Account(addr), StateValue::Account(None));
                     }
 
                     // Read and verify
@@ -1447,10 +1424,7 @@ mod tests {
             Arc::new(RwLock::new(AHashMap::default()));
 
         // Initialize
-        map.write().insert(
-            StateKey::Storage(USDC, U256::ZERO),
-            StateValue::Storage(U256::ZERO),
-        );
+        map.write().insert(StateKey::Storage(USDC, U256::ZERO), StateValue::Storage(U256::ZERO));
 
         let handles: Vec<_> = (0..50)
             .map(|_| {
@@ -1510,7 +1484,24 @@ mod tests {
 
         for i in 0u16..1000 {
             let addr = Address::from_slice(&[
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
                 (i >> 8) as u8,
                 (i & 0xFF) as u8,
             ]);
@@ -1568,9 +1559,26 @@ mod tests {
             match i % 3 {
                 0 => {
                     let addr = Address::from_slice(&[
-                        0xDE, 0xAD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                        (i >> 24) as u8, (i >> 16) as u8, (i >> 8) as u8, i as u8,
-                        0, 0, 0, 0
+                        0xDE,
+                        0xAD,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        (i >> 24) as u8,
+                        (i >> 16) as u8,
+                        (i >> 8) as u8,
+                        i as u8,
+                        0,
+                        0,
+                        0,
+                        0,
                     ]);
                     map.insert(StateKey::Account(addr), StateValue::Account(None));
                 }
@@ -1582,12 +1590,43 @@ mod tests {
                 }
                 _ => {
                     let hash = B256::from_slice(&[
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                        0, 0, 0, 0, 0, 0, 0, 0,
-                        (i >> 24) as u8, (i >> 16) as u8, (i >> 8) as u8, i as u8,
-                        0, 0, 0, 0
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        (i >> 24) as u8,
+                        (i >> 16) as u8,
+                        (i >> 8) as u8,
+                        i as u8,
+                        0,
+                        0,
+                        0,
+                        0,
                     ]);
-                    map.insert(StateKey::Code(hash), StateValue::Code(Arc::new(Bytecode::default())));
+                    map.insert(
+                        StateKey::Code(hash),
+                        StateValue::Code(Arc::new(Bytecode::default())),
+                    );
                 }
             }
         }
