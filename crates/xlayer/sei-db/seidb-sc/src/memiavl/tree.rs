@@ -981,4 +981,141 @@ mod tests {
             NUM_TREES, BATCHES_PER_TREE, KEYS_PER_BATCH, elapsed
         );
     }
+
+    /// Comprehensive arena data integrity verification:
+    /// 3 blocks of writes/updates/deletes → read back → snapshot roundtrip → hash determinism.
+    #[test]
+    fn test_arena_data_integrity_comprehensive() {
+        // Block 1: insert 1000 keys
+        let mut tree = Tree::new_empty(0, 0);
+        for i in 0u32..1000 {
+            let key = format!("key_{:06}", i);
+            let val = format!("val_{:06}_block1", i);
+            tree.set(key.as_bytes(), val.as_bytes());
+        }
+        let (hash1, ver1) = tree.save_version(true).unwrap();
+        assert_eq!(ver1, 1);
+        assert_eq!(hash1.len(), 32);
+        eprintln!("Block 1: version={ver1}, hash={}", hex::encode(&hash1));
+
+        // Verify all 1000 keys
+        for i in 0u32..1000 {
+            let key = format!("key_{:06}", i);
+            let expected = format!("val_{:06}_block1", i);
+            let got = tree.get(key.as_bytes());
+            assert_eq!(got.as_deref(), Some(expected.as_bytes()), "block1 key {key}");
+        }
+        eprintln!("Block 1: 1000 keys verified ✓");
+
+        // Block 2: update 500 + insert 500 new
+        for i in 0u32..500 {
+            let key = format!("key_{:06}", i);
+            let val = format!("val_{:06}_block2_upd", i);
+            tree.set(key.as_bytes(), val.as_bytes());
+        }
+        for i in 1000u32..1500 {
+            let key = format!("key_{:06}", i);
+            let val = format!("val_{:06}_block2_new", i);
+            tree.set(key.as_bytes(), val.as_bytes());
+        }
+        let (hash2, ver2) = tree.save_version(true).unwrap();
+        assert_eq!(ver2, 2);
+        assert_ne!(hash1, hash2);
+        eprintln!("Block 2: version={ver2}, hash={}", hex::encode(&hash2));
+
+        for i in 0u32..500 {
+            let key = format!("key_{:06}", i);
+            let expected = format!("val_{:06}_block2_upd", i);
+            assert_eq!(tree.get(key.as_bytes()).unwrap(), expected.as_bytes(), "updated {key}");
+        }
+        for i in 500u32..1000 {
+            let key = format!("key_{:06}", i);
+            let expected = format!("val_{:06}_block1", i);
+            assert_eq!(tree.get(key.as_bytes()).unwrap(), expected.as_bytes(), "untouched {key}");
+        }
+        for i in 1000u32..1500 {
+            let key = format!("key_{:06}", i);
+            let expected = format!("val_{:06}_block2_new", i);
+            assert_eq!(tree.get(key.as_bytes()).unwrap(), expected.as_bytes(), "new {key}");
+        }
+        eprintln!("Block 2: 1500 keys verified ✓");
+
+        // Block 3: delete 200 keys
+        for i in 0u32..200 {
+            let key = format!("key_{:06}", i);
+            assert!(tree.remove(key.as_bytes()).is_some(), "remove {key}");
+        }
+        let (hash3, ver3) = tree.save_version(true).unwrap();
+        assert_eq!(ver3, 3);
+        assert_ne!(hash2, hash3);
+        eprintln!("Block 3: version={ver3}, hash={}", hex::encode(&hash3));
+
+        for i in 0u32..200 {
+            let key = format!("key_{:06}", i);
+            assert!(tree.get(key.as_bytes()).is_none(), "deleted {key} still exists");
+        }
+        for i in 200u32..1500 {
+            let key = format!("key_{:06}", i);
+            assert!(tree.get(key.as_bytes()).is_some(), "surviving {key} missing");
+        }
+        eprintln!("Block 3: deletes verified, 1300 keys ✓");
+
+        // Snapshot roundtrip
+        let dir = tempfile::tempdir().unwrap();
+        tree.write_snapshot(dir.path()).unwrap();
+        let snapshot = crate::memiavl::snapshot::Snapshot::open(dir.path()).unwrap();
+        let loaded = Tree::new_from_snapshot(snapshot);
+        assert_eq!(loaded.version(), 3);
+        assert_eq!(loaded.root_hash(), hash3, "snapshot hash mismatch");
+
+        for i in 0u32..200 {
+            let key = format!("key_{:06}", i);
+            assert!(loaded.get(key.as_bytes()).is_none(), "snapshot: deleted {key}");
+        }
+        for i in 200u32..500 {
+            let key = format!("key_{:06}", i);
+            let expected = format!("val_{:06}_block2_upd", i);
+            assert_eq!(loaded.get(key.as_bytes()).unwrap(), expected.as_bytes());
+        }
+        for i in 500u32..1000 {
+            let key = format!("key_{:06}", i);
+            let expected = format!("val_{:06}_block1", i);
+            assert_eq!(loaded.get(key.as_bytes()).unwrap(), expected.as_bytes());
+        }
+        for i in 1000u32..1500 {
+            let key = format!("key_{:06}", i);
+            let expected = format!("val_{:06}_block2_new", i);
+            assert_eq!(loaded.get(key.as_bytes()).unwrap(), expected.as_bytes());
+        }
+        eprintln!("Snapshot roundtrip: 1300 keys verified ✓");
+
+        // Hash determinism: rebuild from scratch
+        let mut tree2 = Tree::new_empty(0, 0);
+        for i in 0u32..1000 {
+            tree2
+                .set(format!("key_{:06}", i).as_bytes(), format!("val_{:06}_block1", i).as_bytes());
+        }
+        tree2.save_version(true).unwrap();
+        for i in 0u32..500 {
+            tree2.set(
+                format!("key_{:06}", i).as_bytes(),
+                format!("val_{:06}_block2_upd", i).as_bytes(),
+            );
+        }
+        for i in 1000u32..1500 {
+            tree2.set(
+                format!("key_{:06}", i).as_bytes(),
+                format!("val_{:06}_block2_new", i).as_bytes(),
+            );
+        }
+        tree2.save_version(true).unwrap();
+        for i in 0u32..200 {
+            tree2.remove(format!("key_{:06}", i).as_bytes());
+        }
+        let (hash3_dup, _) = tree2.save_version(true).unwrap();
+        assert_eq!(hash3, hash3_dup, "hash not deterministic");
+        eprintln!("Hash determinism verified ✓");
+
+        eprintln!("\n=== ALL ARENA DATA INTEGRITY CHECKS PASSED ===");
+    }
 }
