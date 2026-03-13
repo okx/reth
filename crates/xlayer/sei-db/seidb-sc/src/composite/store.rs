@@ -116,12 +116,24 @@ impl CompositeCommitStore {
                 self.cosmos_committer.apply_change_sets(changesets)?;
             }
             WriteMode::DualWrite => {
-                // All data goes to cosmos, EVM data also goes to flatkv
-                self.cosmos_committer.apply_change_sets(changesets)?;
+                // All data goes to cosmos, EVM data also goes to flatkv.
+                // Run both in parallel since they operate on independent
+                // data structures (MemIAVL trees vs RocksDB instances).
                 if let Some(ref mut evm) = self.evm_committer &&
                     !evm_changesets.is_empty()
                 {
-                    evm.apply_change_sets(&evm_changesets)?;
+                    let cosmos = &mut self.cosmos_committer;
+                    let mut cosmos_err: Result<()> = Ok(());
+                    let mut evm_err: Result<()> = Ok(());
+                    std::thread::scope(|s| {
+                        let cosmos_handle = s.spawn(|| cosmos.apply_change_sets(changesets));
+                        evm_err = evm.apply_change_sets(&evm_changesets);
+                        cosmos_err = cosmos_handle.join().expect("cosmos apply panicked");
+                    });
+                    cosmos_err?;
+                    evm_err?;
+                } else {
+                    self.cosmos_committer.apply_change_sets(changesets)?;
                 }
             }
             WriteMode::SplitWrite => {
@@ -149,20 +161,29 @@ impl CompositeCommitStore {
 
     /// Commits the current state to all active backends and returns the new version.
     ///
-    /// If both backends are active, verifies that they produce the same version number.
+    /// If both backends are active, runs cosmos and EVM commits in parallel
+    /// then verifies they produce the same version number.
     pub fn commit(&mut self) -> Result<i64> {
-        let cosmos_version = self.cosmos_committer.commit()?;
-
         if let Some(ref mut evm) = self.evm_committer {
-            let evm_version = evm.commit()?;
+            let cosmos = &mut self.cosmos_committer;
+            let mut cosmos_result: Result<i64> = Ok(0);
+            let mut evm_result: Result<i64> = Ok(0);
+            std::thread::scope(|s| {
+                let cosmos_handle = s.spawn(|| cosmos.commit());
+                evm_result = evm.commit();
+                cosmos_result = cosmos_handle.join().expect("cosmos commit panicked");
+            });
+            let cosmos_version = cosmos_result?;
+            let evm_version = evm_result?;
             if cosmos_version != evm_version {
                 return Err(SeiDbError::Other(format!(
                     "cosmos and EVM version mismatch after commit: cosmos={cosmos_version}, evm={evm_version}"
                 )));
             }
+            Ok(cosmos_version)
+        } else {
+            self.cosmos_committer.commit()
         }
-
-        Ok(cosmos_version)
     }
 
     /// Returns the current committed version (from the cosmos backend).
