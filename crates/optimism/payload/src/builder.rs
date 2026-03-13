@@ -237,12 +237,12 @@ where
 
             if reth_transaction_pool::pre_warming::should_prefetch_for_parent(parent_hash) {
                 if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
-                    const MAX_TXS_TO_PREFETCH: usize = 500;
-                    let pending_txs = self.pool.pending_transactions_max(MAX_TXS_TO_PREFETCH);
-                    let tx_hashes: Vec<alloy_primitives::B256> =
-                        pending_txs.iter().map(|tx| *tx.hash()).collect();
-
-                    let keys_arcs = cache.get_keys_arcs(&tx_hashes);
+                    // Use ALL cached entries rather than a capped top-N subset.
+                    // With remove_txs() evicting mined TXs, the cache holds exactly
+                    // the current pending mempool. Prefetching all of it covers every
+                    // transaction the block builder might select, restoring ~98% hit rate.
+                    // (The old 500-TX cap only covered 7.9% of a 6k-TX block.)
+                    let keys_arcs = cache.get_all_keys_arcs();
 
                     if !keys_arcs.is_empty() {
                         // Prefer the simulation workers' warm snapshot over a fresh cold one.

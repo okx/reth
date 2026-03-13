@@ -237,6 +237,21 @@ impl PreWarmedCache {
             .collect()
     }
 
+    /// Get Arc refs for ALL cached transactions (zero-copy, no merge).
+    ///
+    /// Returns the entire cache as a Vec of Arc<ExtractedKeys>. With `remove_txs()`
+    /// enabled, the cache reflects exactly the current pending mempool: only
+    /// transactions not yet included in a block remain. Prefetching all of them
+    /// maximises coverage — every transaction the block builder might select will
+    /// have its state pre-warmed, recovering the ~98% CachedReads hit rate.
+    ///
+    /// Prefer this over `get_keys_arcs(&top_N)` so coverage is not artificially
+    /// capped below the block size.
+    #[inline]
+    pub fn get_all_keys_arcs(&self) -> Vec<Arc<ExtractedKeys>> {
+        self.per_tx_keys.iter().map(|r| Arc::clone(r.value())).collect()
+    }
+
     /// Check if keys exist for a transaction without cloning
     #[inline]
     pub fn contains(&self, tx_hash: &TxHash) -> bool {
