@@ -9,7 +9,9 @@
 //! `TreeImporter` for snapshot creation.
 
 use crate::memiavl::{
+    arena::{resolve_mem_node, FrozenArena, MutableArena, NodeIdx},
     node::{MemNode, Node, NodeRef},
+    snapshot::Snapshot,
     snapshot_writer,
 };
 use seidb_common::error::{Result, SeiDbError};
@@ -153,6 +155,106 @@ impl Iterator for Exporter {
             let left = entry.node.left().expect("branch must have left child").clone();
             self.stack.push(StackEntry { node: right, expanded: false });
             self.stack.push(StackEntry { node: left, expanded: false });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arena-based Exporter
+// ---------------------------------------------------------------------------
+
+/// Stack entry for arena-based iterative post-order traversal.
+struct ArenaStackEntry {
+    idx: NodeIdx,
+    expanded: bool,
+}
+
+/// Arena-based exporter that traverses via NodeIdx without building Arc<Node>.
+pub struct ArenaExporter<'a> {
+    stack: Vec<ArenaStackEntry>,
+    arena: &'a MutableArena,
+    frozen: &'a [std::sync::Arc<FrozenArena>],
+    snapshot: &'a Option<std::sync::Arc<Snapshot>>,
+    current_gen: u16,
+}
+
+impl<'a> ArenaExporter<'a> {
+    pub fn new(
+        root: Option<NodeIdx>,
+        arena: &'a MutableArena,
+        frozen: &'a [std::sync::Arc<FrozenArena>],
+        snapshot: &'a Option<std::sync::Arc<Snapshot>>,
+        current_gen: u16,
+    ) -> Self {
+        let stack = match root {
+            Some(idx) => vec![ArenaStackEntry { idx, expanded: false }],
+            None => Vec::new(),
+        };
+        Self { stack, arena, frozen, snapshot, current_gen }
+    }
+
+    pub fn close(self) {}
+}
+
+impl Iterator for ArenaExporter<'_> {
+    type Item = ExportNode;
+
+    fn next(&mut self) -> Option<ExportNode> {
+        loop {
+            let entry = self.stack.last_mut()?;
+            let idx = entry.idx;
+
+            if idx.is_persisted() {
+                // Persisted nodes: delegate to PersistedNode
+                let snap = self.snapshot.as_ref().expect("snapshot required");
+                let pn = snap.node_at(idx.persisted_index(), idx.persisted_is_leaf());
+
+                if pn.is_leaf() || entry.expanded {
+                    self.stack.pop();
+                    return Some(ExportNode {
+                        key: pn.key().to_vec(),
+                        value: if pn.is_leaf() {
+                            pn.value().unwrap_or(&[]).to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                        version: pn.version() as i64,
+                        height: pn.height() as i8,
+                    });
+                }
+
+                entry.expanded = true;
+                let right_pn = pn.right();
+                let left_pn = pn.left();
+                self.stack.push(ArenaStackEntry {
+                    idx: NodeIdx::persisted(right_pn.index, right_pn.is_leaf),
+                    expanded: false,
+                });
+                self.stack.push(ArenaStackEntry {
+                    idx: NodeIdx::persisted(left_pn.index, left_pn.is_leaf),
+                    expanded: false,
+                });
+                continue;
+            }
+
+            let n = resolve_mem_node(self.arena, self.frozen, self.current_gen, idx);
+
+            if n.height == 0 || entry.expanded {
+                let node = self.stack.pop().unwrap();
+                let n = resolve_mem_node(self.arena, self.frozen, self.current_gen, node.idx);
+                return Some(ExportNode {
+                    key: n.key.clone(),
+                    value: if n.height == 0 { n.value.clone() } else { Vec::new() },
+                    version: n.version as i64,
+                    height: n.height as i8,
+                });
+            }
+
+            entry.expanded = true;
+            let right = n.right_idx.expect("branch must have right child");
+            let left = n.left_idx.expect("branch must have left child");
+            self.stack.push(ArenaStackEntry { idx: right, expanded: false });
+            self.stack.push(ArenaStackEntry { idx: left, expanded: false });
         }
     }
 }
