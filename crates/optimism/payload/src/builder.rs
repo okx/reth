@@ -254,14 +254,28 @@ where
                     // of the block. The old 500-TX cap was too small (6% coverage); this
                     // cap is calibrated to the block build time budget.
                     //
-                    // TODO: replace random truncation with gas-price ordered selection so
-                    // the cap covers the highest-priority TXs that will actually execute.
+                    // Select the highest-priority TXs so the cap covers exactly what
+                    // the block builder will execute first. `best_transactions()` yields
+                    // pending transactions ordered by effective gas tip (highest first),
+                    // mirroring the block builder's own ordering. We take up to
+                    // PREFETCH_TX_CAP hashes, then look up only the simulated subset via
+                    // `get_keys_arcs` — unsimulated TXs are silently skipped (no penalty).
+                    //
+                    // This replaces the previous `get_all_keys_arcs().take(N)` which used
+                    // random DashMap iteration order, covering ~50% of the block by
+                    // accident rather than targeting the top-priority transactions.
                     const PREFETCH_TX_CAP: usize = 4_000;
-                    let all_keys = cache.get_all_keys_arcs();
-                    let keys_arcs = if all_keys.len() > PREFETCH_TX_CAP {
-                        all_keys.into_iter().take(PREFETCH_TX_CAP).collect::<Vec<_>>()
+                    let top_hashes: Vec<_> = self
+                        .pool
+                        .best_transactions()
+                        .take(PREFETCH_TX_CAP)
+                        .map(|tx| *tx.hash())
+                        .collect();
+                    let keys_arcs = if top_hashes.is_empty() {
+                        // Pool has no pending transactions yet — fall back to full cache.
+                        cache.get_all_keys_arcs()
                     } else {
-                        all_keys
+                        cache.get_keys_arcs(&top_hashes)
                     };
 
                     if !keys_arcs.is_empty() {
