@@ -1,3 +1,4 @@
+pub mod arena;
 pub mod import_export;
 pub mod iterator;
 pub mod layout;
