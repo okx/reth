@@ -328,7 +328,7 @@ use parking_lot::RwLock;
 use reth_chainspec::ChainSpec;
 use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinHandle};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Shared snapshot holder that workers can read from.
 ///
@@ -387,8 +387,9 @@ pub struct SimulationWorkerPool<T, E = ()> {
     /// Sender for submitting simulation jobs.
     ///
     /// Clone-able and cheap (just an Arc increment).
-    /// Uses bounded channel to prevent unbounded memory growth.
-    sender: mpsc::Sender<SimulationRequest<T>>,
+    /// Unbounded so trigger_simulation() never blocks or drops due to capacity.
+    /// Concurrent simulation count is bounded by the semaphore in drain_loop.
+    sender: mpsc::UnboundedSender<SimulationRequest<T>>,
 
     /// Worker task handles for graceful shutdown.
     ///
@@ -486,13 +487,14 @@ where
         snapshot: Arc<SnapshotState>,
         chain_spec: Arc<ChainSpec>,
     ) -> Self {
-        // Bounded channel: capacity = workers × 100.
-        // Sized to absorb burst arrivals (mempool sync, P2P batch announcements)
-        // where 50-200 txs can arrive within a single millisecond.
-        // workers × 10 was too small — bursts filled it instantly.
-        // Memory cost: 200 × ~500 bytes = ~100 KB at default 2 workers. Negligible.
-        let channel_capacity = config.num_workers * 100;
-        let (sender, receiver) = mpsc::channel(channel_capacity);
+        // Unbounded channel: drain_loop blocks on semaphore acquisition while waiting
+        // for a free simulation slot. During that wait, recv() is not called, so a
+        // bounded channel would fill and drop requests. With unbounded, items queue
+        // up in memory instead. Memory cost is negligible — each item is an Arc
+        // pointer (~40 bytes); even 100k queued txs = ~4 MB. Simulations complete
+        // in ~10ms so the queue drains quickly in practice.
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let channel_capacity = "unbounded";
 
         // Wrap snapshot in RwLock so the drain task can see block updates.
         let snapshot_holder: SharedSnapshot = Arc::new(RwLock::new(snapshot));
@@ -692,30 +694,13 @@ where
         // Record that a simulation was triggered
         self.metrics.simulations_triggered.increment(1);
 
-        match self.sender.try_send(request) {
-            Ok(_) => {
-                // Successfully queued for simulation
-            }
-            Err(mpsc::error::TrySendError::Full(req)) => {
-                // Channel is full - workers can't keep up!
-                // Record the dropped simulation
-                self.metrics.simulations_dropped.increment(1);
-                warn!(
-                    target: "txpool::pre_warming",
-                    tx_hash = ?req.tx_hash,
-                    "Simulation channel full - workers overloaded, dropping simulation request. \
-                     Consider increasing worker count or reducing transaction rate."
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Channel closed - worker pool shutdown
-                // Record as dropped
-                self.metrics.simulations_dropped.increment(1);
-                warn!(
-                    target: "txpool::pre_warming",
-                    "Simulation channel closed - worker pool shut down"
-                );
-            }
+        if self.sender.send(request).is_err() {
+            // Channel closed — worker pool is shutting down
+            self.metrics.simulations_dropped.increment(1);
+            tracing::trace!(
+                target: "txpool::pre_warming",
+                "Simulation channel closed - worker pool shut down"
+            );
         }
     }
 
@@ -823,7 +808,7 @@ where
 /// semaphore permit, which unblocks as soon as any simulation finishes.
 /// The large channel buffer (workers × 100) absorbs burst arrivals.
 async fn drain_loop<T>(
-    mut receiver: mpsc::Receiver<SimulationRequest<T>>,
+    mut receiver: mpsc::UnboundedReceiver<SimulationRequest<T>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     cache: Arc<PreWarmedCache>,
     snapshot_holder: SharedSnapshot,
