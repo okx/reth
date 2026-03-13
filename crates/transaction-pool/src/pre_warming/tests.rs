@@ -408,20 +408,20 @@ mod integration {
 
         assert_eq!(cache.len(), 5);
 
-        // Alice, Bob, Charlie got mined - NOTE: Eviction is disabled
+        // Alice, Bob, Charlie got mined — evict them
         let mined = &tx_hashes[0..3];
         cache.remove_txs(mined);
 
-        // With eviction disabled, all 5 entries remain
-        assert_eq!(cache.len(), 5);
+        // Only Dave and Eve remain
+        assert_eq!(cache.len(), 2);
 
         // Dave and Eve's keys should still be available
         let remaining = cache.get_keys_for_txs(&tx_hashes[3..5]);
         assert_eq!(remaining.accounts.len(), 2);
 
-        // Mined TXs are still in cache (eviction disabled)
+        // Mined TXs are gone
         let removed = cache.get_keys_for_txs(mined);
-        assert!(!removed.is_empty());
+        assert!(removed.is_empty());
     }
 
     /// # Test: Cache Statistics Accuracy
@@ -631,9 +631,9 @@ mod e2e {
         assert!(prefetch_keys.accounts.len() > 50);
         assert!(prefetch_keys.storage_slots.len() > 0);
 
-        // NOTE: Eviction is disabled, so cache.len() stays at 100
+        // 50 selected TXs are evicted; 50 remain
         cache.remove_txs(&selected_for_block);
-        assert_eq!(cache.len(), 100);
+        assert_eq!(cache.len(), 50);
     }
 
     /// # Test: Overlapping Keys Deduplication (Hot Contract)
@@ -1814,14 +1814,12 @@ mod stress {
                 })
                 .collect();
 
-            // With eviction disabled, cache keeps growing
-            // After block 0: 100 entries, after block 1: 200, etc.
-            let expected_len = (block_num + 1) * 100;
-            assert_eq!(cache.len(), expected_len);
+            // After storing this block's 100 TXs the cache grows
+            assert_eq!(cache.len(), 100);
 
-            // remove_txs is a no-op with eviction disabled
+            // remove_txs evicts the mined TXs — cache returns to 0 for next block
             cache.remove_txs(&tx_hashes);
-            assert_eq!(cache.len(), expected_len);
+            assert_eq!(cache.len(), 0);
         }
     }
 

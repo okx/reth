@@ -266,14 +266,16 @@ impl PreWarmedCache {
 
     /// Remove keys for mined/dropped transactions (called from hook)
     ///
-    /// This is called when transactions are removed from the pool (mined, dropped, etc.).
-    /// Removes the keys for those transactions from the cache.
+    /// Called when transactions are removed from the pool (included in a block or dropped).
+    /// By the time this is called, `build_payload` for that block has already completed,
+    /// and the prefetch-once guard ensures no further prefetch runs for the same parent.
     ///
-    /// NOTE: Eviction temporarily disabled - keys need to remain for payload builder
+    /// Thread-safe: `get_keys_arcs()` returns Arc clones before this runs, so any
+    /// in-flight prefetch holds its own references and is unaffected by concurrent removes.
     pub fn remove_txs(&self, tx_hashes: &[TxHash]) {
-        // DISABLED: Don't evict keys immediately - payload builder needs them
-        // TODO: Implement TTL-based eviction instead
-        let _ = tx_hashes; // Suppress unused warning
+        for hash in tx_hashes {
+            self.per_tx_keys.remove(hash);
+        }
     }
 
     /// Get cache statistics
@@ -480,15 +482,13 @@ mod tests {
 
         assert_eq!(cache.len(), 2);
 
-        // Remove tx1 - NOTE: Eviction is disabled
+        // Remove tx1
         cache.remove_txs(&[tx1]);
 
-        // With eviction disabled, cache still has both entries
-        assert_eq!(cache.len(), 2);
-
-        // tx1 is still there (eviction disabled)
+        // tx1 is evicted
+        assert_eq!(cache.len(), 1);
         let merged = cache.get_keys_for_txs(&[tx1]);
-        assert!(!merged.is_empty());
+        assert!(merged.is_empty());
 
         // tx2 should still be there
         let merged = cache.get_keys_for_txs(&[tx2]);
@@ -508,11 +508,11 @@ mod tests {
 
         assert_eq!(cache.len(), 3);
 
-        // Remove tx1 and tx2 - NOTE: Eviction is disabled, cache stays at 3
+        // Remove tx1 and tx2
         cache.remove_txs(&[tx1, tx2]);
 
-        // With eviction disabled, all entries remain
-        assert_eq!(cache.len(), 3);
+        // tx1 and tx2 are evicted
+        assert_eq!(cache.len(), 1);
 
         // tx3 should still be there
         let merged = cache.get_keys_for_txs(&[tx3]);
@@ -605,13 +605,13 @@ mod tests {
         assert_eq!(merged.accounts.len(), 3);
         assert_eq!(merged.storage_slots.len(), 1 + 3 + 5); // 0+1, 2+1, 4+1
 
-        // Block finalized, remove mined transactions - NOTE: Eviction is disabled
+        // Block finalized — remove the 3 mined transactions
         cache.remove_txs(&selected);
 
-        // With eviction disabled, all 5 entries remain
-        assert_eq!(cache.len(), 5);
+        // Only the 2 non-selected transactions remain
+        assert_eq!(cache.len(), 2);
 
-        // All transactions still accessible
+        // Remaining (non-mined) transactions are still accessible
         let remaining = cache.get_keys_for_txs(&[txs[1], txs[3]]);
         assert_eq!(remaining.accounts.len(), 2);
     }
