@@ -13,6 +13,7 @@
 //!   - `kvs`:      blob of `keyLen(u32 LE) + key + valueLen(u32 LE) + value` entries
 
 use crate::memiavl::{
+    arena::{resolve_mem_node, FrozenArena, MutableArena, NodeIdx},
     layout::{
         OFFSET_HASH, OFFSET_HEIGHT, OFFSET_KEY_LEAF, OFFSET_LEAF_HASH, OFFSET_LEAF_KEY_LEN,
         OFFSET_LEAF_KEY_OFFSET, OFFSET_LEAF_VERSION, OFFSET_PRE_TREES, OFFSET_SIZE, OFFSET_VERSION,
@@ -20,7 +21,8 @@ use crate::memiavl::{
     },
     node::Node,
     rate_limiter::{MonitoringWriter, RateLimitedWriter, RateLimiter},
-    snapshot::{METADATA_SIZE, SNAPSHOT_FORMAT, SNAPSHOT_MAGIC},
+    snapshot::{Snapshot, METADATA_SIZE, SNAPSHOT_FORMAT, SNAPSHOT_MAGIC},
+    tree_algo::compute_hash_recursive,
 };
 use crossbeam_channel::{bounded, Sender};
 use seidb_common::error::{Result, SeiDbError};
@@ -345,6 +347,272 @@ fn write_recursive_pipeline(
     let idx = *branch_count;
     *branch_count += 1;
     Ok((false, idx))
+}
+
+// ---------------------------------------------------------------------------
+// Arena-based snapshot writing (eliminates ensure_root_ref / idx_to_node_ref)
+// ---------------------------------------------------------------------------
+
+/// Write an IAVL tree snapshot from arena-based storage, without building Arc<Node> tree.
+pub fn write_snapshot_arena(
+    dir: &Path,
+    version: u32,
+    root: Option<NodeIdx>,
+    arena: &MutableArena,
+    frozen: &[std::sync::Arc<FrozenArena>],
+    snapshot: &Option<std::sync::Arc<Snapshot>>,
+    current_gen: u16,
+) -> Result<()> {
+    write_snapshot_arena_with_limiter(
+        dir,
+        version,
+        root,
+        arena,
+        frozen,
+        snapshot,
+        current_gen,
+        None,
+    )
+}
+
+/// Write an IAVL tree snapshot from arena-based storage with optional rate limiting.
+pub fn write_snapshot_arena_with_limiter(
+    dir: &Path,
+    version: u32,
+    root: Option<NodeIdx>,
+    arena: &MutableArena,
+    frozen: &[std::sync::Arc<FrozenArena>],
+    snapshot: &Option<std::sync::Arc<Snapshot>>,
+    current_gen: u16,
+    limiter: Option<&RateLimiter>,
+) -> Result<()> {
+    fs::create_dir_all(dir)?;
+
+    let fp_nodes = File::create(dir.join("nodes"))?;
+    let fp_leaves = File::create(dir.join("leaves"))?;
+    let fp_kvs = File::create(dir.join("kvs"))?;
+
+    if let Some(root_idx) = root {
+        let (kv_tx, kv_rx) = bounded::<KvOp>(PIPELINE_CHANNEL_SIZE);
+        let (leaf_tx, leaf_rx) = bounded::<LeafOp>(PIPELINE_CHANNEL_SIZE);
+        let (branch_tx, branch_rx) = bounded::<BranchOp>(PIPELINE_CHANNEL_SIZE);
+
+        let kv_limiter = limiter.cloned();
+        let leaf_limiter = limiter.cloned();
+        let branch_limiter = limiter.cloned();
+
+        let kv_handle = thread::spawn(move || -> Result<()> {
+            let mut w = wrap_writer(BufWriter::new(fp_kvs), "kvs", kv_limiter.as_ref());
+            for op in kv_rx {
+                write_kv_entry(&mut w, &op.key, &op.value)?;
+            }
+            w.flush()?;
+            Ok(())
+        });
+
+        let leaf_handle = thread::spawn(move || -> Result<()> {
+            let mut w = wrap_writer(BufWriter::new(fp_leaves), "leaves", leaf_limiter.as_ref());
+            for op in leaf_rx {
+                write_leaf_record(&mut w, op.version, op.key_len, op.key_offset, &op.hash)?;
+            }
+            w.flush()?;
+            Ok(())
+        });
+
+        let branch_handle = thread::spawn(move || -> Result<()> {
+            let mut w = wrap_writer(BufWriter::new(fp_nodes), "nodes", branch_limiter.as_ref());
+            for op in branch_rx {
+                write_branch_record(
+                    &mut w,
+                    op.height,
+                    op.pre_trees,
+                    op.version,
+                    op.size,
+                    op.key_leaf,
+                    &op.hash,
+                )?;
+            }
+            w.flush()?;
+            Ok(())
+        });
+
+        let mut branch_count: u32 = 0;
+        let mut leaf_count: u32 = 0;
+        let mut kvs_offset: u64 = 0;
+
+        let traverse_result = write_recursive_arena(
+            root_idx,
+            arena,
+            frozen,
+            snapshot,
+            current_gen,
+            &kv_tx,
+            &leaf_tx,
+            &branch_tx,
+            &mut branch_count,
+            &mut leaf_count,
+            &mut kvs_offset,
+        );
+
+        drop(kv_tx);
+        drop(leaf_tx);
+        drop(branch_tx);
+
+        traverse_result?;
+
+        kv_handle
+            .join()
+            .map_err(|_| SeiDbError::Other("kv writer thread panicked".to_string()))??;
+        leaf_handle
+            .join()
+            .map_err(|_| SeiDbError::Other("leaf writer thread panicked".to_string()))??;
+        branch_handle
+            .join()
+            .map_err(|_| SeiDbError::Other("branch writer thread panicked".to_string()))??;
+    } else {
+        drop(fp_nodes);
+        drop(fp_leaves);
+        drop(fp_kvs);
+    }
+
+    let mut meta_buf = [0u8; METADATA_SIZE];
+    meta_buf[0..4].copy_from_slice(&SNAPSHOT_MAGIC.to_le_bytes());
+    meta_buf[4..8].copy_from_slice(&SNAPSHOT_FORMAT.to_le_bytes());
+    meta_buf[8..12].copy_from_slice(&version.to_le_bytes());
+
+    let mut fp_meta = File::create(dir.join("metadata"))?;
+    fp_meta.write_all(&meta_buf)?;
+    fp_meta.flush()?;
+
+    Ok(())
+}
+
+/// Arena-based post-order DFS traversal for snapshot writing.
+fn write_recursive_arena(
+    idx: NodeIdx,
+    arena: &MutableArena,
+    frozen: &[std::sync::Arc<FrozenArena>],
+    snapshot: &Option<std::sync::Arc<Snapshot>>,
+    current_gen: u16,
+    kv_tx: &Sender<KvOp>,
+    leaf_tx: &Sender<LeafOp>,
+    branch_tx: &Sender<BranchOp>,
+    branch_count: &mut u32,
+    leaf_count: &mut u32,
+    kvs_offset: &mut u64,
+) -> Result<(bool, u32)> {
+    // Handle persisted nodes via PersistedNode API
+    if idx.is_persisted() {
+        let snap = snapshot
+            .as_ref()
+            .ok_or_else(|| SeiDbError::Other("snapshot required for persisted node".into()))?;
+        let pn = snap.node_at(idx.persisted_index(), idx.persisted_is_leaf());
+        // Delegate to the existing Node-based writer via PersistedNode → Node conversion
+        let node = Node::Persisted(pn);
+        return write_recursive_pipeline(
+            &node,
+            kv_tx,
+            leaf_tx,
+            branch_tx,
+            branch_count,
+            leaf_count,
+            kvs_offset,
+        );
+    }
+
+    let n = resolve_mem_node(arena, frozen, current_gen, idx);
+
+    if n.height == 0 {
+        // Leaf
+        let this_offset = *kvs_offset;
+        *kvs_offset += 4 + n.key.len() as u64 + 4 + n.value.len() as u64;
+
+        kv_tx
+            .send(KvOp { key: n.key.clone(), value: n.value.clone() })
+            .map_err(|_| SeiDbError::Other("kv channel closed unexpectedly".to_string()))?;
+
+        let hash = compute_hash_recursive(arena, frozen, snapshot, current_gen, idx);
+
+        leaf_tx
+            .send(LeafOp {
+                version: n.version,
+                key_len: n.key.len() as u32,
+                key_offset: this_offset,
+                hash,
+            })
+            .map_err(|_| SeiDbError::Other("leaf channel closed unexpectedly".to_string()))?;
+
+        let i = *leaf_count;
+        *leaf_count += 1;
+        return Ok((true, i));
+    }
+
+    // Branch
+    if *leaf_count < *branch_count {
+        return Err(SeiDbError::Other(format!(
+            "leafCounter {} < branchCounter {}",
+            leaf_count, branch_count
+        )));
+    }
+
+    let pre_trees = (*leaf_count - *branch_count) as u8;
+
+    // Recurse left
+    let left_idx = n
+        .left_idx
+        .ok_or_else(|| SeiDbError::Other("branch node missing left child".to_string()))?;
+    write_recursive_arena(
+        left_idx,
+        arena,
+        frozen,
+        snapshot,
+        current_gen,
+        kv_tx,
+        leaf_tx,
+        branch_tx,
+        branch_count,
+        leaf_count,
+        kvs_offset,
+    )?;
+
+    let key_leaf = *leaf_count;
+
+    // Recurse right
+    let right_idx = n
+        .right_idx
+        .ok_or_else(|| SeiDbError::Other("branch node missing right child".to_string()))?;
+    write_recursive_arena(
+        right_idx,
+        arena,
+        frozen,
+        snapshot,
+        current_gen,
+        kv_tx,
+        leaf_tx,
+        branch_tx,
+        branch_count,
+        leaf_count,
+        kvs_offset,
+    )?;
+
+    // Re-read node (arena didn't change, but need fresh reference)
+    let n = resolve_mem_node(arena, frozen, current_gen, idx);
+    let hash = compute_hash_recursive(arena, frozen, snapshot, current_gen, idx);
+
+    branch_tx
+        .send(BranchOp {
+            height: n.height,
+            pre_trees,
+            version: n.version,
+            size: n.size as u32,
+            key_leaf,
+            hash,
+        })
+        .map_err(|_| SeiDbError::Other("branch channel closed unexpectedly".to_string()))?;
+
+    let i = *branch_count;
+    *branch_count += 1;
+    Ok((false, i))
 }
 
 /// Write a key-value entry to the kvs file: keyLen(4 LE) + key + valueLen(4 LE) + value.

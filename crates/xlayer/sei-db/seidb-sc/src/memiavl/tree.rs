@@ -483,8 +483,15 @@ impl Tree {
 
     /// Write the current tree state to a snapshot directory.
     pub fn write_snapshot(&self, dir: &Path) -> Result<()> {
-        let root_ref = self.ensure_root_ref();
-        snapshot_writer::write_snapshot(dir, self.version, root_ref.as_deref())
+        snapshot_writer::write_snapshot_arena(
+            dir,
+            self.version,
+            self.root_idx,
+            &self.arena,
+            &self.frozen_arenas,
+            &self.snapshot,
+            self.current_gen,
+        )
     }
 
     /// Write the current tree state to a snapshot directory with optional rate limiting.
@@ -493,11 +500,14 @@ impl Tree {
         dir: &Path,
         limiter: Option<&RateLimiter>,
     ) -> Result<()> {
-        let root_ref = self.ensure_root_ref();
-        snapshot_writer::write_snapshot_with_limiter(
+        snapshot_writer::write_snapshot_arena_with_limiter(
             dir,
             self.version,
-            root_ref.as_deref(),
+            self.root_idx,
+            &self.arena,
+            &self.frozen_arenas,
+            &self.snapshot,
+            self.current_gen,
             limiter,
         )
     }
