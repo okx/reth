@@ -23,7 +23,7 @@ impl StateStore for MvccDatabase {
         let start_opt = if start.is_empty() { None } else { Some(start) };
         let end_opt = if end.is_empty() { None } else { Some(end) };
         let iter = MvccIterator::new(
-            self.db.clone(),
+            self.engine.as_ref(),
             store_key,
             start_opt,
             end_opt,
@@ -44,7 +44,7 @@ impl StateStore for MvccDatabase {
         let start_opt = if start.is_empty() { None } else { Some(start) };
         let end_opt = if end.is_empty() { None } else { Some(end) };
         let iter = MvccIterator::new(
-            self.db.clone(),
+            self.engine.as_ref(),
             store_key,
             start_opt,
             end_opt,

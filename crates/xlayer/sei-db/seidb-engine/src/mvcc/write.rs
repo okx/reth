@@ -7,7 +7,7 @@ use crate::mvcc::{
 use crossbeam_channel::Receiver;
 use seidb_common::error::{Result, SeiDbError};
 use seidb_proto::{ChangelogEntry, NamedChangeSet};
-use seidb_traits::wal::Wal;
+use seidb_traits::{types::IterOptions, wal::Wal};
 use std::sync::{atomic::Ordering, Arc};
 
 impl MvccDatabase {
@@ -19,7 +19,7 @@ impl MvccDatabase {
         // Genesis compatibility: remap version 0 -> 1
         let version = if version == 0 { 1 } else { version };
 
-        let mut batch = MvccBatch::new(Arc::clone(&self.db), version)?;
+        let mut batch = MvccBatch::new(self.engine.as_ref(), version)?;
 
         for cs in changesets {
             if let Some(ref changeset) = cs.changeset {
@@ -123,7 +123,7 @@ impl MvccDatabase {
 
     /// Physically remove all MVCC entries for `module` at a specific `version`.
     ///
-    /// Iterates over the module's key space using a raw RocksDB iterator,
+    /// Iterates over the module's key space using a KvEngine iterator,
     /// identifies entries whose MVCC version matches `version`, and hard-deletes
     /// them in batches of [`DELETE_COMMIT_BATCH_SIZE`].
     pub fn delete_keys_at_version(&self, module: &str, version: i64) -> Result<()> {
@@ -131,23 +131,19 @@ impl MvccDatabase {
         let lower = mvcc_encode(&Self::prepend_store_key(module, &[]), 0);
         let upper = Self::prefix_end(&prefix).map(|pe| mvcc_encode(&pe, 0));
 
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_iterate_lower_bound(lower);
-        if let Some(ref ub) = upper {
-            read_opts.set_iterate_upper_bound(ub.clone());
-        }
+        let iter_opts = IterOptions { lower_bound: Some(lower), upper_bound: upper };
 
-        let mut iter = self.db.raw_iterator_opt(read_opts);
-        iter.seek_to_first();
+        let mut iter = self.engine.new_iter(&iter_opts)?;
+        iter.first();
 
-        let mut batch = MvccBatch::new(Arc::clone(&self.db), version)?;
+        let mut batch = MvccBatch::new(self.engine.as_ref(), version)?;
         let mut delete_counter = 0usize;
 
         while iter.valid() {
-            let raw_key = match iter.key() {
-                Some(k) => k,
-                None => break,
-            };
+            let raw_key = iter.key();
+            if raw_key.is_empty() {
+                break;
+            }
 
             // Skip metadata keys
             if Self::is_metadata_key(raw_key) {
@@ -189,7 +185,7 @@ impl MvccDatabase {
                 if delete_counter >= DELETE_COMMIT_BATCH_SIZE {
                     batch.write()?;
                     delete_counter = 0;
-                    batch = MvccBatch::new(Arc::clone(&self.db), version)?;
+                    batch = MvccBatch::new(self.engine.as_ref(), version)?;
                 }
             }
 
@@ -349,11 +345,7 @@ mod tests {
 
         // SAFETY: we manually set the tx field via a second mutable reference.
         // This is safe because we haven't started any concurrent access yet.
-        // We use a helper to set up the channel since the field is pub(crate).
         {
-            // We need to get a mutable reference to set pending_changes_tx.
-            // Since Arc doesn't allow &mut, we use unsafe to set the field.
-            // This is only for testing — production code initializes in open_db.
             let db_ptr = Arc::as_ptr(&db) as *mut MvccDatabase;
             unsafe {
                 (*db_ptr).pending_changes_tx = Some(tx);

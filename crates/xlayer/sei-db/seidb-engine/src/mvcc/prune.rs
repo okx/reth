@@ -5,9 +5,8 @@ use crate::mvcc::{
     encoding::{decode_uint64_ascending, mvcc_encode, split_mvcc_key, split_mvcc_value},
 };
 use crossbeam_channel::Receiver;
-use rocksdb::{ReadOptions, WriteBatch, DB};
 use seidb_common::error::{Result, SeiDbError};
-use seidb_traits::types::SnapshotNode;
+use seidb_traits::types::{IterOptions, SnapshotNode, WriteOptions};
 use std::sync::Arc;
 
 /// Callback type for `raw_iterate`: receives (key, value, version) and returns
@@ -26,10 +25,11 @@ impl MvccDatabase {
     ///
     /// After pruning, the earliest version is advanced to `version + 1`.
     pub fn prune(&self, version: i64) -> Result<()> {
-        let mut iter = self.db.raw_iterator();
-        iter.seek_to_first();
+        let iter_opts = IterOptions { lower_bound: None, upper_bound: None };
+        let mut iter = self.engine.new_iter(&iter_opts)?;
+        iter.first();
 
-        let mut batch = WriteBatch::default();
+        let mut batch = self.engine.new_batch();
         let mut counter = 0usize;
 
         // Tracking state for the previous entry.
@@ -40,10 +40,10 @@ impl MvccDatabase {
         let mut prev_store: String = String::new();
 
         while iter.valid() {
-            let curr_key_encoded = match iter.key() {
-                Some(k) => k.to_vec(),
-                None => break,
-            };
+            let curr_key_encoded = iter.key().to_vec();
+            if curr_key_encoded.is_empty() {
+                break;
+            }
 
             // Skip metadata keys (e.g. s/_latest, s/_earliest).
             if Self::is_metadata_key(&curr_key_encoded) {
@@ -63,10 +63,9 @@ impl MvccDatabase {
                 if self.should_skip_store(&store_key) {
                     // Seek past all keys of this store by constructing a key
                     // with the next store name (appending "0" sorts after "/").
-                    // Must be MVCC-encoded for the custom comparator.
                     let next_store = format!("{store_key}0");
                     let next = mvcc_encode(&Self::store_prefix(&next_store), 0);
-                    iter.seek(&next);
+                    iter.seek_ge(&next);
                     continue;
                 }
             }
@@ -80,14 +79,10 @@ impl MvccDatabase {
             // and either keep_last_version is on or the previous entry is also
             // above the prune height, skip to the next user key.
             if curr_version > version && (self.config.keep_last_version || prev_version > version) {
-                // Seek to the next user key (skip remaining versions).
-                // Append \x00 to the user key to produce a key that sorts
-                // after all MVCC versions of the current user key, then
-                // encode with version 0 to get a valid seek target.
                 let mut next_user_key = curr_key.to_vec();
                 next_user_key.push(0x00);
                 let seek_target = mvcc_encode(&next_user_key, 0);
-                iter.seek(&seek_target);
+                iter.seek_ge(&seek_target);
                 continue;
             }
 
@@ -100,14 +95,12 @@ impl MvccDatabase {
                     prev_val_encoded.as_ref().is_some_and(|v| Self::val_tombstoned(v));
 
                 if same_key || prev_tombstoned || !self.config.keep_last_version {
-                    batch.delete(prev_enc);
+                    batch.delete(prev_enc)?;
                     counter += 1;
 
                     if counter >= PRUNE_COMMIT_BATCH_SIZE {
-                        self.db
-                            .write(std::mem::take(&mut batch))
-                            .map_err(|e| SeiDbError::RocksDb(e.to_string()))?;
-                        batch = WriteBatch::default();
+                        batch.commit(&WriteOptions::default())?;
+                        batch = self.engine.new_batch();
                         counter = 0;
                     }
                 }
@@ -117,7 +110,7 @@ impl MvccDatabase {
             prev_key = Some(curr_key.to_vec());
             prev_version = curr_version;
             prev_key_encoded = Some(curr_key_encoded);
-            prev_val_encoded = iter.value().map(|v| v.to_vec());
+            prev_val_encoded = if iter.valid() { Some(iter.value().to_vec()) } else { None };
 
             iter.next();
         }
@@ -130,14 +123,14 @@ impl MvccDatabase {
                 prev_val_encoded.as_ref().is_some_and(|v| Self::val_tombstoned(v));
 
             if prev_tombstoned || !self.config.keep_last_version {
-                batch.delete(prev_enc);
+                batch.delete(prev_enc)?;
                 counter += 1;
             }
         }
 
         // Commit any remaining deletes.
         if counter > 0 {
-            self.db.write(batch).map_err(|e| SeiDbError::RocksDb(e.to_string()))?;
+            batch.commit(&WriteOptions::default())?;
         }
 
         // Advance the earliest version.
@@ -158,15 +151,15 @@ impl MvccDatabase {
     /// version, using multiple worker threads for parallelism.
     pub fn import(&self, version: i64, nodes: Receiver<SnapshotNode>) -> Result<()> {
         let num_workers = self.config.import_num_workers.max(1);
-        let db = Arc::clone(&self.db);
+        let engine = Arc::clone(&self.engine);
 
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(num_workers);
 
             for _ in 0..num_workers {
                 let rx = nodes.clone();
-                let db_ref = Arc::clone(&db);
-                handles.push(s.spawn(move || Self::import_worker(db_ref, version, rx)));
+                let engine_ref = Arc::clone(&engine);
+                handles.push(s.spawn(move || Self::import_worker(engine_ref, version, rx)));
             }
 
             let mut first_err: Option<SeiDbError> = None;
@@ -191,8 +184,12 @@ impl MvccDatabase {
 
     /// Single import worker: consume nodes from the channel and write in
     /// batches of `IMPORT_COMMIT_BATCH_SIZE`.
-    fn import_worker(db: Arc<DB>, version: i64, rx: Receiver<SnapshotNode>) -> Result<()> {
-        let mut batch = MvccRawBatch::new(Arc::clone(&db));
+    fn import_worker(
+        engine: Arc<dyn seidb_traits::kv::KvEngine>,
+        version: i64,
+        rx: Receiver<SnapshotNode>,
+    ) -> Result<()> {
+        let mut batch = MvccRawBatch::new(engine.as_ref());
         let mut counter = 0usize;
 
         for node in rx {
@@ -201,7 +198,7 @@ impl MvccDatabase {
 
             if counter.is_multiple_of(IMPORT_COMMIT_BATCH_SIZE) {
                 batch.write()?;
-                batch = MvccRawBatch::new(Arc::clone(&db));
+                batch = MvccRawBatch::new(engine.as_ref());
             }
         }
 
@@ -224,20 +221,16 @@ impl MvccDatabase {
         let lower = mvcc_encode(&Self::prepend_store_key(store_key, &[]), 0);
         let upper = Self::prefix_end(&prefix);
 
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_iterate_lower_bound(lower);
-        if let Some(ref ub) = upper {
-            read_opts.set_iterate_upper_bound(ub.clone());
-        }
+        let iter_opts = IterOptions { lower_bound: Some(lower), upper_bound: upper };
 
-        let mut iter = self.db.raw_iterator_opt(read_opts);
-        iter.seek_to_first();
+        let mut iter = self.engine.new_iter(&iter_opts)?;
+        iter.first();
 
         while iter.valid() {
-            let curr_key_encoded = match iter.key() {
-                Some(k) => k,
-                None => break,
-            };
+            let curr_key_encoded = iter.key();
+            if curr_key_encoded.is_empty() {
+                break;
+            }
 
             // Skip metadata keys.
             if Self::is_metadata_key(curr_key_encoded) {
@@ -261,10 +254,10 @@ impl MvccDatabase {
             };
 
             // Decode value and check for tombstone.
-            let curr_val_encoded = match iter.value() {
-                Some(v) => v,
-                None => break,
-            };
+            let curr_val_encoded = iter.value();
+            if curr_val_encoded.is_empty() {
+                break;
+            }
 
             if !Self::val_tombstoned(curr_val_encoded) {
                 let (val_bytes, _) = split_mvcc_value(curr_val_encoded).ok_or_else(|| {
@@ -294,6 +287,7 @@ mod tests {
     use super::*;
     use crate::mvcc::encoding::mvcc_encode_value;
     use seidb_common::config::StateStoreConfig;
+    use seidb_traits::types::WriteOptions;
     use tempfile::TempDir;
 
     /// Helper: build a minimal StateStoreConfig pointing at the given dir.
@@ -314,19 +308,30 @@ mod tests {
         }
     }
 
-    /// Write an MVCC key/value directly into the database.
-    fn write_mvcc(db: &DB, store_key: &str, key: &[u8], value: &[u8], version: i64) {
+    /// Write an MVCC key/value directly into the engine.
+    fn write_mvcc(
+        engine: &dyn seidb_traits::kv::KvEngine,
+        store_key: &str,
+        key: &[u8],
+        value: &[u8],
+        version: i64,
+    ) {
         let k = mvcc_encode(&MvccDatabase::prepend_store_key(store_key, key), version);
         let v = mvcc_encode_value(value, 0);
-        db.put(&k, &v).unwrap();
+        engine.set(&k, &v, &WriteOptions::default()).unwrap();
     }
 
-    /// Write an MVCC tombstone directly into the database.
-    fn write_mvcc_tombstone(db: &DB, store_key: &str, key: &[u8], version: i64) {
+    /// Write an MVCC tombstone directly into the engine.
+    fn write_mvcc_tombstone(
+        engine: &dyn seidb_traits::kv::KvEngine,
+        store_key: &str,
+        key: &[u8],
+        version: i64,
+    ) {
         use crate::mvcc::constants::TOMBSTONE_VAL;
         let k = mvcc_encode(&MvccDatabase::prepend_store_key(store_key, key), version);
         let v = mvcc_encode_value(TOMBSTONE_VAL, version);
-        db.put(&k, &v).unwrap();
+        engine.set(&k, &v, &WriteOptions::default()).unwrap();
     }
 
     // ── Prune tests ──────────────────────────────────────────────────────
@@ -340,26 +345,16 @@ mod tests {
         // Mark store as dirty so prune doesn't skip it.
         mvcc.store_key_dirty.write().insert("store".to_string(), 1);
 
-        write_mvcc(&mvcc.db, "store", b"key", b"v1", 1);
-        write_mvcc(&mvcc.db, "store", b"key", b"v2", 2);
-        write_mvcc(&mvcc.db, "store", b"key", b"v3", 3);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"v1", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"v2", 2);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"v3", 3);
 
         mvcc.prune(2).unwrap();
 
-        // After prune(2), earliest_version is set to 3.
-        // v1 should be deleted (superseded by v2 which is <= prune height).
-        // v2 should remain (keep_last_version=true, it's the latest <= prune).
-        // v3 should remain (above prune height).
-        // Query at v3 to be above earliest_version.
         assert_eq!(mvcc.get("store", 3, b"key").unwrap(), Some(b"v3".to_vec()));
 
-        // Verify v1 was physically removed by checking that a direct lookup
-        // at v1's encoded key returns nothing (but we can't query via get()
-        // since v1 < earliest_version=3). We verify indirectly: at v3 we get
-        // v3, confirming v2 is still there as a valid older entry.
-
         // Write a new version and verify the chain is still consistent.
-        write_mvcc(&mvcc.db, "store", b"key", b"v4", 4);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"v4", 4);
         assert_eq!(mvcc.get("store", 4, b"key").unwrap(), Some(b"v4".to_vec()));
         assert_eq!(mvcc.get("store", 3, b"key").unwrap(), Some(b"v3".to_vec()));
     }
@@ -372,12 +367,11 @@ mod tests {
 
         mvcc.store_key_dirty.write().insert("store".to_string(), 1);
 
-        write_mvcc(&mvcc.db, "store", b"key", b"alive", 1);
-        write_mvcc_tombstone(&mvcc.db, "store", b"key", 2);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"alive", 1);
+        write_mvcc_tombstone(mvcc.engine.as_ref(), "store", b"key", 2);
 
         mvcc.prune(2).unwrap();
 
-        // Both v1 (superseded) and v2 (tombstoned at <= prune) should be gone.
         assert_eq!(mvcc.get("store", 1, b"key").unwrap(), None);
         assert_eq!(mvcc.get("store", 2, b"key").unwrap(), None);
         assert_eq!(mvcc.get("store", 3, b"key").unwrap(), None);
@@ -391,23 +385,13 @@ mod tests {
 
         mvcc.store_key_dirty.write().insert("store".to_string(), 1);
 
-        // Two versions of the same key and one version at prune height.
-        write_mvcc(&mvcc.db, "store", b"key", b"old", 1);
-        write_mvcc(&mvcc.db, "store", b"key", b"kept", 2);
-        // A separate key with only one version at the prune height.
-        write_mvcc(&mvcc.db, "store", b"solo", b"only", 2);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"old", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"kept", 2);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"solo", b"only", 2);
 
         mvcc.prune(2).unwrap();
 
-        // v1 of "key" should be pruned (superseded by v2).
-        // v2 of "key" should be preserved (keep_last_version=true, it's
-        // the latest version even though at prune height).
-        // After prune, earliest_version becomes 3, so we query at v3 which
-        // will return the v2 entry (latest <= 3).
         assert_eq!(mvcc.get("store", 3, b"key").unwrap(), Some(b"kept".to_vec()));
-
-        // "solo" has only one version at prune height. With keep_last_version
-        // it should survive.
         assert_eq!(mvcc.get("store", 3, b"solo").unwrap(), Some(b"only".to_vec()));
     }
 
@@ -419,12 +403,10 @@ mod tests {
 
         mvcc.store_key_dirty.write().insert("store".to_string(), 1);
 
-        write_mvcc(&mvcc.db, "store", b"key", b"only", 2);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"only", 2);
 
         mvcc.prune(2).unwrap();
 
-        // With keep_last_version=false, even the last version at prune height
-        // gets deleted.
         assert_eq!(mvcc.get("store", 2, b"key").unwrap(), None);
     }
 
@@ -439,7 +421,7 @@ mod tests {
         // Write more entries than PRUNE_COMMIT_BATCH_SIZE (50).
         for i in 0..100u32 {
             let key = format!("key_{i:04}");
-            write_mvcc(&mvcc.db, "store", key.as_bytes(), b"val", 1);
+            write_mvcc(mvcc.engine.as_ref(), "store", key.as_bytes(), b"val", 1);
         }
 
         mvcc.prune(1).unwrap();
@@ -462,7 +444,7 @@ mod tests {
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
 
         mvcc.store_key_dirty.write().insert("store".to_string(), 1);
-        write_mvcc(&mvcc.db, "store", b"k", b"v", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"k", b"v", 1);
 
         assert_eq!(mvcc.get_earliest_version(), 0);
 
@@ -478,12 +460,10 @@ mod tests {
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
 
         // Do NOT mark "store" as dirty — it should be skipped during prune.
-        write_mvcc(&mvcc.db, "store", b"key", b"val", 5);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"val", 5);
 
         mvcc.prune(3).unwrap();
 
-        // Key should still exist because the store was skipped and version 5
-        // is above the prune height. earliest_version is now 4.
         assert_eq!(mvcc.get("store", 5, b"key").unwrap(), Some(b"val".to_vec()));
     }
 
@@ -506,7 +486,6 @@ mod tests {
                 })
                 .unwrap();
             }
-            // tx is dropped here, closing the channel.
         });
 
         mvcc.import(10, rx).unwrap();
@@ -569,9 +548,9 @@ mod tests {
         let cfg = test_config(dir.path());
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
 
-        write_mvcc(&mvcc.db, "store", b"a", b"val_a_1", 1);
-        write_mvcc(&mvcc.db, "store", b"a", b"val_a_2", 2);
-        write_mvcc(&mvcc.db, "store", b"b", b"val_b_1", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"a", b"val_a_1", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"a", b"val_a_2", 2);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"b", b"val_b_1", 1);
 
         let mut entries: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
         let stopped_early = mvcc
@@ -584,7 +563,6 @@ mod tests {
         assert!(!stopped_early);
         assert_eq!(entries.len(), 3);
 
-        // Entries should be in MVCC order: (a,v1), (a,v2), (b,v1)
         assert_eq!(entries[0], (b"a".to_vec(), b"val_a_1".to_vec(), 1));
         assert_eq!(entries[1], (b"a".to_vec(), b"val_a_2".to_vec(), 2));
         assert_eq!(entries[2], (b"b".to_vec(), b"val_b_1".to_vec(), 1));
@@ -596,9 +574,9 @@ mod tests {
         let cfg = test_config(dir.path());
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
 
-        write_mvcc(&mvcc.db, "store", b"a", b"alive", 1);
-        write_mvcc_tombstone(&mvcc.db, "store", b"a", 2);
-        write_mvcc(&mvcc.db, "store", b"b", b"also_alive", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"a", b"alive", 1);
+        write_mvcc_tombstone(mvcc.engine.as_ref(), "store", b"a", 2);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"b", b"also_alive", 1);
 
         let mut entries: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
         mvcc.raw_iterate("store", &mut |key, val, ver| {
@@ -607,7 +585,6 @@ mod tests {
         })
         .unwrap();
 
-        // Tombstoned entry for (a, v2) should be skipped.
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0], (b"a".to_vec(), b"alive".to_vec(), 1));
         assert_eq!(entries[1], (b"b".to_vec(), b"also_alive".to_vec(), 1));
@@ -619,9 +596,9 @@ mod tests {
         let cfg = test_config(dir.path());
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
 
-        write_mvcc(&mvcc.db, "store", b"a", b"v1", 1);
-        write_mvcc(&mvcc.db, "store", b"b", b"v2", 1);
-        write_mvcc(&mvcc.db, "store", b"c", b"v3", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"a", b"v1", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"b", b"v2", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"c", b"v3", 1);
 
         let mut count = 0;
         let stopped = mvcc

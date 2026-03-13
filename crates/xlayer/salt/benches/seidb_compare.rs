@@ -744,12 +744,23 @@ fn bench_seidb_parallel(c: &mut Criterion) {
 // SC + SS full-stack benchmark (includes RocksDB MVCC write)
 // ---------------------------------------------------------------------------
 
-/// Open SeiDb with both SC and SS layers enabled.
+/// Open SeiDb with both SC and SS layers enabled (RocksDB SS backend).
 fn setup_seidb_full_stack(
     dir: &std::path::Path,
     write_mode: WriteMode,
     pre_pop: &BundleState,
     async_apply: bool,
+) -> SeiDb {
+    setup_seidb_full_stack_backend(dir, write_mode, pre_pop, async_apply, "pebbledb")
+}
+
+/// Open SeiDb with both SC and SS layers, choosing SS backend.
+fn setup_seidb_full_stack_backend(
+    dir: &std::path::Path,
+    write_mode: WriteMode,
+    pre_pop: &BundleState,
+    async_apply: bool,
+    ss_backend: &str,
 ) -> SeiDb {
     let home = dir.to_string_lossy().to_string();
     let sc_config = StateCommitConfig {
@@ -765,6 +776,7 @@ fn setup_seidb_full_stack(
         enable: true,
         db_directory: dir.join("cosmos_ss").to_string_lossy().to_string(),
         evm_db_directory: dir.join("evm_ss").to_string_lossy().to_string(),
+        backend: ss_backend.to_string(),
         keep_last_version: true,
         ..Default::default()
     };
@@ -924,6 +936,33 @@ fn bench_seidb_full_stack(c: &mut Criterion) {
                 total += elapsed;
                 if i == 0 {
                     print_stats("SC + SS Parallel (9 modules)", &stats);
+                }
+            }
+            total
+        })
+    });
+
+    // --- SC + SS with MDBX backend (parallel 9 modules) ---
+    let mut full_mdbx_state: Option<(SeiDb, tempfile::TempDir)> = None;
+    group.bench_function(BenchmarkId::new("sc_plus_ss_mdbx_parallel", &label), |b| {
+        let (db, _dir) = full_mdbx_state.get_or_insert_with(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = setup_seidb_full_stack_backend(
+                dir.path(),
+                WriteMode::CosmosOnly,
+                &pre_pop,
+                true,
+                "mdbx",
+            );
+            (db, dir)
+        });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                let (elapsed, stats) = run_seidb_full_stack(db, &block_bundles, true);
+                total += elapsed;
+                if i == 0 {
+                    print_stats("SC + SS MDBX Parallel (9 modules)", &stats);
                 }
             }
             total

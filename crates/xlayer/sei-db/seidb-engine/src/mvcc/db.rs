@@ -1,5 +1,6 @@
 use crate::{
     engine::RocksDbEngine,
+    mdbx_engine::MdbxEngine,
     mvcc::{
         comparator::{mvcc_comparator_name, mvcc_compare_fn},
         constants::*,
@@ -8,13 +9,12 @@ use crate::{
 };
 use crossbeam_channel::Sender;
 use parking_lot::{Mutex, RwLock};
-use rocksdb::{ReadOptions, DB};
 use seidb_common::{
     config::{StateStoreConfig, WalConfig},
     error::{Result, SeiDbError},
 };
 use seidb_proto::NamedChangeSet;
-use seidb_traits::wal::Wal;
+use seidb_traits::{kv::KvEngine, types::IterOptions, wal::Wal};
 use seidb_wal::changelog::{new_changelog_wal, ChangelogWal};
 use std::{
     collections::HashMap,
@@ -24,13 +24,14 @@ use std::{
     },
 };
 
-/// MVCC database wrapping RocksDB with version-aware key/value storage.
+/// MVCC database wrapping a KvEngine backend with version-aware key/value storage.
 ///
 /// Supports multi-version concurrency control through MVCC-encoded keys,
 /// tombstone-based deletion tracking, and atomic version management.
+/// The backend can be RocksDB or MDBX, selected at construction time.
 #[allow(dead_code)]
 pub struct MvccDatabase {
-    pub(crate) db: Arc<DB>,
+    pub(crate) engine: Arc<dyn KvEngine>,
     pub(crate) config: StateStoreConfig,
     pub(crate) earliest_version: AtomicI64,
     pub(crate) latest_version: AtomicI64,
@@ -52,26 +53,40 @@ pub(crate) struct VersionedChangesets {
 impl MvccDatabase {
     /// Open the MVCC database at the directory specified in `config`.
     ///
-    /// Uses the custom MVCC comparator for key ordering unless
-    /// `config.use_default_comparer` is set.
+    /// Uses the `backend` config field to select the engine:
+    /// - "mdbx" uses MdbxEngine (lexicographic ordering, no custom comparator)
+    /// - anything else uses RocksDbEngine with optional MVCC comparator
     pub fn open_db(config: &StateStoreConfig) -> Result<Self> {
-        let data_dir = std::path::Path::new(&config.db_directory);
-
-        let comparator_fn = if config.use_default_comparer {
-            None
+        let engine: Arc<dyn KvEngine> = if config.backend == "mdbx" {
+            let data_dir = std::path::Path::new(&config.db_directory);
+            Arc::new(MdbxEngine::open(data_dir)?)
         } else {
-            Some((
-                mvcc_comparator_name().to_string(),
-                Box::new(mvcc_compare_fn)
-                    as Box<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>,
-            ))
+            let data_dir = std::path::Path::new(&config.db_directory);
+            let comparator_fn = if config.use_default_comparer {
+                None
+            } else {
+                Some((
+                    mvcc_comparator_name().to_string(),
+                    Box::new(mvcc_compare_fn)
+                        as Box<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>,
+                ))
+            };
+            let rocks_engine = RocksDbEngine::open_mvcc(data_dir, comparator_fn)?;
+            Arc::new(rocks_engine)
         };
 
-        let engine = RocksDbEngine::open_mvcc(data_dir, comparator_fn)?;
-        let db = Arc::clone(engine.db());
+        Self::open_db_with_engine(engine, config)
+    }
 
-        let latest = Self::retrieve_latest_version(&db)?;
-        let earliest = Self::retrieve_earliest_version(&db)?;
+    /// Open the MVCC database using a pre-constructed KvEngine backend.
+    ///
+    /// This allows callers to provide any engine implementing KvEngine.
+    pub fn open_db_with_engine(
+        engine: Arc<dyn KvEngine>,
+        config: &StateStoreConfig,
+    ) -> Result<Self> {
+        let latest = Self::retrieve_latest_version(engine.as_ref())?;
+        let earliest = Self::retrieve_earliest_version(engine.as_ref())?;
 
         // Optionally initialize the WAL for async writes
         let stream_handler = if config.async_write_buffer > 0 {
@@ -84,7 +99,7 @@ impl MvccDatabase {
         };
 
         Ok(Self {
-            db,
+            engine,
             config: config.clone(),
             earliest_version: AtomicI64::new(earliest),
             latest_version: AtomicI64::new(latest),
@@ -153,8 +168,8 @@ impl MvccDatabase {
 
     /// Retrieve the latest version stored in the database.
     /// Returns 0 if no version has been persisted yet.
-    fn retrieve_latest_version(db: &DB) -> Result<i64> {
-        match db.get(LATEST_VERSION_KEY) {
+    fn retrieve_latest_version(engine: &dyn KvEngine) -> Result<i64> {
+        match engine.get(LATEST_VERSION_KEY) {
             Ok(Some(bytes)) => {
                 if bytes.len() < 8 {
                     return Err(SeiDbError::Other(format!(
@@ -172,14 +187,14 @@ impl MvccDatabase {
                 Ok(val as i64)
             }
             Ok(None) => Ok(0),
-            Err(e) => Err(SeiDbError::RocksDb(e.to_string())),
+            Err(e) => Err(e),
         }
     }
 
     /// Retrieve the earliest version stored in the database.
     /// Returns 0 if no version has been persisted yet.
-    fn retrieve_earliest_version(db: &DB) -> Result<i64> {
-        match db.get(EARLIEST_VERSION_KEY) {
+    fn retrieve_earliest_version(engine: &dyn KvEngine) -> Result<i64> {
+        match engine.get(EARLIEST_VERSION_KEY) {
             Ok(Some(bytes)) => {
                 if bytes.len() < 8 {
                     return Err(SeiDbError::Other(format!(
@@ -197,7 +212,7 @@ impl MvccDatabase {
                 Ok(val as i64)
             }
             Ok(None) => Ok(0),
-            Err(e) => Err(SeiDbError::RocksDb(e.to_string())),
+            Err(e) => Err(e),
         }
     }
 
@@ -212,7 +227,9 @@ impl MvccDatabase {
     pub fn set_latest_version(&self, version: i64) -> Result<()> {
         self.latest_version.store(version, Ordering::Relaxed);
         let bytes = (version as u64).to_le_bytes();
-        self.db.put(LATEST_VERSION_KEY, bytes).map_err(|e| SeiDbError::RocksDb(e.to_string()))
+        self.engine
+            .set(LATEST_VERSION_KEY, &bytes, &Default::default())
+            .map_err(|e| SeiDbError::Other(format!("set latest version: {e}")))
     }
 
     /// Get the earliest version (atomic, relaxed ordering).
@@ -237,9 +254,9 @@ impl MvccDatabase {
             ) {
                 Ok(_) => {
                     let bytes = (version as u64).to_le_bytes();
-                    self.db
-                        .put(EARLIEST_VERSION_KEY, bytes)
-                        .map_err(|e| SeiDbError::RocksDb(e.to_string()))?;
+                    self.engine
+                        .set(EARLIEST_VERSION_KEY, &bytes, &Default::default())
+                        .map_err(|e| SeiDbError::Other(format!("set earliest version: {e}")))?;
                     return Ok(());
                 }
                 Err(_) => {
@@ -261,7 +278,7 @@ impl MvccDatabase {
             return Ok(None);
         }
 
-        let raw = match Self::get_mvcc_slice(&self.db, store_key, key, version) {
+        let raw = match Self::get_mvcc_slice(self.engine.as_ref(), store_key, key, version) {
             Ok(v) => v,
             Err(e) => {
                 if matches!(e, SeiDbError::RecordNotFound) {
@@ -300,26 +317,44 @@ impl MvccDatabase {
     // ── Internal helpers ────────────────────────────────────────────────
 
     /// Seek the latest MVCC entry for the given key up to (and including)
-    /// `version`. Uses bounded iteration with seek-to-last.
-    fn get_mvcc_slice(db: &DB, store_key: &str, key: &[u8], version: i64) -> Result<Vec<u8>> {
+    /// `version`. Uses seek_lt on the upper bound to find the last entry
+    /// in the range, which works correctly with both RocksDB and MDBX.
+    fn get_mvcc_slice(
+        engine: &dyn KvEngine,
+        store_key: &str,
+        key: &[u8],
+        version: i64,
+    ) -> Result<Vec<u8>> {
         let prefixed_key = prepend_store_key(store_key, key);
         let lower = mvcc_encode(&prefixed_key, 0);
         // Upper bound is exclusive, so use version + 1.
         let upper_version = version.saturating_add(1);
         let upper = mvcc_encode(&prefixed_key, upper_version);
 
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_iterate_lower_bound(lower);
-        read_opts.set_iterate_upper_bound(upper);
+        // Don't set upper_bound on the iterator — MDBX's seek_lt doesn't
+        // work correctly when the seek target equals the iterator's upper
+        // bound. Instead, we seek_lt(upper) and manually verify the result
+        // is within our lower bound.
+        let iter_opts = IterOptions { lower_bound: Some(lower.clone()), upper_bound: None };
 
-        let mut iter = db.raw_iterator_opt(read_opts);
-        iter.seek_to_last();
+        let mut iter = engine.new_iter(&iter_opts)?;
+
+        // seek_lt positions at the largest key strictly less than `upper`.
+        if !iter.seek_lt(&upper) {
+            return Err(SeiDbError::RecordNotFound);
+        }
 
         if !iter.valid() {
             return Err(SeiDbError::RecordNotFound);
         }
 
-        iter.value().map(|v| v.to_vec()).ok_or(SeiDbError::RecordNotFound)
+        // Verify the found key is within our lower bound
+        let found_key = iter.key();
+        if found_key < lower.as_slice() {
+            return Err(SeiDbError::RecordNotFound);
+        }
+
+        Ok(iter.value().to_vec())
     }
 
     /// Returns true if the MVCC-encoded value has a non-empty tombstone suffix.
@@ -384,9 +419,9 @@ impl MvccDatabase {
         None
     }
 
-    /// Expose the inner RocksDB handle.
-    pub fn db(&self) -> &Arc<DB> {
-        &self.db
+    /// Expose the inner KvEngine handle.
+    pub fn engine(&self) -> &Arc<dyn KvEngine> {
+        &self.engine
     }
 }
 
@@ -405,6 +440,7 @@ pub(crate) fn store_prefix(store_key: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::mvcc::encoding::mvcc_encode_value;
+    use seidb_traits::types::WriteOptions;
     use tempfile::TempDir;
 
     /// Helper: build a minimal StateStoreConfig pointing at the given dir.
@@ -416,18 +452,18 @@ mod tests {
         }
     }
 
-    /// Write an MVCC key/value directly into the database.
-    fn write_mvcc(db: &DB, store_key: &str, key: &[u8], value: &[u8], version: i64) {
+    /// Write an MVCC key/value directly into the engine.
+    fn write_mvcc(engine: &dyn KvEngine, store_key: &str, key: &[u8], value: &[u8], version: i64) {
         let k = mvcc_encode(&MvccDatabase::prepend_store_key(store_key, key), version);
         let v = mvcc_encode_value(value, 0);
-        db.put(&k, &v).unwrap();
+        engine.set(&k, &v, &WriteOptions::default()).unwrap();
     }
 
-    /// Write an MVCC tombstone directly into the database.
-    fn write_mvcc_tombstone(db: &DB, store_key: &str, key: &[u8], version: i64) {
+    /// Write an MVCC tombstone directly into the engine.
+    fn write_mvcc_tombstone(engine: &dyn KvEngine, store_key: &str, key: &[u8], version: i64) {
         let k = mvcc_encode(&MvccDatabase::prepend_store_key(store_key, key), version);
         let v = mvcc_encode_value(TOMBSTONE_VAL, version);
-        db.put(&k, &v).unwrap();
+        engine.set(&k, &v, &WriteOptions::default()).unwrap();
     }
 
     #[test]
@@ -491,7 +527,7 @@ mod tests {
         let cfg = test_config(dir.path());
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
 
-        write_mvcc(&mvcc.db, "mystore", b"hello", b"world", 1);
+        write_mvcc(mvcc.engine.as_ref(), "mystore", b"hello", b"world", 1);
 
         let val = mvcc.get("mystore", 1, b"hello").unwrap();
         assert_eq!(val, Some(b"world".to_vec()));
@@ -507,8 +543,8 @@ mod tests {
         let cfg = test_config(dir.path());
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
 
-        write_mvcc(&mvcc.db, "store", b"key", b"val1", 1);
-        write_mvcc(&mvcc.db, "store", b"key", b"val2", 2);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"val1", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"val2", 2);
 
         assert_eq!(mvcc.get("store", 1, b"key").unwrap(), Some(b"val1".to_vec()));
         assert_eq!(mvcc.get("store", 2, b"key").unwrap(), Some(b"val2".to_vec()));
@@ -523,8 +559,8 @@ mod tests {
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
 
         // Write value at version 1, tombstone at version 2.
-        write_mvcc(&mvcc.db, "store", b"key", b"alive", 1);
-        write_mvcc_tombstone(&mvcc.db, "store", b"key", 2);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"alive", 1);
+        write_mvcc_tombstone(mvcc.engine.as_ref(), "store", b"key", 2);
 
         // At version 1 the value is alive.
         assert_eq!(mvcc.get("store", 1, b"key").unwrap(), Some(b"alive".to_vec()));
@@ -540,7 +576,7 @@ mod tests {
         let cfg = test_config(dir.path());
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
 
-        write_mvcc(&mvcc.db, "store", b"key", b"val", 3);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"val", 3);
         mvcc.set_earliest_version(5, false).unwrap();
 
         // Version 3 is before earliest (5) — should return None.
@@ -553,7 +589,7 @@ mod tests {
         let cfg = test_config(dir.path());
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
 
-        write_mvcc(&mvcc.db, "store", b"key", b"val", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"val", 1);
 
         assert!(mvcc.has("store", 1, b"key").unwrap());
         assert!(!mvcc.has("store", 1, b"missing").unwrap());
@@ -596,11 +632,93 @@ mod tests {
     }
 
     #[test]
-    fn test_db_accessor() {
+    fn test_engine_accessor() {
         let dir = TempDir::new().unwrap();
         let cfg = test_config(dir.path());
         let mvcc = MvccDatabase::open_db(&cfg).unwrap();
-        // Should be able to access the underlying DB.
-        let _db: &Arc<DB> = mvcc.db();
+        // Should be able to access the underlying engine.
+        let _engine: &Arc<dyn KvEngine> = mvcc.engine();
+    }
+
+    // ── MDBX backend tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_mdbx_open_and_close() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.backend = "mdbx".to_string();
+        let mut db = MvccDatabase::open_db(&cfg).unwrap();
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_mdbx_version_management() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.backend = "mdbx".to_string();
+
+        {
+            let db = MvccDatabase::open_db(&cfg).unwrap();
+            assert_eq!(db.get_latest_version(), 0);
+            db.set_latest_version(100).unwrap();
+            assert_eq!(db.get_latest_version(), 100);
+        }
+
+        // Reopen — version should be persisted.
+        {
+            let db = MvccDatabase::open_db(&cfg).unwrap();
+            assert_eq!(db.get_latest_version(), 100);
+        }
+    }
+
+    #[test]
+    fn test_mdbx_get_set() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.backend = "mdbx".to_string();
+        // MDBX uses lexicographic ordering, so we use default comparer
+        cfg.use_default_comparer = true;
+        let mvcc = MvccDatabase::open_db(&cfg).unwrap();
+
+        write_mvcc(mvcc.engine.as_ref(), "mystore", b"hello", b"world", 1);
+
+        let val = mvcc.get("mystore", 1, b"hello").unwrap();
+        assert_eq!(val, Some(b"world".to_vec()));
+
+        // Key that doesn't exist.
+        let val = mvcc.get("mystore", 1, b"missing").unwrap();
+        assert_eq!(val, None);
+    }
+
+    #[test]
+    fn test_mdbx_get_version_aware() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.backend = "mdbx".to_string();
+        cfg.use_default_comparer = true;
+        let mvcc = MvccDatabase::open_db(&cfg).unwrap();
+
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"val1", 1);
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"val2", 2);
+
+        assert_eq!(mvcc.get("store", 1, b"key").unwrap(), Some(b"val1".to_vec()));
+        assert_eq!(mvcc.get("store", 2, b"key").unwrap(), Some(b"val2".to_vec()));
+        assert_eq!(mvcc.get("store", 3, b"key").unwrap(), Some(b"val2".to_vec()));
+    }
+
+    #[test]
+    fn test_mdbx_get_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.backend = "mdbx".to_string();
+        cfg.use_default_comparer = true;
+        let mvcc = MvccDatabase::open_db(&cfg).unwrap();
+
+        write_mvcc(mvcc.engine.as_ref(), "store", b"key", b"alive", 1);
+        write_mvcc_tombstone(mvcc.engine.as_ref(), "store", b"key", 2);
+
+        assert_eq!(mvcc.get("store", 1, b"key").unwrap(), Some(b"alive".to_vec()));
+        assert_eq!(mvcc.get("store", 2, b"key").unwrap(), None);
+        assert_eq!(mvcc.get("store", 3, b"key").unwrap(), None);
     }
 }

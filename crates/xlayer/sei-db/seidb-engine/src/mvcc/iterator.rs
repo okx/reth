@@ -2,10 +2,12 @@ use crate::mvcc::{
     db::{prepend_store_key, store_prefix, MvccDatabase},
     encoding::{decode_uint64_ascending, mvcc_encode, split_mvcc_key, split_mvcc_value},
 };
-use rocksdb::{DBRawIteratorWithThreadMode, ReadOptions, DB};
 use seidb_common::error::{Result, SeiDbError};
-use seidb_traits::iterator::DbIterator;
-use std::sync::Arc;
+use seidb_traits::{
+    iterator::DbIterator,
+    kv::{KvEngine, KvIterator},
+    types::IterOptions,
+};
 
 /// MVCC version-aware iterator over a store's key space.
 ///
@@ -13,17 +15,13 @@ use std::sync::Arc;
 /// don't have a version <= the target or that have been tombstoned. Supports
 /// both forward and reverse iteration.
 ///
-/// Internally uses `DBRawIteratorWithThreadMode` for zero-copy seeks, but
-/// caches the decoded user key and value in owned `Vec<u8>` fields so the
+/// Internally uses a `Box<dyn KvIterator>` for backend-agnostic iteration,
+/// and caches the decoded user key and value in owned `Vec<u8>` fields so the
 /// `DbIterator` trait (which returns `&[u8]`) can be satisfied.
 #[allow(dead_code)]
 pub(crate) struct MvccIterator {
-    /// The underlying RocksDB raw iterator.
-    /// MUST be declared before `_db` so it drops first (Rust drops fields in
-    /// declaration order, and the iterator must be destroyed before the DB).
-    raw: DBRawIteratorWithThreadMode<'static, DB>,
-    /// Prevent the DB from being dropped while the raw iterator is alive.
-    _db: Arc<DB>,
+    /// The underlying KvEngine raw iterator.
+    raw: Box<dyn KvIterator>,
     /// Store name (e.g. "bank").
     #[allow(dead_code)]
     store_key: String,
@@ -47,11 +45,6 @@ pub(crate) struct MvccIterator {
     cached_error: Option<SeiDbError>,
 }
 
-// SAFETY: `_db` (Arc<DB>) keeps the database alive while the raw iterator exists.
-// The raw iterator holds only a C pointer and PhantomData; we use 'static via
-// transmute because the Arc guarantees the DB outlives the iterator.
-unsafe impl Send for MvccIterator {}
-
 #[allow(dead_code)]
 impl MvccIterator {
     /// Create a new MVCC iterator over the given store's key space.
@@ -61,7 +54,7 @@ impl MvccIterator {
     /// - `earliest_version`: if `version < earliest_version`, the iterator is immediately invalid.
     /// - `reverse`: if true, iterate in descending key order.
     pub(crate) fn new(
-        db: Arc<DB>,
+        engine: &dyn KvEngine,
         store_key: &str,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
@@ -87,22 +80,15 @@ impl MvccIterator {
             vec![]
         };
 
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_iterate_lower_bound(mvcc_start);
-        if !mvcc_end.is_empty() {
-            read_opts.set_iterate_upper_bound(mvcc_end);
-        }
+        let iter_opts = IterOptions {
+            lower_bound: Some(mvcc_start),
+            upper_bound: if !mvcc_end.is_empty() { Some(mvcc_end) } else { None },
+        };
 
-        // Create the raw iterator. We transmute the lifetime to 'static because
-        // we hold an Arc<DB> that keeps the database alive for the iterator's
-        // entire lifetime (and `raw` is dropped before `_db` due to field order).
-        let raw_iter = db.raw_iterator_opt(read_opts);
-        let raw: DBRawIteratorWithThreadMode<'static, DB> =
-            unsafe { std::mem::transmute(raw_iter) };
+        let raw = engine.new_iter(&iter_opts)?;
 
         let mut itr = Self {
             raw,
-            _db: db,
             store_key: store_key.to_string(),
             prefix,
             start: start.map(|s| s.to_vec()),
@@ -122,9 +108,9 @@ impl MvccIterator {
 
         // Initial positioning
         if reverse {
-            itr.raw.seek_to_last();
+            itr.raw.last();
         } else {
-            itr.raw.seek_to_first();
+            itr.raw.first();
         }
 
         if !itr.raw.valid() {
@@ -152,7 +138,6 @@ impl MvccIterator {
             }
         } else {
             // Seek to the latest version <= target for this user key.
-            // Go uses SeekLT (strictly less than), so we use our seek_lt helper.
             let seek_key = mvcc_encode(&cur_user_key, itr.version + 1);
             itr.seek_lt(&seek_key);
             itr.is_valid = itr.raw.valid();
@@ -177,14 +162,26 @@ impl MvccIterator {
 
     /// Extract the full user key (with store prefix) from the current raw iterator position.
     fn current_user_key(&self) -> Option<Vec<u8>> {
-        let raw_key = self.raw.key()?;
+        if !self.raw.valid() {
+            return None;
+        }
+        let raw_key = self.raw.key();
+        if raw_key.is_empty() {
+            return None;
+        }
         let (user_key, _) = split_mvcc_key(raw_key)?;
         Some(user_key.to_vec())
     }
 
     /// Decode the version from the current raw iterator key.
     fn current_key_version(&self) -> Option<i64> {
-        let raw_key = self.raw.key()?;
+        if !self.raw.valid() {
+            return None;
+        }
+        let raw_key = self.raw.key();
+        if raw_key.is_empty() {
+            return None;
+        }
         let (_, version_bytes) = split_mvcc_key(raw_key)?;
         match version_bytes {
             Some(vb) => decode_uint64_ascending(vb).ok(),
@@ -193,14 +190,14 @@ impl MvccIterator {
     }
 
     /// Check if the current cursor position points to a tombstoned entry.
-    ///
-    /// A value is tombstoned if its tombstone version suffix is non-empty and
-    /// the decoded tombstone version is <= the iterator's target version.
     fn cursor_tombstoned(&self) -> bool {
-        let raw_val = match self.raw.value() {
-            Some(v) => v,
-            None => return false,
-        };
+        if !self.raw.valid() {
+            return false;
+        }
+        let raw_val = self.raw.value();
+        if raw_val.is_empty() {
+            return false;
+        }
         let (_, tomb_bytes) = match split_mvcc_value(raw_val) {
             Some(v) => v,
             None => return false,
@@ -223,13 +220,11 @@ impl MvccIterator {
         }
 
         // Decode and cache the user key (strip store prefix)
-        let raw_key = match self.raw.key() {
-            Some(k) => k,
-            None => {
-                self.is_valid = false;
-                return;
-            }
-        };
+        let raw_key = self.raw.key();
+        if raw_key.is_empty() {
+            self.is_valid = false;
+            return;
+        }
         let (user_key, _) = match split_mvcc_key(raw_key) {
             Some(v) => v,
             None => {
@@ -246,13 +241,11 @@ impl MvccIterator {
         }
 
         // Decode and cache the value (strip tombstone suffix)
-        let raw_val = match self.raw.value() {
-            Some(v) => v,
-            None => {
-                self.is_valid = false;
-                return;
-            }
-        };
+        let raw_val = self.raw.value();
+        if raw_val.is_empty() {
+            self.is_valid = false;
+            return;
+        }
         let (val, _) = match split_mvcc_value(raw_val) {
             Some(v) => v,
             None => {
@@ -266,28 +259,19 @@ impl MvccIterator {
     }
 
     /// Simulate PebbleDB's `SeekLT(target)`: find the largest key strictly
-    /// less than `target`. RocksDB's `seek_for_prev` returns the largest key
-    /// <= target, so we must step back if we land exactly on it.
+    /// less than `target`.
     fn seek_lt(&mut self, target: &[u8]) {
-        self.raw.seek_for_prev(target);
-        if self.raw.valid() &&
-            let Some(k) = self.raw.key() &&
-            k == target
-        {
-            self.raw.prev();
-        }
+        self.raw.seek_lt(target);
     }
 
     /// Simulate PebbleDB's `NextPrefix()`: advance past all versions of the
     /// current user key by seeking to a key that sorts after all MVCC-encoded
     /// versions of `user_key`.
     fn seek_next_user_key_forward(&mut self, user_key: &[u8]) {
-        // Appending \x00 to the user key creates a key that sorts after all
-        // MVCC-encoded versions of user_key (which use \x00 as separator).
         let mut next_key = user_key.to_vec();
         next_key.push(0x00);
         let seek_target = mvcc_encode(&next_key, 0);
-        self.raw.seek(&seek_target);
+        self.raw.seek_ge(&seek_target);
     }
 
     /// Move the forward iterator to the next visible (non-tombstoned) user key.
@@ -345,7 +329,6 @@ impl MvccIterator {
         };
 
         // seek_lt may have moved us back to the previous user key
-        // (happens when no version of the next key is <= target)
         if tmp_key == curr_key {
             self.seek_next_user_key_forward(&curr_key);
             if !self.raw.valid() {
@@ -394,8 +377,6 @@ impl MvccIterator {
         };
 
         // Seek before all versions of the current user key.
-        // Go: SeekLT(MVCCEncode(currKey, 0)) — strictly less than the
-        // version-0 sentinel for this key, landing on the previous user key.
         let seek_key = mvcc_encode(&curr_key, 0);
         self.seek_lt(&seek_key);
 
@@ -499,43 +480,46 @@ mod tests {
             encoding::mvcc_encode_value,
         },
     };
+    use seidb_traits::types::WriteOptions;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
-    /// Open a RocksDB with the MVCC comparator for testing.
-    fn open_test_db(dir: &std::path::Path) -> Arc<DB> {
+    /// Open a RocksDB engine with the MVCC comparator for testing.
+    fn open_test_engine(dir: &std::path::Path) -> Arc<dyn KvEngine> {
         let comparator_fn = Some((
             mvcc_comparator_name().to_string(),
             Box::new(mvcc_compare_fn)
                 as Box<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>,
         ));
         let engine = RocksDbEngine::open_mvcc(dir, comparator_fn).unwrap();
-        Arc::clone(engine.db())
+        Arc::new(engine)
     }
 
-    /// Write an MVCC key/value directly into the database.
-    fn write_mvcc(db: &DB, store: &str, key: &[u8], val: &[u8], ver: i64) {
+    /// Write an MVCC key/value directly into the engine.
+    fn write_mvcc(engine: &dyn KvEngine, store: &str, key: &[u8], val: &[u8], ver: i64) {
         let k = mvcc_encode(&prepend_store_key(store, key), ver);
         let v = mvcc_encode_value(val, 0);
-        db.put(k, v).unwrap();
+        engine.set(&k, &v, &WriteOptions::default()).unwrap();
     }
 
-    /// Write an MVCC tombstone directly into the database.
-    fn write_tombstone(db: &DB, store: &str, key: &[u8], ver: i64) {
+    /// Write an MVCC tombstone directly into the engine.
+    fn write_tombstone(engine: &dyn KvEngine, store: &str, key: &[u8], ver: i64) {
         let k = mvcc_encode(&prepend_store_key(store, key), ver);
         let v = mvcc_encode_value(b"TOMBSTONE", ver);
-        db.put(k, v).unwrap();
+        engine.set(&k, &v, &WriteOptions::default()).unwrap();
     }
 
     #[test]
     fn test_forward_iterator() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a", 1);
-        write_mvcc(&db, "store", b"b", b"val_b", 1);
-        write_mvcc(&db, "store", b"c", b"val_c", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a", 1);
+        write_mvcc(engine.as_ref(), "store", b"b", b"val_b", 1);
+        write_mvcc(engine.as_ref(), "store", b"c", b"val_c", 1);
 
-        let mut iter = MvccIterator::new(db, "store", None, None, 1, 0, false).unwrap();
+        let mut iter =
+            MvccIterator::new(engine.as_ref(), "store", None, None, 1, 0, false).unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key(), b"a");
@@ -558,13 +542,14 @@ mod tests {
     #[test]
     fn test_forward_iterator_multi_version() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a_v1", 1);
-        write_mvcc(&db, "store", b"a", b"val_a_v2", 2);
-        write_mvcc(&db, "store", b"b", b"val_b_v1", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a_v1", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a_v2", 2);
+        write_mvcc(engine.as_ref(), "store", b"b", b"val_b_v1", 1);
 
-        let mut iter = MvccIterator::new(db, "store", None, None, 1, 0, false).unwrap();
+        let mut iter =
+            MvccIterator::new(engine.as_ref(), "store", None, None, 1, 0, false).unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key(), b"a");
@@ -582,13 +567,14 @@ mod tests {
     #[test]
     fn test_forward_iterator_tombstone_skip() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a", 1);
-        write_tombstone(&db, "store", b"a", 2);
-        write_mvcc(&db, "store", b"b", b"val_b", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a", 1);
+        write_tombstone(engine.as_ref(), "store", b"a", 2);
+        write_mvcc(engine.as_ref(), "store", b"b", b"val_b", 1);
 
-        let mut iter = MvccIterator::new(db, "store", None, None, 2, 0, false).unwrap();
+        let mut iter =
+            MvccIterator::new(engine.as_ref(), "store", None, None, 2, 0, false).unwrap();
 
         // "a" is tombstoned at version 2, so only "b" should be visible
         assert!(iter.valid());
@@ -602,13 +588,13 @@ mod tests {
     #[test]
     fn test_reverse_iterator() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a", 1);
-        write_mvcc(&db, "store", b"b", b"val_b", 1);
-        write_mvcc(&db, "store", b"c", b"val_c", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a", 1);
+        write_mvcc(engine.as_ref(), "store", b"b", b"val_b", 1);
+        write_mvcc(engine.as_ref(), "store", b"c", b"val_c", 1);
 
-        let mut iter = MvccIterator::new(db, "store", None, None, 1, 0, true).unwrap();
+        let mut iter = MvccIterator::new(engine.as_ref(), "store", None, None, 1, 0, true).unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key(), b"c");
@@ -631,13 +617,13 @@ mod tests {
     #[test]
     fn test_reverse_iterator_multi_version() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a_v1", 1);
-        write_mvcc(&db, "store", b"a", b"val_a_v2", 2);
-        write_mvcc(&db, "store", b"b", b"val_b_v1", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a_v1", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a_v2", 2);
+        write_mvcc(engine.as_ref(), "store", b"b", b"val_b_v1", 1);
 
-        let mut iter = MvccIterator::new(db, "store", None, None, 1, 0, true).unwrap();
+        let mut iter = MvccIterator::new(engine.as_ref(), "store", None, None, 1, 0, true).unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key(), b"b");
@@ -655,15 +641,17 @@ mod tests {
     #[test]
     fn test_iterator_bounds() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a", 1);
-        write_mvcc(&db, "store", b"b", b"val_b", 1);
-        write_mvcc(&db, "store", b"c", b"val_c", 1);
-        write_mvcc(&db, "store", b"d", b"val_d", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a", 1);
+        write_mvcc(engine.as_ref(), "store", b"b", b"val_b", 1);
+        write_mvcc(engine.as_ref(), "store", b"c", b"val_c", 1);
+        write_mvcc(engine.as_ref(), "store", b"d", b"val_d", 1);
 
         // start=b, end=d -> should yield b, c (end is exclusive via upper bound)
-        let mut iter = MvccIterator::new(db, "store", Some(b"b"), Some(b"d"), 1, 0, false).unwrap();
+        let mut iter =
+            MvccIterator::new(engine.as_ref(), "store", Some(b"b"), Some(b"d"), 1, 0, false)
+                .unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key(), b"b");
@@ -681,13 +669,14 @@ mod tests {
     #[test]
     fn test_iterator_empty_range() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a", 1);
-        write_mvcc(&db, "store", b"b", b"val_b", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a", 1);
+        write_mvcc(engine.as_ref(), "store", b"b", b"val_b", 1);
 
         // Range [x, z) has no keys
-        let iter = MvccIterator::new(db, "store", Some(b"x"), Some(b"z"), 1, 0, false).unwrap();
+        let iter = MvccIterator::new(engine.as_ref(), "store", Some(b"x"), Some(b"z"), 1, 0, false)
+            .unwrap();
 
         assert!(!iter.valid());
     }
@@ -695,11 +684,12 @@ mod tests {
     #[test]
     fn test_iterator_close_idempotent() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a", 1);
 
-        let mut iter = MvccIterator::new(db, "store", None, None, 1, 0, false).unwrap();
+        let mut iter =
+            MvccIterator::new(engine.as_ref(), "store", None, None, 1, 0, false).unwrap();
 
         assert!(iter.valid());
         iter.close().unwrap();
@@ -712,12 +702,12 @@ mod tests {
     #[test]
     fn test_iterator_version_below_earliest() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a", 1);
 
         // earliest_version=5, requested version=1 -> invalid immediately
-        let iter = MvccIterator::new(db, "store", None, None, 1, 5, false).unwrap();
+        let iter = MvccIterator::new(engine.as_ref(), "store", None, None, 1, 5, false).unwrap();
 
         assert!(!iter.valid());
     }
@@ -725,14 +715,14 @@ mod tests {
     #[test]
     fn test_forward_iterator_latest_version() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a_v1", 1);
-        write_mvcc(&db, "store", b"a", b"val_a_v2", 2);
-        write_mvcc(&db, "store", b"a", b"val_a_v3", 3);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a_v1", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a_v2", 2);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a_v3", 3);
 
         // At version 2, should see val_a_v2
-        let iter = MvccIterator::new(db, "store", None, None, 2, 0, false).unwrap();
+        let iter = MvccIterator::new(engine.as_ref(), "store", None, None, 2, 0, false).unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key(), b"a");
@@ -742,15 +732,15 @@ mod tests {
     #[test]
     fn test_reverse_iterator_tombstone_skip() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        write_mvcc(&db, "store", b"a", b"val_a", 1);
-        write_mvcc(&db, "store", b"b", b"val_b", 1);
-        write_tombstone(&db, "store", b"b", 2);
-        write_mvcc(&db, "store", b"c", b"val_c", 1);
+        write_mvcc(engine.as_ref(), "store", b"a", b"val_a", 1);
+        write_mvcc(engine.as_ref(), "store", b"b", b"val_b", 1);
+        write_tombstone(engine.as_ref(), "store", b"b", 2);
+        write_mvcc(engine.as_ref(), "store", b"c", b"val_c", 1);
 
         // Reverse at version 2: b is tombstoned, should see c, a
-        let mut iter = MvccIterator::new(db, "store", None, None, 2, 0, true).unwrap();
+        let mut iter = MvccIterator::new(engine.as_ref(), "store", None, None, 2, 0, true).unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key(), b"c");
@@ -768,10 +758,11 @@ mod tests {
     #[test]
     fn test_domain() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
         let iter =
-            MvccIterator::new(db, "store", Some(b"start"), Some(b"end"), 1, 0, false).unwrap();
+            MvccIterator::new(engine.as_ref(), "store", Some(b"start"), Some(b"end"), 1, 0, false)
+                .unwrap();
 
         let (start, end) = iter.domain();
         assert_eq!(start, Some(b"start".as_slice()));
@@ -781,9 +772,9 @@ mod tests {
     #[test]
     fn test_domain_no_bounds() {
         let dir = TempDir::new().unwrap();
-        let db = open_test_db(dir.path());
+        let engine = open_test_engine(dir.path());
 
-        let iter = MvccIterator::new(db, "store", None, None, 1, 0, false).unwrap();
+        let iter = MvccIterator::new(engine.as_ref(), "store", None, None, 1, 0, false).unwrap();
 
         let (start, end) = iter.domain();
         assert!(start.is_none());
