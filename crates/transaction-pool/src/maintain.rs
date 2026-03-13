@@ -407,6 +407,10 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                     })
                     .collect::<Vec<_>>();
 
+                // Capture changed accounts before they are moved into CanonicalStateUpdate.
+                #[cfg(feature = "pre-warming")]
+                let prewarm_changed = changed_accounts.clone();
+
                 // update the pool first
                 let update = CanonicalStateUpdate {
                     new_tip: new_tip.sealed_block(),
@@ -435,7 +439,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                 // ============================================================
                 #[cfg(feature = "pre-warming")]
                 if let Ok(state_provider) = client.latest() {
-                    pool.update_pre_warming_snapshot(state_provider, new_tip.hash());
+                    pool.update_pre_warming_snapshot(state_provider, new_tip.hash(), &prewarm_changed);
                     trace!(target: "txpool", "Updated pre-warming snapshot after reorg");
                 }
 
@@ -511,6 +515,10 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                     maintained_state = MaintainedPoolState::Drifted;
                 }
 
+                // Capture changed accounts before they are moved into CanonicalStateUpdate.
+                #[cfg(feature = "pre-warming")]
+                let prewarm_changed = changed_accounts.clone();
+
                 // Canonical update
                 let update = CanonicalStateUpdate {
                     new_tip: tip.sealed_block(),
@@ -539,7 +547,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                 // ============================================================
                 #[cfg(feature = "pre-warming")]
                 if let Ok(state_provider) = client.latest() {
-                    pool.update_pre_warming_snapshot(state_provider, tip.hash());
+                    pool.update_pre_warming_snapshot(state_provider, tip.hash(), &prewarm_changed);
                     trace!(target: "txpool", "Updated pre-warming snapshot after commit");
                 }
 

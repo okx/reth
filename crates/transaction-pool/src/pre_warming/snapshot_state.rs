@@ -543,6 +543,50 @@ impl SnapshotState {
         }
     }
 
+    /// Inherit the previous snapshot's warm cache, evicting only addresses
+    /// that changed in the committed block.
+    ///
+    /// ## Why this is correct
+    ///
+    /// An address in `changed` had at least one of its fields (balance, nonce,
+    /// or a storage slot) written during block N. Its cached values from the
+    /// N-1 snapshot would be stale. We evict them so the next read falls
+    /// through to MDBX at block N and gets the correct value.
+    ///
+    /// All other addresses are identical at block N and N-1 — their cached
+    /// values are still valid and safe to reuse. This is what makes the warm
+    /// DashMap available to the payload builder immediately after block commit
+    /// instead of requiring a full 400 ms re-warm cycle.
+    ///
+    /// ## Safety: over-eviction is safe, under-eviction is not
+    ///
+    /// `changed` is derived from the canonical BundleState and includes every
+    /// address touched by any transaction in the block (balance, nonce, or
+    /// storage writes). If in doubt about an entry we keep it out.
+    pub fn inherit_and_evict(
+        &self,
+        old: &SnapshotState,
+        changed: &std::collections::HashSet<Address>,
+    ) {
+        if old.cache.is_empty() {
+            return;
+        }
+        // DashMap iteration: no global lock, shards visited one shard at a time.
+        // When `changed` is empty (e.g. empty block) every entry passes the
+        // `!changed.contains` check and the full cache is inherited — correct
+        // because nothing changed.
+        for entry in old.cache.iter() {
+            let keep = match entry.key() {
+                StateKey::Account(addr) => !changed.contains(addr),
+                StateKey::Storage(addr, _) => !changed.contains(addr),
+                StateKey::Code(_) => true, // bytecode is immutable on-chain
+            };
+            if keep {
+                self.cache.insert(entry.key().clone(), entry.value().clone());
+            }
+        }
+    }
+
     /// Get cache statistics (for monitoring)
     pub fn cache_size(&self) -> usize {
         self.cache.len()

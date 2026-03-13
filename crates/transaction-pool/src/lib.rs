@@ -977,11 +977,13 @@ where
         &self,
         state_provider: Box<dyn reth_provider::StateProvider + Send>,
         block_hash: alloy_primitives::B256,
+        changed: &[reth_execution_types::ChangedAccount],
     ) {
         let snapshot = std::sync::Arc::new(
             crate::pre_warming::SnapshotState::new_at_block(state_provider, block_hash),
         );
-        self.pool.update_pre_warming_snapshot(snapshot);
+        let changed_addrs: Vec<Address> = changed.iter().map(|c| c.address).collect();
+        self.pool.update_pre_warming_snapshot(snapshot, &changed_addrs);
     }
 }
 

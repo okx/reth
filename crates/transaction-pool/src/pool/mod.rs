@@ -270,9 +270,10 @@ where
     pub fn update_pre_warming_snapshot(
         &self,
         snapshot: std::sync::Arc<crate::pre_warming::SnapshotState>,
+        changed: &[alloy_primitives::Address],
     ) {
         if let Some(wp) = self.worker_pool.read().as_ref() {
-            wp.update_snapshot(snapshot);
+            wp.update_snapshot(snapshot, changed);
         }
     }
 

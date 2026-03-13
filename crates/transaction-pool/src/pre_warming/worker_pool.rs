@@ -324,6 +324,7 @@ use crate::{
     },
     PoolTransaction,
 };
+use alloy_primitives::Address;
 use parking_lot::RwLock;
 use reth_chainspec::ChainSpec;
 use std::sync::Arc;
@@ -639,19 +640,25 @@ where
     ///     self.worker_pool.update_snapshot(new_snapshot);
     /// }
     /// ```
-    pub fn update_snapshot(&self, new_snapshot: Arc<SnapshotState>) {
+    pub fn update_snapshot(&self, new_snapshot: Arc<SnapshotState>, changed: &[Address]) {
         debug!(
             target: "txpool::pre_warming",
+            changed_addresses = changed.len(),
             "Updating snapshot for worker pool"
         );
 
-        // Carry bytecode cache forward from the old snapshot before swapping.
-        // Bytecode is immutable on-chain, so entries from the previous block are
-        // always valid. This eliminates cold MDBX code_by_hash queries at the
-        // start of every new block.
+        // Carry the previous snapshot's warm DashMap into the new one, evicting
+        // only addresses that were touched in the committed block. Unchanged
+        // entries are valid at block N (same value as N-1) so they can be reused
+        // immediately by the payload builder instead of going to cold MDBX.
+        //
+        // inherit_and_evict also copies bytecode (immutable, always valid), so
+        // the separate inherit_code_cache call is no longer needed.
         {
             let old = self.snapshot_holder.read();
-            new_snapshot.inherit_code_cache(&old);
+            let changed_set: std::collections::HashSet<Address> =
+                changed.iter().copied().collect();
+            new_snapshot.inherit_and_evict(&old, &changed_set);
         }
 
         // Clone before move — registry and snapshot_holder both need ownership.
@@ -659,8 +666,6 @@ where
         *self.snapshot_holder.write() = new_snapshot;
 
         // Update global registry so the payload builder reuses this warm snapshot.
-        // The snapshot's DashMap cache already contains state queried by simulation
-        // workers, turning most prefetch MDBX queries into cheap in-memory hits.
         crate::pre_warming::registry::set_global_simulation_snapshot(snapshot_for_registry);
 
         // Record snapshot update

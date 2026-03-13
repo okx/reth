@@ -742,6 +742,7 @@ pub trait TransactionPoolExt: TransactionPool {
         &self,
         state_provider: Box<dyn reth_provider::StateProvider + Send>,
         block_hash: alloy_primitives::B256,
+        changed: &[ChangedAccount],
     );
 
     /// No-op when pre-warming feature is disabled.
@@ -750,6 +751,7 @@ pub trait TransactionPoolExt: TransactionPool {
         &self,
         _state_provider: Box<dyn reth_provider::StateProvider + Send>,
         _block_hash: alloy_primitives::B256,
+        _changed: &[ChangedAccount],
     ) {
     }
 }
