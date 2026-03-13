@@ -500,6 +500,17 @@ where
         // Create metrics instance (registers with global Prometheus registry)
         let metrics = Arc::new(PreWarmingMetrics::default());
 
+        // Dedicated rayon thread pool for simulations.
+        // Isolated from tokio's blocking pool so simulation work cannot starve
+        // the payload processor (multiproof, execution) which also uses spawn_blocking.
+        let simulation_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(config.num_workers)
+                .thread_name(|i| format!("pre-warm-sim-{i}"))
+                .build()
+                .expect("Failed to build pre-warming simulation thread pool"),
+        );
+
         let mut workers = Vec::with_capacity(config.num_workers);
 
         // Spawn N workers using tokio::spawn for async runtime integration
@@ -510,6 +521,7 @@ where
             let chain_spec = Arc::clone(&chain_spec);
             let config = config.clone();
             let metrics = Arc::clone(&metrics);
+            let simulation_pool = Arc::clone(&simulation_pool);
 
             let handle = tokio::spawn(async move {
                 worker_loop(
@@ -520,6 +532,7 @@ where
                     chain_spec,
                     config,
                     metrics,
+                    simulation_pool,
                 )
                 .await;
             });
@@ -817,6 +830,7 @@ async fn worker_loop<T>(
     chain_spec: Arc<ChainSpec>,
     config: PreWarmingConfig,
     metrics: Arc<PreWarmingMetrics>,
+    simulation_pool: Arc<rayon::ThreadPool>,
 ) where
     T: PoolTransaction,
 {
@@ -833,14 +847,18 @@ async fn worker_loop<T>(
     const BASE_SLEEP_MICROS: u64 = 100;
     const MAX_SLEEP_MICROS: u64 = 10_000; // Cap at 10ms
 
-    // OPTIMIZATION: Batch cache writes to reduce DashMap lock acquisitions
-    // Instead of writing each key individually, we accumulate and flush in batches
-    const BATCH_SIZE: usize = 32;
+    // Batch cache writes to reduce DashMap lock acquisitions.
+    // Flush when batch is full OR when the oldest item exceeds MAX_BATCH_AGE_MS.
+    // The age limit ensures keys reach the cache well within one block period
+    // (400ms on X Layer) so the payload builder can actually use them.
+    const BATCH_SIZE: usize = 8;
+    const MAX_BATCH_AGE_MS: u64 = 50;
     let mut write_batch: Vec<(TxHash, ExtractedKeys)> = Vec::with_capacity(BATCH_SIZE);
     let mut batch_keys_count: usize = 0;
+    let mut batch_start_time: Option<std::time::Instant> = None;
 
-    // OPTIMIZATION: Cache snapshot per batch to avoid repeated Arc clones
-    // Snapshot only changes on new blocks, so reusing within a batch is safe
+    // Cache snapshot per batch to avoid repeated Arc clones.
+    // Snapshot only changes on new blocks, so reusing within a batch is safe.
     let mut cached_snapshot: Option<Arc<SnapshotState>> = None;
 
     loop {
@@ -890,24 +908,34 @@ async fn worker_loop<T>(
                 // Start timing the simulation
                 let simulation_start = std::time::Instant::now();
 
-                // Simulate transaction with timeout
+                // Simulate transaction on the dedicated rayon pool.
+                // Using rayon instead of tokio::task::spawn_blocking keeps simulation
+                // threads isolated from tokio's shared blocking pool, which is also
+                // used by the payload processor (multiproof, execution). Without
+                // isolation, heavy simulation load can starve block execution threads.
                 let simulation_timeout = config.simulation_timeout;
-                let keys = match tokio::time::timeout(
-                    simulation_timeout,
-                    tokio::task::spawn_blocking({
-                        let tx = req.transaction.clone();
-                        move || simulate_transaction_sync(&simulator, &tx)
-                    }),
-                )
-                .await
-                {
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                simulation_pool.spawn({
+                    let tx = req.transaction.clone();
+                    move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            simulate_transaction_sync(&simulator, &tx)
+                        }));
+                        if let Ok(sim_result) = result {
+                            let _ = result_tx.send(sim_result);
+                        }
+                        // On panic: sender drops → receiver returns Err → fallback below
+                    }
+                });
+
+                let keys = match tokio::time::timeout(simulation_timeout, result_rx).await {
                     Ok(Ok(Ok(keys))) => {
                         // Record successful simulation
                         metrics.simulations_completed.increment(1);
                         keys
                     }
                     Ok(Ok(Err(e))) => {
-                        // Record failed simulation
+                        // Simulation returned an error
                         metrics.simulations_failed.increment(1);
                         tracing::trace!(
                             target: "txpool::pre_warming",
@@ -918,20 +946,19 @@ async fn worker_loop<T>(
                         );
                         dummy_simulate(&req.transaction)
                     }
-                    Ok(Err(join_err)) => {
-                        // Record failed simulation (panic)
+                    Ok(Err(_recv_err)) => {
+                        // Rayon worker panicked (sender dropped without sending)
                         metrics.simulations_failed.increment(1);
                         tracing::trace!(
                             target: "txpool::pre_warming",
                             worker_id,
                             tx_hash = ?req.tx_hash,
-                            error = ?join_err,
-                            "Simulation task panicked, using fallback"
+                            "Simulation worker panicked, using fallback"
                         );
                         dummy_simulate(&req.transaction)
                     }
                     Err(_timeout) => {
-                        // Record failed simulation (timeout)
+                        // Simulation exceeded timeout
                         metrics.simulations_failed.increment(1);
                         tracing::trace!(
                             target: "txpool::pre_warming",
@@ -973,17 +1000,27 @@ async fn worker_loop<T>(
                     "TX_TIMING: Simulation complete"
                 );
 
-                // OPTIMIZATION: Accumulate in batch instead of individual writes
-                // This reduces DashMap lock acquisitions by ~16x
+                // Accumulate in batch to reduce DashMap lock acquisitions.
+                if batch_start_time.is_none() {
+                    batch_start_time = Some(std::time::Instant::now());
+                }
                 write_batch.push((req.tx_hash, keys));
                 batch_keys_count += keys_count;
 
-                // Flush batch when full
-                if write_batch.len() >= BATCH_SIZE {
+                // Flush when batch is full OR keys have been waiting too long.
+                // The age check ensures the payload builder sees fresh keys within
+                // MAX_BATCH_AGE_MS even under sustained high load.
+                let batch_aged = batch_start_time
+                    .map(|t| t.elapsed().as_millis() as u64 >= MAX_BATCH_AGE_MS)
+                    .unwrap_or(false);
+
+                if write_batch.len() >= BATCH_SIZE || batch_aged {
+                    let batch_len = write_batch.len();
                     cache.store_tx_keys_batch(write_batch.drain(..));
-                    metrics.cache_entries.increment(BATCH_SIZE as f64);
+                    metrics.cache_entries.increment(batch_len as f64);
                     metrics.cache_keys_total.increment(batch_keys_count as f64);
                     batch_keys_count = 0;
+                    batch_start_time = None;
                 }
             }
             Err(mpsc::error::TryRecvError::Empty) => {
@@ -994,6 +1031,7 @@ async fn worker_loop<T>(
                     metrics.cache_entries.increment(batch_len as f64);
                     metrics.cache_keys_total.increment(batch_keys_count as f64);
                     batch_keys_count = 0;
+                    batch_start_time = None;
                 }
 
                 // Adaptive sleep

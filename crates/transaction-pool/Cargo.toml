@@ -97,6 +97,7 @@ pre-warming = [
     "dashmap",
     "ahash",
     "nohash-hasher",
+    "dep:rayon",
 ]  # Experimental: opt-in only for now
 serde = [
     "reth-execution-types/serde",
