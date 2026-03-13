@@ -65,7 +65,6 @@ pub async fn prefetch_with_snapshot(
     num_tasks: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::sync::Arc;
-    use tokio::sync::Mutex as TokioMutex;
 
     let num_tasks = num_tasks.max(1);
 
@@ -79,98 +78,84 @@ pub async fn prefetch_with_snapshot(
         return Ok(());
     }
 
-    // Pre-allocate result vectors with expected capacity
-    let account_results: Arc<TokioMutex<Vec<(Address, CachedAccount)>>> =
-        Arc::new(TokioMutex::new(Vec::with_capacity(accounts.len())));
-    let storage_results: Arc<TokioMutex<Vec<(Address, U256, U256)>>> =
-        Arc::new(TokioMutex::new(Vec::with_capacity(storage_slots.len())));
-    let bytecode_results: Arc<TokioMutex<Vec<(B256, revm::bytecode::Bytecode)>>> =
-        Arc::new(TokioMutex::new(Vec::with_capacity(code_hashes.len())));
-
-    // Pre-allocate handles vector
-    let total_chunks = (accounts.len() / num_tasks.max(1)).max(1) +
-        (storage_slots.len() / num_tasks.max(1)).max(1) +
-        (code_hashes.len() / num_tasks.max(1)).max(1);
-    let mut handles = Vec::with_capacity(total_chunks);
-
-    // Spawn account prefetch tasks
+    // Each spawned task returns its results directly via JoinHandle.
+    // This eliminates Arc<TokioMutex<Vec<...>>> and the associated lock
+    // contention + scheduler yields from .lock().await calls.
     let chunk_size = (accounts.len() / num_tasks).max(1);
+    let mut account_handles: Vec<tokio::task::JoinHandle<Vec<(Address, CachedAccount)>>> =
+        Vec::with_capacity((accounts.len() + chunk_size - 1) / chunk_size);
     for chunk in accounts.chunks(chunk_size) {
         let chunk = chunk.to_vec();
         let snapshot = Arc::clone(&snapshot);
-        let results = Arc::clone(&account_results);
-
-        handles.push(tokio::spawn(async move {
-            let mut local_results = Vec::with_capacity(chunk.len());
+        account_handles.push(tokio::spawn(async move {
+            let mut results = Vec::with_capacity(chunk.len());
             for address in chunk {
                 if let Ok(info) = snapshot.basic_account(address) {
-                    local_results
-                        .push((address, CachedAccount { info, storage: HashMap::default() }));
+                    results.push((address, CachedAccount { info, storage: HashMap::default() }));
                 }
             }
-            results.lock().await.extend(local_results);
+            results
         }));
     }
 
-    // Spawn storage prefetch tasks
     let chunk_size = (storage_slots.len() / num_tasks).max(1);
+    let mut storage_handles: Vec<tokio::task::JoinHandle<Vec<(Address, U256, U256)>>> =
+        Vec::with_capacity((storage_slots.len() + chunk_size - 1) / chunk_size);
     for chunk in storage_slots.chunks(chunk_size) {
         let chunk = chunk.to_vec();
         let snapshot = Arc::clone(&snapshot);
-        let results = Arc::clone(&storage_results);
-
-        handles.push(tokio::spawn(async move {
-            let mut local_results = Vec::with_capacity(chunk.len());
+        storage_handles.push(tokio::spawn(async move {
+            let mut results = Vec::with_capacity(chunk.len());
             for (address, slot) in chunk {
                 if let Ok(value) = snapshot.storage(address, slot) {
-                    local_results.push((address, slot, value));
+                    results.push((address, slot, value));
                 }
             }
-            results.lock().await.extend(local_results);
+            results
         }));
     }
 
-    // Spawn bytecode prefetch tasks
     let chunk_size = (code_hashes.len() / num_tasks).max(1);
+    let mut code_handles: Vec<tokio::task::JoinHandle<Vec<(B256, revm::bytecode::Bytecode)>>> =
+        Vec::with_capacity((code_hashes.len() + chunk_size - 1) / chunk_size);
     for chunk in code_hashes.chunks(chunk_size) {
         let chunk = chunk.to_vec();
         let snapshot = Arc::clone(&snapshot);
-        let results = Arc::clone(&bytecode_results);
-
-        handles.push(tokio::spawn(async move {
-            let mut local_results = Vec::with_capacity(chunk.len());
+        code_handles.push(tokio::spawn(async move {
+            let mut results = Vec::with_capacity(chunk.len());
             for code_hash in chunk {
                 if code_hash.is_zero() {
                     continue;
                 }
                 if let Ok(bytecode) = snapshot.code_by_hash(code_hash) {
-                    local_results.push((code_hash, bytecode));
+                    results.push((code_hash, bytecode));
                 }
             }
-            results.lock().await.extend(local_results);
+            results
         }));
     }
 
-    // Wait for all tasks to complete
-    for handle in handles {
-        handle.await.map_err(|e| format!("Task join error: {}", e))?;
+    // Collect and merge results. Tasks run concurrently; we await each in turn.
+    for handle in account_handles {
+        for (address, account) in handle.await.map_err(|e| format!("Task join error: {e}"))? {
+            cached_reads.accounts.entry(address).or_insert(account);
+        }
     }
 
-    // Merge results into cached_reads
-    for (address, account) in account_results.lock().await.drain(..) {
-        cached_reads.accounts.entry(address).or_insert(account);
+    for handle in storage_handles {
+        for (address, slot, value) in handle.await.map_err(|e| format!("Task join error: {e}"))? {
+            let account = cached_reads
+                .accounts
+                .entry(address)
+                .or_insert_with(|| CachedAccount { info: None, storage: HashMap::default() });
+            account.storage.insert(slot, value);
+        }
     }
 
-    for (address, slot, value) in storage_results.lock().await.drain(..) {
-        let account = cached_reads
-            .accounts
-            .entry(address)
-            .or_insert_with(|| CachedAccount { info: None, storage: HashMap::default() });
-        account.storage.insert(slot, value);
-    }
-
-    for (code_hash, bytecode) in bytecode_results.lock().await.drain(..) {
-        cached_reads.contracts.entry(code_hash).or_insert(bytecode);
+    for handle in code_handles {
+        for (code_hash, bytecode) in handle.await.map_err(|e| format!("Task join error: {e}"))? {
+            cached_reads.contracts.entry(code_hash).or_insert(bytecode);
+        }
     }
 
     Ok(())

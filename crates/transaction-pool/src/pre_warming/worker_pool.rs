@@ -638,6 +638,15 @@ where
             target: "txpool::pre_warming",
             "Updating snapshot for worker pool"
         );
+
+        // Carry bytecode cache forward from the old snapshot before swapping.
+        // Bytecode is immutable on-chain, so entries from the previous block are
+        // always valid. This eliminates cold MDBX code_by_hash queries at the
+        // start of every new block.
+        {
+            let old = self.snapshot_holder.read();
+            new_snapshot.inherit_code_cache(&old);
+        }
         *self.snapshot_holder.write() = new_snapshot;
 
         // Record snapshot update
@@ -852,13 +861,15 @@ async fn drain_loop<T>(
         tokio::spawn(async move {
             let _permit = permit;
 
-            let simulator = Simulator::new(snapshot, chain_spec);
             let simulation_start = std::time::Instant::now();
 
             let (result_tx, result_rx) = tokio::sync::oneshot::channel();
             simulation_pool.spawn({
                 let tx = req.transaction.clone();
                 move || {
+                    // Construct Simulator on the rayon thread where CPU work belongs.
+                    // This keeps CfgEnv creation off the tokio async scheduler.
+                    let simulator = Simulator::new(snapshot, chain_spec);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         simulate_transaction_sync(&simulator, &tx)
                     }));
@@ -954,14 +965,13 @@ fn simulate_transaction<T: PoolTransaction>(
     let sender = tx.sender();
     let consensus_tx = tx.clone_into_consensus();
     let (tx_inner, _signer) = consensus_tx.into_parts();
-    let block_env = revm::context::BlockEnv::default();
 
     // Use optimized simulation with fast paths:
     // - Simple ETH transfers: Just sender + recipient (no DB queries)
     // - Known ERC20/DeFi: Heuristic slot prediction (no DB queries)
     // - Unknown contracts: Full simulation with TrackingDB
     simulator
-        .simulate(&tx_inner, sender, block_env)
+        .simulate(&tx_inner, sender)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
 

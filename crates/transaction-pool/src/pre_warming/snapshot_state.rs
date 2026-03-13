@@ -306,8 +306,11 @@ use reth_provider::{AccountReader, ProviderError, StateProvider};
 use revm::{bytecode::Bytecode, state::AccountInfo};
 use std::sync::{Arc, Mutex};
 
-/// Default cache capacity for typical block simulation
-const DEFAULT_STATE_CACHE_CAPACITY: usize = 512;
+/// Default cache capacity for typical block simulation.
+/// Set high enough to hold a full block's worth of unique accounts/storage
+/// without any HashMap resizing (resizes are O(n) + memcopy).
+/// A busy block touches 1000+ unique accounts; 4096 avoids all resize events.
+const DEFAULT_STATE_CACHE_CAPACITY: usize = 4096;
 
 /// Immutable state snapshot for parallel simulation
 ///
@@ -493,6 +496,29 @@ impl SnapshotState {
         }
 
         Ok(result)
+    }
+
+    /// Inherit bytecode cache entries from a previous snapshot.
+    ///
+    /// Contract bytecode is immutable on-chain — once deployed it never changes.
+    /// When a new block arrives the simulation snapshot is replaced, but the
+    /// bytecode for every contract seen in previous blocks is still valid.
+    /// Calling this after constructing the new snapshot avoids re-querying MDBX
+    /// for `code_by_hash` on every contract encountered in the new block.
+    ///
+    /// Account and storage entries are intentionally NOT inherited because they
+    /// can change with every transaction.
+    pub fn inherit_code_cache(&self, old: &SnapshotState) {
+        let old_cache = old.cache.read();
+        if old_cache.is_empty() {
+            return;
+        }
+        let mut new_cache = self.cache.write();
+        for (key, value) in old_cache.iter() {
+            if matches!(key, StateKey::Code(_)) {
+                new_cache.insert(key.clone(), value.clone());
+            }
+        }
     }
 
     /// Get cache statistics (for monitoring)

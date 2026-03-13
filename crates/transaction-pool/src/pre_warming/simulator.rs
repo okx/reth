@@ -404,7 +404,6 @@ impl Simulator {
         &self,
         tx: &Tx,
         sender: Address,
-        _block_env: BlockEnv,
     ) -> Result<ExtractedKeys, SimulationError>
     where
         Tx: alloy_consensus::Transaction,
