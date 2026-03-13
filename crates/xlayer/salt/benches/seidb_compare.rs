@@ -934,6 +934,80 @@ fn bench_seidb_full_stack(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Raw DB write benchmark: RocksDB vs MDBX for 22K KV batch writes
+// ---------------------------------------------------------------------------
+
+fn bench_raw_db_writes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Raw DB batch write");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(20));
+
+    let num_keys = ACCOUNTS_PER_BLOCK * (1 + SLOTS_PER_ACCOUNT); // 22K
+    let label = format!("{num_keys}_kvs");
+
+    // Generate deterministic KV pairs (simulate MVCC-encoded keys)
+    let mut rng = StdRng::seed_from_u64(99);
+    let kv_pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..num_keys)
+        .map(|_| {
+            let mut key = vec![0u8; 40]; // ~40 byte MVCC key
+            rng.fill_bytes(&mut key);
+            let mut val = vec![0u8; 32]; // 32 byte value
+            rng.fill_bytes(&mut val);
+            (key, val)
+        })
+        .collect();
+
+    // --- RocksDB batch write ---
+    let rocksdb_dir = tempfile::TempDir::new().unwrap();
+    let rocksdb_engine =
+        seidb_engine::engine::RocksDbEngine::open_plain(rocksdb_dir.path()).unwrap();
+
+    group.bench_function(BenchmarkId::new("rocksdb", &label), |b| {
+        b.iter(|| {
+            let mut batch =
+                <seidb_engine::engine::RocksDbEngine as seidb_traits::kv::KvEngine>::new_batch(
+                    &rocksdb_engine,
+                );
+            for (k, v) in &kv_pairs {
+                batch.set(k, v).unwrap();
+            }
+            batch.commit(&seidb_traits::types::WriteOptions { sync: false }).unwrap();
+        })
+    });
+
+    // --- MDBX batch write ---
+    let mdbx_dir = tempfile::TempDir::new().unwrap();
+    let mdbx_env = reth_libmdbx::Environment::builder()
+        .set_max_dbs(1)
+        .set_geometry(reth_libmdbx::Geometry {
+            size: Some(0..=(1024 * 1024 * 1024)), // 1GB max
+            ..Default::default()
+        })
+        .open(mdbx_dir.path())
+        .unwrap();
+
+    // Create the default database
+    {
+        let txn = mdbx_env.begin_rw_txn().unwrap();
+        txn.create_db(None, reth_libmdbx::DatabaseFlags::default()).unwrap();
+        txn.commit().unwrap();
+    }
+
+    group.bench_function(BenchmarkId::new("mdbx", &label), |b| {
+        b.iter(|| {
+            let txn = mdbx_env.begin_rw_txn().unwrap();
+            let db = txn.open_db(None).unwrap();
+            for (k, v) in &kv_pairs {
+                txn.put(db.dbi(), k, v, reth_libmdbx::WriteFlags::default()).unwrap();
+            }
+            txn.commit().unwrap();
+        })
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion main
 // ---------------------------------------------------------------------------
 
@@ -945,5 +1019,6 @@ criterion_group!(
     bench_seidb_go_equivalent,
     bench_seidb_parallel,
     bench_seidb_full_stack,
+    bench_raw_db_writes,
 );
 criterion_main!(benches);

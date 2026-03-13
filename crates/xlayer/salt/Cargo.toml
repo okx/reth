@@ -51,6 +51,7 @@ qmdb.workspace = true
 revm = { workspace = true, features = ["std"] }
 seidb.workspace = true
 seidb-common.workspace = true
+seidb-engine.workspace = true
 seidb-sc.workspace = true
 seidb-traits.workspace = true
 
