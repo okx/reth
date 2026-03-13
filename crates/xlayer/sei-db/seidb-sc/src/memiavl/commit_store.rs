@@ -1,11 +1,15 @@
-use crate::memiavl::{db::DB, import_export::Exporter as TreeExporter, tree::Tree};
+use crate::memiavl::{
+    db::DB,
+    import_export::{Exporter as TreeExporter, MultiTreeImporter},
+    tree::Tree,
+};
 use seidb_common::{
     config::MemIavlConfig,
     error::{Result, SeiDbError},
     path::get_commit_store_path,
 };
 use seidb_proto::{CommitInfo, NamedChangeSet, TreeNameUpgrade};
-use seidb_traits::sc::{Exporter, ScSnapshotNode};
+use seidb_traits::sc::{Exporter, Importer, ScSnapshotNode};
 use std::path::Path;
 
 /// High-level commit store wrapping [`DB`] with lifecycle management.
@@ -192,6 +196,22 @@ impl MemiavlCommitStore {
             self.db = None;
         }
         Ok(())
+    }
+
+    /// Create an importer for bulk-loading snapshot nodes at the given version.
+    ///
+    /// The importer writes into the commit store's DB directory (committer.db).
+    /// After `close()`, the imported data becomes a new snapshot pointed to by
+    /// the `current` symlink.
+    pub fn importer(&self, version: i64) -> Result<Box<dyn Importer>> {
+        if version <= 0 || version > u32::MAX as i64 {
+            return Err(SeiDbError::Other(format!("invalid import version: {version}")));
+        }
+        let dir = get_commit_store_path(std::path::Path::new(&self.home_dir));
+        // Ensure the commit store directory exists
+        std::fs::create_dir_all(&dir)?;
+        let importer = MultiTreeImporter::new(&dir, version)?;
+        Ok(Box::new(importer))
     }
 
     /// Create an exporter that streams all tree nodes in post-order.
@@ -422,5 +442,49 @@ mod tests {
         assert_eq!(nodes[1].key, b"bank_key");
         assert_eq!(nodes[1].value, b"bank_val");
         assert_eq!(nodes[1].height, 0);
+    }
+
+    #[test]
+    fn test_commit_store_importer_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let store = MemiavlCommitStore::new(home, MemIavlConfig::default());
+
+        // importer() should succeed (creates the commit store directory if needed)
+        let mut importer = store.importer(5).unwrap();
+
+        // Import a module with data
+        importer.add_module("bank").unwrap();
+        importer.add_node(&ScSnapshotNode {
+            key: b"key1".to_vec(),
+            value: b"val1".to_vec(),
+            version: 5,
+            height: 0,
+        });
+        importer.close().unwrap();
+
+        // Verify snapshot was created under committer.db
+        let commit_path = seidb_common::path::get_commit_store_path(std::path::Path::new(home));
+        let version = seidb_common::snapshot_dir::current_version(&commit_path).unwrap();
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn test_importer_version_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let store = MemiavlCommitStore::new(home, MemIavlConfig::default());
+
+        // Version 0 is invalid
+        assert!(store.importer(0).is_err());
+
+        // Negative version is invalid
+        assert!(store.importer(-1).is_err());
+
+        // Version exceeding u32::MAX is invalid
+        assert!(store.importer(u32::MAX as i64 + 1).is_err());
+
+        // Valid version should succeed
+        assert!(store.importer(1).is_ok());
     }
 }

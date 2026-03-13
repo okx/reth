@@ -158,6 +158,96 @@ impl Iterator for Exporter {
 }
 
 // ---------------------------------------------------------------------------
+// MultiTreeImporter — imports multiple named trees from a snapshot stream
+// ---------------------------------------------------------------------------
+
+/// Imports a stream of snapshot modules and nodes, reconstructing the full
+/// multi-tree state at a given version.
+///
+/// Mirrors Go's `MultiTreeImporter` in `memiavl/import.go`.
+///
+/// Usage:
+/// 1. Call `add_module("bank")` to start importing the "bank" tree.
+/// 2. Call `add_node(...)` for each node in post-order.
+/// 3. Call `add_module("staking")` to start the next tree (auto-closes previous).
+/// 4. Call `close()` to finalize: writes metadata, renames tmp → final, updates symlink.
+pub struct MultiTreeImporter {
+    dir: PathBuf,
+    tmp_dir: PathBuf,
+    version: i64,
+    current_importer: Option<TreeImporter>,
+}
+
+impl MultiTreeImporter {
+    /// Create a new multi-tree importer targeting `dir` at the given `version`.
+    ///
+    /// A temporary directory is created for the import. Any previous failed
+    /// import directory is cleaned up first.
+    pub fn new(dir: &Path, version: i64) -> Result<Self> {
+        let snap_name = seidb_common::snapshot_dir::snapshot_name(version);
+        let tmp_dir = dir.join(format!("{snap_name}-importing"));
+
+        // Clean up any previous failed import
+        if tmp_dir.exists() {
+            std::fs::remove_dir_all(&tmp_dir)?;
+        }
+        std::fs::create_dir_all(&tmp_dir)?;
+
+        Ok(Self { dir: dir.to_path_buf(), tmp_dir, version, current_importer: None })
+    }
+}
+
+impl seidb_traits::sc::Importer for MultiTreeImporter {
+    fn add_module(&mut self, name: &str) -> Result<()> {
+        // Close previous tree importer if any
+        if let Some(importer) = self.current_importer.take() {
+            importer.close()?;
+        }
+
+        // Start new TreeImporter for this module
+        let tree_dir = self.tmp_dir.join(name);
+        let importer = TreeImporter::new(&tree_dir, self.version);
+        self.current_importer = Some(importer);
+
+        Ok(())
+    }
+
+    fn add_node(&mut self, node: &seidb_traits::sc::ScSnapshotNode) {
+        if let Some(ref mut importer) = self.current_importer {
+            importer.add(ExportNode {
+                key: node.key.clone(),
+                value: node.value.clone(),
+                version: node.version,
+                height: node.height,
+            });
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        // Close current tree importer
+        if let Some(importer) = self.current_importer.take() {
+            importer.close()?;
+        }
+
+        // Write metadata file (reads subdirectories, opens snapshots, writes protobuf)
+        crate::memiavl::multitree::write_metadata(&self.tmp_dir, self.version)?;
+
+        // Atomic rename: tmp → final snapshot dir
+        let snap_name = seidb_common::snapshot_dir::snapshot_name(self.version);
+        let final_dir = self.dir.join(&snap_name);
+        if final_dir.exists() {
+            std::fs::remove_dir_all(&final_dir)?;
+        }
+        std::fs::rename(&self.tmp_dir, &final_dir)?;
+
+        // Update current symlink
+        seidb_common::snapshot_dir::update_current_symlink(&self.dir, &snap_name)?;
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -347,5 +437,184 @@ mod tests {
     fn test_export_empty_tree() {
         let mut exp = Exporter::new(None);
         assert!(exp.next().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // MultiTreeImporter tests
+    // -----------------------------------------------------------------------
+
+    use seidb_traits::sc::{Importer, ScSnapshotNode};
+
+    #[test]
+    fn test_multi_tree_importer_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("committer.db");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut imp = MultiTreeImporter::new(&root, 5).unwrap();
+
+        // Import module "acc" with one leaf
+        imp.add_module("acc").unwrap();
+        imp.add_node(&ScSnapshotNode {
+            key: b"addr1".to_vec(),
+            value: b"info1".to_vec(),
+            version: 5,
+            height: 0,
+        });
+
+        // Import module "bank" with two leaves + branch
+        imp.add_module("bank").unwrap();
+        imp.add_node(&ScSnapshotNode {
+            key: b"alice".to_vec(),
+            value: b"100".to_vec(),
+            version: 5,
+            height: 0,
+        });
+        imp.add_node(&ScSnapshotNode {
+            key: b"bob".to_vec(),
+            value: b"200".to_vec(),
+            version: 5,
+            height: 0,
+        });
+        imp.add_node(&ScSnapshotNode {
+            key: b"bob".to_vec(),
+            value: Vec::new(),
+            version: 5,
+            height: 1,
+        });
+
+        imp.close().unwrap();
+
+        // Verify snapshot was created
+        let snap_name = seidb_common::snapshot_dir::snapshot_name(5);
+        let snap_dir = root.join(&snap_name);
+        assert!(snap_dir.exists(), "snapshot directory should exist");
+
+        // Verify subdirectories
+        assert!(snap_dir.join("acc").exists(), "acc tree dir should exist");
+        assert!(snap_dir.join("bank").exists(), "bank tree dir should exist");
+
+        // Verify current symlink points to the snapshot
+        let version = seidb_common::snapshot_dir::current_version(&root).unwrap();
+        assert_eq!(version, 5);
+
+        // Verify we can load the acc snapshot
+        let acc_snap = Snapshot::open(&snap_dir.join("acc")).unwrap();
+        assert_eq!(acc_snap.leaf_count(), 1);
+
+        // Verify we can load the bank snapshot
+        let bank_snap = Snapshot::open(&snap_dir.join("bank")).unwrap();
+        assert_eq!(bank_snap.leaf_count(), 2);
+        assert_eq!(bank_snap.node_count(), 1);
+    }
+
+    #[test]
+    fn test_multi_tree_importer_roundtrip() {
+        // Build trees in memory, export via TreeExporter, import via MultiTreeImporter,
+        // verify root hashes match.
+        use crate::memiavl::multitree::MultiTree;
+        use seidb_proto::{ChangeSet, KvPair, NamedChangeSet, TreeNameUpgrade};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Build a MultiTree with two modules
+        let mut mt = MultiTree::new_empty(0);
+        mt.apply_upgrades(&[
+            TreeNameUpgrade { name: "acc".into(), rename_from: String::new(), delete: false },
+            TreeNameUpgrade { name: "bank".into(), rename_from: String::new(), delete: false },
+        ])
+        .unwrap();
+        mt.apply_change_sets(&[
+            NamedChangeSet {
+                name: "acc".into(),
+                changeset: Some(ChangeSet {
+                    pairs: vec![KvPair {
+                        key: b"addr".to_vec(),
+                        value: b"data".to_vec(),
+                        delete: false,
+                    }],
+                }),
+            },
+            NamedChangeSet {
+                name: "bank".into(),
+                changeset: Some(ChangeSet {
+                    pairs: vec![
+                        KvPair { key: b"alice".to_vec(), value: b"100".to_vec(), delete: false },
+                        KvPair { key: b"bob".to_vec(), value: b"200".to_vec(), delete: false },
+                    ],
+                }),
+            },
+        ])
+        .unwrap();
+        mt.save_version(true).unwrap();
+
+        // Collect root hashes per tree
+        let acc_hash = mt.tree_by_name("acc").unwrap().root_hash();
+        let bank_hash = mt.tree_by_name("bank").unwrap().root_hash();
+
+        // Export each tree and collect nodes
+        let mut tree_exports: Vec<(String, Vec<ExportNode>)> = Vec::new();
+        for nt in mt.trees() {
+            let exporter = Exporter::new(nt.tree.root_ref());
+            let nodes: Vec<_> = exporter.collect();
+            tree_exports.push((nt.name.clone(), nodes));
+        }
+
+        // Import via MultiTreeImporter
+        let import_root = dir.path().join("imported");
+        std::fs::create_dir_all(&import_root).unwrap();
+
+        let mut imp = MultiTreeImporter::new(&import_root, 1).unwrap();
+        for (name, nodes) in &tree_exports {
+            imp.add_module(name).unwrap();
+            for node in nodes {
+                imp.add_node(&ScSnapshotNode {
+                    key: node.key.clone(),
+                    value: node.value.clone(),
+                    version: node.version,
+                    height: node.height,
+                });
+            }
+        }
+        imp.close().unwrap();
+
+        // Verify by loading the snapshot and checking root hashes
+        let snap_name = seidb_common::snapshot_dir::snapshot_name(1);
+        let snap_dir = import_root.join(&snap_name);
+
+        let acc_snap = Snapshot::open(&snap_dir.join("acc")).unwrap();
+        assert_eq!(acc_snap.root_hash(), acc_hash, "acc root hash mismatch");
+
+        let bank_snap = Snapshot::open(&snap_dir.join("bank")).unwrap();
+        assert_eq!(bank_snap.root_hash(), bank_hash, "bank root hash mismatch");
+    }
+
+    #[test]
+    fn test_multi_tree_importer_cleanup_previous() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("committer.db");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let snap_name = seidb_common::snapshot_dir::snapshot_name(10);
+        let tmp_dir = root.join(format!("{snap_name}-importing"));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::write(tmp_dir.join("stale"), b"old data").unwrap();
+
+        // Creating a new importer at the same version should clean up the stale dir
+        let mut imp = MultiTreeImporter::new(&root, 10).unwrap();
+        assert!(!tmp_dir.join("stale").exists(), "stale file should be cleaned up");
+
+        // Add a module and close to verify it works after cleanup
+        imp.add_module("test").unwrap();
+        imp.add_node(&ScSnapshotNode {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            version: 10,
+            height: 0,
+        });
+        imp.close().unwrap();
+
+        let version = seidb_common::snapshot_dir::current_version(&root).unwrap();
+        assert_eq!(version, 10);
     }
 }

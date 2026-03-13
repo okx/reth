@@ -159,8 +159,8 @@ impl Committer for MemiavlCommitStore {
         Some(Box::new(cloned))
     }
 
-    fn importer(&self, _version: i64) -> Result<Box<dyn Importer>> {
-        Err(SeiDbError::Other("importer not implemented yet".into()))
+    fn importer(&self, version: i64) -> Result<Box<dyn Importer>> {
+        self.importer(version)
     }
 
     fn exporter(&self, version: i64) -> Result<Box<dyn Exporter>> {

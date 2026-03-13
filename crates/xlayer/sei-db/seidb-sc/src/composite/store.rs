@@ -235,9 +235,22 @@ impl CompositeCommitStore {
 
     /// Creates an importer for state sync at the given version.
     ///
-    /// TODO: importer needs more complex composite setup (Phase 9).
-    pub fn create_importer(&self, _version: i64) -> Result<Box<dyn Importer>> {
-        Err(SeiDbError::Other("composite importer not yet implemented".into()))
+    /// The cosmos (memiavl) importer receives all nodes — it needs the full tree
+    /// for root hash computation. The EVM (flatkv) importer is currently `None`:
+    /// EVM leaf nodes are included in the memiavl tree hash, and FlatKV can be
+    /// rebuilt separately.
+    pub fn create_importer(&self, version: i64) -> Result<Box<dyn Importer>> {
+        let cosmos_importer = self.cosmos_committer.importer(version)?;
+
+        // EVM importer is None for now: EVM nodes go to memiavl (for tree hash
+        // computation). FlatKV can be rebuilt separately from the memiavl snapshot.
+        // This matches the Go approach where evmImporter is only populated when
+        // the EVM committer explicitly supports snapshot import.
+        let evm_importer: Option<Box<dyn Importer>> = None;
+
+        let importer =
+            crate::composite::importer::SnapshotImporter::new(cosmos_importer, evm_importer);
+        Ok(Box::new(importer))
     }
 
     /// Creates an exporter for state sync at the given version.
@@ -481,10 +494,37 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_create_importer_not_implemented() {
+    fn test_composite_create_importer() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
         let cfg = default_config(WriteMode::CosmosOnly);
-        let store = CompositeCommitStore::new("/tmp/test_importer", &cfg);
-        assert!(store.create_importer(1).is_err());
+        let store = CompositeCommitStore::new(home, &cfg);
+
+        // create_importer should succeed now
+        let mut importer = store.create_importer(5).unwrap();
+
+        // Import a module
+        importer.add_module("bank").unwrap();
+        importer.add_node(&seidb_traits::sc::ScSnapshotNode {
+            key: b"key1".to_vec(),
+            value: b"val1".to_vec(),
+            version: 5,
+            height: 0,
+        });
+        importer.close().unwrap();
+
+        // Verify snapshot was created
+        let commit_path = seidb_common::path::get_commit_store_path(std::path::Path::new(home));
+        let version = seidb_common::snapshot_dir::current_version(&commit_path).unwrap();
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn test_composite_create_importer_invalid_version() {
+        let cfg = default_config(WriteMode::CosmosOnly);
+        let store = CompositeCommitStore::new("/tmp/test_importer_invalid", &cfg);
+        assert!(store.create_importer(0).is_err());
+        assert!(store.create_importer(-1).is_err());
     }
 
     #[test]

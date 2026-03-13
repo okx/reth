@@ -63,15 +63,27 @@ impl Snapshot {
             )));
         }
 
-        let magic = u32::from_le_bytes(meta_bytes[0..4].try_into().unwrap());
+        let magic = u32::from_le_bytes(
+            meta_bytes[0..4]
+                .try_into()
+                .map_err(|_| SeiDbError::Other("invalid metadata layout (magic)".into()))?,
+        );
         if magic != SNAPSHOT_MAGIC {
             return Err(SeiDbError::Other(format!("invalid metadata file magic: {magic}")));
         }
-        let format = u32::from_le_bytes(meta_bytes[4..8].try_into().unwrap());
+        let format = u32::from_le_bytes(
+            meta_bytes[4..8]
+                .try_into()
+                .map_err(|_| SeiDbError::Other("invalid metadata layout (format)".into()))?,
+        );
         if format != SNAPSHOT_FORMAT {
             return Err(SeiDbError::Other(format!("unknown snapshot format: {format}")));
         }
-        let version = u32::from_le_bytes(meta_bytes[8..12].try_into().unwrap());
+        let version = u32::from_le_bytes(
+            meta_bytes[8..12]
+                .try_into()
+                .map_err(|_| SeiDbError::Other("invalid metadata layout (version)".into()))?,
+        );
 
         // --- mmap files ---
         let nodes_mmap = MmapFile::open(&dir.join(FILE_NAME_NODES))?;

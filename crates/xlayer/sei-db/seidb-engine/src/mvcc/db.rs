@@ -104,10 +104,10 @@ impl MvccDatabase {
     /// # Safety
     /// Uses interior pointer mutation to set fields on the Arc'd struct.
     /// Must only be called once, before any concurrent access begins.
-    pub fn init_async_writer(self: &Arc<Self>) {
+    pub fn init_async_writer(self: &Arc<Self>) -> Result<()> {
         let buffer = self.config.async_write_buffer;
         if buffer == 0 {
-            return;
+            return Ok(());
         }
 
         let (tx, rx) = crossbeam_channel::bounded(buffer);
@@ -125,9 +125,10 @@ impl MvccDatabase {
             .spawn(move || {
                 Self::write_async_in_background(db_clone, rx);
             })
-            .expect("failed to spawn async writer thread");
+            .map_err(|e| SeiDbError::Other(format!("failed to spawn async writer thread: {e}")))?;
 
         self.worker_handle.lock().replace(handle);
+        Ok(())
     }
 
     /// Shut down the database: drain the async writer, join the worker thread,
@@ -161,7 +162,10 @@ impl MvccDatabase {
                         bytes.len()
                     )));
                 }
-                let val = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                let arr: [u8; 8] = bytes[..8].try_into().map_err(|_| {
+                    SeiDbError::Other("latest version value length mismatch".into())
+                })?;
+                let val = u64::from_le_bytes(arr);
                 if val > i64::MAX as u64 {
                     return Err(SeiDbError::Other(format!("latest version overflows i64: {val}")));
                 }
@@ -183,7 +187,10 @@ impl MvccDatabase {
                         bytes.len()
                     )));
                 }
-                let val = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                let arr: [u8; 8] = bytes[..8].try_into().map_err(|_| {
+                    SeiDbError::Other("earliest version value length mismatch".into())
+                })?;
+                let val = u64::from_le_bytes(arr);
                 if val > i64::MAX as u64 {
                     return Err(SeiDbError::Other(format!("earliest version overflows i64: {val}")));
                 }

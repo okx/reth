@@ -419,8 +419,45 @@ pub fn read_metadata(dir: &Path) -> Result<MultiTreeMetadata> {
     Ok(metadata)
 }
 
+/// Write a `MultiTreeMetadata` protobuf to the metadata file in `dir`.
+///
+/// This is used by [`MultiTreeImporter`] to finalize a snapshot import.
+/// It reads all subdirectories, opens each as a snapshot to get the root hash,
+/// and writes the aggregated metadata (matching Go's `updateMetadataFile`).
+pub fn write_metadata(dir: &Path, version: i64) -> Result<()> {
+    let entries = fs::read_dir(dir)?;
+    let mut store_infos: Vec<StoreInfo> = Vec::new();
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|os| SeiDbError::Other(format!("non-utf8 directory name: {os:?}")))?;
+        let snapshot = crate::memiavl::snapshot::Snapshot::open(&dir.join(&name))?;
+        store_infos.push(StoreInfo {
+            name,
+            commit_id: Some(CommitId { version, hash: snapshot.root_hash() }),
+        });
+    }
+
+    // Sort store infos by name for deterministic output
+    store_infos.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let metadata = MultiTreeMetadata {
+        commit_info: Some(CommitInfo { version, store_infos }),
+        // initial_version should correspond to the first rlog entry (version + 1)
+        initial_version: version + 1,
+    };
+    let buf = metadata.encode_to_vec();
+    write_file_sync(&dir.join(METADATA_FILE_NAME), &buf)
+}
+
 /// Write data to a file and fsync before closing.
-fn write_file_sync(path: &Path, data: &[u8]) -> Result<()> {
+pub fn write_file_sync(path: &Path, data: &[u8]) -> Result<()> {
     let mut f = fs::File::create(path)?;
     f.write_all(data)?;
     f.sync_all()?;

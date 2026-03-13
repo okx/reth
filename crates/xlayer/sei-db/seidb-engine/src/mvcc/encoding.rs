@@ -69,7 +69,10 @@ pub fn decode_uint64_ascending(b: &[u8]) -> Result<i64> {
         )));
     }
 
-    let uv = u64::from_be_bytes(b[..8].try_into().unwrap());
+    let arr: [u8; 8] = b[..8]
+        .try_into()
+        .map_err(|_| SeiDbError::Other("invalid slice length for u64 decode".into()))?;
+    let uv = u64::from_be_bytes(arr);
     if uv > i64::MAX as u64 {
         return Err(SeiDbError::Other(format!("uint64 value overflows int64: {uv}")));
     }
