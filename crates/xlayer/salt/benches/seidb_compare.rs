@@ -797,7 +797,7 @@ fn setup_seidb_full_stack(
     db
 }
 
-/// Run blocks through SC + SS, measuring total time including RocksDB writes.
+/// Run blocks through SC + SS (sync), measuring total time including RocksDB writes.
 fn run_seidb_full_stack(
     db: &mut SeiDb,
     block_bundles: &[BundleState],
@@ -816,16 +816,12 @@ fn run_seidb_full_stack(
         };
         let state_changes = bundle_state_changes(bundle);
 
-        // SC apply
         let apply_start = Instant::now();
         db.sc_mut().apply_change_sets(&changesets).unwrap();
         let apply_time = apply_start.elapsed();
 
-        // SC commit (hash computation)
         let commit_start = Instant::now();
         let ver = db.sc_mut().commit().unwrap();
-
-        // SS write (RocksDB MVCC — the real disk I/O)
         if let Some(ss) = db.ss() {
             ss.apply_changeset_sync(ver, &changesets).unwrap();
         }
@@ -834,7 +830,7 @@ fn run_seidb_full_stack(
         block_stats.push(BlockStats {
             wall_time: block_start.elapsed(),
             apply_time,
-            commit_time, // includes both SC commit + SS write
+            commit_time,
             state_changes,
         });
     }
