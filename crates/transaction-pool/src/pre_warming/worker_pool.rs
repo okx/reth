@@ -324,7 +324,6 @@ use crate::{
     },
     PoolTransaction,
 };
-use alloy_primitives::TxHash;
 use parking_lot::RwLock;
 use reth_chainspec::ChainSpec;
 use std::sync::Arc;
@@ -487,14 +486,15 @@ where
         snapshot: Arc<SnapshotState>,
         chain_spec: Arc<ChainSpec>,
     ) -> Self {
-        // Bounded channel: capacity = workers × 10
-        let channel_capacity = config.num_workers * 10;
+        // Bounded channel: capacity = workers × 100.
+        // Sized to absorb burst arrivals (mempool sync, P2P batch announcements)
+        // where 50-200 txs can arrive within a single millisecond.
+        // workers × 10 was too small — bursts filled it instantly.
+        // Memory cost: 200 × ~500 bytes = ~100 KB at default 2 workers. Negligible.
+        let channel_capacity = config.num_workers * 100;
         let (sender, receiver) = mpsc::channel(channel_capacity);
 
-        // Create shared receiver wrapped in Arc<Mutex> for worker tasks
-        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
-
-        // Wrap snapshot in RwLock so workers can see updates
+        // Wrap snapshot in RwLock so the drain task can see block updates.
         let snapshot_holder: SharedSnapshot = Arc::new(RwLock::new(snapshot));
 
         // Create metrics instance (registers with global Prometheus registry)
@@ -511,11 +511,13 @@ where
                 .expect("Failed to build pre-warming simulation thread pool"),
         );
 
-        let mut workers = Vec::with_capacity(config.num_workers);
+        // Semaphore bounds concurrent simulations to num_workers.
+        // The drain task receives items immediately (no blocking on simulation),
+        // so the channel is drained as fast as items arrive. The semaphore
+        // prevents unbounded spawning of simulation tasks.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(config.num_workers));
 
-        // Spawn N workers using tokio::spawn for async runtime integration
-        for worker_id in 0..config.num_workers {
-            let receiver = Arc::clone(&receiver);
+        let handle = {
             let cache = Arc::clone(&cache);
             let snapshot_holder = Arc::clone(&snapshot_holder);
             let chain_spec = Arc::clone(&chain_spec);
@@ -523,10 +525,10 @@ where
             let metrics = Arc::clone(&metrics);
             let simulation_pool = Arc::clone(&simulation_pool);
 
-            let handle = tokio::spawn(async move {
-                worker_loop(
-                    worker_id,
+            tokio::spawn(async move {
+                drain_loop(
                     receiver,
+                    semaphore,
                     cache,
                     snapshot_holder,
                     chain_spec,
@@ -535,10 +537,9 @@ where
                     simulation_pool,
                 )
                 .await;
-            });
-
-            workers.push(handle);
-        }
+            })
+        };
+        let workers = vec![handle];
 
         info!(
             target: "txpool::pre_warming",
@@ -783,48 +784,38 @@ where
     }
 }
 
-/// Worker loop - runs as a tokio async task.
+/// Drain loop - single async task that dispatches simulation work.
 ///
-/// Continuously receives simulation requests from the channel, simulates them,
-/// and stores the results in the cache.
+/// Receives simulation requests one at a time and spawns a concurrent tokio
+/// task for each. A semaphore with capacity = `num_workers` bounds concurrent
+/// simulations without ever blocking the receive path.
 ///
-/// ## Loop Structure
-///
-/// ```text
-/// loop {
-///     1. Try to receive from channel (non-blocking!)
-///        - Don't hold lock while waiting
-///
-///     2. If request received:
-///        a. Read fresh snapshot
-///        b. Simulate transaction (with timeout)
-///        c. Store keys in cache
-///
-///     3. If channel empty:
-///        - Adaptive sleep (backoff to prevent busy-spin)
-///
-///     4. If channel closed:
-///        - Exit loop (shutdown)
-/// }
-/// ```
-///
-/// ## Why Non-Blocking Receive?
+/// ## Design
 ///
 /// ```text
-/// WRONG (blocking receive):
-///     let req = rx.recv().await;  // Holds lock forever!
-///     // Other workers can't receive
+/// drain_loop:
+///   loop {
+///     recv item (blocks until available, never spins)
+///     acquire semaphore permit (blocks only if num_workers sims running)
+///     spawn simulation task (returns immediately)
+///   }
 ///
-/// CORRECT (non-blocking):
-///     let req = {
-///         let mut rx = receiver.lock().await;
-///         rx.try_recv()  // Returns immediately
-///     };  // Lock released here!
-///     // Other workers can now receive
+/// spawned task:
+///   run rayon simulation (holds permit for duration)
+///   write result to cache
+///   drop permit (releases semaphore slot)
 /// ```
-async fn worker_loop<T>(
-    worker_id: usize,
-    receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<SimulationRequest<T>>>>,
+///
+/// ## Why This Prevents Burst Drops
+///
+/// The old design (N workers each blocked on simulation) meant the channel
+/// filled during bursts: workers could not receive new items while simulating.
+/// This loop drains the channel continuously — the only wait is acquiring a
+/// semaphore permit, which unblocks as soon as any simulation finishes.
+/// The large channel buffer (workers × 100) absorbs burst arrivals.
+async fn drain_loop<T>(
+    mut receiver: mpsc::Receiver<SimulationRequest<T>>,
+    semaphore: Arc<tokio::sync::Semaphore>,
     cache: Arc<PreWarmedCache>,
     snapshot_holder: SharedSnapshot,
     chain_spec: Arc<ChainSpec>,
@@ -832,238 +823,112 @@ async fn worker_loop<T>(
     metrics: Arc<PreWarmingMetrics>,
     simulation_pool: Arc<rayon::ThreadPool>,
 ) where
-    T: PoolTransaction,
+    T: PoolTransaction + Send + 'static,
 {
-    debug!(
-        target: "txpool::pre_warming",
-        worker_id,
-        chain_id = chain_spec.chain.id(),
-        "Worker started"
-    );
+    debug!(target: "txpool::pre_warming", "Pre-warming drain loop started");
 
-    // Track consecutive empty receives for adaptive sleep
-    let mut consecutive_empty: u32 = 0;
-    const MAX_CONSECUTIVE_EMPTY: u32 = 100;
-    const BASE_SLEEP_MICROS: u64 = 100;
-    const MAX_SLEEP_MICROS: u64 = 10_000; // Cap at 10ms
+    while let Some(req) = receiver.recv().await {
+        // Skip if already simulated to avoid duplicate work
+        if cache.contains_tx(&req.tx_hash) {
+            continue;
+        }
 
-    // Batch cache writes to reduce DashMap lock acquisitions.
-    // Flush when batch is full OR when the oldest item exceeds MAX_BATCH_AGE_MS.
-    // The age limit ensures keys reach the cache well within one block period
-    // (400ms on X Layer) so the payload builder can actually use them.
-    const BATCH_SIZE: usize = 8;
-    const MAX_BATCH_AGE_MS: u64 = 50;
-    let mut write_batch: Vec<(TxHash, ExtractedKeys)> = Vec::with_capacity(BATCH_SIZE);
-    let mut batch_keys_count: usize = 0;
-    let mut batch_start_time: Option<std::time::Instant> = None;
+        // Acquire a simulation slot. Blocks only when num_workers simulations
+        // are already running; the channel continues to buffer items in the meantime.
+        let permit = match Arc::clone(&semaphore).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // Semaphore closed (shutdown)
+        };
 
-    // Cache snapshot per batch to avoid repeated Arc clones.
-    // Snapshot only changes on new blocks, so reusing within a batch is safe.
-    let mut cached_snapshot: Option<Arc<SnapshotState>> = None;
+        let cache = Arc::clone(&cache);
+        let snapshot = snapshot_holder.read().clone();
+        let chain_spec = Arc::clone(&chain_spec);
+        let simulation_pool = Arc::clone(&simulation_pool);
+        let metrics = Arc::clone(&metrics);
+        let simulation_timeout = config.simulation_timeout;
 
-    loop {
-        // Try to receive from channel (non-blocking)
-        // CRITICAL: We must NOT hold the lock while waiting for items!
-        let request = {
-            let mut rx = receiver.lock().await;
-            rx.try_recv()
-        }; // Lock released here!
+        // Spawn simulation task — drain loop returns to recv() immediately.
+        // The permit is held by the task and released when the task completes.
+        tokio::spawn(async move {
+            let _permit = permit;
 
-        match request {
-            Ok(req) => {
-                // Reset empty counter on successful receive
-                consecutive_empty = 0;
+            let simulator = Simulator::new(snapshot, chain_spec);
+            let simulation_start = std::time::Instant::now();
 
-                // OPTIMIZATION: Skip if TX already simulated (avoid duplicate work)
-                if cache.contains_tx(&req.tx_hash) {
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            simulation_pool.spawn({
+                let tx = req.transaction.clone();
+                move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        simulate_transaction_sync(&simulator, &tx)
+                    }));
+                    if let Ok(sim_result) = result {
+                        let _ = result_tx.send(sim_result);
+                    }
+                    // On panic: sender drops → receiver gets Err → fallback below
+                }
+            });
+
+            let keys = match tokio::time::timeout(simulation_timeout, result_rx).await {
+                Ok(Ok(Ok(keys))) => {
+                    metrics.simulations_completed.increment(1);
+                    keys
+                }
+                Ok(Ok(Err(e))) => {
+                    metrics.simulations_failed.increment(1);
                     tracing::trace!(
                         target: "txpool::pre_warming",
-                        worker_id,
                         tx_hash = ?req.tx_hash,
-                        "Skipping duplicate TX - already in cache"
+                        error = ?e,
+                        "Simulation failed, using fallback"
                     );
-                    continue;
+                    dummy_simulate(&req.transaction)
                 }
-
-                let age = req.age();
-                tracing::trace!(
-                    target: "txpool::pre_warming",
-                    worker_id,
-                    tx_hash = ?req.tx_hash,
-                    age_ms = age.as_millis(),
-                    "Processing simulation request"
-                );
-
-                // OPTIMIZATION: Reuse cached snapshot within batch
-                // Only refresh when batch is empty (start of new batch) or on first use
-                let snapshot = if write_batch.is_empty() || cached_snapshot.is_none() {
-                    let fresh = snapshot_holder.read().clone();
-                    cached_snapshot = Some(Arc::clone(&fresh));
-                    fresh
-                } else {
-                    Arc::clone(cached_snapshot.as_ref().unwrap())
-                };
-                let simulator = Simulator::new(snapshot, Arc::clone(&chain_spec));
-
-                // Start timing the simulation
-                let simulation_start = std::time::Instant::now();
-
-                // Simulate transaction on the dedicated rayon pool.
-                // Using rayon instead of tokio::task::spawn_blocking keeps simulation
-                // threads isolated from tokio's shared blocking pool, which is also
-                // used by the payload processor (multiproof, execution). Without
-                // isolation, heavy simulation load can starve block execution threads.
-                let simulation_timeout = config.simulation_timeout;
-                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-                simulation_pool.spawn({
-                    let tx = req.transaction.clone();
-                    move || {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            simulate_transaction_sync(&simulator, &tx)
-                        }));
-                        if let Ok(sim_result) = result {
-                            let _ = result_tx.send(sim_result);
-                        }
-                        // On panic: sender drops → receiver returns Err → fallback below
-                    }
-                });
-
-                let keys = match tokio::time::timeout(simulation_timeout, result_rx).await {
-                    Ok(Ok(Ok(keys))) => {
-                        // Record successful simulation
-                        metrics.simulations_completed.increment(1);
-                        keys
-                    }
-                    Ok(Ok(Err(e))) => {
-                        // Simulation returned an error
-                        metrics.simulations_failed.increment(1);
-                        tracing::trace!(
-                            target: "txpool::pre_warming",
-                            worker_id,
-                            tx_hash = ?req.tx_hash,
-                            error = ?e,
-                            "Simulation failed, using fallback"
-                        );
-                        dummy_simulate(&req.transaction)
-                    }
-                    Ok(Err(_recv_err)) => {
-                        // Rayon worker panicked (sender dropped without sending)
-                        metrics.simulations_failed.increment(1);
-                        tracing::trace!(
-                            target: "txpool::pre_warming",
-                            worker_id,
-                            tx_hash = ?req.tx_hash,
-                            "Simulation worker panicked, using fallback"
-                        );
-                        dummy_simulate(&req.transaction)
-                    }
-                    Err(_timeout) => {
-                        // Simulation exceeded timeout
-                        metrics.simulations_failed.increment(1);
-                        tracing::trace!(
-                            target: "txpool::pre_warming",
-                            worker_id,
-                            tx_hash = ?req.tx_hash,
-                            timeout_ms = simulation_timeout.as_millis(),
-                            "Simulation timed out, using fallback"
-                        );
-                        dummy_simulate(&req.transaction)
-                    }
-                };
-
-                // Record simulation duration
-                let simulation_duration = simulation_start.elapsed();
-                metrics.simulation_duration.record(simulation_duration.as_secs_f64());
-
-                // Store keys per transaction (thread-safe)
-                let keys_count = keys.accounts.len() +
-                    keys.storage_slots.len() +
-                    keys.code_hashes.len() +
-                    keys.block_hashes.len();
-                let accounts_count = keys.accounts.len();
-                let storage_count = keys.storage_slots.len();
-                let code_count = keys.code_hashes.len();
-
-                // Log simulation timing at INFO level with full details for per-TX tracking
-                // Format: TX_TIMING|SIMULATION|<tx_hash>|<duration_us>|<keys_count>
-                // Use trace level to avoid per-TX logging overhead in production
-                tracing::trace!(
-                    target: "txpool::pre_warming",
-                    tx_hash = ?req.tx_hash,
-                    phase = "SIMULATION",
-                    duration_us = simulation_duration.as_micros(),
-                    keys_total = keys_count,
-                    accounts = accounts_count,
-                    storage_slots = storage_count,
-                    code_hashes = code_count,
-                    worker_id,
-                    "TX_TIMING: Simulation complete"
-                );
-
-                // Accumulate in batch to reduce DashMap lock acquisitions.
-                if batch_start_time.is_none() {
-                    batch_start_time = Some(std::time::Instant::now());
+                Ok(Err(_recv_err)) => {
+                    // Rayon worker panicked (sender dropped without sending)
+                    metrics.simulations_failed.increment(1);
+                    tracing::trace!(
+                        target: "txpool::pre_warming",
+                        tx_hash = ?req.tx_hash,
+                        "Simulation worker panicked, using fallback"
+                    );
+                    dummy_simulate(&req.transaction)
                 }
-                write_batch.push((req.tx_hash, keys));
-                batch_keys_count += keys_count;
-
-                // Flush when batch is full OR keys have been waiting too long.
-                // The age check ensures the payload builder sees fresh keys within
-                // MAX_BATCH_AGE_MS even under sustained high load.
-                let batch_aged = batch_start_time
-                    .map(|t| t.elapsed().as_millis() as u64 >= MAX_BATCH_AGE_MS)
-                    .unwrap_or(false);
-
-                if write_batch.len() >= BATCH_SIZE || batch_aged {
-                    let batch_len = write_batch.len();
-                    cache.store_tx_keys_batch(write_batch.drain(..));
-                    metrics.cache_entries.increment(batch_len as f64);
-                    metrics.cache_keys_total.increment(batch_keys_count as f64);
-                    batch_keys_count = 0;
-                    batch_start_time = None;
+                Err(_timeout) => {
+                    metrics.simulations_failed.increment(1);
+                    tracing::trace!(
+                        target: "txpool::pre_warming",
+                        tx_hash = ?req.tx_hash,
+                        timeout_ms = simulation_timeout.as_millis(),
+                        "Simulation timed out, using fallback"
+                    );
+                    dummy_simulate(&req.transaction)
                 }
-            }
-            Err(mpsc::error::TryRecvError::Empty) => {
-                // Channel empty - flush any pending batch before sleeping
-                if !write_batch.is_empty() {
-                    let batch_len = write_batch.len();
-                    cache.store_tx_keys_batch(write_batch.drain(..));
-                    metrics.cache_entries.increment(batch_len as f64);
-                    metrics.cache_keys_total.increment(batch_keys_count as f64);
-                    batch_keys_count = 0;
-                    batch_start_time = None;
-                }
+            };
 
-                // Adaptive sleep
-                consecutive_empty = consecutive_empty.saturating_add(1);
+            let simulation_duration = simulation_start.elapsed();
+            metrics.simulation_duration.record(simulation_duration.as_secs_f64());
 
-                let sleep_micros = if consecutive_empty > MAX_CONSECUTIVE_EMPTY {
-                    MAX_SLEEP_MICROS
-                } else {
-                    BASE_SLEEP_MICROS
-                        .saturating_mul(1 + (consecutive_empty as u64 / 10))
-                        .min(MAX_SLEEP_MICROS)
-                };
+            let keys_count = keys.accounts.len()
+                + keys.storage_slots.len()
+                + keys.code_hashes.len()
+                + keys.block_hashes.len();
 
-                tokio::time::sleep(tokio::time::Duration::from_micros(sleep_micros)).await;
-            }
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                // Channel closed, exit worker
-                debug!(
-                    target: "txpool::pre_warming",
-                    worker_id,
-                    "Channel closed, worker exiting"
-                );
-                break;
-            }
-        }
+            tracing::trace!(
+                target: "txpool::pre_warming",
+                tx_hash = ?req.tx_hash,
+                duration_us = simulation_duration.as_micros(),
+                keys_total = keys_count,
+                "TX_TIMING: Simulation complete"
+            );
+
+            cache.store_tx_keys(req.tx_hash, keys);
+            metrics.cache_entries.increment(1.0);
+            metrics.cache_keys_total.increment(keys_count as f64);
+        });
     }
 
-    debug!(
-        target: "txpool::pre_warming",
-        worker_id,
-        "Worker stopped"
-    );
+    debug!(target: "txpool::pre_warming", "Pre-warming drain loop stopped");
 }
 
 /// Simulate transaction synchronously (for use in spawn_blocking).
