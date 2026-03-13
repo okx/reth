@@ -27,6 +27,9 @@ alloy-consensus.workspace = true
 revm-database.workspace = true
 revm-state.workspace = true
 
+# sei-db
+seidb-proto.workspace = true
+
 # misc
 tracing.workspace = true
 thiserror.workspace = true
@@ -46,6 +49,9 @@ proptest.workspace = true
 proptest-arbitrary-interop.workspace = true
 qmdb.workspace = true
 revm = { workspace = true, features = ["std"] }
+seidb.workspace = true
+seidb-common.workspace = true
+seidb-traits.workspace = true
 
 [[bench]]
 name = "mpt_vs_salt"
@@ -61,6 +67,10 @@ harness = false
 
 [[bench]]
 name = "evm_compare"
+harness = false
+
+[[bench]]
+name = "seidb_compare"
 harness = false
 
 [lints]

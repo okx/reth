@@ -33,17 +33,17 @@ pub fn compute_lt_hash(prev: &LtHash, kv_pairs: &[KvPairWithLastValue]) -> LtHas
 }
 
 /// Computes the LtHash delta for a changeset serially.
+/// Uses a reusable buffer to avoid per-pair heap allocation.
 fn compute_delta_serial(kv_pairs: &[KvPairWithLastValue]) -> LtHash {
     let mut delta = LtHash::new();
+    let mut buf = Vec::with_capacity(256);
     for pair in kv_pairs {
         if !pair.last_value.is_empty() &&
-            let Some(buf) = LtHash::serialize_kv(&pair.key, &pair.last_value)
+            LtHash::serialize_kv_into(&mut buf, &pair.key, &pair.last_value)
         {
             delta.mix_out(&LtHash::hash(&buf));
         }
-        if !pair.delete &&
-            let Some(buf) = LtHash::serialize_kv(&pair.key, &pair.value)
-        {
+        if !pair.delete && LtHash::serialize_kv_into(&mut buf, &pair.key, &pair.value) {
             delta.mix_in(&LtHash::hash(&buf));
         }
     }

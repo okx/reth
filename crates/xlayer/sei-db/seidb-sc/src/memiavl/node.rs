@@ -29,7 +29,7 @@ pub struct MemNode {
     pub value: Vec<u8>,
     pub left: Option<NodeRef>,
     pub right: Option<NodeRef>,
-    pub(crate) hash: OnceLock<Vec<u8>>,
+    pub(crate) hash: OnceLock<[u8; 32]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +163,7 @@ impl Node {
     /// For `Persisted` nodes the hash is read directly from the mmap-backed snapshot.
     pub fn hash(&self) -> &[u8] {
         match self {
-            Node::Mem(m) => m.hash.get_or_init(|| compute_hash(self)),
+            Node::Mem(m) => m.hash.get_or_init(|| compute_hash(self)).as_slice(),
             Node::Persisted(pn) => pn.hash(),
         }
     }
@@ -333,7 +333,7 @@ fn encode_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
 /// Branch: `SHA256(varint(height) || varint(size) || varint(version) || encode_bytes(left_hash) ||
 /// encode_bytes(right_hash))` Leaf:   `SHA256(varint(0) || varint(1) || varint(version) ||
 /// encode_bytes(key) || encode_bytes(SHA256(value)))`
-fn compute_hash(node: &Node) -> Vec<u8> {
+fn compute_hash(node: &Node) -> [u8; 32] {
     let mut data = Vec::with_capacity(128);
 
     encode_varint_signed(node.height() as i64, &mut data);
@@ -351,7 +351,7 @@ fn compute_hash(node: &Node) -> Vec<u8> {
         encode_bytes(right_hash, &mut data);
     }
 
-    Sha256::digest(&data).to_vec()
+    Sha256::digest(&data).into()
 }
 
 // ---------------------------------------------------------------------------

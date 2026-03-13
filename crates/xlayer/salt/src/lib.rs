@@ -17,4 +17,5 @@ pub mod convert;
 pub mod flat_store;
 pub mod mdbx_store;
 pub mod rocks_store;
+pub mod seidb_adapter;
 pub mod state_root;

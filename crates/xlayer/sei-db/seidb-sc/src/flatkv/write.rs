@@ -59,32 +59,19 @@ impl CommitStore {
                         let old_value = self.get_storage_last_value(key_bytes)?;
 
                         let key_vec = key_bytes.to_vec();
-                        if pair.delete {
-                            self.storage_writes.insert(
-                                key_vec,
-                                PendingKvWrite {
-                                    key: key_bytes.to_vec(),
-                                    value: Vec::new(),
-                                    is_delete: true,
-                                },
-                            );
-                        } else {
-                            self.storage_writes.insert(
-                                key_vec,
-                                PendingKvWrite {
-                                    key: key_bytes.to_vec(),
-                                    value: pair.value.clone(),
-                                    is_delete: false,
-                                },
-                            );
-                        }
+                        let value = if pair.delete { Vec::new() } else { pair.value.clone() };
 
                         storage_pairs.push(KvPairWithLastValue {
-                            key: key_bytes.to_vec(),
-                            value: pair.value.clone(),
+                            key: key_vec.clone(),
+                            value: value.clone(),
                             last_value: old_value.unwrap_or_default(),
                             delete: pair.delete,
                         });
+
+                        self.storage_writes.insert(
+                            key_vec.clone(),
+                            PendingKvWrite { key: key_vec, value, is_delete: pair.delete },
+                        );
                     }
 
                     EvmKeyKind::Nonce | EvmKeyKind::CodeHash => {
@@ -98,14 +85,13 @@ impl CommitStore {
                         let addr_key = addr.to_vec();
 
                         // Pre-capture: record old raw value BEFORE updating, only once per addr.
-                        if !old_account_raw_values.contains_key(&addr_key) {
-                            if let Some(paw) = self.account_writes.get(&addr_key) {
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            old_account_raw_values.entry(addr_key.clone())
+                        {
+                            if let Some(paw) = self.account_writes.get(entry.key()) {
                                 // Account already in pending from a previous apply — use its
                                 // already-captured last_raw_value to avoid phantom MixOut.
-                                old_account_raw_values.insert(
-                                    addr_key.clone(),
-                                    paw.last_raw_value.clone().unwrap_or_default(),
-                                );
+                                entry.insert(paw.last_raw_value.clone().unwrap_or_default());
                             } else {
                                 // Load from DB.
                                 let db = self.account_db.as_ref().ok_or_else(|| {
@@ -113,11 +99,11 @@ impl CommitStore {
                                 })?;
                                 match db.get(&account_key(&addr))? {
                                     Some(raw) => {
-                                        old_account_raw_values.insert(addr_key.clone(), raw);
+                                        entry.insert(raw);
                                     }
                                     None => {
                                         // New account — empty means no MixOut.
-                                        old_account_raw_values.insert(addr_key.clone(), Vec::new());
+                                        entry.insert(Vec::new());
                                     }
                                 }
                             }
@@ -159,64 +145,38 @@ impl CommitStore {
                         let old_value = self.get_code_last_value(key_bytes)?;
 
                         let key_vec = key_bytes.to_vec();
-                        if pair.delete {
-                            self.code_writes.insert(
-                                key_vec,
-                                PendingKvWrite {
-                                    key: key_bytes.to_vec(),
-                                    value: Vec::new(),
-                                    is_delete: true,
-                                },
-                            );
-                        } else {
-                            self.code_writes.insert(
-                                key_vec,
-                                PendingKvWrite {
-                                    key: key_bytes.to_vec(),
-                                    value: pair.value.clone(),
-                                    is_delete: false,
-                                },
-                            );
-                        }
+                        let value = if pair.delete { Vec::new() } else { pair.value.clone() };
 
                         code_pairs.push(KvPairWithLastValue {
-                            key: key_bytes.to_vec(),
-                            value: pair.value.clone(),
+                            key: key_vec.clone(),
+                            value: value.clone(),
                             last_value: old_value.unwrap_or_default(),
                             delete: pair.delete,
                         });
+
+                        self.code_writes.insert(
+                            key_vec.clone(),
+                            PendingKvWrite { key: key_vec, value, is_delete: pair.delete },
+                        );
                     }
 
                     EvmKeyKind::Legacy => {
                         let old_value = self.get_legacy_last_value(key_bytes)?;
 
                         let key_vec = key_bytes.to_vec();
-                        if pair.delete {
-                            self.legacy_writes.insert(
-                                key_vec,
-                                PendingKvWrite {
-                                    key: key_bytes.to_vec(),
-                                    value: Vec::new(),
-                                    is_delete: true,
-                                },
-                            );
-                        } else {
-                            self.legacy_writes.insert(
-                                key_vec,
-                                PendingKvWrite {
-                                    key: key_bytes.to_vec(),
-                                    value: pair.value.clone(),
-                                    is_delete: false,
-                                },
-                            );
-                        }
+                        let value = if pair.delete { Vec::new() } else { pair.value.clone() };
 
                         legacy_pairs.push(KvPairWithLastValue {
-                            key: key_bytes.to_vec(),
-                            value: pair.value.clone(),
+                            key: key_vec.clone(),
+                            value: value.clone(),
                             last_value: old_value.unwrap_or_default(),
                             delete: pair.delete,
                         });
+
+                        self.legacy_writes.insert(
+                            key_vec.clone(),
+                            PendingKvWrite { key: key_vec, value, is_delete: pair.delete },
+                        );
                     }
                 }
             }
@@ -255,30 +215,34 @@ impl CommitStore {
         &mut self,
         addr: &Address,
     ) -> Result<&mut PendingAccountWrite> {
+        use std::collections::hash_map::Entry;
+
         let addr_key = addr.to_vec();
+        match self.account_writes.entry(addr_key) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                // Load existing account value from DB (or default for new accounts).
+                let db = self
+                    .account_db
+                    .as_ref()
+                    .ok_or_else(|| SeiDbError::Other("account_db not open".into()))?;
 
-        if !self.account_writes.contains_key(&addr_key) {
-            // Load existing account value from DB (or default for new accounts).
-            let db = self
-                .account_db
-                .as_ref()
-                .ok_or_else(|| SeiDbError::Other("account_db not open".into()))?;
+                let (value, last_raw_value) = match db.get(&account_key(addr))? {
+                    Some(raw) => {
+                        let av = decode_account_value(&raw)?;
+                        (av, Some(raw))
+                    }
+                    None => (AccountValue::default(), None),
+                };
 
-            let (value, last_raw_value) = match db.get(&account_key(addr))? {
-                Some(raw) => {
-                    let av = decode_account_value(&raw)?;
-                    (av, Some(raw))
-                }
-                None => (AccountValue::default(), None),
-            };
-
-            self.account_writes.insert(
-                addr_key.clone(),
-                PendingAccountWrite { addr: *addr, value, is_delete: false, last_raw_value },
-            );
+                Ok(entry.insert(PendingAccountWrite {
+                    addr: *addr,
+                    value,
+                    is_delete: false,
+                    last_raw_value,
+                }))
+            }
         }
-
-        Ok(self.account_writes.get_mut(&addr_key).unwrap())
     }
 
     /// Returns the last (current) value for a storage key, checking pending

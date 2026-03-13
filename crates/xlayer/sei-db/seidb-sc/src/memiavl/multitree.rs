@@ -135,8 +135,9 @@ impl MultiTree {
             let Some(&idx) = self.trees_by_name.get(&cs.name) else {
                 continue;
             };
-            let pairs = changeset_to_pairs(cs);
-            self.trees[idx].tree.apply_change_set(&pairs);
+            if let Some(changeset) = &cs.changeset {
+                self.trees[idx].tree.apply_kvpairs(&changeset.pairs);
+            }
         }
         Ok(())
     }

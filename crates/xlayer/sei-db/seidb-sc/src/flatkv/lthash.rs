@@ -116,6 +116,25 @@ impl LtHash {
         buf[off..off + value_len].copy_from_slice(value);
         Some(buf)
     }
+
+    /// Like [`serialize_kv`] but writes into a reusable buffer to avoid
+    /// per-call heap allocation. Returns `true` if serialization succeeded.
+    #[allow(dead_code)]
+    pub(crate) fn serialize_kv_into(buf: &mut Vec<u8>, key: &[u8], value: &[u8]) -> bool {
+        if key.is_empty() || value.is_empty() {
+            return false;
+        }
+        let key_len = key.len();
+        let value_len = value.len();
+        let total = 4 + key_len + 4 + value_len;
+        buf.clear();
+        buf.reserve(total);
+        buf.extend_from_slice(&(key_len as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&(value_len as u32).to_le_bytes());
+        buf.extend_from_slice(value);
+        true
+    }
 }
 
 impl Default for LtHash {

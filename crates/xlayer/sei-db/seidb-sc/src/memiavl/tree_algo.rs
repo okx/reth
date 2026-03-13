@@ -17,38 +17,42 @@ pub fn set_recursive(
     version: u32,
     cow_version: u32,
 ) -> (NodeRef, bool) {
+    set_recursive_owned(node, key.to_vec(), value.to_vec(), version, cow_version)
+}
+
+/// Like [`set_recursive`] but takes owned key/value to avoid cloning when the
+/// caller already has owned `Vec<u8>` data (e.g. from `apply_change_set`).
+pub fn set_recursive_owned(
+    node: Option<NodeRef>,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    version: u32,
+    cow_version: u32,
+) -> (NodeRef, bool) {
     let node_ref = match node {
         None => {
-            let leaf = MemNode::new_leaf_node(key.to_vec(), value.to_vec(), version);
+            let leaf = MemNode::new_leaf_node(key, value, version);
             return (Arc::new(Node::Mem(leaf)), false);
         }
         Some(n) => n,
     };
 
     if node_ref.is_leaf() {
-        match key.cmp(node_ref.key()) {
+        match key.as_slice().cmp(node_ref.key()) {
             Ordering::Less => {
-                let new_leaf = Arc::new(Node::Mem(MemNode::new_leaf_node(
-                    key.to_vec(),
-                    value.to_vec(),
-                    version,
-                )));
+                let new_leaf = Arc::new(Node::Mem(MemNode::new_leaf_node(key, value, version)));
                 let branch = MemNode::new_branch_node(new_leaf, node_ref, version);
                 return (Arc::new(Node::Mem(branch)), false);
             }
             Ordering::Greater => {
-                let new_leaf = Arc::new(Node::Mem(MemNode::new_leaf_node(
-                    key.to_vec(),
-                    value.to_vec(),
-                    version,
-                )));
+                let new_leaf = Arc::new(Node::Mem(MemNode::new_leaf_node(key, value, version)));
                 let branch = MemNode::new_branch_node(node_ref, new_leaf, version);
                 return (Arc::new(Node::Mem(branch)), false);
             }
             Ordering::Equal => {
                 // Update existing leaf value.
                 let mut mem = Node::into_mem_node(node_ref, version);
-                mem.value = value.to_vec();
+                mem.value = value;
                 return (Arc::new(Node::Mem(mem)), true);
             }
         }
@@ -56,18 +60,19 @@ pub fn set_recursive(
 
     // Branch node — recurse into the appropriate child.
     let node_key = node_ref.key();
-    let go_left = key < node_key;
+    let go_left = key.as_slice() < node_key;
 
     let mut mem = Node::into_mem_node(node_ref, version);
 
     let updated = if go_left {
         let left_child = mem.left.take();
-        let (new_left, updated) = set_recursive(left_child, key, value, version, cow_version);
+        let (new_left, updated) = set_recursive_owned(left_child, key, value, version, cow_version);
         mem.left = Some(new_left);
         updated
     } else {
         let right_child = mem.right.take();
-        let (new_right, updated) = set_recursive(right_child, key, value, version, cow_version);
+        let (new_right, updated) =
+            set_recursive_owned(right_child, key, value, version, cow_version);
         mem.right = Some(new_right);
         updated
     };
@@ -102,38 +107,41 @@ pub fn remove_recursive(
         return (None, Some(node), None);
     }
 
-    // Branch node.
-    let node_key = node.key();
+    // Branch node — convert to MemNode first, then take children to avoid Arc clones.
+    let go_left = key < node.key();
+    let mut mem = Node::into_mem_node(node, version);
 
-    if key < node_key {
-        let left = node.left().expect("branch node must have left child").clone();
+    if go_left {
+        let left = mem.left.take().expect("branch node must have left child");
         let (value, new_left, new_key) = remove_recursive(left, key, version, cow_version);
         if value.is_none() {
-            // Key not found — tree unchanged.
-            return (None, Some(node), None);
+            // Key not found — restore left and return original node.
+            mem.left = new_left;
+            return (None, Some(Arc::new(Node::Mem(mem))), None);
         }
         if new_left.is_none() {
             // Left child removed entirely — promote right child.
-            let right = node.right().expect("branch node must have right child").clone();
-            return (value, Some(right), Some(node_key.to_vec()));
+            let right = mem.right.take().expect("branch node must have right child");
+            let key_copy = mem.key.clone();
+            return (value, Some(right), Some(key_copy));
         }
-        let mut mem = Node::into_mem_node(node, version);
         mem.left = new_left;
         mem.update_height_size();
         let balanced = rebalance(mem, version, cow_version);
         (value, Some(Arc::new(Node::Mem(balanced))), new_key)
     } else {
-        let right = node.right().expect("branch node must have right child").clone();
+        let right = mem.right.take().expect("branch node must have right child");
         let (value, new_right, new_key) = remove_recursive(right, key, version, cow_version);
         if value.is_none() {
-            return (None, Some(node), None);
+            // Key not found — restore right and return original node.
+            mem.right = new_right;
+            return (None, Some(Arc::new(Node::Mem(mem))), None);
         }
         if new_right.is_none() {
             // Right child removed entirely — promote left child.
-            let left = node.left().expect("branch node must have left child").clone();
+            let left = mem.left.take().expect("branch node must have left child");
             return (value, Some(left), None);
         }
-        let mut mem = Node::into_mem_node(node, version);
         mem.right = new_right;
         if let Some(ref nk) = new_key {
             mem.key = nk.clone();
@@ -246,10 +254,10 @@ pub fn hash_node(node: &Node) -> Vec<u8> {
 ///
 /// Returns `true` if the hash matches (or is not yet cached), `false` on mismatch.
 pub fn verify_hash(node: &Node) -> bool {
-    let cached = node.hash().to_vec();
+    let cached = node.hash();
     // Recompute by creating a fresh node with the same data but no cached hash.
     let recomputed = recompute_hash(node);
-    cached == recomputed
+    cached == recomputed.as_slice()
 }
 
 /// Recompute the hash from scratch without using any cache.
@@ -266,10 +274,10 @@ fn recompute_hash(node: &Node) -> Vec<u8> {
         let value_hash = Sha256::digest(node.value());
         encode_bytes(&value_hash, &mut data);
     } else {
-        let left_hash = node.left().map(|l| l.hash().to_vec()).unwrap_or_default();
-        let right_hash = node.right().map(|r| r.hash().to_vec()).unwrap_or_default();
-        encode_bytes(&left_hash, &mut data);
-        encode_bytes(&right_hash, &mut data);
+        let left_hash = node.left().map(|l| l.hash()).unwrap_or(&[]);
+        let right_hash = node.right().map(|r| r.hash()).unwrap_or(&[]);
+        encode_bytes(left_hash, &mut data);
+        encode_bytes(right_hash, &mut data);
     }
 
     Sha256::digest(&data).to_vec()

@@ -26,7 +26,7 @@ impl CommitStore {
         // Step 1: Write WAL — always sync, source of truth for crash recovery.
         let changelog_entry = ChangelogEntry {
             version,
-            changesets: self.pending_change_sets.clone(),
+            changesets: std::mem::take(&mut self.pending_change_sets),
             upgrades: vec![],
         };
         let changelog = self

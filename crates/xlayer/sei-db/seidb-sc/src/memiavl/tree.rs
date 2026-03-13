@@ -3,7 +3,7 @@ use crate::memiavl::{
     rate_limiter::RateLimiter,
     snapshot::Snapshot,
     snapshot_writer,
-    tree_algo::{remove_recursive, set_recursive},
+    tree_algo::{remove_recursive, set_recursive, set_recursive_owned},
 };
 use seidb_common::error::Result;
 use sha2::{Digest, Sha256};
@@ -81,6 +81,15 @@ impl Tree {
         self.root = Some(new_root);
     }
 
+    /// Like [`set`] but takes owned key/value to avoid allocation when the
+    /// caller already has `Vec<u8>` data.
+    pub fn set_owned(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        let ver = self.next_version_u32();
+        let (new_root, _updated) =
+            set_recursive_owned(self.root.take(), key, value, ver, self.cow_version);
+        self.root = Some(new_root);
+    }
+
     /// Remove a key from the tree.
     ///
     /// Returns `Some(value)` if the key was found and removed, `None` otherwise.
@@ -100,6 +109,31 @@ impl Tree {
                 None => {
                     self.remove(key);
                 }
+            }
+        }
+    }
+
+    /// Like [`apply_change_set`] but consumes the changeset, passing owned
+    /// key/value data through to avoid cloning.
+    pub fn apply_change_set_owned(&mut self, changes: Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+        for (key, value_opt) in changes {
+            match value_opt {
+                Some(value) => self.set_owned(key, value),
+                None => {
+                    self.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Apply changes directly from protobuf `KvPair` slice, avoiding
+    /// the intermediate `Vec<(Vec<u8>, Option<Vec<u8>>)>` allocation.
+    pub fn apply_kvpairs(&mut self, pairs: &[seidb_proto::KvPair]) {
+        for pair in pairs {
+            if pair.delete {
+                self.remove(&pair.key);
+            } else {
+                self.set(&pair.key, &pair.value);
             }
         }
     }
@@ -141,7 +175,7 @@ impl Tree {
 
         let handle = std::thread::spawn(move || {
             for changes in rx {
-                worker_tree.apply_change_set(&changes);
+                worker_tree.apply_change_set_owned(changes);
                 let _ = worker_tree.save_version(false);
             }
             worker_tree
