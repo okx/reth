@@ -459,25 +459,6 @@ impl MultiTree {
     }
 }
 
-/// Convert a `NamedChangeSet` into the `(key, Option<value>)` format expected
-/// by `Tree::apply_change_set`.
-fn changeset_to_pairs(cs: &NamedChangeSet) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
-    let Some(changeset) = &cs.changeset else {
-        return Vec::new();
-    };
-    changeset
-        .pairs
-        .iter()
-        .map(|pair| {
-            if pair.delete {
-                (pair.key.clone(), None)
-            } else {
-                (pair.key.clone(), Some(pair.value.clone()))
-            }
-        })
-        .collect()
-}
-
 /// Read and decode the `MultiTreeMetadata` protobuf from the metadata file.
 pub fn read_metadata(dir: &Path) -> Result<MultiTreeMetadata> {
     let bz = fs::read(dir.join(METADATA_FILE_NAME))?;

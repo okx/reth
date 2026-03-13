@@ -1,6 +1,6 @@
 use crate::memiavl::{
     arena::{resolve_mem_node, FrozenArena, MutableArena, NodeIdx},
-    node::{Node, NodeRef},
+    node::Node,
     snapshot::Snapshot,
     tree::Tree,
     tree_algo::compute_hash_recursive,
@@ -30,53 +30,7 @@ struct PathNode {
     right: Vec<u8>,
 }
 
-/// Walk from `node` down to the leaf matching `key`, collecting inner-node
-/// path entries along the way. Returns `(path, leaf_node)` or an error if
-/// the key is not found.
-fn path_to_leaf(
-    node: &NodeRef,
-    key: &[u8],
-) -> std::result::Result<(Vec<PathNode>, NodeRef), String> {
-    let mut path = Vec::new();
-    let mut current = node.clone();
-
-    loop {
-        let h = current.height();
-        if h == 0 {
-            // Leaf node -- check key match.
-            if current.key() == key {
-                return Ok((path, current));
-            }
-            return Err("key does not exist".to_string());
-        }
-
-        let height = h as i8;
-
-        if key < current.key() {
-            // Go left; record right sibling hash.
-            let right = current.right().expect("branch node must have right child");
-            path.push(PathNode {
-                height,
-                size: current.size(),
-                version: current.version() as i64,
-                left: Vec::new(),
-                right: right.safe_hash(),
-            });
-            current = current.left().expect("branch node must have left child").clone();
-        } else {
-            // Go right; record left sibling hash.
-            let left = current.left().expect("branch node must have left child");
-            path.push(PathNode {
-                height,
-                size: current.size(),
-                version: current.version() as i64,
-                left: left.safe_hash(),
-                right: Vec::new(),
-            });
-            current = current.right().expect("branch node must have right child").clone();
-        }
-    }
-}
+// Old Arc-based path_to_leaf removed — replaced by path_to_leaf_arena above.
 
 // ---------------------------------------------------------------------------
 // Arena-based path-to-leaf
@@ -362,19 +316,7 @@ fn convert_inner_ops(path: &[PathNode]) -> Vec<InnerOp> {
     steps
 }
 
-/// Create an `ExistenceProof` for the given key in the tree rooted at `root`.
-fn create_existence_proof(
-    root: &NodeRef,
-    key: &[u8],
-) -> std::result::Result<ExistenceProof, String> {
-    let (path, leaf) = path_to_leaf(root, key)?;
-    Ok(ExistenceProof {
-        key: leaf.key().to_vec(),
-        value: leaf.value().to_vec(),
-        leaf: Some(convert_leaf_op(leaf.version() as i64)),
-        path: convert_inner_ops(&path),
-    })
-}
+// Old Arc-based create_existence_proof removed — replaced by create_existence_proof_arena above.
 
 // ---------------------------------------------------------------------------
 // get_with_index -- returns the insertion-point index even for missing keys
