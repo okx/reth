@@ -2,16 +2,17 @@ use crossbeam_channel::Receiver;
 use seidb_common::error::Result;
 use seidb_proto::NamedChangeSet;
 use seidb_traits::{iterator::DbIterator, ss::StateStore, types::SnapshotNode};
+use std::sync::Arc;
 
 /// Thin wrapper that delegates all [`StateStore`] operations to an inner implementation.
 ///
 /// This is the SS-layer adapter for the main Cosmos state (all non-EVM modules).
 pub struct CosmosStateStore {
-    db: Box<dyn StateStore>,
+    db: Arc<dyn StateStore>,
 }
 
 impl CosmosStateStore {
-    pub fn new(db: Box<dyn StateStore>) -> Self {
+    pub fn new(db: Arc<dyn StateStore>) -> Self {
         Self { db }
     }
 }
@@ -86,7 +87,13 @@ impl StateStore for CosmosStateStore {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.db.close()
+        // Try to get exclusive access for close. If other refs exist
+        // (e.g. async writer thread), close will happen on final Arc drop.
+        if let Some(db) = Arc::get_mut(&mut self.db) {
+            db.close()
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -125,7 +132,7 @@ mod tests {
     fn open_cosmos(dir: &std::path::Path) -> CosmosStateStore {
         let cfg = test_config(dir);
         let db = MvccDatabase::open_db(&cfg).unwrap();
-        CosmosStateStore::new(Box::new(db))
+        CosmosStateStore::new(Arc::new(db))
     }
 
     #[test]

@@ -38,7 +38,16 @@ impl CompositeStateStore {
         // Open Cosmos MVCC database.
         let db = MvccDatabase::open_db(config)
             .map_err(|e| SeiDbError::Other(format!("failed to create cosmos MVCC DB: {e}")))?;
-        let cosmos_store = CosmosStateStore::new(Box::new(db));
+
+        // Wrap in Arc and initialize async writer if configured.
+        let db_arc: Arc<MvccDatabase> = Arc::new(db);
+        if config.async_write_buffer > 0 {
+            db_arc
+                .init_async_writer()
+                .map_err(|e| SeiDbError::Other(format!("init async writer: {e}")))?;
+        }
+
+        let cosmos_store = CosmosStateStore::new(db_arc);
 
         let mut cs = Self {
             cosmos_store,

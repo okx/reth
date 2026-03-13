@@ -106,17 +106,11 @@ impl MvccDatabase {
     ) {
         for msg in rx {
             if let Some(done) = msg.done {
-                // Barrier message — signal the waiter and continue
                 let _ = done.send(());
                 continue;
             }
-
             if let Err(e) = db.apply_changeset_sync(msg.version, &msg.changesets) {
-                tracing::warn!(
-                    version = msg.version,
-                    error = %e,
-                    "async write failed"
-                );
+                tracing::warn!(version = msg.version, error = %e, "async write failed");
             }
         }
     }

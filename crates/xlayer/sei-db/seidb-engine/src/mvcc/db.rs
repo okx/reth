@@ -114,10 +114,10 @@ impl MvccDatabase {
     ///
     /// Must be called after wrapping in `Arc`. Sets up a bounded channel
     /// with capacity `config.async_write_buffer` and spawns a background
-    /// thread that consumes from it.
+    /// thread that consumes changesets and applies them synchronously.
     ///
     /// # Safety
-    /// Uses interior pointer mutation to set fields on the Arc'd struct.
+    /// Uses interior pointer mutation to set `pending_changes_tx`.
     /// Must only be called once, before any concurrent access begins.
     pub fn init_async_writer(self: &Arc<Self>) -> Result<()> {
         let buffer = self.config.async_write_buffer;

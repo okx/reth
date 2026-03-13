@@ -942,6 +942,52 @@ fn bench_seidb_full_stack(c: &mut Criterion) {
         })
     });
 
+    // --- SC + SS async (parallel SC, fire-and-forget SS) ---
+    let mut full_async_state: Option<(SeiDb, tempfile::TempDir)> = None;
+    group.bench_function(BenchmarkId::new("sc_plus_ss_async_parallel", &label), |b| {
+        let (db, _dir) = full_async_state.get_or_insert_with(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = setup_seidb_full_stack(dir.path(), WriteMode::CosmosOnly, &pre_pop, true);
+            (db, dir)
+        });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for i in 0..iters {
+                let mut block_stats = Vec::with_capacity(block_bundles.len());
+                let iter_start = Instant::now();
+                for bundle in &block_bundles {
+                    let block_start = Instant::now();
+                    let changesets = seidb_adapter::bundle_to_multimodule_changesets(bundle);
+                    let state_changes = bundle_state_changes(bundle);
+
+                    let apply_start = Instant::now();
+                    db.sc_mut().apply_change_sets(&changesets).unwrap();
+                    let apply_time = apply_start.elapsed();
+
+                    let commit_start = Instant::now();
+                    let ver = db.sc_mut().commit().unwrap();
+                    // Async SS write — fire and forget, background thread handles it
+                    if let Some(ss) = db.ss() {
+                        ss.apply_changeset_async(ver, &changesets).unwrap();
+                    }
+                    let commit_time = commit_start.elapsed();
+
+                    block_stats.push(BlockStats {
+                        wall_time: block_start.elapsed(),
+                        apply_time,
+                        commit_time,
+                        state_changes,
+                    });
+                }
+                total += iter_start.elapsed();
+                if i == 0 {
+                    print_stats("SC + SS Async Parallel (9 modules)", &block_stats);
+                }
+            }
+            total
+        })
+    });
+
     // --- SC + SS with MDBX backend (parallel 9 modules) ---
     let mut full_mdbx_state: Option<(SeiDb, tempfile::TempDir)> = None;
     group.bench_function(BenchmarkId::new("sc_plus_ss_mdbx_parallel", &label), |b| {
