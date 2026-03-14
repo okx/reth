@@ -328,12 +328,14 @@ where
         }
 
         let total_slots = total_slots(&bal);
+        let total_entries = bal.len();
 
-        trace!(
+        debug!(
             target: "engine::tree::payload_processor::prewarm",
             total_slots,
+            total_entries,
             max_concurrency = self.max_concurrency,
-            "Starting BAL prewarm"
+            "Starting BAL prewarm — prefetching EIP-2930 access list slots"
         );
 
         if total_slots == 0 {
@@ -376,11 +378,14 @@ where
             completed_workers += 1;
         }
 
-        trace!(
+        debug!(
             target: "engine::tree::payload_processor::prewarm",
             completed_workers,
+            total_slots,
             "All BAL prewarm workers completed"
         );
+
+        self.ctx.metrics.bal_slots_prefetched.increment(total_slots as u64);
 
         // Signal that execution has finished
         let _ = actions_tx.send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: 0 });
@@ -863,4 +868,6 @@ pub(crate) struct PrewarmMetrics {
     pub(crate) transaction_errors: Counter,
     /// A histogram of BAL slot iteration duration during prefetching
     pub(crate) bal_slot_iteration_duration: Histogram,
+    /// Total storage slots prefetched via BAL across all workers
+    pub(crate) bal_slots_prefetched: Counter,
 }

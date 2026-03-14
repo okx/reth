@@ -425,13 +425,34 @@ where
         // Get an iterator over the transactions in the payload
         let txs = self.tx_iterator_for(&input)?;
 
-        // Extract the BAL, if valid and available
+        // Extract the BAL built from EIP-2930 access lists in the block's transactions.
+        // Returns None if no transactions carry access list entries.
         let block_access_list = ensure_ok!(input
             .block_access_list()
             .transpose()
             // Eventually gets converted to a `InsertBlockErrorKind::Other`
             .map_err(Box::<dyn std::error::Error + Send + Sync>::from))
         .map(Arc::new);
+
+        if let Some(bal) = &block_access_list {
+            let total_slots: usize = bal
+                .iter()
+                .map(|a| a.storage_reads.len() + a.storage_changes.len())
+                .sum();
+            debug!(
+                target: "engine::tree",
+                block_hash = %input.hash(),
+                entries = bal.len(),
+                total_slots,
+                "Sending EIP-2930 access list BAL to prefetcher"
+            );
+        } else {
+            trace!(
+                target: "engine::tree",
+                block_hash = %input.hash(),
+                "No EIP-2930 access lists found in block — BAL prefetch skipped"
+            );
+        }
 
         // Create lazy overlay from ancestors - this doesn't block, allowing execution to start
         // before the trie data is ready. The overlay will be computed on first access.
