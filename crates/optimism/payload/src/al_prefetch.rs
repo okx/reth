@@ -1,8 +1,9 @@
 //! Access-list-driven prefetch into [`CachedReads`].
 //!
 //! At block build time, iterates all pending pool transactions, extracts every
-//! EIP-2930 access list entry, and pre-loads the referenced accounts and storage
-//! slots into [`CachedReads`] via sequential MDBX reads.
+//! EIP-2930 access list entry, deduplicates the keys, and pre-loads the
+//! referenced accounts and storage slots into [`CachedReads`] via sequential
+//! MDBX reads.
 //!
 //! When enabled (`TXPOOL_AL_PREFETCH_ONLY=true`), this fires inside
 //! `build_payload()` before the EVM is handed the state database, so every
@@ -15,16 +16,26 @@
 //! build_payload()
 //!   ├── state_provider = StateProviderDatabase::new(...)   (existing)
 //!   ├── prefetch_from_pool(pool, cached_reads, state)      ← THIS MODULE
-//!   │     for each pending TX with EIP-2930 access list:
-//!   │       preload.basic(address)           → MDBX read, cached
-//!   │       preload.storage(address, slot)   → MDBX read, cached
+//!   │     Pass 1 — key extraction (no MDBX):
+//!   │       for each pending TX with EIP-2930 access list:
+//!   │         unique_accounts.insert(address)
+//!   │         unique_slots.insert((address, slot))
+//!   │     Pass 2 — MDBX reads (deduplicated):
+//!   │       for each unique address:
+//!   │         preload.basic(address)           → MDBX read, cached
+//!   │       for each unique (address, slot):
+//!   │         preload.storage(address, slot)   → MDBX read, cached
 //!   └── builder.build(cached_reads.as_db_mut(state), ...)  (existing)
 //!         EVM reads: near-100% cache hits
 //! ```
 //!
 //! ## Design decisions
 //!
-//! - **Zero background workers** — all work is sequential on the block-build thread.
+//! - **Zero background workers** — all work is on the block-build thread.
+//! - **Deduplication before reads** — hot contracts (USDC, WETH) appear in
+//!   thousands of TXs; without dedup we'd call `basic(usdc)` thousands of times
+//!   even though only the first is an MDBX round-trip. A `HashSet` pass first
+//!   eliminates all redundant calls.
 //! - **Reuses `CachedReadsDbMut`** — standard reth cache layer; no new data structures.
 //! - **Best-effort** — errors from individual MDBX reads are silently ignored; the
 //!   EVM falls back to live MDBX reads for any missed entry.
@@ -32,7 +43,10 @@
 //!   at first call and cached in a [`OnceLock`].
 
 use alloy_consensus::Transaction as _;
-use alloy_primitives::U256;
+use alloy_primitives::{
+    map::{HashSet},
+    Address, U256,
+};
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
 use reth_storage_api::StateProvider;
 use reth_transaction_pool::TransactionPool;
@@ -68,9 +82,9 @@ pub fn is_enabled() -> bool {
 pub struct AlPrefetchStats {
     /// Number of pending TXs that had a non-empty EIP-2930 access list.
     pub tx_with_al: usize,
-    /// Total account entries loaded (one per unique address in all access lists).
+    /// Unique accounts loaded (one MDBX read per unique address).
     pub accounts_loaded: usize,
-    /// Total storage slots loaded.
+    /// Unique storage slots loaded (one MDBX read per unique (address, slot) pair).
     pub slots_loaded: usize,
     /// Wall-clock time for the entire prefetch call (key extraction + MDBX reads).
     pub elapsed_us: u64,
@@ -79,13 +93,17 @@ pub struct AlPrefetchStats {
 /// Pre-populate `cached_reads` from the EIP-2930 access lists of all pending
 /// pool transactions.
 ///
-/// For every pending transaction that carries a non-empty access list:
-/// - `basic(address)` is called for each declared address → loads account info
-/// - `storage(address, slot)` is called for each declared slot → loads value
+/// ## Two-pass approach
 ///
-/// The [`CachedReadsDbMut`] wrapper caches each MDBX result in `cached_reads`
-/// automatically. When the EVM later calls the same addresses/slots it gets
-/// in-memory hits instead of MDBX round-trips.
+/// **Pass 1** (no I/O): iterate all pending TXs and collect unique addresses
+/// and `(address, slot)` pairs into `HashSet`s. Hot contracts like USDC/WETH
+/// appear in thousands of transactions; deduplicating here means we issue
+/// exactly one MDBX read per unique key regardless of mempool size.
+///
+/// **Pass 2** (MDBX reads): iterate the deduplicated sets and call
+/// `preload.basic(address)` / `preload.storage(address, slot)` once each.
+/// The [`CachedReadsDbMut`] wrapper stores each result in `cached_reads`
+/// automatically. The EVM later gets in-memory hits instead of MDBX round-trips.
 ///
 /// # Errors
 ///
@@ -102,45 +120,50 @@ where
 {
     let start = std::time::Instant::now();
 
-    // Wrap state_provider in a CachedReadsDbMut.
-    // Every MDBX read inside this block is automatically stored in cached_reads.
-    // We drop `preload` before returning so that cached_reads is usable again
-    // by the main block build path.
-    let db = StateProviderDatabase::new(state_provider);
-    let mut preload = cached_reads.as_db_mut(db);
+    // ── Pass 1: key extraction (no MDBX, no allocations beyond the sets) ──
 
     let mut tx_with_al = 0usize;
-    let mut accounts_loaded = 0usize;
-    let mut slots_loaded = 0usize;
+    let mut unique_accounts: HashSet<Address> = HashSet::default();
+    let mut unique_slots: HashSet<(Address, U256)> = HashSet::default();
 
     for valid_tx in pool.pending_transactions() {
-        // Deref Arc → ValidPoolTransaction → .transaction (Pool::Transaction: PoolTransaction)
         let Some(al) = valid_tx.transaction.access_list() else { continue };
         if al.0.is_empty() {
             continue;
         }
-
         tx_with_al += 1;
-
         for item in &al.0 {
-            // Load account (nonce, balance, code hash) — miss triggers MDBX read
-            // and populates cached_reads.accounts entry.
-            let _ = preload.basic(item.address);
-            accounts_loaded += 1;
-
-            // Load each declared storage slot.
-            // CachedReadsDbMut::storage() finds the already-loaded account and
-            // issues a targeted MDBX read only for the slot value.
+            unique_accounts.insert(item.address);
             for key in &item.storage_keys {
-                let _ = preload.storage(item.address, U256::from_be_bytes(key.0));
-                slots_loaded += 1;
+                unique_slots.insert((item.address, U256::from_be_bytes(key.0)));
             }
         }
     }
 
-    // Drop the CachedReadsDbMut borrow — cached_reads is free to use again.
+    if tx_with_al == 0 {
+        return AlPrefetchStats::default();
+    }
+
+    // ── Pass 2: MDBX reads on deduplicated keys ──
+    //
+    // Wrap state_provider in a CachedReadsDbMut so every read is automatically
+    // stored in cached_reads. Drop `preload` before returning so the borrow ends.
+
+    let db = StateProviderDatabase::new(state_provider);
+    let mut preload = cached_reads.as_db_mut(db);
+
+    for &addr in &unique_accounts {
+        let _ = preload.basic(addr);
+    }
+
+    for &(addr, slot) in &unique_slots {
+        let _ = preload.storage(addr, slot);
+    }
+
     drop(preload);
 
+    let accounts_loaded = unique_accounts.len();
+    let slots_loaded = unique_slots.len();
     let elapsed_us = start.elapsed().as_micros() as u64;
 
     // Emit Prometheus metrics.
