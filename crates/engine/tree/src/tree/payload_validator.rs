@@ -439,7 +439,7 @@ where
                 .iter()
                 .map(|a| a.storage_reads.len() + a.storage_changes.len())
                 .sum();
-            debug!(
+            info!(
                 target: "engine::tree",
                 block_hash = %input.hash(),
                 entries = bal.len(),
