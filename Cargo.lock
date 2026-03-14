@@ -11462,6 +11462,7 @@ dependencies = [
  "dashmap 6.1.0",
  "futures",
  "futures-util",
+ "libc",
  "metrics",
  "nohash-hasher",
  "parking_lot",

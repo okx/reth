@@ -549,10 +549,23 @@ where
         // Dedicated rayon thread pool for simulations.
         // Isolated from tokio's blocking pool so simulation work cannot starve
         // the payload processor (multiproof, execution) which also uses spawn_blocking.
+        //
+        // start_handler lowers each worker thread's OS niceness to +10 (below-normal).
+        // This ensures the kernel scheduler prefers execution threads over simulation
+        // workers during the ~400ms block-build window when both compete for CPU.
+        // Workers use leftover CPU cycles; zero coverage loss.
         let simulation_pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(config.num_workers)
                 .thread_name(|i| format!("pre-warm-sim-{i}"))
+                .start_handler(|_| {
+                    #[cfg(target_os = "linux")]
+                    // SAFETY: nice() only affects the calling thread's scheduling priority.
+                    // Return value (new niceness) is intentionally ignored.
+                    unsafe {
+                        libc::nice(10);
+                    }
+                })
                 .build()
                 .expect("Failed to build pre-warming simulation thread pool"),
         );

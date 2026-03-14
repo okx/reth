@@ -35,6 +35,7 @@ revm = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 ahash = { workspace = true, optional = true }
 nohash-hasher = { version = "0.2", optional = true }
+libc = { version = "0.2", optional = true }
 
 # ethereum
 alloy-eips = { workspace = true, features = ["kzg"] }
@@ -98,6 +99,7 @@ pre-warming = [
     "ahash",
     "nohash-hasher",
     "dep:rayon",
+    "dep:libc",
 ]  # Experimental: opt-in only for now
 serde = [
     "reth-execution-types/serde",
