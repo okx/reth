@@ -26,10 +26,7 @@ where
 {
     let start = std::time::Instant::now();
     let mut tx_count = 0usize;
-
-    // Pass 1: collect unique keys across all access lists — no I/O.
-    // Hot contracts (USDC, WETH) appear in many transactions; deduplicating
-    // here ensures each address/slot is read from MDBX exactly once.
+    
     let mut accounts: HashSet<Address> = HashSet::default();
     let mut slots: HashSet<(Address, U256)> = HashSet::default();
 
