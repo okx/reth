@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod al_prefetch;
 pub mod builder;
 pub use builder::OpPayloadBuilder;
 pub mod error;

@@ -223,6 +223,15 @@ where
         let builder = OpBuilder::new(best);
 
         let state_provider = self.client.state_by_block_hash(ctx.parent().hash())?;
+
+        // AL prefetch: pre-populate cached_reads from EIP-2930 access lists in the
+        // pending pool before handing state to the EVM. Zero background workers —
+        // all MDBX reads happen here, sequentially, in < 50ms.
+        // Enabled by setting TXPOOL_AL_PREFETCH_ONLY=1 in the environment.
+        if !ctx.attributes().no_tx_pool() && crate::al_prefetch::is_enabled() {
+            crate::al_prefetch::prefetch_from_pool(&self.pool, &mut cached_reads, &state_provider);
+        }
+
         let state = StateProviderDatabase::new(&state_provider);
 
         if ctx.attributes().no_tx_pool() {
