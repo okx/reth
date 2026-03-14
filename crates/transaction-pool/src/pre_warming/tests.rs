@@ -149,7 +149,7 @@ fn test_module_exports() {
     let _config = PreWarmingConfig::default();
     let _cache = PreWarmedCache::new(PreWarmingConfig::default());
     let _keys = ExtractedKeys::new();
-    let _request = SimulationRequest::new(TxHash::random(), 42u64);
+    let _request = SimulationRequest::new(TxHash::random(), 42u64, 0);
 }
 
 /// # Test: End-to-End Key Aggregation Flow
@@ -820,7 +820,7 @@ mod e2e {
     #[test]
     fn test_simulation_request_lifecycle() {
         let tx_hash = TxHash::random();
-        let request = SimulationRequest::new(tx_hash, 42u64);
+        let request = SimulationRequest::new(tx_hash, 42u64, 0);
 
         assert_eq!(request.tx_hash, tx_hash);
         assert_eq!(request.transaction, 42u64);
@@ -1518,7 +1518,7 @@ mod benchmarks {
 
         let duration = measure(|| {
             for _ in 0..iterations {
-                let _ = SimulationRequest::new(TxHash::random(), ONE_ETH);
+                let _ = SimulationRequest::new(TxHash::random(), ONE_ETH, 0);
             }
         });
 

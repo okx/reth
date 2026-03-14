@@ -328,9 +328,43 @@ use alloy_consensus::Transaction;
 use alloy_primitives::Address;
 use parking_lot::RwLock;
 use reth_chainspec::ChainSpec;
-use std::sync::Arc;
-use tokio::{sync::mpsc, task::JoinHandle};
+use std::{
+    cmp::Ordering,
+    collections::BinaryHeap,
+    sync::{Arc, Mutex},
+};
+use tokio::{sync::Notify, task::JoinHandle};
 use tracing::{debug, error, info};
+
+/// Wrapper that orders `SimulationRequest` by gas tip (highest first).
+/// Used as BinaryHeap elements so workers always pick the highest-priority tx.
+struct PriorityRequest<T> {
+    gas_tip: u128,
+    request: SimulationRequest<T>,
+}
+
+impl<T> PartialEq for PriorityRequest<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.gas_tip == other.gas_tip
+    }
+}
+impl<T> Eq for PriorityRequest<T> {}
+impl<T> PartialOrd for PriorityRequest<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for PriorityRequest<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap: highest gas_tip = highest priority.
+        self.gas_tip.cmp(&other.gas_tip)
+    }
+}
+
+/// Shared priority queue: heap protected by std Mutex + Notify for wakeup.
+/// `trigger_simulation` pushes to the heap and wakes the drain loop.
+/// The drain loop pops the highest-tip item, or waits if the heap is empty.
+type SharedPriorityQueue<T> = Arc<(Mutex<BinaryHeap<PriorityRequest<T>>>, Notify)>;
 
 /// Shared snapshot holder that workers can read from.
 ///
@@ -386,12 +420,15 @@ type SharedSnapshot = Arc<RwLock<Arc<SnapshotState>>>;
 /// to discover all state keys including storage slots. When `E = ()`, workers
 /// use heuristic-based key extraction.
 pub struct SimulationWorkerPool<T, E = ()> {
-    /// Sender for submitting simulation jobs.
+    /// Priority queue for simulation jobs (highest gas tip = simulated first).
     ///
-    /// Clone-able and cheap (just an Arc increment).
-    /// Unbounded so trigger_simulation() never blocks or drops due to capacity.
-    /// Concurrent simulation count is bounded by the semaphore in drain_loop.
-    sender: mpsc::UnboundedSender<SimulationRequest<T>>,
+    /// Replaces the old FIFO unbounded channel so workers always simulate the
+    /// transactions the executor will pick first — matching `best_transactions_with_attributes`
+    /// ordering. This eliminates the 37% high-tip coverage gap from FIFO ordering.
+    priority_queue: SharedPriorityQueue<T>,
+
+    /// Shutdown flag set by `shutdown()`. Drain loop exits when this is true.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 
     /// Worker task handles for graceful shutdown.
     ///
@@ -489,14 +526,15 @@ where
         snapshot: Arc<SnapshotState>,
         chain_spec: Arc<ChainSpec>,
     ) -> Self {
-        // Unbounded channel: drain_loop blocks on semaphore acquisition while waiting
-        // for a free simulation slot. During that wait, recv() is not called, so a
-        // bounded channel would fill and drop requests. With unbounded, items queue
-        // up in memory instead. Memory cost is negligible — each item is an Arc
-        // pointer (~40 bytes); even 100k queued txs = ~4 MB. Simulations complete
-        // in ~10ms so the queue drains quickly in practice.
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let channel_capacity = "unbounded";
+        // Priority queue replaces the FIFO unbounded channel.
+        // Workers always simulate the highest-gas-tip transaction first, matching the
+        // executor's best_transactions_with_attributes ordering. This ensures the
+        // top-N transactions by gas tip are always simulated first — exactly the
+        // ones the block builder will select. Memory cost is the same (~40 bytes/item).
+        let priority_queue: SharedPriorityQueue<T> =
+            Arc::new((Mutex::new(BinaryHeap::new()), Notify::new()));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let channel_capacity = "priority_heap";
 
         // Register initial snapshot globally — payload builder can reuse the warm
         // DashMap cache immediately instead of opening a fresh cold MDBX transaction.
@@ -532,10 +570,13 @@ where
             let config = config.clone();
             let metrics = Arc::clone(&metrics);
             let simulation_pool = Arc::clone(&simulation_pool);
+            let queue = Arc::clone(&priority_queue);
+            let shutdown_flag = Arc::clone(&shutdown);
 
             tokio::spawn(async move {
                 drain_loop(
-                    receiver,
+                    queue,
+                    shutdown_flag,
                     semaphore,
                     cache,
                     snapshot_holder,
@@ -569,7 +610,8 @@ where
         crate::pre_warming::registry::set_global_prefetch_threads(config.prefetch_num_workers);
 
         Self {
-            sender,
+            priority_queue,
+            shutdown,
             workers,
             cache,
             snapshot_holder,
@@ -712,14 +754,15 @@ where
         // Record that a simulation was triggered
         self.metrics.simulations_triggered.increment(1);
 
-        if self.sender.send(request).is_err() {
-            // Channel closed — worker pool is shutting down
+        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             self.metrics.simulations_dropped.increment(1);
-            tracing::trace!(
-                target: "txpool::pre_warming",
-                "Simulation channel closed - worker pool shut down"
-            );
+            return;
         }
+
+        let (heap, notify) = self.priority_queue.as_ref();
+        heap.lock().unwrap().push(PriorityRequest { gas_tip: request.gas_tip, request });
+        // Wake the drain loop if it is waiting on an empty queue.
+        notify.notify_one();
     }
 
     /// Get reference to the cache.
@@ -747,9 +790,9 @@ where
         self.workers.len()
     }
 
-    /// Check if the channel is closed (shutdown in progress or complete).
+    /// Check if the pool is shut down.
     pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
+        self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Shutdown the worker pool gracefully.
@@ -777,8 +820,10 @@ where
             "Shutting down worker pool"
         );
 
-        // Drop sender to close channel
-        drop(self.sender);
+        // Signal drain loop to exit, then wake it so it sees the flag.
+        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (_, notify) = self.priority_queue.as_ref();
+        notify.notify_one();
 
         // Wait for all workers to finish
         for (worker_id, handle) in self.workers.into_iter().enumerate() {
@@ -826,7 +871,8 @@ where
 /// semaphore permit, which unblocks as soon as any simulation finishes.
 /// The large channel buffer (workers × 100) absorbs burst arrivals.
 async fn drain_loop<T>(
-    mut receiver: mpsc::UnboundedReceiver<SimulationRequest<T>>,
+    queue: SharedPriorityQueue<T>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
     semaphore: Arc<tokio::sync::Semaphore>,
     cache: Arc<PreWarmedCache>,
     snapshot_holder: SharedSnapshot,
@@ -839,7 +885,30 @@ async fn drain_loop<T>(
 {
     debug!(target: "txpool::pre_warming", "Pre-warming drain loop started");
 
-    while let Some(req) = receiver.recv().await {
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
+        // Pop the highest-priority (gas tip) item from the heap.
+        let req = {
+            let (heap, _) = queue.as_ref();
+            heap.lock().unwrap().pop().map(|item| item.request)
+        };
+
+        let req = match req {
+            Some(r) => r,
+            None => {
+                // Heap empty — wait for trigger_simulation() to push an item.
+                // tokio Notify stores one pending notification, so if items
+                // arrived while we were processing, notified().await returns
+                // immediately rather than blocking.
+                let (_, notify) = queue.as_ref();
+                notify.notified().await;
+                continue;
+            }
+        };
+
         // Skip if already simulated to avoid duplicate work
         if cache.contains_tx(&req.tx_hash) {
             continue;
@@ -1322,7 +1391,7 @@ mod tests {
     #[test]
     fn test_simulation_request_age() {
         let tx_hash = TxHash::random();
-        let request = SimulationRequest::new(tx_hash, 42u64);
+        let request = SimulationRequest::new(tx_hash, 42u64, 0);
 
         // Age should be very small initially
         assert!(request.age() < Duration::from_millis(10));

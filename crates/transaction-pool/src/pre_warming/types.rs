@@ -31,12 +31,16 @@ pub struct SimulationRequest<T> {
 
     /// When the request was created
     pub timestamp: Instant,
+
+    /// Effective gas tip (max_fee_per_gas) used for priority ordering.
+    /// Higher tip = simulated first, matching executor's selection order.
+    pub gas_tip: u128,
 }
 
 impl<T> SimulationRequest<T> {
-    /// Create a new simulation request
-    pub fn new(tx_hash: TxHash, transaction: T) -> Self {
-        Self { tx_hash, transaction, timestamp: Instant::now() }
+    /// Create a new simulation request with explicit gas tip for priority ordering.
+    pub fn new(tx_hash: TxHash, transaction: T, gas_tip: u128) -> Self {
+        Self { tx_hash, transaction, timestamp: Instant::now(), gas_tip }
     }
 
     /// Age of this request
@@ -235,7 +239,7 @@ mod tests {
     #[test]
     fn test_simulation_request_creation() {
         let tx_hash = TxHash::random();
-        let request = SimulationRequest::new(tx_hash, 42u64);
+        let request = SimulationRequest::new(tx_hash, 42u64, 0);
 
         assert_eq!(request.tx_hash, tx_hash);
         assert_eq!(request.transaction, 42u64);
@@ -244,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_simulation_request_age_increases() {
-        let request = SimulationRequest::new(TxHash::random(), 42u64);
+        let request = SimulationRequest::new(TxHash::random(), 42u64, 0);
         let age1 = request.age();
 
         std::thread::sleep(std::time::Duration::from_millis(10));

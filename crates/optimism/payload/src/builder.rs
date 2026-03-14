@@ -224,57 +224,55 @@ where
             cached_reads.set_metrics_callbacks(on_hit, on_miss);
         }
 
+        let ctx = OpPayloadBuilderCtx {
+            evm_config: self.evm_config.clone(),
+            builder_config: self.config.clone(),
+            bridge_intercept: self.bridge_intercept.clone(),
+            chain_spec: self.client.chain_spec(),
+            config,
+            cancel,
+            best_payload,
+        };
+
+        let builder = OpBuilder::new(best);
+
+        let state_provider = self.client.state_by_block_hash(ctx.parent().hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
+
         // Pre-warming: Prefetch state using keys discovered by background simulation.
         //
-        // build_payload is called every ~200ms per slot. We skip duplicate prefetch
-        // for the same parent block — subsequent calls already have warm CachedReads.
-        // We also reuse the simulation workers' warm SnapshotState instead of opening
-        // a fresh cold MDBX transaction: the DashMap cache already holds state queried
-        // during simulation, so prefetch queries become cheap in-memory hits.
+        // Runs AFTER ctx is built so we can use the correct basefee-filtered tx set —
+        // the same filter the executor applies at step 3.2. build_payload is called every
+        // ~200ms per slot; we skip duplicate prefetch for the same parent block so
+        // subsequent calls already have warm CachedReads. We reuse the simulation
+        // workers' warm SnapshotState instead of opening a fresh cold MDBX transaction:
+        // the DashMap cache already holds state from simulation, so prefetch queries
+        // become cheap in-memory hits.
         #[cfg(feature = "pre-warming")]
         {
-            let parent_hash = config.parent_header.hash();
+            let parent_hash = ctx.parent().hash();
 
             if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
                 if reth_transaction_pool::pre_warming::should_prefetch_for_parent(parent_hash, cache.len()) {
                     // Cap prefetch to estimated block capacity.
                     //
-                    // Prefetching the full mempool (15,000+ TXs) costs ~100ms even on a
-                    // warm DashMap because each TX contributes ~7 unique accounts and ~11
-                    // storage slots. With a diverse workload (unique senders/recipients)
-                    // deduplication saves little: 110,000 unique accounts × 1µs each ÷
-                    // 4 threads = 27ms just for lookups, plus 27ms serial CachedReads writes.
-                    // That 100ms overhead causes 290 prefetch ops × 100ms = 29s of wasted
-                    // time per benchmark run, reducing blocks/sec from 1.00 to 0.90.
-                    //
                     // A block holds ~8,000 transactions. Prefetching beyond that is wasted
-                    // work — those transactions will never be selected. Capping at 4,000
-                    // (≈0.5× block size to target <15ms prefetch) recovers the missed block
-                    // slots while still providing meaningful cache hits for the first half
-                    // of the block. The old 500-TX cap was too small (6% coverage); this
-                    // cap is calibrated to the block build time budget.
-                    //
-                    // Select the highest-priority TXs so the cap covers exactly what
-                    // the block builder will execute first. `best_transactions()` yields
-                    // pending transactions ordered by effective gas tip (highest first),
-                    // mirroring the block builder's own ordering. We take up to
-                    // PREFETCH_TX_CAP hashes, then look up only the simulated subset via
-                    // `get_keys_arcs` — unsimulated TXs are silently skipped (no penalty).
-                    //
-                    // This replaces the previous `get_all_keys_arcs().take(N)` which used
-                    // random DashMap iteration order, covering ~50% of the block by
-                    // accident rather than targeting the top-priority transactions.
-                    //
-                    // Cap is set to full block capacity (~8,000 TXs). At ~63% simulation
+                    // work — those transactions will never be selected. At ~63% simulation
                     // coverage, get_keys_arcs returns ~5,040 simulated entries → ~1.2M
                     // unique accounts → ~26ms prefetch. Total build stays ~222ms, well
-                    // within the 400ms slot (vs 196ms at 4K cap). Expected hit rate
-                    // improvement: 49% → ~58% as the unprefetched bottom half of the
-                    // block gains cache coverage.
+                    // within the 400ms slot.
                     const PREFETCH_TX_CAP: usize = 8_000;
+
+                    // Use basefee-filtered selection to match the executor's transaction set.
+                    // Parent basefee is within 12.5% of the next block's basefee (EIP-1559
+                    // max change per block), so this accurately targets the same transactions
+                    // step 3.2 will execute — avoiding wasted prefetch budget on transactions
+                    // that can't pay the current fee.
+                    let parent_basefee = ctx.parent().base_fee_per_gas().unwrap_or(0);
+                    let prefetch_attrs = BestTransactionsAttributes::new(parent_basefee, None);
                     let top_hashes: Vec<_> = self
                         .pool
-                        .best_transactions()
+                        .best_transactions_with_attributes(prefetch_attrs)
                         .take(PREFETCH_TX_CAP)
                         .map(|tx| *tx.hash())
                         .collect();
@@ -340,21 +338,6 @@ where
                 }
             }
         }
-
-        let ctx = OpPayloadBuilderCtx {
-            evm_config: self.evm_config.clone(),
-            builder_config: self.config.clone(),
-            bridge_intercept: self.bridge_intercept.clone(),
-            chain_spec: self.client.chain_spec(),
-            config,
-            cancel,
-            best_payload,
-        };
-
-        let builder = OpBuilder::new(best);
-
-        let state_provider = self.client.state_by_block_hash(ctx.parent().hash())?;
-        let state = StateProviderDatabase::new(&state_provider);
 
         if ctx.attributes().no_tx_pool() {
             builder.build(state, &state_provider, ctx)

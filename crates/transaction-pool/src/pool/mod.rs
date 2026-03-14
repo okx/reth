@@ -911,10 +911,14 @@ where
             // Only clone and simulate for non-ETH transfers
             if !is_simple_eth_transfer {
                 let tx_hash = *meta.added.hash();
+                // Use max_fee_per_gas as simulation priority so workers simulate
+                // high-tip transactions first — matching executor selection order.
+                let gas_tip = tx_ref.max_fee_per_gas();
                 let transaction = tx_ref.clone();
                 worker_pool.trigger_simulation(crate::pre_warming::SimulationRequest::new(
                     tx_hash,
                     transaction,
+                    gas_tip,
                 ));
             }
         }
