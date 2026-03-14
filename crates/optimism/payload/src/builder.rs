@@ -202,7 +202,7 @@ where
     fn build_payload<'a, Txs>(
         &self,
         args: BuildArguments<Attrs, OpBuiltPayload<N>>,
-        best: impl FnOnce(BestTransactionsAttributes) -> Txs + Send + Sync + 'a,
+        best: impl Fn(BestTransactionsAttributes) -> Txs + Send + Sync + 'a,
     ) -> Result<BuildOutcome<OpBuiltPayload<N>>, PayloadBuilderError>
     where
         Txs:
@@ -223,14 +223,6 @@ where
         let builder = OpBuilder::new(best);
 
         let state_provider = self.client.state_by_block_hash(ctx.parent().hash())?;
-
-        // AL prefetch: pre-populate cached_reads from EIP-2930 access lists in the
-        // pending pool before handing state to the EVM. Zero background workers —
-        // all MDBX reads happen here, sequentially, in < 50ms.
-        // Enabled by setting TXPOOL_AL_PREFETCH_ONLY=1 in the environment.
-        if !ctx.attributes().no_tx_pool() && crate::al_prefetch::is_enabled() {
-            crate::al_prefetch::prefetch_from_pool(&self.pool, &mut cached_reads, &state_provider);
-        }
 
         let state = StateProviderDatabase::new(&state_provider);
 
@@ -295,7 +287,7 @@ where
         args: BuildArguments<Self::Attributes, Self::BuiltPayload>,
     ) -> Result<BuildOutcome<Self::BuiltPayload>, PayloadBuilderError> {
         let pool = self.pool.clone();
-        self.build_payload(args, |attrs| self.best_transactions.best_transactions(pool, attrs))
+        self.build_payload(args, |attrs| self.best_transactions.best_transactions(pool.clone(), attrs))
     }
 
     fn on_missing_payload(
@@ -344,12 +336,12 @@ where
 pub struct OpBuilder<'a, Txs> {
     /// Yields the best transaction to include if transactions from the mempool are allowed.
     #[debug(skip)]
-    best: Box<dyn FnOnce(BestTransactionsAttributes) -> Txs + 'a>,
+    best: Box<dyn Fn(BestTransactionsAttributes) -> Txs + 'a>,
 }
 
 impl<'a, Txs> OpBuilder<'a, Txs> {
     /// Creates a new [`OpBuilder`].
-    pub fn new(best: impl FnOnce(BestTransactionsAttributes) -> Txs + Send + Sync + 'a) -> Self {
+    pub fn new(best: impl Fn(BestTransactionsAttributes) -> Txs + Send + Sync + 'a) -> Self {
         Self { best: Box::new(best) }
     }
 }
@@ -435,10 +427,24 @@ impl<Txs> OpBuilder<'_, Txs> {
         // 3. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool() {
             // 3.1. select/pack mempool transactions
+            let tx_attrs = ctx.best_transaction_attributes(builder.evm_mut().block());
             let best_txs = {
                 let _guard = timing_ctx.time_select_mempool_transactions();
-                best(ctx.best_transaction_attributes(builder.evm_mut().block()))
+                best(tx_attrs)
             };
+
+            // 3.1.5. AL prefetch: extract EIP-2930 access-list keys from the
+            // already-selected best transactions and pre-load them from MDBX
+            // into CachedReads before the EVM starts executing.
+            // A second iterator over the same selection is created — `best` is
+            // now `Fn` (not `FnOnce`) so this is safe and cheap.
+            if crate::al_prefetch::is_enabled() {
+                let prefetch_txs = best(tx_attrs);
+                crate::al_prefetch::prefetch_from_best_txs(
+                    prefetch_txs,
+                    builder.evm_mut().db_mut(),
+                );
+            }
 
             // 3.2. execute mempool transactions
             {
