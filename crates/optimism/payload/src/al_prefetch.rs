@@ -1,5 +1,5 @@
 use alloy_consensus::Transaction as _;
-use alloy_primitives::U256;
+use alloy_primitives::{map::HashSet, Address, U256};
 use reth_payload_util::PayloadTransactions;
 use std::sync::OnceLock;
 use tracing::debug;
@@ -26,7 +26,12 @@ where
 {
     let start = std::time::Instant::now();
     let mut tx_count = 0usize;
-    let mut key_count = 0usize;
+
+    // Pass 1: collect unique keys across all access lists — no I/O.
+    // Hot contracts (USDC, WETH) appear in many transactions; deduplicating
+    // here ensures each address/slot is read from MDBX exactly once.
+    let mut accounts: HashSet<Address> = HashSet::default();
+    let mut slots: HashSet<(Address, U256)> = HashSet::default();
 
     while let Some(tx) = txs.next(()) {
         let Some(al) = tx.access_list() else { continue };
@@ -35,14 +40,22 @@ where
         }
         tx_count += 1;
         for item in &al.0 {
-            let _ = db.basic(item.address);
-            key_count += 1;
+            accounts.insert(item.address);
             for key in &item.storage_keys {
-                let _ = db.storage(item.address, U256::from_be_bytes(key.0));
-                key_count += 1;
+                slots.insert((item.address, U256::from_be_bytes(key.0)));
             }
         }
     }
+
+    // Pass 2: one MDBX read per unique key — populates State/CachedReads.
+    for &addr in &accounts {
+        let _ = db.basic(addr);
+    }
+    for &(addr, slot) in &slots {
+        let _ = db.storage(addr, slot);
+    }
+
+    let key_count = accounts.len() + slots.len();
 
     let elapsed_us = start.elapsed().as_micros() as u64;
 
