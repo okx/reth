@@ -342,6 +342,9 @@ where
 
         *self.worker_pool.write() = Some(std::sync::Arc::new(worker_pool));
 
+        // Initialise global TX arrival time tracker for latency measurement.
+        crate::pre_warming::init_tx_arrival_tracker();
+
         tracing::info!(
             target: "txpool::pre_warming",
             num_workers = self.config.pre_warming.num_workers,
@@ -883,6 +886,10 @@ where
     /// Performs blob storage operations and sends all notifications. This should be called
     /// after the pool write lock has been released to avoid blocking pool operations.
     fn on_added_transaction(&self, meta: AddedTransactionMeta<T::Transaction>) {
+        // Record TX arrival time for latency tracking (all TXs, not just simulated).
+        #[cfg(feature = "pre-warming")]
+        crate::pre_warming::record_tx_arrival(*meta.added.hash());
+
         // Trigger pre-warming simulation (fire-and-forget, non-blocking)
         #[cfg(feature = "pre-warming")]
         if let Some(worker_pool) = self.worker_pool.read().as_ref() {

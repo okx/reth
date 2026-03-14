@@ -324,6 +324,7 @@ use crate::{
     },
     PoolTransaction,
 };
+use alloy_consensus::Transaction;
 use alloy_primitives::Address;
 use parking_lot::RwLock;
 use reth_chainspec::ChainSpec;
@@ -883,8 +884,18 @@ async fn drain_loop<T>(
             });
 
             let keys = match tokio::time::timeout(simulation_timeout, result_rx).await {
-                Ok(Ok(Ok(keys))) => {
+                Ok(Ok(Ok((keys, has_access_list)))) => {
                     metrics.simulations_completed.increment(1);
+                    if has_access_list {
+                        metrics.simulations_with_access_list.increment(1);
+                        tracing::debug!(
+                            target: "txpool::pre_warming",
+                            tx_hash = ?req.tx_hash,
+                            accounts = keys.accounts.len(),
+                            storage_slots = keys.storage_slots.len(),
+                            "Simulation used EIP-2930 access list (PRIORITY 0)"
+                        );
+                    }
                     keys
                 }
                 Ok(Ok(Err(e))) => {
@@ -944,11 +955,14 @@ async fn drain_loop<T>(
     debug!(target: "txpool::pre_warming", "Pre-warming drain loop stopped");
 }
 
-/// Simulate transaction synchronously (for use in spawn_blocking).
+/// Simulate transaction synchronously (called from rayon pool).
+///
+/// Returns `(ExtractedKeys, has_access_list)` so the caller can track whether
+/// the EIP-2930 PRIORITY 0 path was taken.
 fn simulate_transaction_sync<T: PoolTransaction>(
     simulator: &Simulator,
     tx: &T,
-) -> Result<ExtractedKeys, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(ExtractedKeys, bool), Box<dyn std::error::Error + Send + Sync>> {
     simulate_transaction(simulator, tx)
 }
 
@@ -959,21 +973,23 @@ fn simulate_transaction_sync<T: PoolTransaction>(
 /// - Access list entries (EIP-2930)
 /// - Storage slots accessed during execution
 ///
-/// Uses optimized simulation with fast paths for common transaction types.
+/// Returns `(ExtractedKeys, has_access_list)` where `has_access_list` is `true`
+/// when the transaction carried a non-empty EIP-2930 access list (PRIORITY 0 path).
 fn simulate_transaction<T: PoolTransaction>(
     simulator: &Simulator,
     tx: &T,
-) -> Result<ExtractedKeys, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(ExtractedKeys, bool), Box<dyn std::error::Error + Send + Sync>> {
     let sender = tx.sender();
     let consensus_tx = tx.clone_into_consensus();
     let (tx_inner, _signer) = consensus_tx.into_parts();
 
-    // Use optimized simulation with fast paths:
-    // - Simple ETH transfers: Just sender + recipient (no DB queries)
-    // - Known ERC20/DeFi: Heuristic slot prediction (no DB queries)
-    // - Unknown contracts: Full simulation with TrackingDB
+    // Record whether this TX has a non-empty EIP-2930 access list before simulating,
+    // so the caller can increment the metric without re-cloning the transaction.
+    let has_access_list = tx_inner.access_list().is_some_and(|al| !al.0.is_empty());
+
     simulator
         .simulate(&tx_inner, sender)
+        .map(|keys| (keys, has_access_list))
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
 

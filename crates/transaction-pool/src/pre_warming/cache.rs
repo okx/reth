@@ -290,6 +290,8 @@ impl PreWarmedCache {
     pub fn remove_txs(&self, tx_hashes: &[TxHash]) {
         for hash in tx_hashes {
             self.per_tx_keys.remove(hash);
+            // Clean up arrival time entry so the global map doesn't grow unbounded.
+            crate::pre_warming::evict_tx_arrival_time(hash);
         }
     }
 

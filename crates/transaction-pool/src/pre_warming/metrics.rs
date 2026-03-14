@@ -163,6 +163,22 @@ pub struct PreWarmingMetrics {
     /// Incremented when `update_pre_warming_snapshot()` is called.
     /// Should roughly match the number of new blocks.
     pub snapshot_updates: Counter,
+
+    /// Number of simulations that used EIP-2930 access list keys directly (PRIORITY 0 path).
+    ///
+    /// When non-zero, confirms AL transactions are reaching the simulator and the
+    /// PRIORITY 0 fast path is exercised. Ratio to `simulations_completed` shows
+    /// what fraction of the workload carries access lists.
+    pub simulations_with_access_list: Counter,
+
+    // ========================================================================
+    // TX Latency Metrics (arrival → inclusion)
+    // ========================================================================
+    /// Histogram of transaction pool dwell time in seconds.
+    ///
+    /// Measured from when the TX enters the pool to when it is sealed in a block.
+    /// Use sum/count to compute the average; bucket values for percentiles.
+    pub tx_pool_dwell_time: Histogram,
 }
 
 #[cfg(test)]

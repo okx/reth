@@ -59,9 +59,11 @@ pub use cache::{CacheStats, PreWarmedCache};
 pub use config::PreWarmingConfig;
 pub use metrics::PreWarmingMetrics;
 pub use registry::{
-    clear_global_cache, get_global_cache, get_global_metrics, get_global_prefetch_threads,
-    get_global_simulation_snapshot, is_pre_warming_active, set_global_cache, set_global_metrics,
+    clear_global_cache, evict_tx_arrival_time, get_global_cache, get_global_metrics,
+    get_global_prefetch_threads, get_global_simulation_snapshot, init_tx_arrival_tracker,
+    is_pre_warming_active, record_tx_arrival, set_global_cache, set_global_metrics,
     set_global_prefetch_threads, set_global_simulation_snapshot, should_prefetch_for_parent,
+    take_tx_arrival_time,
 };
 pub use simulator::Simulator;
 pub use snapshot_state::SnapshotState;

@@ -21,11 +21,12 @@
 //! ```
 
 use crate::pre_warming::{PreWarmedCache, PreWarmingMetrics};
-use alloy_primitives::B256;
+use alloy_primitives::{TxHash, B256};
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 
 use super::snapshot_state::SnapshotState;
@@ -45,6 +46,40 @@ static GLOBAL_PREFETCH_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// mempool transactions. The payload builder reuses it instead of creating a
 /// fresh cold SnapshotState, converting MDBX queries into in-memory DashMap hits.
 static GLOBAL_SIMULATION_SNAPSHOT: RwLock<Option<Arc<SnapshotState>>> = RwLock::new(None);
+
+/// Global TX arrival time tracker.
+///
+/// Maps tx_hash → Instant the TX first entered the pool.
+/// Used to compute time-to-inclusion (pool arrival → sealed in block).
+/// Entries are removed when the TX is included in a block or evicted from the pool.
+static GLOBAL_TX_ARRIVAL_TIMES: OnceLock<Arc<DashMap<TxHash, std::time::Instant>>> =
+    OnceLock::new();
+
+/// Initialise the TX arrival time tracker. Called once during pool setup.
+pub fn init_tx_arrival_tracker() {
+    let _ = GLOBAL_TX_ARRIVAL_TIMES.set(Arc::new(DashMap::new()));
+}
+
+/// Record the arrival time for a transaction entering the pool.
+///
+/// Uses `entry().or_insert_with()` so re-submissions don't overwrite the original time.
+pub fn record_tx_arrival(tx_hash: TxHash) {
+    if let Some(map) = GLOBAL_TX_ARRIVAL_TIMES.get() {
+        map.entry(tx_hash).or_insert_with(std::time::Instant::now);
+    }
+}
+
+/// Remove and return the arrival time for a transaction included in a block.
+pub fn take_tx_arrival_time(tx_hash: &TxHash) -> Option<std::time::Instant> {
+    GLOBAL_TX_ARRIVAL_TIMES.get()?.remove(tx_hash).map(|(_, t)| t)
+}
+
+/// Evict the arrival time entry when a TX is dropped or replaced from the pool.
+pub fn evict_tx_arrival_time(tx_hash: &TxHash) {
+    if let Some(map) = GLOBAL_TX_ARRIVAL_TIMES.get() {
+        map.remove(tx_hash);
+    }
+}
 
 /// Parent block hash and cache size at the time of the last prefetch.
 ///

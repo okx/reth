@@ -600,6 +600,23 @@ impl<Txs> OpBuilder<'_, Txs> {
             trie_updates: either::Either::Left(Arc::new(trie_updates)),
         };
 
+        // Record TX pool dwell time (arrival → inclusion) for every TX in this block.
+        #[cfg(feature = "pre-warming")]
+        {
+            let inclusion_time = std::time::Instant::now();
+            if let Some(metrics) = reth_transaction_pool::pre_warming::get_global_metrics() {
+                for tx in executed.recovered_block.transactions_recovered() {
+                    let tx_hash = *tx.tx_hash();
+                    if let Some(arrival) =
+                        reth_transaction_pool::pre_warming::take_tx_arrival_time(&tx_hash)
+                    {
+                        let dwell_secs = inclusion_time.duration_since(arrival).as_secs_f64();
+                        metrics.tx_pool_dwell_time.record(dwell_secs);
+                    }
+                }
+            }
+        }
+
         let no_tx_pool = ctx.attributes().no_tx_pool();
 
         // X Layer: Log block build start and end (success)
