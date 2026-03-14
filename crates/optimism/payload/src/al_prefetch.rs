@@ -56,6 +56,9 @@ where
 
     let elapsed_us = start.elapsed().as_micros() as u64;
 
+    // Always increments — non-zero confirms is_enabled() fired and the code
+    // path is executing, even if no incoming txns carry access lists.
+    metrics::counter!("reth_al_prefetch_calls_total").increment(1);
     metrics::counter!("reth_al_prefetch_tx_with_access_list_total").increment(tx_count as u64);
     metrics::counter!("reth_al_prefetch_keys_extracted_total").increment(key_count as u64);
     metrics::histogram!("reth_al_prefetch_duration_seconds")
