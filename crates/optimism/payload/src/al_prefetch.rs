@@ -8,9 +8,16 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub fn is_enabled() -> bool {
     *ENABLED.get_or_init(|| {
-        std::env::var("TXPOOL_AL_PREFETCH_ONLY")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "True" | "TRUE"))
-            .unwrap_or(false)
+        let raw = std::env::var("TXPOOL_AL_PREFETCH_ONLY").unwrap_or_default();
+        let enabled = matches!(raw.as_str(), "1" | "true" | "True" | "TRUE");
+        // Fires exactly once at first call — visible in node logs regardless of log level.
+        tracing::warn!(
+            target: "payload_builder::al_prefetch",
+            enabled,
+            raw_value = %raw,
+            "AL prefetch init (TXPOOL_AL_PREFETCH_ONLY)"
+        );
+        enabled
     })
 }
 
