@@ -2,7 +2,7 @@ use alloy_consensus::Transaction as _;
 use alloy_primitives::{map::HashSet, Address, U256};
 use reth_payload_util::PayloadTransactions;
 use std::sync::OnceLock;
-use tracing::debug;
+use tracing::{debug, info};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -31,6 +31,8 @@ where
     Txs::Transaction: alloy_consensus::Transaction,
     DB: revm::Database,
 {
+    info!("invoked prefetch_from_best_txs with al");
+
     let start = std::time::Instant::now();
     let mut tx_count = 0usize;
     
@@ -38,12 +40,18 @@ where
     let mut slots: HashSet<(Address, U256)> = HashSet::default();
 
     while let Some(tx) = txs.next(()) {
-        let Some(al) = tx.access_list() else { continue };
+        let Some(al) = tx.access_list() else {
+            info!("prefetch_from_best_txs : tx does not have an access list");
+            continue
+        };
         if al.0.is_empty() {
+            info!("prefetch_from_best_txs: access lisrt is empty");
             continue;
         }
+
         tx_count += 1;
         for item in &al.0 {
+            info!("prefetch_from_best_txs : received access list entry: {:?}", item.address);
             accounts.insert(item.address);
             for key in &item.storage_keys {
                 slots.insert((item.address, U256::from_be_bytes(key.0)));
@@ -65,7 +73,7 @@ where
 
     // Always increments — non-zero confirms is_enabled() fired and the code
     // path is executing, even if no incoming txns carry access lists.
-    metrics::counter!("reth_al_prefetch_calls_total").increment(1);
+    metrics::counter!("reth_al_prefetch_calls_totcal").increment(1);
     metrics::counter!("reth_al_prefetch_tx_with_access_list_total").increment(tx_count as u64);
     metrics::counter!("reth_al_prefetch_keys_extracted_total").increment(key_count as u64);
     metrics::histogram!("reth_al_prefetch_duration_seconds")

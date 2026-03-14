@@ -2,7 +2,7 @@
 //! [`LocalMiner`](super::LocalMiner).
 
 use alloy_consensus::BlockHeader;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, B64};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_primitives::PayloadAttributesBuilder;
@@ -66,14 +66,27 @@ impl<ChainSpec>
     PayloadAttributesBuilder<op_alloy_rpc_types_engine::OpPayloadAttributes, ChainSpec::Header>
     for LocalPayloadAttributesBuilder<ChainSpec>
 where
-    ChainSpec: EthChainSpec + EthereumHardforks + 'static,
+    ChainSpec: EthChainSpec + EthereumHardforks + reth_optimism_forks::OpHardforks + 'static,
 {
     fn build(
         &self,
         parent: &SealedHeader<ChainSpec::Header>,
     ) -> op_alloy_rpc_types_engine::OpPayloadAttributes {
+        let eth_attrs: EthPayloadAttributes = self.build(parent);
+        let timestamp = eth_attrs.timestamp;
+        // Holocene+ requires eip_1559_params to be Some. B64::ZERO (elasticity=0, denominator=0)
+        // tells the payload builder to use the chain spec's default base fee params.
+        let eip_1559_params = self
+            .chain_spec
+            .is_holocene_active_at_timestamp(timestamp)
+            .then_some(B64::ZERO);
+        // Jovian requires min_base_fee to be Some; use 1 wei as the floor for dev mode.
+        let min_base_fee = self
+            .chain_spec
+            .is_jovian_active_at_timestamp(timestamp)
+            .then_some(1u64);
         op_alloy_rpc_types_engine::OpPayloadAttributes {
-            payload_attributes: self.build(parent),
+            payload_attributes: eth_attrs,
             // Add dummy system transaction
             transactions: Some(vec![
                 reth_optimism_chainspec::constants::TX_SET_L1_BLOCK_OP_MAINNET_BLOCK_124665056
@@ -81,8 +94,8 @@ where
             ]),
             no_tx_pool: None,
             gas_limit: None,
-            eip_1559_params: None,
-            min_base_fee: None,
+            eip_1559_params,
+            min_base_fee,
         }
     }
 }

@@ -438,13 +438,13 @@ impl<Txs> OpBuilder<'_, Txs> {
             // into CachedReads before the EVM starts executing.
             // A second iterator over the same selection is created — `best` is
             // now `Fn` (not `FnOnce`) so this is safe and cheap.
-            if crate::al_prefetch::is_enabled() {
+           // if crate::al_prefetch::is_enabled() {
                 let prefetch_txs = best(tx_attrs);
                 crate::al_prefetch::prefetch_from_best_txs(
                     prefetch_txs,
                     builder.evm_mut().db_mut(),
                 );
-            }
+            //}
 
             // 3.2. execute mempool transactions
             {
