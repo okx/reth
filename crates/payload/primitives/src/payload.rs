@@ -58,6 +58,14 @@ pub trait ExecutionPayload:
 
     /// Returns the number of transactions in the payload.
     fn transaction_count(&self) -> usize;
+
+    /// Returns the raw RLP-encoded transactions in the payload.
+    ///
+    /// Used to extract EIP-2930 access lists for pre-warming state before block execution.
+    /// Returns an empty slice for payload types that don't expose raw transaction bytes.
+    fn encoded_transactions(&self) -> &[Bytes] {
+        &[]
+    }
 }
 
 impl ExecutionPayload for ExecutionData {
@@ -206,6 +214,10 @@ impl ExecutionPayload for op_alloy_rpc_types_engine::OpExecutionData {
 
     fn transaction_count(&self) -> usize {
         self.payload.as_v1().transactions.len()
+    }
+
+    fn encoded_transactions(&self) -> &[Bytes] {
+        &self.payload.as_v1().transactions
     }
 }
 
