@@ -34,8 +34,7 @@ alloy-evm = { workspace = true, optional = true }
 revm = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 ahash = { workspace = true, optional = true }
-nohash-hasher = { version = "0.2", optional = true }
-libc = { version = "0.2", optional = true }
+libc = { version = "0.2", optional = true, default-features = false }
 
 # ethereum
 alloy-eips = { workspace = true, features = ["kzg"] }
@@ -97,7 +96,6 @@ pre-warming = [
     "revm",
     "dashmap",
     "ahash",
-    "nohash-hasher",
     "dep:rayon",
     "dep:libc",
 ]  # Experimental: opt-in only for now

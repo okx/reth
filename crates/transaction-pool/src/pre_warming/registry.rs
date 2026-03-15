@@ -25,7 +25,7 @@ use alloy_primitives::{TxHash, B256};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, OnceLock,
 };
 
@@ -46,6 +46,24 @@ static GLOBAL_PREFETCH_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// mempool transactions. The payload builder reuses it instead of creating a
 /// fresh cold SnapshotState, converting MDBX queries into in-memory DashMap hits.
 static GLOBAL_SIMULATION_SNAPSHOT: RwLock<Option<Arc<SnapshotState>>> = RwLock::new(None);
+
+/// Set while the payload builder is actively building a block.
+///
+/// Simulation drain_loop checks this flag before acquiring a simulation permit.
+/// When true, the drain loop skips new simulations and yields until the flag
+/// clears — typically 100-200ms. This eliminates the ~11ms CPU competition
+/// penalty measured when 4 simulation workers compete with block execution.
+static BLOCK_BUILDING: AtomicBool = AtomicBool::new(false);
+
+/// Signal that block building has started; simulation workers will pause.
+pub fn set_block_building(building: bool) {
+    BLOCK_BUILDING.store(building, Ordering::Relaxed);
+}
+
+/// Returns true if the payload builder is currently inside a block build.
+pub fn is_block_building() -> bool {
+    BLOCK_BUILDING.load(Ordering::Relaxed)
+}
 
 /// Global TX arrival time tracker.
 ///

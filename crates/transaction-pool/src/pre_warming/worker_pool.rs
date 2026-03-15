@@ -927,6 +927,15 @@ async fn drain_loop<T>(
             continue;
         }
 
+        // Yield while the payload builder is building a block. Simulations compete
+        // for CPU with block execution (EVM + state root). Pausing here for the
+        // ~100-200ms build window eliminates the ~11ms tx_execution penalty seen
+        // when 4 workers run concurrently with block building on a 4-core machine.
+        if crate::pre_warming::registry::is_block_building() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            continue;
+        }
+
         // Acquire a simulation slot. Blocks only when num_workers simulations
         // are already running; the channel continues to buffer items in the meantime.
         let permit = match Arc::clone(&semaphore).acquire_owned().await {

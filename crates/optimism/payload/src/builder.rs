@@ -339,13 +339,23 @@ where
             }
         }
 
-        if ctx.attributes().no_tx_pool() {
+        // Signal simulation workers to pause while block execution runs.
+        // Workers poll this flag before acquiring simulation permits, eliminating
+        // CPU competition during the ~100-200ms build window.
+        #[cfg(feature = "pre-warming")]
+        reth_transaction_pool::pre_warming::set_block_building(true);
+
+        let result = if ctx.attributes().no_tx_pool() {
             builder.build(state, &state_provider, ctx)
         } else {
             // sequencer mode we can reuse cachedreads from previous runs
             builder.build(cached_reads.as_db_mut(state), &state_provider, ctx)
-        }
-        .map(|out| out.with_cached_reads(cached_reads))
+        };
+
+        #[cfg(feature = "pre-warming")]
+        reth_transaction_pool::pre_warming::set_block_building(false);
+
+        result.map(|out| out.with_cached_reads(cached_reads))
     }
 
     /// Computes the witness for the payload.
