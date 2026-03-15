@@ -31,8 +31,6 @@ where
     Txs::Transaction: alloy_consensus::Transaction,
     DB: revm::Database,
 {
-    info!("invoked prefetch_from_best_txs with al");
-
     let start = std::time::Instant::now();
     let mut tx_count = 0usize;
     
@@ -41,17 +39,14 @@ where
 
     while let Some(tx) = txs.next(()) {
         let Some(al) = tx.access_list() else {
-            info!("prefetch_from_best_txs : tx does not have an access list");
             continue
         };
         if al.0.is_empty() {
-            info!("prefetch_from_best_txs: access lisrt is empty");
             continue;
         }
 
         tx_count += 1;
         for item in &al.0 {
-            info!("prefetch_from_best_txs : received access list entry: {:?}", item.address);
             accounts.insert(item.address);
             for key in &item.storage_keys {
                 slots.insert((item.address, U256::from_be_bytes(key.0)));
