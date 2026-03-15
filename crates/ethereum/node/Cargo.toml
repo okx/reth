@@ -113,3 +113,9 @@ test-utils = [
     "reth-evm-ethereum/test-utils",
     "reth-stages-types/test-utils",
 ]
+
+pre-warming = [
+    "reth-transaction-pool/pre-warming",
+    "reth-node-core/pre-warming",
+]
+

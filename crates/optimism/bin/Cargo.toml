@@ -32,7 +32,7 @@ xlayer-db.workspace = true
 workspace = true
 
 [features]
-default = ["jemalloc", "otlp", "reth-optimism-evm/portable", "js-tracer", "keccak-cache-global", "asm-keccak"]
+default = ["jemalloc", "otlp", "reth-optimism-evm/portable", "js-tracer", "keccak-cache-global", "asm-keccak", "pre-warming"]
 
 otlp = ["reth-optimism-cli/otlp"]
 
@@ -63,6 +63,11 @@ min-debug-logs = ["tracing/release_max_level_debug"]
 min-trace-logs = ["tracing/release_max_level_trace"]
 
 edge = ["reth-optimism-cli/edge"]
+
+pre-warming = [
+    "reth-optimism-cli/pre-warming",
+    "reth-optimism-node/pre-warming",
+]
 
 [[bin]]
 name = "op-reth"

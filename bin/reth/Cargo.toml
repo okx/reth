@@ -100,6 +100,13 @@ js-tracer = [
 
 dev = ["reth-ethereum-cli/dev"]
 
+# Pre-warming cache for transaction simulation
+# Extracts state keys via simulation before execution, batch-fetches to reduce I/O
+pre-warming = [
+    "reth-transaction-pool/pre-warming",
+    "reth-node-core/pre-warming",
+]
+
 asm-keccak = [
     "reth-node-core/asm-keccak",
     "reth-primitives/asm-keccak",

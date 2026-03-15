@@ -22,8 +22,19 @@ reth-execution-types.workspace = true
 reth-fs-util.workspace = true
 reth-storage-api.workspace = true
 reth-tasks.workspace = true
+reth-provider.workspace = true
 revm-interpreter.workspace = true
 revm-primitives.workspace = true
+
+# Pre-warming specific dependencies (optional)
+reth-primitives = { workspace = true, optional = true }
+reth-revm = { workspace = true, optional = true }
+reth-evm = { workspace = true, optional = true }
+alloy-evm = { workspace = true, optional = true }
+revm = { workspace = true, optional = true }
+dashmap = { workspace = true, optional = true }
+ahash = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true, default-features = false }
 
 # ethereum
 alloy-eips = { workspace = true, features = ["kzg"] }
@@ -35,12 +46,11 @@ alloy-consensus = { workspace = true, features = ["kzg"] }
 futures-util.workspace = true
 parking_lot.workspace = true
 pin-project.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
 tokio-stream.workspace = true
 
 # metrics
 reth-metrics.workspace = true
-reth-node-metrics.workspace = true
 metrics.workspace = true
 
 # misc
@@ -54,6 +64,7 @@ serde_json.workspace = true
 bitflags.workspace = true
 auto_impl.workspace = true
 smallvec.workspace = true
+rayon = { workspace = true, optional = true }
 
 # testing
 rand = { workspace = true, optional = true }
@@ -77,6 +88,17 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 futures.workspace = true
 
 [features]
+default = []
+pre-warming = [
+    "reth-revm",
+    "reth-evm",
+    "alloy-evm",
+    "revm",
+    "dashmap",
+    "ahash",
+    "dep:rayon",
+    "dep:libc",
+]  # Experimental: opt-in only for now
 serde = [
     "reth-execution-types/serde",
     "reth-eth-wire-types/serde",

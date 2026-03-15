@@ -522,6 +522,25 @@ where
         info!(target: "reth::cli", "Transaction pool initialized");
         debug!(target: "reth::cli", "Spawned txpool maintenance task");
 
+        // Initialize pre-warming if feature is enabled
+        #[cfg(feature = "pre-warming")]
+        {
+            use reth_chainspec::EthChainSpec;
+            use reth_provider::StateProviderFactory;
+            if let Ok(state_provider) = ctx.provider().latest() {
+                transaction_pool.initialize_pre_warming(
+                    state_provider,
+                    std::sync::Arc::new(reth_chainspec::ChainSpec::new(
+                        ctx.chain_spec().chain(),
+                        Default::default(),
+                        ctx.chain_spec().genesis().clone(),
+                    )),
+                );
+            } else {
+                tracing::warn!(target: "reth::cli", "Failed to get state provider for pre-warming initialization");
+            }
+        }
+
         Ok(transaction_pool)
     }
 }

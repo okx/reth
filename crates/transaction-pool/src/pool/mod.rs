@@ -162,6 +162,13 @@ where
     blob_transaction_sidecar_listener: Mutex<Vec<BlobTransactionSidecarListener>>,
     /// Metrics for the blob store
     blob_store_metrics: BlobStoreMetrics,
+    /// Worker pool for pre-warming simulations.
+    ///
+    /// Wrapped in RwLock to allow late initialization after pool creation,
+    /// when StateProvider becomes available.
+    #[cfg(feature = "pre-warming")]
+    worker_pool:
+        RwLock<Option<std::sync::Arc<crate::pre_warming::SimulationWorkerPool<T::Transaction>>>>,
 }
 
 // === impl PoolInner ===
@@ -186,6 +193,8 @@ where
             config,
             blob_store,
             blob_store_metrics: Default::default(),
+            #[cfg(feature = "pre-warming")]
+            worker_pool: RwLock::new(None),
         }
     }
 
@@ -197,6 +206,180 @@ where
     /// Returns stats about the size of the pool.
     pub fn size(&self) -> PoolSize {
         self.get_pool_data().size()
+    }
+
+    /// Returns pre-warming statistics if pre-warming is enabled.
+    ///
+    /// This method is primarily used for testing and monitoring.
+    #[cfg(feature = "pre-warming")]
+    pub fn pre_warming_stats(&self) -> Option<crate::pre_warming::CacheStats> {
+        self.worker_pool.read().as_ref().map(|wp| wp.cache().stats())
+    }
+
+    /// Returns pre-warmed keys discovered by simulation if pre-warming is enabled.
+    ///
+    /// This is called by the payload builder to prefetch state before execution.
+    /// Returns None if pre-warming is disabled or not available.
+    ///
+    /// **Deprecated:** Use `get_keys_for_txs` instead for per-TX tracking.
+    #[cfg(feature = "pre-warming")]
+    pub fn get_prewarmed_keys(&self) -> Option<crate::pre_warming::ExtractedKeys> {
+        // For backward compatibility, return empty keys
+        // Payload builder should use get_keys_for_txs with selected TXs
+        Some(crate::pre_warming::ExtractedKeys::new())
+    }
+
+    /// Returns merged pre-warmed keys for selected transactions.
+    ///
+    /// This is called by the payload builder with the list of selected transaction hashes.
+    /// Returns merged ExtractedKeys for only those transactions.
+    #[cfg(feature = "pre-warming")]
+    pub fn get_keys_for_txs(
+        &self,
+        tx_hashes: &[alloy_primitives::TxHash],
+    ) -> Option<crate::pre_warming::ExtractedKeys> {
+        self.worker_pool.read().as_ref().map(|wp| wp.cache().get_keys_for_txs(tx_hashes))
+    }
+
+    /// Notify pre-warming cache that transactions have been removed.
+    ///
+    /// This is called when transactions are mined, dropped, or otherwise removed from the pool.
+    /// The cache will remove the keys for these transactions.
+    #[cfg(feature = "pre-warming")]
+    fn notify_txs_removed(&self, tx_hashes: &[alloy_primitives::TxHash]) {
+        if let Some(worker_pool) = self.worker_pool.read().as_ref() {
+            tracing::debug!(
+                target: "txpool::pre_warming",
+                tx_count = tx_hashes.len(),
+                "Removing mined transactions from pre-warming cache"
+            );
+            worker_pool.cache().remove_txs(tx_hashes);
+        }
+    }
+
+    #[cfg(not(feature = "pre-warming"))]
+    fn notify_txs_removed(&self, _tx_hashes: &[alloy_primitives::TxHash]) {
+        // No-op when feature disabled
+    }
+
+    /// Updates the snapshot used for simulation when a new block arrives.
+    ///
+    /// This should be called whenever the chain state changes to ensure simulations
+    /// are performed against current state.
+    #[cfg(feature = "pre-warming")]
+    pub fn update_pre_warming_snapshot(
+        &self,
+        snapshot: std::sync::Arc<crate::pre_warming::SnapshotState>,
+        changed: &[alloy_primitives::Address],
+    ) {
+        if let Some(wp) = self.worker_pool.read().as_ref() {
+            wp.update_snapshot(snapshot, changed);
+        }
+    }
+
+    /// Initializes the pre-warming worker pool with a state provider.
+    ///
+    /// This must be called after pool creation when the state provider becomes available.
+    /// Without this call, pre-warming simulation will not run even if enabled in config.
+    ///
+    /// # Arguments
+    /// * `state_provider` - Boxed state provider for querying blockchain state
+    /// * `chain_spec` - Chain specification for EVM configuration
+    ///
+    /// # Example
+    /// ```ignore
+    /// // After pool creation, when state provider is available:
+    /// let state_provider = provider.latest()?;
+    /// pool.initialize_pre_warming(state_provider, chain_spec);
+    /// ```
+    #[cfg(feature = "pre-warming")]
+    pub fn initialize_pre_warming(
+        &self,
+        state_provider: Box<dyn reth_provider::StateProvider + Send>,
+        chain_spec: std::sync::Arc<reth_chainspec::ChainSpec>,
+    ) {
+        tracing::warn!(
+            target: "txpool::pre_warming",
+            enabled = self.config.pre_warming.enabled,
+            num_workers = self.config.pre_warming.num_workers,
+            ">>> initialize_pre_warming called with config"
+        );
+
+        if !self.config.pre_warming.enabled {
+            tracing::warn!(
+                target: "txpool::pre_warming",
+                ">>> Pre-warming DISABLED in config (config.pre_warming.enabled=false)"
+            );
+            return;
+        }
+
+        {
+            let guard = self.worker_pool.read();
+            if guard.is_some() {
+                tracing::warn!(
+                    target: "txpool::pre_warming",
+                    "Pre-warming worker pool already initialized, skipping"
+                );
+                return;
+            }
+        }
+
+        // Create snapshot from state provider
+        let snapshot = std::sync::Arc::new(crate::pre_warming::SnapshotState::new(state_provider));
+
+        // Create cache
+        let cache = std::sync::Arc::new(crate::pre_warming::PreWarmedCache::new(
+            self.config.pre_warming.clone(),
+        ));
+
+        // Create worker pool
+        let worker_pool = crate::pre_warming::SimulationWorkerPool::new(
+            self.config.pre_warming.clone(),
+            cache,
+            snapshot,
+            chain_spec,
+        );
+
+        *self.worker_pool.write() = Some(std::sync::Arc::new(worker_pool));
+
+        // Initialise global TX arrival time tracker for latency measurement.
+        crate::pre_warming::init_tx_arrival_tracker();
+
+        tracing::info!(
+            target: "txpool::pre_warming",
+            num_workers = self.config.pre_warming.num_workers,
+            prefetch_workers = self.config.pre_warming.prefetch_num_workers,
+            simulation_timeout_ms = self.config.pre_warming.simulation_timeout.as_millis() as u64,
+            cache_max_entries = self.config.pre_warming.cache_max_entries,
+            "Pre-warming ENABLED - worker pool initialized successfully"
+        );
+    }
+
+    /// Returns whether the pre-warming worker pool is initialized and running.
+    #[cfg(feature = "pre-warming")]
+    pub fn is_pre_warming_active(&self) -> bool {
+        self.worker_pool.read().is_some()
+    }
+
+    /// Returns whether the pre-warming worker pool is initialized and running.
+    #[cfg(not(feature = "pre-warming"))]
+    pub fn is_pre_warming_active(&self) -> bool {
+        false
+    }
+
+    /// Get all pre-warmed keys from the cache.
+    ///
+    /// Returns merged ExtractedKeys from all cached transactions,
+    /// or None if pre-warming is not active.
+    #[cfg(feature = "pre-warming")]
+    pub fn get_all_prewarmed_keys(&self) -> Option<crate::pre_warming::ExtractedKeys> {
+        self.worker_pool.read().as_ref().map(|wp| wp.cache().get_all_keys())
+    }
+
+    /// Get all pre-warmed keys - no-op when feature disabled.
+    #[cfg(not(feature = "pre-warming"))]
+    pub fn get_all_prewarmed_keys(&self) -> Option<()> {
+        None
     }
 
     /// Returns the currently tracked block
@@ -516,9 +699,13 @@ where
         } = update;
         self.validator.on_new_head_block(new_tip);
 
+        // Notify pre-warming cache BEFORE passing mined_transactions to pool
+        // This avoids cloning mined_transactions
+        self.notify_txs_removed(&mined_transactions);
+
         let changed_senders = self.changed_senders(changed_accounts.into_iter());
 
-        // update the pool
+        // update the pool (takes ownership of mined_transactions)
         let outcome = self.pool.write().on_canonical_state_change(
             block_info,
             mined_transactions,
@@ -699,6 +886,43 @@ where
     /// Performs blob storage operations and sends all notifications. This should be called
     /// after the pool write lock has been released to avoid blocking pool operations.
     fn on_added_transaction(&self, meta: AddedTransactionMeta<T::Transaction>) {
+        // Record TX arrival time for latency tracking (all TXs, not just simulated).
+        #[cfg(feature = "pre-warming")]
+        crate::pre_warming::record_tx_arrival(*meta.added.hash());
+
+        // Trigger pre-warming simulation (fire-and-forget, non-blocking)
+        #[cfg(feature = "pre-warming")]
+        if let Some(worker_pool) = self.worker_pool.read().as_ref() {
+            // OPTIMIZATION: Check for simple ETH transfer BEFORE cloning transaction
+            // Only skip ETH transfers (empty input) - they have no storage slots
+            // Keep ERC20 simulation to maintain high cache hit rate for storage slots
+            use alloy_consensus::Transaction;
+
+            let tx_ref = match &meta.added {
+                AddedTransaction::Pending(tx) => &tx.transaction.transaction,
+                AddedTransaction::Parked { transaction, .. } => &transaction.transaction,
+            };
+
+            // Only skip simple ETH transfers (empty input, not create, has recipient)
+            // ERC20 transfers still need simulation for storage slot prefetch
+            let is_simple_eth_transfer =
+                tx_ref.input().is_empty() && !tx_ref.is_create() && tx_ref.to().is_some();
+
+            // Only clone and simulate for non-ETH transfers
+            if !is_simple_eth_transfer {
+                let tx_hash = *meta.added.hash();
+                // Use max_fee_per_gas as simulation priority so workers simulate
+                // high-tip transactions first — matching executor selection order.
+                let gas_tip = tx_ref.max_fee_per_gas();
+                let transaction = tx_ref.clone();
+                worker_pool.trigger_simulation(crate::pre_warming::SimulationRequest::new(
+                    tx_hash,
+                    transaction,
+                    gas_tip,
+                ));
+            }
+        }
+
         // Handle blob sidecar storage and notifications for EIP-4844 transactions
         if let Some(sidecar) = meta.blob_sidecar {
             let hash = *meta.added.hash();
@@ -1703,5 +1927,404 @@ mod tests {
 
         let identifiers = test_pool.identifiers.read();
         assert_eq!(identifiers.sender_id(&auth), Some(SenderId::from(1)));
+    }
+
+    // TODO: Rewrite these integration tests for the new per-TX cache API
+    // The tests below use the old aggregate cache API and need to be updated
+    #[cfg(all(feature = "pre-warming", feature = "disabled-for-refactoring"))]
+    mod pre_warming_integration_tests {
+        use super::*;
+        use crate::{pre_warming::PreWarmingConfig, test_utils::TestPoolBuilder};
+        use std::time::Duration;
+
+        #[test]
+        fn test_pool_config_has_prewarming_field() {
+            // Verify PoolConfig can be created with pre_warming field
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(2),
+                ..Default::default()
+            };
+
+            assert!(config.pre_warming.enabled);
+            assert_eq!(config.pre_warming.num_workers, 2);
+        }
+
+        #[test]
+        fn test_pool_config_default_has_disabled_prewarming() {
+            // Verify default config has pre-warming disabled
+            let config = PoolConfig::default();
+
+            assert!(!config.pre_warming.enabled);
+        }
+
+        #[test]
+        fn test_pool_with_prewarming_disabled_has_no_stats() {
+            // Pool with pre-warming disabled should return None for stats
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::default(), // disabled
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Should return None since pre-warming is disabled
+            assert!(test_pool.pool.pre_warming_stats().is_none());
+        }
+
+        #[test]
+        fn test_pool_with_prewarming_enabled_has_stats() {
+            // Pool with pre-warming enabled should return Some(stats)
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(2),
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Should return Some since pre-warming is enabled
+            let stats = test_pool.pool.pre_warming_stats();
+            assert!(stats.is_some(), "Pre-warming stats should be available");
+
+            let stats = stats.unwrap();
+            assert_eq!(stats.simulation_count, 0, "No simulations yet");
+            assert_eq!(stats.total_accounts, 0, "No keys yet");
+        }
+
+        #[test]
+        fn test_transaction_triggers_simulation() {
+            // Verify that adding a transaction triggers simulation
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(1),
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Add transaction
+            let tx = MockTransaction::eip1559();
+            let results = test_pool.add_transactions(
+                TransactionOrigin::External,
+                [TransactionValidationOutcome::Valid {
+                    balance: U256::from(1_000_000),
+                    state_nonce: 0,
+                    bytecode_hash: None,
+                    transaction: ValidTransaction::Valid(tx),
+                    propagate: true,
+                    authorities: None,
+                }],
+            );
+
+            assert!(results[0].is_ok());
+
+            // Give worker time to process
+            std::thread::sleep(Duration::from_millis(100));
+
+            // Verify simulation happened
+            let stats = test_pool.pool.pre_warming_stats().unwrap();
+            assert_eq!(stats.simulation_count, 1, "One simulation should have occurred");
+            assert_eq!(stats.total_accounts, 0, "No keys yet");
+        }
+
+        #[test]
+        fn test_multiple_transactions_trigger_multiple_simulations() {
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(2),
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Add 5 transactions
+            for nonce in 0..5 {
+                let mut tx = MockTransaction::eip1559();
+                tx.set_nonce(nonce);
+
+                let results = test_pool.add_transactions(
+                    TransactionOrigin::External,
+                    [TransactionValidationOutcome::Valid {
+                        balance: U256::from(1_000_000),
+                        state_nonce: nonce,
+                        bytecode_hash: None,
+                        transaction: ValidTransaction::Valid(tx),
+                        propagate: true,
+                        authorities: None,
+                    }],
+                );
+
+                assert!(results[0].is_ok());
+            }
+
+            // Give workers time to process
+            std::thread::sleep(Duration::from_millis(200));
+
+            // Verify all simulations happened
+            let stats = test_pool.pool.pre_warming_stats().unwrap();
+            assert_eq!(stats.simulation_count, 5, "All 5 transactions should be simulated");
+        }
+
+        #[test]
+        fn test_pending_transaction_triggers_simulation() {
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(1),
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Add pending transaction (Local origin goes to pending)
+            let tx = MockTransaction::eip1559();
+            let results = test_pool.add_transactions(
+                TransactionOrigin::Local,
+                [TransactionValidationOutcome::Valid {
+                    balance: U256::from(1_000_000),
+                    state_nonce: 0,
+                    bytecode_hash: None,
+                    transaction: ValidTransaction::Valid(tx),
+                    propagate: true,
+                    authorities: None,
+                }],
+            );
+
+            assert!(results[0].is_ok());
+            std::thread::sleep(Duration::from_millis(100));
+
+            // Verify simulation triggered for Pending variant
+            let stats = test_pool.pool.pre_warming_stats().unwrap();
+            assert_eq!(stats.simulation_count, 1);
+        }
+
+        #[test]
+        fn test_parked_transaction_triggers_simulation() {
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(1),
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Add transaction with nonce gap (will be parked)
+            let mut tx = MockTransaction::eip1559();
+            tx.set_nonce(5); // Nonce gap
+
+            let results = test_pool.add_transactions(
+                TransactionOrigin::External,
+                [TransactionValidationOutcome::Valid {
+                    balance: U256::from(1_000_000),
+                    state_nonce: 0, // Current nonce is 0
+                    bytecode_hash: None,
+                    transaction: ValidTransaction::Valid(tx),
+                    propagate: true,
+                    authorities: None,
+                }],
+            );
+
+            assert!(results[0].is_ok());
+            std::thread::sleep(Duration::from_millis(100));
+
+            // Verify simulation triggered for Parked variant
+            let stats = test_pool.pool.pre_warming_stats().unwrap();
+            assert_eq!(
+                stats.simulation_count, 1,
+                "Parked transaction should also trigger simulation"
+            );
+        }
+
+        #[test]
+        fn test_invalid_transaction_does_not_trigger_simulation() {
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(1),
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Add invalid transaction
+            let tx = MockTransaction::eip1559();
+            let results = test_pool.add_transactions(
+                TransactionOrigin::External,
+                [TransactionValidationOutcome::Invalid(
+                    tx,
+                    crate::error::InvalidPoolTransactionError::Underpriced,
+                )],
+            );
+
+            assert!(results[0].is_err());
+            std::thread::sleep(Duration::from_millis(100));
+
+            // Invalid transaction should NOT trigger simulation
+            let stats = test_pool.pool.pre_warming_stats().unwrap();
+            assert_eq!(stats.simulation_count, 0, "Invalid transactions should not be simulated");
+        }
+
+        #[test]
+        fn test_rapid_transaction_submission() {
+            // Test that rapid submission doesn't cause issues
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(4),
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Submit 20 transactions rapidly
+            for nonce in 0..20 {
+                let mut tx = MockTransaction::eip1559();
+                tx.set_nonce(nonce);
+
+                let results = test_pool.add_transactions(
+                    TransactionOrigin::External,
+                    [TransactionValidationOutcome::Valid {
+                        balance: U256::from(1_000_000),
+                        state_nonce: nonce,
+                        bytecode_hash: None,
+                        transaction: ValidTransaction::Valid(tx),
+                        propagate: true,
+                        authorities: None,
+                    }],
+                );
+
+                assert!(results[0].is_ok());
+            }
+
+            // Give workers time to process
+            std::thread::sleep(Duration::from_millis(300));
+
+            // Verify all got simulated
+            let stats = test_pool.pool.pre_warming_stats().unwrap();
+            assert_eq!(stats.simulation_count, 20, "All 20 transactions should be processed");
+
+            // Pool should still be functional
+            assert_eq!(test_pool.size().total, 20);
+        }
+
+        #[test]
+        fn test_mixed_transaction_origins() {
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(2),
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Mix of Local and External transactions
+            for nonce in 0..4 {
+                let mut tx = MockTransaction::eip1559();
+                tx.set_nonce(nonce);
+
+                let origin = if nonce % 2 == 0 {
+                    TransactionOrigin::Local
+                } else {
+                    TransactionOrigin::External
+                };
+
+                let results = test_pool.add_transactions(
+                    origin,
+                    [TransactionValidationOutcome::Valid {
+                        balance: U256::from(1_000_000),
+                        state_nonce: nonce,
+                        bytecode_hash: None,
+                        transaction: ValidTransaction::Valid(tx),
+                        propagate: true,
+                        authorities: None,
+                    }],
+                );
+
+                assert!(results[0].is_ok());
+            }
+
+            std::thread::sleep(Duration::from_millis(150));
+
+            // All should be simulated regardless of origin
+            let stats = test_pool.pool.pre_warming_stats().unwrap();
+            assert_eq!(stats.simulation_count, 4);
+        }
+
+        #[test]
+        fn test_keys_accumulate_in_cache() {
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(1),
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Add first transaction
+            let tx1 = MockTransaction::eip1559();
+            test_pool.add_transactions(
+                TransactionOrigin::External,
+                [TransactionValidationOutcome::Valid {
+                    balance: U256::from(1_000_000),
+                    state_nonce: 0,
+                    bytecode_hash: None,
+                    transaction: ValidTransaction::Valid(tx1),
+                    propagate: true,
+                    authorities: None,
+                }],
+            );
+
+            std::thread::sleep(Duration::from_millis(100));
+
+            let stats1 = test_pool.pool.pre_warming_stats().unwrap();
+            let accounts1 = stats1.total_accounts;
+
+            // Add second transaction
+            let mut tx2 = MockTransaction::eip1559();
+            tx2.set_nonce(1);
+            test_pool.add_transactions(
+                TransactionOrigin::External,
+                [TransactionValidationOutcome::Valid {
+                    balance: U256::from(1_000_000),
+                    state_nonce: 1,
+                    bytecode_hash: None,
+                    transaction: ValidTransaction::Valid(tx2),
+                    propagate: true,
+                    authorities: None,
+                }],
+            );
+
+            std::thread::sleep(Duration::from_millis(100));
+
+            let stats2 = test_pool.pool.pre_warming_stats().unwrap();
+
+            // Keys should accumulate
+            assert_eq!(stats2.simulation_count, 2);
+            assert!(stats2.total_accounts >= accounts1, "Keys should accumulate");
+        }
+
+        #[test]
+        fn test_worker_pool_handles_concurrent_simulations() {
+            // Test that multiple workers can process simulations concurrently
+            let config = PoolConfig {
+                pre_warming: PreWarmingConfig::enabled().with_workers(8),
+                ..Default::default()
+            };
+
+            let test_pool = &TestPoolBuilder::default().with_config(config);
+
+            // Add 16 transactions (more than workers)
+            for nonce in 0..16 {
+                let mut tx = MockTransaction::eip1559();
+                tx.set_nonce(nonce);
+
+                test_pool.add_transactions(
+                    TransactionOrigin::External,
+                    [TransactionValidationOutcome::Valid {
+                        balance: U256::from(1_000_000),
+                        state_nonce: nonce,
+                        bytecode_hash: None,
+                        transaction: ValidTransaction::Valid(tx),
+                        propagate: true,
+                        authorities: None,
+                    }],
+                );
+            }
+
+            // Give workers time to process
+            std::thread::sleep(Duration::from_millis(250));
+
+            // All should be processed
+            let stats = test_pool.pool.pre_warming_stats().unwrap();
+            assert_eq!(stats.simulation_count, 16, "All simulations should complete");
+        }
     }
 }

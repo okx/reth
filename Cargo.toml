@@ -702,6 +702,7 @@ snmalloc-rs = { version = "0.3.7", features = ["build_cc"] }
 aes = "0.8.1"
 ahash = "0.8"
 anyhow = "1.0"
+nohash-hasher = "0.2"
 bindgen = { version = "0.71", default-features = false }
 block-padding = "0.3.2"
 cc = "1.2.15"

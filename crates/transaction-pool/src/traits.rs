@@ -700,6 +700,60 @@ pub trait TransactionPoolExt: TransactionPool {
 
     /// Maintenance function to cleanup blobs that are no longer needed.
     fn cleanup_blobs(&self);
+
+    /// Updates the snapshot used for pre-warming simulation.
+    ///
+    /// # Pre-Warming Feature
+    ///
+    /// This method is part of the pre-warming optimization feature that simulates transactions
+    /// in the background to discover which state keys (accounts, storage slots) will be accessed
+    /// during execution. By knowing these keys in advance, the system can batch-fetch values
+    /// from MDBX before execution, resulting in higher cache hit rates.
+    ///
+    /// # When to Call
+    ///
+    /// This should be called whenever the canonical chain state changes (new block committed
+    /// or reorg) to ensure simulation workers use the latest state snapshot. Stale snapshots
+    /// can lead to:
+    /// - Incorrect key discovery (simulating against old state)
+    /// - Wasted work (keys that are no longer relevant)
+    /// - Potential simulation failures
+    ///
+    /// # Arguments
+    ///
+    /// * `state_provider` - A boxed state provider representing the latest canonical state. This is
+    ///   typically obtained from `StateProviderFactory::latest()` after a new block.
+    ///
+    /// # Feature Flag
+    ///
+    /// This method is only available when the `pre-warming` feature is enabled.
+    /// When disabled, it's a no-op.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // In maintain.rs after on_canonical_state_change:
+    /// if let Ok(state_provider) = client.latest() {
+    ///     pool.update_pre_warming_snapshot(state_provider);
+    /// }
+    /// ```
+    #[cfg(feature = "pre-warming")]
+    fn update_pre_warming_snapshot(
+        &self,
+        state_provider: Box<dyn reth_provider::StateProvider + Send>,
+        block_hash: alloy_primitives::B256,
+        changed: &[ChangedAccount],
+    );
+
+    /// No-op when pre-warming feature is disabled.
+    #[cfg(not(feature = "pre-warming"))]
+    fn update_pre_warming_snapshot(
+        &self,
+        _state_provider: Box<dyn reth_provider::StateProvider + Send>,
+        _block_hash: alloy_primitives::B256,
+        _changed: &[ChangedAccount],
+    ) {
+    }
 }
 
 /// A Helper type that bundles all transactions in the pool.

@@ -41,7 +41,20 @@ mod metrics;
 mod stack;
 
 pub use better_payload_emitter::BetterPayloadEmitter;
+pub use metrics::CachedReadsMetrics;
 pub use stack::PayloadBuilderStack;
+
+/// Re-export the PreWarmingPool trait from transaction-pool.
+/// This trait provides access to pre-warmed keys discovered by background simulation.
+#[cfg(feature = "pre-warming")]
+pub use reth_transaction_pool::pre_warming::PreWarmingPool;
+
+/// Blanket implementation when pre-warming feature is disabled
+#[cfg(not(feature = "pre-warming"))]
+pub trait PreWarmingPool {}
+
+#[cfg(not(feature = "pre-warming"))]
+impl<T> PreWarmingPool for T {}
 
 /// Helper to access [`NodePrimitives::BlockHeader`] from [`PayloadBuilder::BuiltPayload`].
 pub type HeaderForPayload<P> = <<P as BuiltPayload>::Primitives as NodePrimitives>::BlockHeader;
@@ -85,7 +98,11 @@ impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
             pre_cached: None,
         }
     }
+}
 
+// === impl BasicPayloadJobGenerator ===
+
+impl<Client, Tasks, Builder> BasicPayloadJobGenerator<Client, Tasks, Builder> {
     /// Returns the maximum duration a job should be allowed to run.
     ///
     /// This adheres to the following specification:
@@ -144,6 +161,10 @@ where
         &self,
         attributes: <Self::Job as PayloadJob>::PayloadAttributes,
     ) -> Result<Self::Job, PayloadBuilderError> {
+        tracing::info!(
+            target: "payload_builder",
+            "new_payload_job called - starting payload job creation"
+        );
         let parent_header = if attributes.parent().is_zero() {
             // Use latest header for genesis block case
             self.client
@@ -158,7 +179,129 @@ where
                 .ok_or_else(|| PayloadBuilderError::MissingParentHeader(attributes.parent()))?
         };
 
-        let cached_reads = self.maybe_pre_cached(parent_header.hash());
+        let mut cached_reads = self.maybe_pre_cached(parent_header.hash()).unwrap_or_default();
+
+        // ALWAYS set metrics callbacks for CachedReads hit/miss tracking
+        // This ensures we track cache performance regardless of pre-warming feature
+        {
+            use crate::metrics::CachedReadsMetrics;
+            use std::sync::Arc;
+
+            let on_hit = Arc::new(|| {
+                CachedReadsMetrics::global().inc_hits();
+            });
+
+            let on_miss = Arc::new(|| {
+                CachedReadsMetrics::global().inc_misses();
+            });
+
+            cached_reads.set_metrics_callbacks(on_hit, on_miss);
+        }
+
+        // Pre-warming: Prefetch state using keys discovered by simulation (PARALLEL)
+        // Uses global registry to access pre-warmed cache without complex trait bounds
+        // Note: Pre-warming may override the metrics callbacks above with its own
+        #[cfg(feature = "pre-warming")]
+        {
+            tracing::debug!(
+                target: "payload_builder",
+                "Pre-warming: Checking global cache for keys"
+            );
+
+            // Set metrics callbacks for hit/miss tracking during EVM execution
+            if let Some(metrics) = reth_transaction_pool::pre_warming::get_global_metrics() {
+                let metrics_clone_hit = metrics.clone();
+                let metrics_clone_miss = metrics.clone();
+
+                let on_hit = std::sync::Arc::new(move || {
+                    metrics_clone_hit.cache_hits.increment(1);
+                });
+
+                let on_miss = std::sync::Arc::new(move || {
+                    metrics_clone_miss.cache_misses.increment(1);
+                });
+
+                cached_reads.set_metrics_callbacks(on_hit, on_miss);
+            }
+
+            if let Some(cache) = reth_transaction_pool::pre_warming::get_global_cache() {
+                let keys = cache.get_all_keys();
+                let cache_stats = cache.stats();
+                tracing::info!(
+                    target: "payload_builder",
+                    cache_entries = cache_stats.total_transactions,
+                    total_accounts = cache_stats.total_accounts,
+                    total_storage_slots = cache_stats.total_storage_slots,
+                    total_code_hashes = cache_stats.total_code_hashes,
+                    total_keys = cache_stats.total_keys,
+                    accounts_in_keys = keys.accounts.len(),
+                    storage_in_keys = keys.storage_slots.len(),
+                    code_hashes_in_keys = keys.code_hashes.len(),
+                    is_empty = keys.is_empty(),
+                    "Pre-warming: Got cache with stats and keys"
+                );
+                // Skip if no keys were discovered
+                if keys.is_empty() {
+                    tracing::warn!(
+                        target: "payload_builder",
+                        "Pre-warming: No keys discovered by simulation (cache reports {} entries but is_empty=true)",
+                        cache_stats.total_transactions
+                    );
+                } else {
+                    tracing::info!(
+                        target: "payload_builder",
+                        accounts = keys.accounts.len(),
+                        storage_slots = keys.storage_slots.len(),
+                        "Pre-warming: Found keys, starting prefetch"
+                    );
+                    // Get state provider for prefetching
+                    if let Ok(state_provider) =
+                        self.client.state_by_block_hash(parent_header.hash())
+                    {
+                        // Wrap in Arc<SnapshotState> for parallel prefetch
+                        let snapshot = std::sync::Arc::new(
+                            reth_transaction_pool::pre_warming::SnapshotState::new(state_provider),
+                        );
+
+                        // Use globally configured prefetch threads (from
+                        // --txpool.pre-warming-workers)
+                        let num_threads =
+                            reth_transaction_pool::pre_warming::get_global_prefetch_threads();
+
+                        // Use sync version (uses std::thread::scope internally)
+                        if let Err(err) =
+                            reth_transaction_pool::pre_warming::prefetch_with_snapshot_sync(
+                                &mut cached_reads,
+                                &keys,
+                                snapshot,
+                                num_threads,
+                                None, // No metrics for basic payload builder
+                            )
+                        {
+                            tracing::warn!(
+                                target: "payload_builder",
+                                ?err,
+                                "Failed to prefetch pre-warmed state, continuing with partial cache"
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "payload_builder",
+                                accounts = keys.accounts.len(),
+                                storage_slots = keys.storage_slots.len(),
+                                contracts = keys.code_hashes.len(),
+                                threads = num_threads,
+                                "Pre-warmed cache populated from simulation (parallel)"
+                            );
+                        }
+                    }
+                }
+            } else {
+                tracing::trace!(
+                    target: "payload_builder",
+                    "Pre-warming not active (global cache not registered)"
+                );
+            }
+        }
 
         let config = PayloadConfig::new(Arc::new(parent_header), attributes);
 
@@ -173,7 +316,7 @@ where
             interval: tokio::time::interval(self.config.interval),
             best_payload: PayloadState::Missing,
             pending_block: None,
-            cached_reads,
+            cached_reads: Some(cached_reads),
             payload_task_guard: self.payload_task_guard.clone(),
             metrics: Default::default(),
             builder: self.builder.clone(),

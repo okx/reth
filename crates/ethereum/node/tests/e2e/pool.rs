@@ -295,7 +295,6 @@ async fn maintain_txpool_commit() -> eyre::Result<()> {
 
     txpool.add_transaction(TransactionOrigin::External, pooled_tx).await.unwrap();
     assert_eq!(txpool.len(), 1);
-
     // make the node advance and eventually generate `CanonStateNotification::Commit` event to
     // propagate to the pool
     let _ = node.rpc.inject_tx(envelop.encoded_2718().into()).await.unwrap();

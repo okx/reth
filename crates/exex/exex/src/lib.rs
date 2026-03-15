@@ -75,7 +75,7 @@
 //! - Minimize blocking operations
 //! - Use efficient data structures for state tracking
 //! - Implement proper error handling and logging
-//! - Consider batching operations for better performance
+//! - Consider pre-warming operations for better performance
 //!
 //! [`Future`]: std::future::Future
 //! [`ExExContext`]: crate::ExExContext

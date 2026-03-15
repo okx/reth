@@ -407,6 +407,10 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                     })
                     .collect::<Vec<_>>();
 
+                // Capture changed accounts before they are moved into CanonicalStateUpdate.
+                #[cfg(feature = "pre-warming")]
+                let prewarm_changed = changed_accounts.clone();
+
                 // update the pool first
                 let update = CanonicalStateUpdate {
                     new_tip: new_tip.sealed_block(),
@@ -418,6 +422,26 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                     update_kind: PoolUpdateKind::Reorg,
                 };
                 pool.on_canonical_state_change(update);
+
+                // ============================================================
+                // PRE-WARMING: Update snapshot after canonical state change
+                // ============================================================
+                // After a reorg, the chain state has changed. We need to update
+                // the snapshot used by pre-warming simulation workers so they
+                // simulate against the new canonical state, not the old fork.
+                //
+                // This is critical because:
+                // 1. Account balances/nonces may have changed
+                // 2. Storage values may be different on the new fork
+                // 3. Simulating against stale state wastes resources
+                //
+                // We use `latest()` to get the state at the new tip.
+                // ============================================================
+                #[cfg(feature = "pre-warming")]
+                if let Ok(state_provider) = client.latest() {
+                    pool.update_pre_warming_snapshot(state_provider, new_tip.hash(), &prewarm_changed);
+                    trace!(target: "txpool", "Updated pre-warming snapshot after reorg");
+                }
 
                 // all transactions that were mined in the old chain but not in the new chain need
                 // to be re-injected
@@ -491,6 +515,10 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                     maintained_state = MaintainedPoolState::Drifted;
                 }
 
+                // Capture changed accounts before they are moved into CanonicalStateUpdate.
+                #[cfg(feature = "pre-warming")]
+                let prewarm_changed = changed_accounts.clone();
+
                 // Canonical update
                 let update = CanonicalStateUpdate {
                     new_tip: tip.sealed_block(),
@@ -501,6 +529,27 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                     update_kind: PoolUpdateKind::Commit,
                 };
                 pool.on_canonical_state_change(update);
+
+                // ============================================================
+                // PRE-WARMING: Update snapshot after canonical state change
+                // ============================================================
+                // After a new block is committed, the chain state has advanced.
+                // We update the snapshot used by pre-warming simulation workers
+                // so they simulate against the latest canonical state.
+                //
+                // This ensures:
+                // 1. New simulations see updated account balances/nonces
+                // 2. Storage changes from the committed block are visible
+                // 3. Key discovery is accurate for the next block
+                //
+                // Note: Mined transactions were already removed from the cache
+                // in on_canonical_state_change() via notify_txs_removed().
+                // ============================================================
+                #[cfg(feature = "pre-warming")]
+                if let Ok(state_provider) = client.latest() {
+                    pool.update_pre_warming_snapshot(state_provider, tip.hash(), &prewarm_changed);
+                    trace!(target: "txpool", "Updated pre-warming snapshot after commit");
+                }
 
                 // keep track of mined blob transactions
                 blob_store_tracker.add_new_chain_blocks(&blocks);
@@ -891,7 +940,7 @@ mod tests {
         let blob_store = InMemoryBlobStore::default();
         let validator = EthTransactionValidatorBuilder::new(provider).build(blob_store.clone());
 
-        let txpool = Pool::new(
+        let txpool: Pool<_, _, _, ()> = Pool::new(
             validator,
             CoinbaseTipOrdering::default(),
             blob_store.clone(),

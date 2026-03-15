@@ -1,4 +1,5 @@
 //! Database adapters for payload building.
+use alloc::sync::Arc;
 use alloy_primitives::{
     map::{Entry, HashMap},
     Address, B256, U256,
@@ -28,7 +29,7 @@ use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseRef};
 ///     let state = State::builder().with_database(db).build();
 /// }
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CachedReads {
     /// Block state account with storage.
     pub accounts: HashMap<Address, CachedAccount>,
@@ -36,6 +37,21 @@ pub struct CachedReads {
     pub contracts: HashMap<B256, Bytecode>,
     /// Block hash mapped to the block number.
     pub block_hashes: HashMap<u64, B256>,
+    /// Optional callback for tracking cache hits (always available, set via set_metrics_callbacks)
+    pub on_cache_hit: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Optional callback for tracking cache misses (always available, set via
+    /// set_metrics_callbacks)
+    pub on_cache_miss: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl core::fmt::Debug for CachedReads {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CachedReads")
+            .field("accounts", &self.accounts)
+            .field("contracts", &self.contracts)
+            .field("block_hashes", &self.block_hashes)
+            .finish()
+    }
 }
 
 // === impl CachedReads ===
@@ -51,6 +67,18 @@ impl CachedReads {
         CachedReadsDbMut { cached: self, db }
     }
 
+    /// Sets the metrics callbacks for tracking cache hits/misses.
+    ///
+    /// Pass closures that will be called on cache hits and misses.
+    pub fn set_metrics_callbacks(
+        &mut self,
+        on_hit: Arc<dyn Fn() + Send + Sync>,
+        on_miss: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.on_cache_hit = Some(on_hit);
+        self.on_cache_miss = Some(on_miss);
+    }
+
     /// Inserts an account info into the cache.
     pub fn insert_account(
         &mut self,
@@ -64,10 +92,18 @@ impl CachedReads {
     /// Extends current cache with entries from another [`CachedReads`] instance.
     ///
     /// Note: It is expected that both instances are based on the exact same state.
+    /// Callbacks are preserved from the current instance.
     pub fn extend(&mut self, other: Self) {
         self.accounts.extend(other.accounts);
         self.contracts.extend(other.contracts);
         self.block_hashes.extend(other.block_hashes);
+        // Preserve callbacks from self, don't overwrite with other's callbacks
+        if self.on_cache_hit.is_none() && other.on_cache_hit.is_some() {
+            self.on_cache_hit = other.on_cache_hit;
+        }
+        if self.on_cache_miss.is_none() && other.on_cache_miss.is_some() {
+            self.on_cache_miss = other.on_cache_miss;
+        }
     }
 }
 
@@ -111,8 +147,18 @@ impl<DB: DatabaseRef> Database for CachedReadsDbMut<'_, DB> {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let basic = match self.cached.accounts.entry(address) {
-            Entry::Occupied(entry) => entry.get().info.clone(),
+            Entry::Occupied(entry) => {
+                // Cache hit - data already in cache
+                if let Some(ref on_hit) = self.cached.on_cache_hit {
+                    on_hit();
+                }
+                entry.get().info.clone()
+            }
             Entry::Vacant(entry) => {
+                // Cache miss - need to fetch from underlying database
+                if let Some(ref on_miss) = self.cached.on_cache_miss {
+                    on_miss();
+                }
                 entry.insert(CachedAccount::new(self.db.basic_ref(address)?)).info.clone()
             }
         };
@@ -130,10 +176,26 @@ impl<DB: DatabaseRef> Database for CachedReadsDbMut<'_, DB> {
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         match self.cached.accounts.entry(address) {
             Entry::Occupied(mut acc_entry) => match acc_entry.get_mut().storage.entry(index) {
-                Entry::Occupied(entry) => Ok(*entry.get()),
-                Entry::Vacant(entry) => Ok(*entry.insert(self.db.storage_ref(address, index)?)),
+                Entry::Occupied(entry) => {
+                    // Cache hit - storage slot already in cache
+                    if let Some(ref on_hit) = self.cached.on_cache_hit {
+                        on_hit();
+                    }
+                    Ok(*entry.get())
+                }
+                Entry::Vacant(entry) => {
+                    // Cache miss - storage slot not in cache
+                    if let Some(ref on_miss) = self.cached.on_cache_miss {
+                        on_miss();
+                    }
+                    Ok(*entry.insert(self.db.storage_ref(address, index)?))
+                }
             },
             Entry::Vacant(acc_entry) => {
+                // Cache miss - account not in cache
+                if let Some(ref on_miss) = self.cached.on_cache_miss {
+                    on_miss();
+                }
                 // acc needs to be loaded for us to access slots.
                 let info = self.db.basic_ref(address)?;
                 let (account, value) = if info.is_some() {

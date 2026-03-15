@@ -79,7 +79,7 @@ impl<Node, Pool, PB, EvmConfig> PayloadServiceBuilder<Node, Pool, EvmConfig>
     for BasicPayloadServiceBuilder<PB>
 where
     Node: FullNodeTypes,
-    Pool: TransactionPool,
+    Pool: TransactionPool + Clone + 'static,
     EvmConfig: Send,
     PB: PayloadBuilderBuilder<Node, Pool, EvmConfig>,
 {
@@ -104,6 +104,7 @@ where
             payload_job_config,
             payload_builder,
         );
+
         let (payload_service, payload_service_handle) =
             PayloadBuilderService::new(payload_generator, ctx.provider().canonical_state_stream());
 

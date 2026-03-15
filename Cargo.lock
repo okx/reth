@@ -8016,6 +8016,7 @@ dependencies = [
  "reth-revm",
  "reth-storage-api",
  "reth-tasks",
+ "reth-transaction-pool",
  "tokio",
  "tracing",
 ]
@@ -8703,7 +8704,6 @@ dependencies = [
  "reth-chainspec",
  "reth-engine-primitives",
  "reth-ethereum-engine-primitives",
- "reth-optimism-chainspec",
  "reth-payload-builder",
  "reth-payload-primitives",
  "reth-primitives-traits",
@@ -9210,6 +9210,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "revm",
+ "tracing",
 ]
 
 [[package]]
@@ -9229,7 +9230,6 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-execution-types",
- "reth-node-metrics",
  "reth-primitives-traits",
  "reth-storage-errors",
  "reth-testing-utils",
@@ -10165,7 +10165,6 @@ dependencies = [
  "alloy-primitives",
  "once_cell",
  "reth-ethereum-forks",
- "tracing",
 ]
 
 [[package]]
@@ -11443,8 +11442,10 @@ dependencies = [
 name = "reth-transaction-pool"
 version = "1.10.1"
 dependencies = [
+ "ahash",
  "alloy-consensus",
  "alloy-eips",
+ "alloy-evm",
  "alloy-primitives",
  "alloy-rlp",
  "aquamarine",
@@ -11452,8 +11453,10 @@ dependencies = [
  "auto_impl",
  "bitflags 2.10.0",
  "codspeed-criterion-compat",
+ "dashmap 6.1.0",
  "futures",
  "futures-util",
+ "libc",
  "metrics",
  "parking_lot",
  "paste",
@@ -11461,19 +11464,23 @@ dependencies = [
  "proptest",
  "proptest-arbitrary-interop",
  "rand 0.9.2",
+ "rayon",
  "reth-chain-state",
  "reth-chainspec",
  "reth-eth-wire-types",
  "reth-ethereum-primitives",
+ "reth-evm",
  "reth-execution-types",
  "reth-fs-util",
  "reth-metrics",
- "reth-node-metrics",
+ "reth-primitives",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-revm",
  "reth-storage-api",
  "reth-tasks",
  "reth-tracing",
+ "revm",
  "revm-interpreter",
  "revm-primitives 22.0.0",
  "rustc-hash",

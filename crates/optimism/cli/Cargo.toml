@@ -125,3 +125,9 @@ serde = [
 ]
 
 edge = ["reth-cli-commands/edge", "reth-node-core/edge"]
+
+pre-warming = [
+    "reth-node-core/pre-warming",
+    "reth-optimism-node/pre-warming",
+]
+

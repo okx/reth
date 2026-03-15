@@ -56,3 +56,8 @@ either.workspace = true
 
 # xlayer
 xlayer-db.workspace = true
+
+[features]
+default = []
+pre-warming = ["reth-transaction-pool/pre-warming"]
+
