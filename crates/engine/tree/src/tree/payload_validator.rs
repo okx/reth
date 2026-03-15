@@ -425,34 +425,13 @@ where
         // Get an iterator over the transactions in the payload
         let txs = self.tx_iterator_for(&input)?;
 
-        // Extract the BAL built from EIP-2930 access lists in the block's transactions.
-        // Returns None if no transactions carry access list entries.
+        // Extract the BAL, if valid and available
         let block_access_list = ensure_ok!(input
             .block_access_list()
             .transpose()
             // Eventually gets converted to a `InsertBlockErrorKind::Other`
             .map_err(Box::<dyn std::error::Error + Send + Sync>::from))
         .map(Arc::new);
-
-        if let Some(bal) = &block_access_list {
-            let total_slots: usize = bal
-                .iter()
-                .map(|a| a.storage_reads.len() + a.storage_changes.len())
-                .sum();
-            info!(
-                target: "engine::tree",
-                block_hash = %input.hash(),
-                entries = bal.len(),
-                total_slots,
-                "Sending EIP-2930 access list BAL to prefetcher"
-            );
-        } else {
-            trace!(
-                target: "engine::tree",
-                block_hash = %input.hash(),
-                "No EIP-2930 access lists found in block — BAL prefetch skipped"
-            );
-        }
 
         // Create lazy overlay from ancestors - this doesn't block, allowing execution to start
         // before the trie data is ready. The overlay will be computed on first access.
@@ -1473,63 +1452,10 @@ impl<T: PayloadTypes> BlockOrPayload<T> {
         }
     }
 
-    /// Returns a [`BlockAccessList`] built from EIP-2930 access lists declared in the block's
-    /// transactions.
-    ///
-    /// Every transaction type that carries an access list (EIP-2930/1559/4844/7702) contributes
-    /// its entries as `storage_reads` in the returned BAL. The prefetcher uses these to warm the
-    /// state cache before execution starts, without needing full EVM simulation.
-    ///
-    /// Returns `None` if no transaction in the block declares any access list entries.
-    pub fn block_access_list(&self) -> Option<Result<BlockAccessList, alloy_rlp::Error>>
-    where
-        T::ExecutionData: ExecutionPayload,
-        <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives,
-        <<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::SignedTx: Transaction,
-    {
-        use alloy_consensus::TxEnvelope;
-        use alloy_eip7928::AccountChanges;
-        use alloy_eips::eip2718::Decodable2718;
-        use alloy_primitives::U256;
-
-        // Helper: convert an EIP-2930 AccessList into AccountChanges entries for the BAL.
-        // Each AccessListItem declares an address + storage slots the tx will touch.
-        // We put those slots into `storage_reads` so the prefetcher loads them before execution.
-        let al_to_entries = |al: &alloy_eips::eip2930::AccessList| -> Vec<AccountChanges> {
-            al.iter()
-                .filter(|item| !item.storage_keys.is_empty())
-                .map(|item| {
-                    AccountChanges::new(item.address).extend_storage_reads(
-                        item.storage_keys.iter().map(|k| U256::from_be_bytes(k.0)),
-                    )
-                })
-                .collect()
-        };
-
-        let mut bal = BlockAccessList::new();
-
-        match self {
-            Self::Block(block) => {
-                for tx in block.body().transactions() {
-                    if let Some(al) = tx.access_list() {
-                        bal.extend(al_to_entries(al));
-                    }
-                }
-            }
-            Self::Payload(payload) => {
-                for raw_tx in payload.encoded_transactions() {
-                    // Deposit transactions (OP type 0x7e = 126) are not standard Ethereum
-                    // typed transactions and will fail to decode here — skip them silently.
-                    if let Ok(tx) = TxEnvelope::decode_2718(&mut raw_tx.as_ref()) {
-                        if let Some(al) = tx.access_list() {
-                            bal.extend(al_to_entries(al));
-                        }
-                    }
-                }
-            }
-        }
-
-        if bal.is_empty() { None } else { Some(Ok(bal)) }
+    /// Returns the block access list if available.
+    pub const fn block_access_list(&self) -> Option<Result<BlockAccessList, alloy_rlp::Error>> {
+        // TODO decode and return `BlockAccessList`
+        None
     }
 
     /// Returns the number of transactions in the payload or block.
