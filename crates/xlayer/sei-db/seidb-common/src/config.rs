@@ -8,7 +8,7 @@ use std::{str::FromStr, time::Duration};
 /// Defines how EVM data writes are routed between backends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WriteMode {
-    /// Writes all data to Cosmos (memiavl) only. Default/legacy behavior.
+    /// Writes all data to Cosmos only. Default/legacy behavior.
     #[default]
     CosmosOnly,
     /// Writes EVM data to both Cosmos and EVM backends (migration phase).
@@ -58,7 +58,7 @@ impl FromStr for WriteMode {
 /// Defines how EVM data reads are routed between backends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ReadMode {
-    /// Reads all data from Cosmos (memiavl) only. Default/legacy behavior.
+    /// Reads all data from Cosmos only. Default/legacy behavior.
     #[default]
     CosmosOnly,
     /// Reads EVM data from EVM backend first, falls back to Cosmos.
@@ -138,128 +138,29 @@ impl Default for WalConfig {
 }
 
 // ---------------------------------------------------------------------------
-// MemIavlConfig
-// ---------------------------------------------------------------------------
-
-/// Configuration for the MemIAVL (Cosmos) commit store backend.
-#[derive(Debug, Clone)]
-pub struct MemIavlConfig {
-    /// Size of asynchronous commit queue. <= 0 means synchronous commit.
-    pub async_commit_buffer: usize,
-    /// How many old snapshots (excluding latest) to keep. 0 keeps only current.
-    pub snapshot_keep_recent: u32,
-    /// Block interval between snapshots. 0 disables auto-snapshots.
-    pub snapshot_interval: u32,
-    /// Minimum time (seconds) between snapshots to prevent excessive creation.
-    pub snapshot_min_time_interval: u32,
-    /// Concurrency limit for snapshot writers.
-    pub snapshot_writer_limit: usize,
-    /// Page cache residency threshold (0.0-1.0) to trigger snapshot prefetch.
-    pub snapshot_prefetch_threshold: f64,
-    /// Global snapshot write rate limit in MB/s. 0 means unlimited.
-    pub snapshot_write_rate_mbps: usize,
-}
-
-impl Default for MemIavlConfig {
-    fn default() -> Self {
-        Self {
-            async_commit_buffer: 100,
-            snapshot_keep_recent: 0,
-            snapshot_interval: 10000,
-            snapshot_min_time_interval: 3600,
-            snapshot_writer_limit: 4,
-            snapshot_prefetch_threshold: 0.8,
-            snapshot_write_rate_mbps: 100,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FlatKvConfig
-// ---------------------------------------------------------------------------
-
-/// Configuration for the FlatKV (EVM) commit store backend.
-#[derive(Debug, Clone)]
-pub struct FlatKvConfig {
-    /// Whether PebbleDB writes use fsync. Default: false.
-    pub fsync: bool,
-    /// Async write buffer size for data DBs. 0 means synchronous.
-    pub async_write_buffer: usize,
-    /// Block interval between PebbleDB checkpoint snapshots. 0 disables.
-    pub snapshot_interval: u32,
-    /// Number of old snapshots to keep besides the latest one.
-    pub snapshot_keep_recent: u32,
-    /// Whether to enable PebbleDB metrics.
-    pub enable_db_metrics: bool,
-}
-
-impl Default for FlatKvConfig {
-    fn default() -> Self {
-        Self {
-            fsync: false,
-            async_write_buffer: 0,
-            snapshot_interval: 10000,
-            snapshot_keep_recent: 2,
-            enable_db_metrics: true,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // StateCommitConfig
 // ---------------------------------------------------------------------------
 
 /// Configuration for the state commit (SC) layer.
+///
+/// MPT-only: legacy MemIAVL/FlatKV fields have been removed.
 #[derive(Debug, Clone)]
 pub struct StateCommitConfig {
     /// Whether the state-commit (SeiDB) layer is enabled.
     pub enable: bool,
     /// Directory for state-commit store files. Empty uses the application home.
     pub directory: String,
-    /// Write routing mode for EVM data.
-    pub write_mode: WriteMode,
-    /// Read routing mode for EVM data.
-    pub read_mode: ReadMode,
-    /// MemIAVL (Cosmos) backend configuration.
-    pub memiavl: MemIavlConfig,
-    /// FlatKV (EVM) backend configuration.
-    pub flatkv: FlatKvConfig,
-    /// Size of the asynchronous commit queue. <= 0 means synchronous.
-    pub async_commit_buffer: usize,
-    /// Max concurrent historical proof queries.
-    pub historical_proof_max_in_flight: usize,
-    /// Token bucket rate (req/sec) for historical proof queries. <= 0 disables.
-    pub historical_proof_rate_limit: f64,
-    /// Token bucket burst for historical proof queries.
-    pub historical_proof_burst: usize,
 }
 
 impl Default for StateCommitConfig {
     fn default() -> Self {
-        Self {
-            enable: true,
-            directory: String::new(),
-            write_mode: WriteMode::default(),
-            read_mode: ReadMode::default(),
-            memiavl: MemIavlConfig::default(),
-            flatkv: FlatKvConfig::default(),
-            async_commit_buffer: 100,
-            historical_proof_max_in_flight: 1,
-            historical_proof_rate_limit: 1.0,
-            historical_proof_burst: 1,
-        }
+        Self { enable: true, directory: String::new() }
     }
 }
 
 impl StateCommitConfig {
     /// Validates the configuration, returning an error if any field is invalid.
     pub fn validate(&self) -> Result<()> {
-        if !self.write_mode.is_valid() {
-            return Err(SeiDbError::Other(format!("invalid write_mode: {}", self.write_mode)));
-        }
-        if !self.read_mode.is_valid() {
-            return Err(SeiDbError::Other(format!("invalid read_mode: {}", self.read_mode)));
-        }
         Ok(())
     }
 }
@@ -435,26 +336,6 @@ mod tests {
         let cfg = StateCommitConfig::default();
         assert!(cfg.enable);
         assert!(cfg.directory.is_empty());
-        assert_eq!(cfg.write_mode, WriteMode::CosmosOnly);
-        assert_eq!(cfg.read_mode, ReadMode::CosmosOnly);
-        assert_eq!(cfg.async_commit_buffer, 100);
-        assert_eq!(cfg.historical_proof_max_in_flight, 1);
-        assert!((cfg.historical_proof_rate_limit - 1.0).abs() < f64::EPSILON);
-        assert_eq!(cfg.historical_proof_burst, 1);
-        // nested memiavl defaults
-        assert_eq!(cfg.memiavl.async_commit_buffer, 100);
-        assert_eq!(cfg.memiavl.snapshot_interval, 10000);
-        assert_eq!(cfg.memiavl.snapshot_keep_recent, 0);
-        assert_eq!(cfg.memiavl.snapshot_min_time_interval, 3600);
-        assert_eq!(cfg.memiavl.snapshot_writer_limit, 4);
-        assert!((cfg.memiavl.snapshot_prefetch_threshold - 0.8).abs() < f64::EPSILON);
-        assert_eq!(cfg.memiavl.snapshot_write_rate_mbps, 100);
-        // nested flatkv defaults
-        assert!(!cfg.flatkv.fsync);
-        assert_eq!(cfg.flatkv.async_write_buffer, 0);
-        assert_eq!(cfg.flatkv.snapshot_interval, 10000);
-        assert_eq!(cfg.flatkv.snapshot_keep_recent, 2);
-        assert!(cfg.flatkv.enable_db_metrics);
         // validate should pass
         assert!(cfg.validate().is_ok());
     }

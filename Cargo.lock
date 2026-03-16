@@ -5147,25 +5147,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ics23"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73b17f1a5bd7d12ad30a21445cfa5f52fd7651cb3243ba866f9916b1ec112f12"
-dependencies = [
- "anyhow",
- "blake2",
- "blake3",
- "bytes",
- "hex",
- "informalsystems-pbjson",
- "prost 0.13.5",
- "ripemd",
- "serde",
- "sha2 0.10.9",
- "sha3",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5374,16 +5355,6 @@ name = "infer"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64e9829a50b42bb782c1df523f78d332fe371b10c661e78b7a3c34b0198e9fac"
-
-[[package]]
-name = "informalsystems-pbjson"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9aa4a0980c8379295100d70854354e78df2ee1c6ca0f96ffe89afeb3140e3a3d"
-dependencies = [
- "base64 0.21.7",
- "serde",
-]
 
 [[package]]
 name = "inotify"
@@ -12892,16 +12863,9 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
- "blake3",
- "bytemuck",
  "codspeed-criterion-compat",
- "crossbeam-channel",
  "fs4",
- "hex",
- "ics23",
- "memmap2",
  "parking_lot",
- "prost 0.13.5",
  "rand 0.9.2",
  "rayon",
  "reth-primitives-traits",
@@ -12911,12 +12875,9 @@ dependencies = [
  "revm-state 9.0.0",
  "seidb-common",
  "seidb-engine",
- "seidb-proto",
  "seidb-traits",
- "seidb-wal",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tracing",
 ]

@@ -82,31 +82,6 @@ pub fn parse_evm_key(key: &[u8]) -> (EvmKeyKind, &[u8]) {
     }
 }
 
-/// Builds a memiavl key from internal (stripped) bytes.
-///
-/// This is the reverse of [`parse_evm_key`] for optimised key types.
-/// For `Empty` and `Legacy` kinds an empty `Vec` is returned because those
-/// kinds have no canonical prefix.
-pub fn build_memiavl_evm_key(kind: EvmKeyKind, key_bytes: &[u8]) -> Vec<u8> {
-    let prefix: Option<u8> = match kind {
-        EvmKeyKind::Storage => Some(STATE_KEY_PREFIX),
-        EvmKeyKind::Nonce => Some(NONCE_KEY_PREFIX),
-        EvmKeyKind::CodeHash => Some(CODE_HASH_KEY_PREFIX),
-        EvmKeyKind::Code => Some(CODE_KEY_PREFIX),
-        _ => None,
-    };
-
-    match prefix {
-        Some(p) => {
-            let mut result = Vec::with_capacity(1 + key_bytes.len());
-            result.push(p);
-            result.extend_from_slice(key_bytes);
-            result
-        }
-        None => Vec::new(),
-    }
-}
-
 /// Returns the expected internal (stripped) key length for a given kind.
 pub fn internal_key_len(kind: EvmKeyKind) -> usize {
     match kind {
@@ -223,31 +198,6 @@ mod tests {
         let (kind, stripped) = parse_evm_key(&key);
         assert_eq!(kind, EvmKeyKind::Legacy);
         assert_eq!(stripped, &key[..]);
-    }
-
-    #[test]
-    fn test_roundtrip() {
-        let addr = make_addr();
-        let slot = make_slot();
-
-        // Test each optimised kind
-        let cases: Vec<(EvmKeyKind, Vec<u8>)> = vec![
-            (EvmKeyKind::Nonce, addr.to_vec()),
-            (EvmKeyKind::CodeHash, addr.to_vec()),
-            (EvmKeyKind::Code, addr.to_vec()),
-            (EvmKeyKind::Storage, {
-                let mut v = addr.to_vec();
-                v.extend_from_slice(&slot);
-                v
-            }),
-        ];
-
-        for (kind, internal) in &cases {
-            let built = build_memiavl_evm_key(*kind, internal);
-            let (parsed_kind, parsed_bytes) = parse_evm_key(&built);
-            assert_eq!(parsed_kind, *kind, "roundtrip failed for {kind:?}");
-            assert_eq!(parsed_bytes, internal.as_slice());
-        }
     }
 
     #[test]

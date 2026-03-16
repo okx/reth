@@ -6,20 +6,11 @@ edition = "2024"
 [dependencies]
 seidb-common = { workspace = true }
 seidb-traits = { workspace = true }
-seidb-proto = { workspace = true }
 seidb-engine = { workspace = true }
-seidb-wal = { workspace = true }
-blake3 = { workspace = true }
-sha2 = { workspace = true, features = ["std"] }
-memmap2 = { workspace = true }
-ics23 = { workspace = true }
-bytemuck = { workspace = true }
 rayon = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 fs4 = { workspace = true }
-prost = { workspace = true }
-crossbeam-channel = { workspace = true }
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rlp = { workspace = true, features = ["derive"] }
 alloy-trie = { workspace = true, features = ["ethereum"] }
@@ -37,18 +28,9 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion.workspace = true
-hex = "0.4"
 rand = { workspace = true }
 reth-trie = { workspace = true, features = ["test-utils"] }
 reth-primitives-traits = { workspace = true, features = ["test-utils"] }
-
-[[bench]]
-name = "memiavl_bench"
-harness = false
-
-[[bench]]
-name = "flatkv_bench"
-harness = false
 
 [[bench]]
 name = "mpt_parallel_bench"

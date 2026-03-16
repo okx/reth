@@ -1,11 +1,6 @@
 use crate::config::StateCommitConfig;
 use std::path::{Path, PathBuf};
 
-/// Returns the path to the commit store database.
-pub fn get_commit_store_path(home: &Path) -> PathBuf {
-    home.join("data").join("committer.db")
-}
-
 /// Returns the path to the MPT commit store database.
 pub fn get_mpt_commit_store_path(home: &Path) -> PathBuf {
     home.join("data").join("mpt_committer.db")
@@ -34,12 +29,6 @@ pub fn get_changelog_path(db_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_commit_store_path() {
-        let home = Path::new("/home/user");
-        assert_eq!(get_commit_store_path(home), PathBuf::from("/home/user/data/committer.db"));
-    }
 
     #[test]
     fn test_state_store_path() {
