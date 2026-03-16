@@ -20,3 +20,6 @@ seidb-ss = { workspace = true }
 seidb-wal = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+alloy-primitives = { workspace = true }
+revm-database = { workspace = true }
+revm-state = { workspace = true }

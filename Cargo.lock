@@ -12815,6 +12815,9 @@ dependencies = [
 name = "seidb"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
+ "revm-database",
+ "revm-state 9.0.0",
  "seidb-common",
  "seidb-proto",
  "seidb-sc",

@@ -1,428 +1,216 @@
-//! End-to-end integration tests for SeiDb: SC+SS, WriteMode routing, rollback, multi-block.
+//! Top-level integration tests for SeiDb with MPT SC backend.
+//!
+//! Tests I4.1-I4.6: lifecycle, multi-block commit, reopen, rollback, SS interop.
 
-use seidb::db::SeiDb;
-use seidb_common::config::{MemIavlConfig, StateCommitConfig, StateStoreConfig, WriteMode};
-use seidb_proto::{ChangeSet, KvPair, NamedChangeSet};
-use seidb_traits::{sc::Committer, ss::StateStore};
-use std::sync::Arc;
+use alloy_primitives::U256;
+use revm_database::{states::StorageSlot, BundleAccount, BundleState};
+use revm_state::AccountInfo;
+use seidb::{
+    db::SeiDb,
+    MptCommitter, // trait import for commit/rollback/load_version/close
+};
+use seidb_common::config::{StateCommitConfig, StateStoreConfig};
 use tempfile::tempdir;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn make_changeset(store: &str, pairs: Vec<(&[u8], &[u8], bool)>) -> NamedChangeSet {
-    NamedChangeSet {
-        name: store.to_string(),
-        changeset: Some(ChangeSet {
-            pairs: pairs
-                .into_iter()
-                .map(|(k, v, del)| KvPair { delete: del, key: k.to_vec(), value: v.to_vec() })
-                .collect(),
-        }),
+fn make_bundle(
+    accounts: Vec<(
+        alloy_primitives::Address,
+        Option<AccountInfo>,
+        revm_database::AccountStatus,
+        Vec<(U256, U256, U256)>,
+    )>,
+) -> BundleState {
+    let mut state: alloy_primitives::map::HashMap<alloy_primitives::Address, BundleAccount> =
+        alloy_primitives::map::HashMap::default();
+    for (address, info, status, storage) in accounts {
+        let storage_map: revm_database::StorageWithOriginalValues = storage
+            .into_iter()
+            .map(|(key, orig, present)| (key, StorageSlot::new_changed(orig, present)))
+            .collect();
+        let bundle_account = BundleAccount::new(None, info, storage_map, status);
+        state.insert(address, bundle_account);
+    }
+    BundleState {
+        state,
+        contracts: Default::default(),
+        reverts: Default::default(),
+        state_size: 0,
+        reverts_size: 0,
     }
 }
 
-fn sc_config(write_mode: WriteMode) -> StateCommitConfig {
-    StateCommitConfig {
-        write_mode,
-        memiavl: MemIavlConfig {
-            snapshot_interval: 0, // disable auto-snapshot for tests
-            ..Default::default()
-        },
-        ..Default::default()
+fn default_info(nonce: u64, balance: u64) -> AccountInfo {
+    AccountInfo {
+        nonce,
+        balance: U256::from(balance),
+        code_hash: alloy_primitives::b256!(
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+        ),
+        account_id: None,
+        code: None,
     }
 }
 
-fn ss_config(dir: &std::path::Path) -> StateStoreConfig {
+fn default_ss_config(dir: &std::path::Path) -> StateStoreConfig {
     StateStoreConfig {
         enable: true,
         db_directory: dir.join("cosmos_ss").to_string_lossy().to_string(),
         evm_db_directory: dir.join("evm_ss").to_string_lossy().to_string(),
         keep_last_version: true,
-        // Disable pruning so background threads do not interfere with tests.
-        keep_recent: 0,
-        prune_interval_seconds: 0,
         ..Default::default()
     }
 }
 
-/// Open a SeiDb with SC only (no SS), initialize with given stores, and load version 0.
-fn open_sc_only(home: &str, stores: &[&str], write_mode: WriteMode) -> SeiDb {
-    let mut db = SeiDb::open(home, sc_config(write_mode), None).unwrap();
-    let store_names: Vec<String> = stores.iter().map(|s| s.to_string()).collect();
-    db.initialize(&store_names);
+/// I4.1: SeiDb open / build / load / close lifecycle
+#[test]
+fn i4_1_lifecycle() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().to_string_lossy().to_string();
+
+    let mut db = SeiDb::open(&home, StateCommitConfig::default(), None).unwrap();
+    assert_eq!(db.version(), 0);
     db.load_version(0).unwrap();
-    db
+    assert_eq!(db.version(), 0);
+    db.close().unwrap();
 }
 
-// ---------------------------------------------------------------------------
-// SC basic operations
-// ---------------------------------------------------------------------------
-
-/// 1. Initialize with stores, apply changesets, commit, verify version.
+/// I4.2: multiple blocks of BundleState commit
 #[test]
-fn test_sc_basic_operations() {
+fn i4_2_multi_block_commit() {
     let dir = tempdir().unwrap();
     let home = dir.path().to_string_lossy().to_string();
+    let mut db = SeiDb::open(&home, StateCommitConfig::default(), None).unwrap();
 
-    let mut db = open_sc_only(&home, &["bank", "staking"], WriteMode::CosmosOnly);
-
-    // Apply changesets for bank and staking.
-    let changesets = vec![
-        make_changeset("bank", vec![(b"alice", b"100", false)]),
-        make_changeset("staking", vec![(b"validator1", b"500", false)]),
-    ];
-    db.sc_mut().apply_change_sets(&changesets).unwrap();
-
-    // Commit and check version.
-    let version = db.sc_mut().commit().unwrap();
-    assert_eq!(version, 1);
-    assert_eq!(db.version(), 1);
-}
-
-/// 2. Commit 5 versions and verify version increments.
-#[test]
-fn test_sc_multi_commit() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-
-    let mut db = open_sc_only(&home, &["bank"], WriteMode::CosmosOnly);
-
-    for i in 1..=5 {
-        let val = format!("{}", i * 100);
-        let changesets = vec![make_changeset("bank", vec![(b"alice", val.as_bytes(), false)])];
-        db.sc_mut().apply_change_sets(&changesets).unwrap();
-        let version = db.sc_mut().commit().unwrap();
-        assert_eq!(version, i);
-    }
-    assert_eq!(db.version(), 5);
-}
-
-/// 3. working_commit_info / last_commit_info have correct version and store count.
-#[test]
-fn test_sc_commit_info() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-
-    let mut db = open_sc_only(&home, &["bank", "staking"], WriteMode::CosmosOnly);
-
-    // Commit once.
-    let changesets = vec![make_changeset("bank", vec![(b"x", b"1", false)])];
-    db.sc_mut().apply_change_sets(&changesets).unwrap();
-    db.sc_mut().commit().unwrap();
-
-    let last = db.sc().last_commit_info();
-    assert_eq!(last.version, 1);
-
-    // After commit, working_commit_info reflects the next pending state.
-    let working = db.sc().working_commit_info();
-    // Working version should be >= last committed version.
-    assert!(
-        working.version >= last.version,
-        "working version {} should be >= last committed version {}",
-        working.version,
-        last.version
-    );
-}
-
-// ---------------------------------------------------------------------------
-// WriteMode routing
-// ---------------------------------------------------------------------------
-
-/// 4. CosmosOnly mode: apply bank+evm changeset, commit succeeds.
-#[test]
-fn test_sc_cosmos_only_mode() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-
-    let mut db = open_sc_only(&home, &["bank", "evm"], WriteMode::CosmosOnly);
-
-    let changesets = vec![
-        make_changeset("bank", vec![(b"alice", b"100", false)]),
-        make_changeset("evm", vec![(b"contract1", b"code", false)]),
-    ];
-    db.sc_mut().apply_change_sets(&changesets).unwrap();
-
-    let version = db.sc_mut().commit().unwrap();
-    assert_eq!(version, 1);
-}
-
-/// 5. DualWrite mode: apply evm changeset, both cosmos and evm backends get data, commit ok.
-#[test]
-fn test_sc_dual_write_mode() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-
-    let mut db = open_sc_only(&home, &["bank", "evm"], WriteMode::DualWrite);
-
-    let changesets = vec![
-        make_changeset("bank", vec![(b"alice", b"100", false)]),
-        make_changeset("evm", vec![(b"contract1", b"code", false)]),
-    ];
-    db.sc_mut().apply_change_sets(&changesets).unwrap();
-
-    let version = db.sc_mut().commit().unwrap();
-    assert_eq!(version, 1);
-
-    // DualWrite mode sends data to both cosmos and EVM backends.
-    // Verify by committing a second version to confirm both backends stay in sync.
-    let changesets2 = vec![make_changeset("bank", vec![(b"bob", b"200", false)])];
-    db.sc_mut().apply_change_sets(&changesets2).unwrap();
-    let version2 = db.sc_mut().commit().unwrap();
-    assert_eq!(version2, 2);
-}
-
-/// 6. SplitWrite mode: apply evm changeset, evm data stripped from cosmos.
-#[test]
-fn test_sc_split_write_mode() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-
-    let mut db = open_sc_only(&home, &["bank", "evm"], WriteMode::SplitWrite);
-
-    let changesets = vec![
-        make_changeset("bank", vec![(b"alice", b"100", false)]),
-        make_changeset("evm", vec![(b"contract1", b"code", false)]),
-    ];
-    db.sc_mut().apply_change_sets(&changesets).unwrap();
-
-    let version = db.sc_mut().commit().unwrap();
-    assert_eq!(version, 1);
-
-    // SplitWrite mode routes EVM data to flatkv and non-EVM to cosmos.
-    // Verify by committing a second version to confirm the split routing is consistent.
-    let changesets2 = vec![make_changeset("bank", vec![(b"bob", b"200", false)])];
-    db.sc_mut().apply_change_sets(&changesets2).unwrap();
-    let version2 = db.sc_mut().commit().unwrap();
-    assert_eq!(version2, 2);
-}
-
-// ---------------------------------------------------------------------------
-// Version management
-// ---------------------------------------------------------------------------
-
-/// 7. Commit 5 versions, rollback to 3, verify version == 3.
-#[test]
-fn test_sc_rollback() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-
-    let mut db = open_sc_only(&home, &["bank"], WriteMode::CosmosOnly);
-
-    for i in 1..=5 {
-        let val = format!("v{i}");
-        let changesets = vec![make_changeset("bank", vec![(b"key", val.as_bytes(), false)])];
-        db.sc_mut().apply_change_sets(&changesets).unwrap();
-        db.sc_mut().commit().unwrap();
-    }
-    assert_eq!(db.version(), 5);
-
-    // Rollback to version 3.
-    db.sc_mut().rollback(3).unwrap();
-
-    // After rollback, reload the DB to pick up the rolled-back state.
-    db.load_version(3).unwrap();
-    assert_eq!(db.version(), 3);
-}
-
-/// 8. get_latest_version / get_earliest_version.
-#[test]
-fn test_sc_get_versions() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-
-    let mut db = open_sc_only(&home, &["bank"], WriteMode::CosmosOnly);
-
-    // Fresh DB: earliest and latest should both be 0.
-    let earliest = db.sc().get_earliest_version().unwrap();
-    let latest = db.sc().get_latest_version().unwrap();
-    assert_eq!(earliest, 0);
-    assert_eq!(latest, 0);
-
-    // Commit a few versions.
-    for _ in 1..=3 {
-        let changesets = vec![make_changeset("bank", vec![(b"k", b"v", false)])];
-        db.sc_mut().apply_change_sets(&changesets).unwrap();
-        db.sc_mut().commit().unwrap();
-    }
-
-    // The in-memory version should track commits.
-    assert_eq!(db.version(), 3);
-
-    // get_latest_version reads from on-disk metadata which may lag behind the
-    // in-memory version (memiavl updates it on snapshot). Verify it is
-    // non-negative and does not exceed the in-memory version.
-    let latest = db.sc().get_latest_version().unwrap();
-    assert!(latest >= 0, "latest version should be non-negative");
-    assert!(
-        latest <= db.version(),
-        "latest on-disk ({latest}) should be <= in-memory ({})",
-        db.version()
-    );
-
-    // Earliest version depends on backend behavior; at minimum it should be <= latest on-disk.
-    let earliest = db.sc().get_earliest_version().unwrap();
-    assert!(
-        earliest <= latest || latest == 0,
-        "earliest ({earliest}) should be <= latest ({latest})"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Committer trait
-// ---------------------------------------------------------------------------
-
-/// 9. Use CompositeCommitStore through Box<dyn Committer>.
-#[test]
-fn test_committer_trait_usage() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-
-    let mut db = open_sc_only(&home, &["bank"], WriteMode::CosmosOnly);
-
-    // Verify we can use the SC store as a Committer trait object reference.
-    let sc: &dyn Committer = db.sc();
-    assert_eq!(sc.version(), 0);
-    let _ = sc.get_latest_version().unwrap();
-    let _ = sc.get_earliest_version().unwrap();
-    let info = sc.working_commit_info();
-    // After load_version(0), working_commit_info version may be 0 or 1
-    // depending on the backend's internal state tracking.
-    assert!(info.version <= 1, "working version should be 0 or 1, got {}", info.version);
-
-    // Use mutable trait object for apply + commit.
-    let sc_mut: &mut dyn Committer = db.sc_mut();
-    let changesets = vec![make_changeset("bank", vec![(b"key", b"val", false)])];
-    sc_mut.apply_change_sets(&changesets).unwrap();
-    let version = sc_mut.commit().unwrap();
-    assert_eq!(version, 1);
-
-    // Verify last_commit_info through trait.
-    let last = db.sc().last_commit_info();
-    assert_eq!(last.version, 1);
-}
-
-// ---------------------------------------------------------------------------
-// SC + SS (both configured)
-// ---------------------------------------------------------------------------
-
-/// 10. SeiDb with SS enabled: SC commit + SS apply, SS can query historical version.
-#[test]
-fn test_seidb_sc_ss_basic() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-    let ss_cfg = ss_config(dir.path());
-
-    let mut db = SeiDb::open(&home, sc_config(WriteMode::CosmosOnly), Some(ss_cfg)).unwrap();
-    let stores = vec!["bank".to_string()];
-    db.initialize(&stores);
-    db.load_version(0).unwrap();
-
-    // Clone the SS Arc so we can use it independently of `db` borrows.
-    let ss: Arc<seidb_ss::composite::store::CompositeStateStore> = Arc::clone(db.ss().unwrap());
-
-    // SC path: apply + commit.
-    let changesets = vec![make_changeset("bank", vec![(b"alice", b"100", false)])];
-    db.sc_mut().apply_change_sets(&changesets).unwrap();
-    let v1 = db.sc_mut().commit().unwrap();
+    // Block 1: create account
+    let addr = alloy_primitives::Address::repeat_byte(0xAA);
+    let bundle1 = make_bundle(vec![(
+        addr,
+        Some(default_info(1, 100)),
+        revm_database::AccountStatus::Changed,
+        vec![(U256::from(1), U256::ZERO, U256::from(42))],
+    )]);
+    db.sc_mut().apply_bundle_state(&bundle1).unwrap();
+    let (v1, _r1) = db.sc_mut().commit().unwrap();
     assert_eq!(v1, 1);
 
-    // SS path: apply same changeset at version 1.
-    ss.apply_changeset_sync(1, &changesets).unwrap();
-    ss.set_latest_version(1).unwrap();
-
-    // SS should be able to query at version 1.
-    let val = ss.get("bank", 1, b"alice").unwrap();
-    assert_eq!(val, Some(b"100".to_vec()));
-
-    // Commit version 2 with an update.
-    let changesets2 = vec![make_changeset("bank", vec![(b"alice", b"200", false)])];
-    db.sc_mut().apply_change_sets(&changesets2).unwrap();
-    let v2 = db.sc_mut().commit().unwrap();
+    // Block 2: update balance
+    let bundle2 = make_bundle(vec![(
+        addr,
+        Some(default_info(2, 200)),
+        revm_database::AccountStatus::Changed,
+        vec![],
+    )]);
+    db.sc_mut().apply_bundle_state(&bundle2).unwrap();
+    let (v2, _r2) = db.sc_mut().commit().unwrap();
     assert_eq!(v2, 2);
 
-    ss.apply_changeset_sync(2, &changesets2).unwrap();
-    ss.set_latest_version(2).unwrap();
-
-    // SS should return version 2 data.
-    let val = ss.get("bank", 2, b"alice").unwrap();
-    assert_eq!(val, Some(b"200".to_vec()));
-
-    // SS should still return version 1 data (historical query).
-    let val = ss.get("bank", 1, b"alice").unwrap();
-    assert_eq!(val, Some(b"100".to_vec()));
+    // Block 3: add another account
+    let addr2 = alloy_primitives::Address::repeat_byte(0xBB);
+    let bundle3 = make_bundle(vec![(
+        addr2,
+        Some(default_info(1, 500)),
+        revm_database::AccountStatus::Changed,
+        vec![],
+    )]);
+    db.sc_mut().apply_bundle_state(&bundle3).unwrap();
+    let (v3, _r3) = db.sc_mut().commit().unwrap();
+    assert_eq!(v3, 3);
+    assert_eq!(db.version(), 3);
 }
 
-// ---------------------------------------------------------------------------
-// Multi-block stress
-// ---------------------------------------------------------------------------
-
-/// 11. 100 blocks with mixed bank+evm changesets, verify final state.
+/// I4.3: reopen + latest-load
 #[test]
-fn test_sc_multi_block_100() {
+fn i4_3_reopen_latest() {
     let dir = tempdir().unwrap();
     let home = dir.path().to_string_lossy().to_string();
 
-    let mut db = open_sc_only(&home, &["bank", "evm"], WriteMode::CosmosOnly);
-
-    for i in 1..=100i64 {
-        let bank_val = format!("bank_{i}");
-        let evm_val = format!("evm_{i}");
-        let changesets = vec![
-            make_changeset("bank", vec![(b"counter", bank_val.as_bytes(), false)]),
-            make_changeset("evm", vec![(b"nonce", evm_val.as_bytes(), false)]),
-        ];
-        db.sc_mut().apply_change_sets(&changesets).unwrap();
-        let version = db.sc_mut().commit().unwrap();
-        assert_eq!(version, i);
-    }
-
-    assert_eq!(db.version(), 100);
-
-    // Verify commit info reflects the final version.
-    let last_info = db.sc().last_commit_info();
-    assert_eq!(last_info.version, 100);
-}
-
-// ---------------------------------------------------------------------------
-// Close and reopen
-// ---------------------------------------------------------------------------
-
-/// 12. Commit data, close, reopen (new SeiDb same dir), load_version, verify version.
-#[test]
-fn test_sc_close_reopen() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-
-    // Phase 1: open, commit 3 versions, close.
     {
-        let mut db = open_sc_only(&home, &["bank"], WriteMode::CosmosOnly);
-
-        for i in 1..=3 {
-            let val = format!("v{i}");
-            let changesets = vec![make_changeset("bank", vec![(b"key", val.as_bytes(), false)])];
-            db.sc_mut().apply_change_sets(&changesets).unwrap();
+        let mut db = SeiDb::open(&home, StateCommitConfig::default(), None).unwrap();
+        for i in 1..=5 {
+            let addr = alloy_primitives::Address::repeat_byte(i);
+            let bundle = make_bundle(vec![(
+                addr,
+                Some(default_info(u64::from(i), u64::from(i) * 100)),
+                revm_database::AccountStatus::Changed,
+                vec![],
+            )]);
+            db.sc_mut().apply_bundle_state(&bundle).unwrap();
             db.sc_mut().commit().unwrap();
         }
-        assert_eq!(db.version(), 3);
+        assert_eq!(db.version(), 5);
         db.close().unwrap();
     }
 
-    // Phase 2: reopen the same directory, load version 3, verify.
-    {
-        let mut db = SeiDb::open(&home, sc_config(WriteMode::CosmosOnly), None).unwrap();
-        let stores = vec!["bank".to_string()];
-        db.initialize(&stores);
-        db.load_version(3).unwrap();
-        assert_eq!(db.version(), 3);
+    let mut db = SeiDb::open(&home, StateCommitConfig::default(), None).unwrap();
+    assert_eq!(db.version(), 5);
+    db.load_version(0).unwrap();
+    assert_eq!(db.version(), 5);
+}
 
-        // Verify we can continue committing from version 3.
-        let changesets = vec![make_changeset("bank", vec![(b"key", b"v4", false)])];
-        db.sc_mut().apply_change_sets(&changesets).unwrap();
-        let version = db.sc_mut().commit().unwrap();
-        assert_eq!(version, 4);
+/// I4.4: rollback + latest-load
+#[test]
+fn i4_4_rollback_latest() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().to_string_lossy().to_string();
+    let mut db = SeiDb::open(&home, StateCommitConfig::default(), None).unwrap();
 
-        db.close().unwrap();
+    for _ in 0..4 {
+        db.sc_mut().apply_bundle_state(&BundleState::default()).unwrap();
+        db.sc_mut().commit().unwrap();
     }
+    assert_eq!(db.version(), 4);
+
+    db.sc_mut().rollback(2).unwrap();
+    assert_eq!(db.version(), 2);
+
+    db.load_version(0).unwrap();
+    assert_eq!(db.version(), 2);
+
+    // Can continue committing after rollback
+    db.sc_mut().apply_bundle_state(&BundleState::default()).unwrap();
+    let (v, _) = db.sc_mut().commit().unwrap();
+    assert_eq!(v, 3);
+}
+
+/// I4.5: SS enabled does not affect MPT SC path
+#[test]
+fn i4_5_ss_with_mpt() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().to_string_lossy().to_string();
+    let ss_config = default_ss_config(dir.path());
+
+    let mut db = SeiDb::open(&home, StateCommitConfig::default(), Some(ss_config)).unwrap();
+    assert!(db.ss().is_some());
+
+    // SC still works
+    db.sc_mut().apply_bundle_state(&BundleState::default()).unwrap();
+    let (ver, _) = db.sc_mut().commit().unwrap();
+    assert_eq!(ver, 1);
+}
+
+/// I4.6: all commit() call sites handle (i64, B256) return value
+#[test]
+fn i4_6_commit_tuple_return() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().to_string_lossy().to_string();
+    let mut db = SeiDb::open(&home, StateCommitConfig::default(), None).unwrap();
+
+    let addr = alloy_primitives::Address::repeat_byte(0xCC);
+    let bundle = make_bundle(vec![(
+        addr,
+        Some(default_info(1, 1000)),
+        revm_database::AccountStatus::Changed,
+        vec![(U256::from(10), U256::ZERO, U256::from(999))],
+    )]);
+
+    db.sc_mut().apply_bundle_state(&bundle).unwrap();
+    let (version, state_root) = db.sc_mut().commit().unwrap();
+    assert_eq!(version, 1);
+    // State root should not be empty since we added an account with storage
+    assert_ne!(
+        state_root,
+        alloy_primitives::b256!(
+            "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+        )
+    );
 }
