@@ -88,12 +88,8 @@ fn i3_4_apply_commit() {
 
     let addr = alloy_primitives::Address::repeat_byte(0x01);
     let info = default_info(1, 1000);
-    let bundle = make_bundle(vec![(
-        addr,
-        Some(info),
-        revm_database::AccountStatus::Changed,
-        vec![],
-    )]);
+    let bundle =
+        make_bundle(vec![(addr, Some(info), revm_database::AccountStatus::Changed, vec![])]);
 
     db.sc_mut().apply_bundle_state(&bundle).unwrap();
     let (ver, _root) = db.sc_mut().commit().unwrap();

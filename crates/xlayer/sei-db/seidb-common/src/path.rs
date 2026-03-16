@@ -81,7 +81,8 @@ mod tests {
     /// T1.3: resolve_sc_path with explicit directory uses that path
     #[test]
     fn t1_3_resolve_sc_path_custom() {
-        let config = StateCommitConfig { directory: "/custom/sc".to_string(), ..Default::default() };
+        let config =
+            StateCommitConfig { directory: "/custom/sc".to_string(), ..Default::default() };
         assert_eq!(resolve_sc_path(Path::new("/home"), &config), PathBuf::from("/custom/sc"));
     }
 }

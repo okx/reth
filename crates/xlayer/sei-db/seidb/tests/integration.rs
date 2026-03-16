@@ -209,8 +209,6 @@ fn i4_6_commit_tuple_return() {
     // State root should not be empty since we added an account with storage
     assert_ne!(
         state_root,
-        alloy_primitives::b256!(
-            "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-        )
+        alloy_primitives::b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
     );
 }
