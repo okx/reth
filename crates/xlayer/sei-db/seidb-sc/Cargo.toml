@@ -20,12 +20,16 @@ tracing = { workspace = true }
 fs4 = { workspace = true }
 prost = { workspace = true }
 crossbeam-channel = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true, features = ["derive"] }
+alloy-trie = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion.workspace = true
 serde_json = { workspace = true }
 hex = "0.4"
+rand = { workspace = true }
 
 [[bench]]
 name = "memiavl_bench"

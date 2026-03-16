@@ -1,0 +1,138 @@
+use super::node::MptNode;
+
+/// Mutable trie arena for the current block.
+/// Phase 1: pure mutable arena, no generation/frozen/hash cache.
+pub struct MutableTrieArena {
+    nodes: Vec<MptNode>,
+    /// RLP encoding cache aligned with nodes.
+    /// After insert/delete, caches on the path from modified node to root must be cleared.
+    rlp_cache: Vec<Option<Vec<u8>>>,
+}
+
+impl MutableTrieArena {
+    pub fn new() -> Self {
+        Self { nodes: Vec::new(), rlp_cache: Vec::new() }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self { nodes: Vec::with_capacity(cap), rlp_cache: Vec::with_capacity(cap) }
+    }
+
+    /// Allocate a new node, returns its index.
+    pub fn alloc(&mut self, node: MptNode) -> u32 {
+        let idx = self.nodes.len() as u32;
+        self.nodes.push(node);
+        self.rlp_cache.push(None);
+        idx
+    }
+
+    /// Read a node by index.
+    pub fn get(&self, index: u32) -> &MptNode {
+        &self.nodes[index as usize]
+    }
+
+    /// Mutably read a node (for insert/delete modifications).
+    pub fn get_mut(&mut self, index: u32) -> &mut MptNode {
+        &mut self.nodes[index as usize]
+    }
+
+    /// Get cached RLP for a node.
+    pub fn get_rlp(&self, index: u32) -> Option<&Vec<u8>> {
+        self.rlp_cache[index as usize].as_ref()
+    }
+
+    /// Set cached RLP for a node.
+    pub fn set_rlp(&mut self, index: u32, rlp: Vec<u8>) {
+        self.rlp_cache[index as usize] = Some(rlp);
+    }
+
+    /// Clear cached RLP for a node (cache invalidation).
+    pub fn clear_rlp(&mut self, index: u32) {
+        self.rlp_cache[index as usize] = None;
+    }
+
+    /// Number of nodes in the arena.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Whether the arena is empty.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+impl Default for MutableTrieArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mpt::node::LeafNode;
+
+    #[test]
+    fn t4_1_construction() {
+        let a = MutableTrieArena::new();
+        assert_eq!(a.len(), 0);
+        assert!(a.is_empty());
+
+        let b = MutableTrieArena::with_capacity(100);
+        assert_eq!(b.len(), 0);
+    }
+
+    #[test]
+    fn t4_2_alloc_get_get_mut() {
+        let mut arena = MutableTrieArena::new();
+        let leaf = MptNode::Leaf(LeafNode {
+            nibbles: alloy_trie::Nibbles::from_nibbles(&[1, 2, 3]),
+            value: vec![0xaa],
+        });
+        let idx = arena.alloc(leaf);
+        assert_eq!(idx, 0);
+        assert!(arena.get(idx).is_leaf());
+
+        // get_mut: modify value
+        if let MptNode::Leaf(l) = arena.get_mut(idx) {
+            l.value = vec![0xbb];
+        }
+        if let MptNode::Leaf(l) = arena.get(idx) {
+            assert_eq!(l.value, vec![0xbb]);
+        }
+    }
+
+    #[test]
+    fn t4_3_rlp_cache() {
+        let mut arena = MutableTrieArena::new();
+        let idx = arena.alloc(MptNode::Leaf(LeafNode {
+            nibbles: alloy_trie::Nibbles::from_nibbles(&[]),
+            value: vec![],
+        }));
+
+        assert!(arena.get_rlp(idx).is_none());
+
+        arena.set_rlp(idx, vec![0xc1, 0x80]);
+        assert_eq!(arena.get_rlp(idx).unwrap(), &vec![0xc1, 0x80]);
+
+        arena.clear_rlp(idx);
+        assert!(arena.get_rlp(idx).is_none());
+    }
+
+    #[test]
+    fn t4_4_len() {
+        let mut arena = MutableTrieArena::new();
+        assert_eq!(arena.len(), 0);
+        arena.alloc(MptNode::Leaf(LeafNode {
+            nibbles: alloy_trie::Nibbles::from_nibbles(&[]),
+            value: vec![],
+        }));
+        assert_eq!(arena.len(), 1);
+        arena.alloc(MptNode::Leaf(LeafNode {
+            nibbles: alloy_trie::Nibbles::from_nibbles(&[1]),
+            value: vec![1],
+        }));
+        assert_eq!(arena.len(), 2);
+    }
+}
