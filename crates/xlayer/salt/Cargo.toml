@@ -37,6 +37,10 @@ page_size.workspace = true
 rocksdb.workspace = true
 parking_lot.workspace = true
 
+[features]
+default = []
+asm-keccak = ["seidb-sc/asm-keccak"]
+
 [dev-dependencies]
 criterion.workspace = true
 rand.workspace = true

@@ -6,7 +6,7 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use reth_primitives_traits::Account as RethAccount;
-use reth_trie::test_utils::state_root_prehashed;
+use reth_trie::test_utils::{state_root_prehashed, storage_root_prehashed};
 use revm_database::{states::StorageSlot, AccountStatus, BundleAccount, BundleState};
 use revm_state::AccountInfo;
 use seidb_sc::mpt::{MptCommitStore, MptCommitter};
@@ -227,6 +227,13 @@ fn g1_4_single_contract_many_slots() {
     let mut cumulative = CumulativeState::new();
     cumulative.apply(&entries);
     assert_eq!(root, cumulative.expected_root());
+
+    // Second assertion: storage_root via account_proof must match reth reference
+    let proof = store.account_proof(1, addr, &[]).unwrap();
+    let expected_storage_root = storage_root_prehashed(
+        (1u64..=20).map(|i| (keccak256(B256::from(U256::from(i))), U256::from(i * 100))),
+    );
+    assert_eq!(proof.storage_root, expected_storage_root);
 }
 
 // ---------------------------------------------------------------------------
