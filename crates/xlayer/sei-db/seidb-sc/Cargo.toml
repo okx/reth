@@ -20,16 +20,21 @@ tracing = { workspace = true }
 fs4 = { workspace = true }
 prost = { workspace = true }
 crossbeam-channel = { workspace = true }
-alloy-primitives = { workspace = true }
+alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rlp = { workspace = true, features = ["derive"] }
-alloy-trie = { workspace = true }
+alloy-trie = { workspace = true, features = ["ethereum"] }
+revm-database = { workspace = true }
+revm-state = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion.workspace = true
-serde_json = { workspace = true }
 hex = "0.4"
 rand = { workspace = true }
+reth-trie = { workspace = true, features = ["test-utils"] }
+reth-primitives-traits = { workspace = true, features = ["test-utils"] }
 
 [[bench]]
 name = "memiavl_bench"

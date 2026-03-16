@@ -1,7 +1,17 @@
 pub mod arena;
+pub mod commit_store;
 pub mod encoding;
 pub mod hash;
+pub mod manifest;
 pub mod nibbles;
 pub mod node;
+pub mod persisted;
+pub mod state;
+pub mod r#trait;
 pub mod tree;
 pub mod tree_algo;
+
+pub use commit_store::MptCommitStore;
+pub use manifest::VersionManifest;
+pub use persisted::PersistedTrieStore;
+pub use r#trait::MptCommitter;

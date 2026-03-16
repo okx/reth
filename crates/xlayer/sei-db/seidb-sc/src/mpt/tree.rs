@@ -145,6 +145,53 @@ impl MptTree {
             ChildRef::Hash(_) => panic!("Phase 1: Hash child refs not supported in encode"),
         }
     }
+
+    /// Return root node reference.
+    #[allow(dead_code)]
+    pub(crate) fn root_node(&self) -> Option<&MptNode> {
+        self.root.map(|idx| self.arena.get(idx))
+    }
+
+    /// Full DFS export of all `(node_hash, node_rlp)` pairs in this trie.
+    ///
+    /// Ensures all RLP caches are populated first via `encode_node`.
+    /// Phase 2 exports every node (no dirty-tracking optimization).
+    pub(crate) fn collect_node_blobs(&mut self) -> Vec<(B256, Vec<u8>)> {
+        let root_idx = match self.root {
+            Some(idx) => idx,
+            None => return vec![],
+        };
+
+        // Ensure all RLP caches are populated
+        self.encode_node(root_idx);
+
+        let mut result = Vec::new();
+        self.collect_blobs_recursive(root_idx, &mut result);
+        result
+    }
+
+    fn collect_blobs_recursive(&self, idx: u32, out: &mut Vec<(B256, Vec<u8>)>) {
+        let rlp = self.arena.get_rlp(idx).expect("RLP cache must be populated").clone();
+        let node_hash = hash::hash_rlp(&rlp);
+        out.push((node_hash, rlp));
+
+        let node = self.arena.get(idx);
+        match node {
+            MptNode::Leaf(_) => {}
+            MptNode::Extension(ext) => {
+                if let ChildRef::Arena(child_idx) = &ext.child {
+                    self.collect_blobs_recursive(*child_idx, out);
+                }
+            }
+            MptNode::Branch(branch) => {
+                for child in &branch.children {
+                    if let Some(ChildRef::Arena(child_idx)) = child {
+                        self.collect_blobs_recursive(*child_idx, out);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Default for MptTree {
@@ -155,10 +202,6 @@ impl Default for MptTree {
 
 #[cfg(test)]
 impl MptTree {
-    pub(crate) fn root_node(&self) -> Option<&MptNode> {
-        self.root.map(|idx| self.arena.get(idx))
-    }
-
     #[allow(dead_code)]
     pub(crate) fn arena_ref(&self) -> &MutableTrieArena {
         &self.arena
