@@ -1,0 +1,17 @@
+[package]
+name = "mptdb-wal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mptdb-common = { workspace = true }
+mptdb-traits = { workspace = true }
+mptdb-proto = { workspace = true }
+prost = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+crc32fast = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

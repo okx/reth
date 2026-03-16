@@ -6334,6 +6334,146 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fafa6961cabd9c63bcd77a45d7e3b7f3b552b70417831fb0f56db717e72407e"
 
 [[package]]
+name = "mptdb"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "mptdb-common",
+ "mptdb-proto",
+ "mptdb-sc",
+ "mptdb-ss",
+ "mptdb-traits",
+ "mptdb-wal",
+ "revm-database",
+ "revm-state 9.0.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "mptdb-common"
+version = "0.1.0"
+dependencies = [
+ "opentelemetry",
+ "prost 0.13.5",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+]
+
+[[package]]
+name = "mptdb-engine"
+version = "0.1.0"
+dependencies = [
+ "codspeed-criterion-compat",
+ "crossbeam-channel",
+ "hex",
+ "mptdb-common",
+ "mptdb-proto",
+ "mptdb-traits",
+ "mptdb-wal",
+ "parking_lot",
+ "reth-libmdbx",
+ "rocksdb",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "mptdb-ledger"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "mptdb-common",
+ "mptdb-engine",
+ "mptdb-proto",
+ "mptdb-traits",
+ "mptdb-wal",
+ "parking_lot",
+ "rand 0.9.2",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "mptdb-proto"
+version = "0.1.0"
+dependencies = [
+ "prost 0.13.5",
+ "prost-build",
+]
+
+[[package]]
+name = "mptdb-sc"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "codspeed-criterion-compat",
+ "fs4",
+ "mptdb-common",
+ "mptdb-engine",
+ "mptdb-traits",
+ "parking_lot",
+ "rand 0.9.2",
+ "rayon",
+ "reth-primitives-traits",
+ "reth-trie",
+ "reth-trie-common",
+ "revm-database",
+ "revm-state 9.0.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "mptdb-ss"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "mptdb-common",
+ "mptdb-engine",
+ "mptdb-proto",
+ "mptdb-traits",
+ "mptdb-wal",
+ "parking_lot",
+ "rand 0.9.2",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "mptdb-traits"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "mptdb-common",
+ "mptdb-proto",
+]
+
+[[package]]
+name = "mptdb-wal"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "crossbeam-channel",
+ "mptdb-common",
+ "mptdb-proto",
+ "mptdb-traits",
+ "parking_lot",
+ "prost 0.13.5",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "multiaddr"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12783,146 +12923,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "seidb"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "revm-database",
- "revm-state 9.0.0",
- "seidb-common",
- "seidb-proto",
- "seidb-sc",
- "seidb-ss",
- "seidb-traits",
- "seidb-wal",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "seidb-common"
-version = "0.1.0"
-dependencies = [
- "opentelemetry",
- "prost 0.13.5",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber 0.3.22",
-]
-
-[[package]]
-name = "seidb-engine"
-version = "0.1.0"
-dependencies = [
- "codspeed-criterion-compat",
- "crossbeam-channel",
- "hex",
- "parking_lot",
- "reth-libmdbx",
- "rocksdb",
- "seidb-common",
- "seidb-proto",
- "seidb-traits",
- "seidb-wal",
- "serde_json",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "seidb-ledger"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "parking_lot",
- "rand 0.9.2",
- "seidb-common",
- "seidb-engine",
- "seidb-proto",
- "seidb-traits",
- "seidb-wal",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "seidb-proto"
-version = "0.1.0"
-dependencies = [
- "prost 0.13.5",
- "prost-build",
-]
-
-[[package]]
-name = "seidb-sc"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-rlp",
- "alloy-trie",
- "codspeed-criterion-compat",
- "fs4",
- "parking_lot",
- "rand 0.9.2",
- "rayon",
- "reth-primitives-traits",
- "reth-trie",
- "reth-trie-common",
- "revm-database",
- "revm-state 9.0.0",
- "seidb-common",
- "seidb-engine",
- "seidb-traits",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "seidb-ss"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "parking_lot",
- "rand 0.9.2",
- "seidb-common",
- "seidb-engine",
- "seidb-proto",
- "seidb-traits",
- "seidb-wal",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "seidb-traits"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "seidb-common",
- "seidb-proto",
-]
-
-[[package]]
-name = "seidb-wal"
-version = "0.1.0"
-dependencies = [
- "crc32fast",
- "crossbeam-channel",
- "parking_lot",
- "prost 0.13.5",
- "seidb-common",
- "seidb-proto",
- "seidb-traits",
- "tempfile",
- "tracing",
-]
-
-[[package]]
 name = "semver"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15559,6 +15559,12 @@ dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "codspeed-criterion-compat",
+ "mptdb",
+ "mptdb-common",
+ "mptdb-engine",
+ "mptdb-proto",
+ "mptdb-sc",
+ "mptdb-traits",
  "page_size",
  "parking_lot",
  "proptest",
@@ -15578,12 +15584,6 @@ dependencies = [
  "revm-state 9.0.0",
  "rocksdb",
  "salt",
- "seidb",
- "seidb-common",
- "seidb-engine",
- "seidb-proto",
- "seidb-sc",
- "seidb-traits",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

@@ -27,8 +27,8 @@ alloy-consensus.workspace = true
 revm-database.workspace = true
 revm-state.workspace = true
 
-# sei-db
-seidb-proto.workspace = true
+# mpt-db
+mptdb-proto.workspace = true
 
 # misc
 tracing.workspace = true
@@ -39,7 +39,7 @@ parking_lot.workspace = true
 
 [features]
 default = []
-asm-keccak = ["seidb-sc/asm-keccak"]
+asm-keccak = ["mptdb-sc/asm-keccak"]
 
 [dev-dependencies]
 criterion.workspace = true
@@ -53,11 +53,11 @@ proptest.workspace = true
 proptest-arbitrary-interop.workspace = true
 qmdb.workspace = true
 revm = { workspace = true, features = ["std"] }
-seidb.workspace = true
-seidb-common.workspace = true
-seidb-engine.workspace = true
-seidb-sc.workspace = true
-seidb-traits.workspace = true
+mptdb.workspace = true
+mptdb-common.workspace = true
+mptdb-engine.workspace = true
+mptdb-sc.workspace = true
+mptdb-traits.workspace = true
 
 [[bench]]
 name = "mpt_vs_salt"
@@ -76,7 +76,7 @@ name = "evm_compare"
 harness = false
 
 [[bench]]
-name = "seidb_vs_reth"
+name = "mptdb_vs_reth"
 harness = false
 
 [lints]

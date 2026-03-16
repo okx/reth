@@ -1,0 +1,29 @@
+[package]
+name = "mptdb"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+asm-keccak = ["mptdb-sc/asm-keccak"]
+
+[dependencies]
+mptdb-common = { workspace = true }
+mptdb-traits = { workspace = true }
+mptdb-proto = { workspace = true }
+mptdb-sc = { workspace = true }
+mptdb-ss = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+mptdb-common = { workspace = true }
+mptdb-traits = { workspace = true }
+mptdb-proto = { workspace = true }
+mptdb-ss = { workspace = true }
+mptdb-wal = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+alloy-primitives = { workspace = true }
+revm-database = { workspace = true }
+revm-state = { workspace = true }

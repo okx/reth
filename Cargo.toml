@@ -185,15 +185,15 @@ members = [
     "crates/xlayer/qmdb-provider",
     "crates/xlayer/rpc",
     "crates/xlayer/salt",
-    "crates/xlayer/sei-db/seidb-common",
-    "crates/xlayer/sei-db/seidb-traits",
-    "crates/xlayer/sei-db/seidb-proto",
-    "crates/xlayer/sei-db/seidb-wal",
-    "crates/xlayer/sei-db/seidb-engine",
-    "crates/xlayer/sei-db/seidb-ss",
-    "crates/xlayer/sei-db/seidb-sc",
-    "crates/xlayer/sei-db/seidb-ledger",
-    "crates/xlayer/sei-db/seidb",
+    "crates/xlayer/mpt-db/mptdb-common",
+    "crates/xlayer/mpt-db/mptdb-traits",
+    "crates/xlayer/mpt-db/mptdb-proto",
+    "crates/xlayer/mpt-db/mptdb-wal",
+    "crates/xlayer/mpt-db/mptdb-engine",
+    "crates/xlayer/mpt-db/mptdb-ss",
+    "crates/xlayer/mpt-db/mptdb-sc",
+    "crates/xlayer/mpt-db/mptdb-ledger",
+    "crates/xlayer/mpt-db/mptdb",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]
@@ -771,18 +771,18 @@ xlayer-qmdb-provider = { path = "crates/xlayer/qmdb-provider" }
 xlayer-rpc = { path = "crates/xlayer/rpc" }
 xlayer-salt = { path = "crates/xlayer/salt" }
 
-# sei-db
-seidb-common = { path = "crates/xlayer/sei-db/seidb-common" }
-seidb-traits = { path = "crates/xlayer/sei-db/seidb-traits" }
-seidb-proto = { path = "crates/xlayer/sei-db/seidb-proto" }
-seidb-wal = { path = "crates/xlayer/sei-db/seidb-wal" }
-seidb-engine = { path = "crates/xlayer/sei-db/seidb-engine" }
-seidb-ss = { path = "crates/xlayer/sei-db/seidb-ss" }
-seidb-sc = { path = "crates/xlayer/sei-db/seidb-sc" }
-seidb-ledger = { path = "crates/xlayer/sei-db/seidb-ledger" }
-seidb = { path = "crates/xlayer/sei-db/seidb" }
+# mpt-db
+mptdb-common = { path = "crates/xlayer/mpt-db/mptdb-common" }
+mptdb-traits = { path = "crates/xlayer/mpt-db/mptdb-traits" }
+mptdb-proto = { path = "crates/xlayer/mpt-db/mptdb-proto" }
+mptdb-wal = { path = "crates/xlayer/mpt-db/mptdb-wal" }
+mptdb-engine = { path = "crates/xlayer/mpt-db/mptdb-engine" }
+mptdb-ss = { path = "crates/xlayer/mpt-db/mptdb-ss" }
+mptdb-sc = { path = "crates/xlayer/mpt-db/mptdb-sc" }
+mptdb-ledger = { path = "crates/xlayer/mpt-db/mptdb-ledger" }
+mptdb = { path = "crates/xlayer/mpt-db/mptdb" }
 
-# sei-db specific deps
+# mpt-db specific deps
 prost = "0.13"
 prost-build = "0.13"
 blake3 = "1"

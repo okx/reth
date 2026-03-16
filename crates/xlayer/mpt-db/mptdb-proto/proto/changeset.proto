@@ -1,0 +1,12 @@
+syntax = "proto3";
+package mptdb;
+
+message KvPair {
+    bool delete = 1;
+    bytes key = 2;
+    bytes value = 3;
+}
+
+message ChangeSet {
+    repeated KvPair pairs = 1;
+}

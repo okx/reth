@@ -1,0 +1,18 @@
+[package]
+name = "mptdb-ss"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mptdb-common = { workspace = true }
+mptdb-traits = { workspace = true }
+mptdb-proto = { workspace = true }
+mptdb-engine = { workspace = true }
+mptdb-wal = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
