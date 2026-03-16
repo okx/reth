@@ -71,5 +71,9 @@ harness = false
 name = "evm_compare"
 harness = false
 
+[[bench]]
+name = "seidb_vs_reth"
+harness = false
+
 [lints]
 workspace = true

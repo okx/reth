@@ -53,3 +53,7 @@ harness = false
 [[bench]]
 name = "mpt_parallel_bench"
 harness = false
+
+[[bench]]
+name = "mpt_commit_bench"
+harness = false
