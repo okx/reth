@@ -28,6 +28,10 @@ revm-state = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
+[features]
+default = []
+asm-keccak = ["alloy-primitives/asm-keccak"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion.workspace = true
@@ -42,4 +46,8 @@ harness = false
 
 [[bench]]
 name = "flatkv_bench"
+harness = false
+
+[[bench]]
+name = "mpt_parallel_bench"
 harness = false

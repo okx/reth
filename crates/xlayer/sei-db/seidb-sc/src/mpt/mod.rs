@@ -5,6 +5,7 @@ pub mod hash;
 pub mod manifest;
 pub mod nibbles;
 pub mod node;
+pub(crate) mod parallel;
 pub mod persisted;
 pub mod state;
 pub mod r#trait;

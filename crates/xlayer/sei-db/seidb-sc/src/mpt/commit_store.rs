@@ -2,6 +2,7 @@ use alloy_primitives::{B256, U256};
 use alloy_rlp::Encodable;
 use alloy_trie::{Nibbles, EMPTY_ROOT_HASH};
 use fs4::fs_std::FileExt;
+use rayon::prelude::*;
 use revm_database::BundleState;
 use seidb_common::error::{Result, SeiDbError};
 use std::{
@@ -12,6 +13,7 @@ use std::{
 
 use super::{
     manifest::VersionManifest,
+    parallel::ParallelismThresholds,
     persisted::{self, PersistedTrieStore},
     r#trait::MptCommitter,
     state::{self, DirtyAccount},
@@ -25,6 +27,13 @@ pub enum CommitFailPoint {
     BeforePersist,
     AfterPersistBeforeManifest,
     ManifestSave,
+}
+
+/// Intermediate result from parallel storage trie root computation.
+struct StorageTrieCommitArtifacts {
+    hashed_address: B256,
+    storage_root: B256,
+    node_blobs: Vec<(B256, Vec<u8>)>,
 }
 
 /// MPT-based commit store with persistence, rollback, and recovery support.
@@ -46,6 +55,8 @@ pub struct MptCommitStore {
     poisoned: bool,
     read_only: bool,
     file_lock: Option<File>,
+
+    parallelism: ParallelismThresholds,
 
     #[cfg(test)]
     fail_point: Option<CommitFailPoint>,
@@ -104,6 +115,7 @@ impl MptCommitStore {
             poisoned: false,
             read_only,
             file_lock,
+            parallelism: ParallelismThresholds::default(),
             #[cfg(test)]
             fail_point: None,
         })
@@ -162,6 +174,10 @@ impl MptCommitStore {
 impl MptCommitStore {
     pub(crate) fn set_fail_point(&mut self, fail: Option<CommitFailPoint>) {
         self.fail_point = fail;
+    }
+
+    pub(crate) fn set_parallelism_thresholds(&mut self, thresholds: ParallelismThresholds) {
+        self.parallelism = thresholds;
     }
 }
 
@@ -287,21 +303,58 @@ impl MptCommitStore {
     }
 
     fn commit_inner(&mut self) -> Result<(i64, B256)> {
-        // Phase 1: compute storage roots for all dirty accounts
+        // Phase 1: compute storage roots for all dirty accounts.
+        //
+        // Collect DELETE/REUSE roots serially (cheap lookups), then compute
+        // RECOMPUTE roots potentially in parallel using mem::take on
+        // storage_tries for ownership transfer.
         let mut storage_roots: HashMap<B256, B256> = HashMap::new();
 
+        // Pre-fill DELETE and REUSE cases (no trie computation needed)
         for dirty in &self.dirty_accounts {
-            let storage_root = if dirty.info.is_none() && dirty.storage_wiped {
+            if dirty.info.is_none() && dirty.storage_wiped {
                 // DELETE case
-                EMPTY_ROOT_HASH
-            } else if let Some(trie) = self.storage_tries.get_mut(&dirty.hashed_address) {
-                // RECOMPUTE case
-                trie.root_hash()
-            } else {
+                storage_roots.insert(dirty.hashed_address, EMPTY_ROOT_HASH);
+            } else if !self.storage_tries.contains_key(&dirty.hashed_address) {
                 // REUSE case: get from existing account leaf
-                self.get_existing_storage_root(&dirty.hashed_address)
-            };
-            storage_roots.insert(dirty.hashed_address, storage_root);
+                let root = self.get_existing_storage_root(&dirty.hashed_address);
+                storage_roots.insert(dirty.hashed_address, root);
+            }
+            // RECOMPUTE case handled below via parallel/serial path
+        }
+
+        // Take ownership of storage tries for parallel root computation
+        let storage_tries = std::mem::take(&mut self.storage_tries);
+        let storage_tries_vec: Vec<(B256, MptTree)> = storage_tries.into_iter().collect();
+        let should_parallel =
+            self.parallelism.should_parallelize_storage_tries(storage_tries_vec.len());
+
+        let mut storage_artifacts: Vec<StorageTrieCommitArtifacts> = if should_parallel {
+            storage_tries_vec
+                .into_par_iter()
+                .map(|(addr, mut trie)| StorageTrieCommitArtifacts {
+                    hashed_address: addr,
+                    storage_root: trie.root_hash(),
+                    node_blobs: trie.collect_node_blobs(),
+                })
+                .collect()
+        } else {
+            storage_tries_vec
+                .into_iter()
+                .map(|(addr, mut trie)| StorageTrieCommitArtifacts {
+                    hashed_address: addr,
+                    storage_root: trie.root_hash(),
+                    node_blobs: trie.collect_node_blobs(),
+                })
+                .collect()
+        };
+
+        // Sort by hashed_address for deterministic ordering
+        storage_artifacts.sort_by_key(|a| a.hashed_address);
+
+        // Merge RECOMPUTE roots into storage_roots map
+        for artifact in &storage_artifacts {
+            storage_roots.insert(artifact.hashed_address, artifact.storage_root);
         }
 
         // Phase 2: update account trie
@@ -334,14 +387,19 @@ impl MptCommitStore {
             }
         }
 
-        // Phase 2b: compute state root and persist
-        let state_root = self.account_trie.root_hash();
+        // Phase 2b: compute state root (parallel if frontier is wide enough)
+        let state_root = if self
+            .parallelism
+            .should_parallelize_account_frontier(self.account_trie.parallel_frontier_width())
+        {
+            self.account_trie.root_hash_parallel(&self.parallelism)
+        } else {
+            self.account_trie.root_hash()
+        };
 
-        // Collect all node blobs
+        // Collect all node blobs: account trie + storage artifacts
         let mut all_blobs = self.account_trie.collect_node_blobs();
-        for (_, trie) in self.storage_tries.iter_mut() {
-            all_blobs.extend(trie.collect_node_blobs());
-        }
+        all_blobs.extend(storage_artifacts.into_iter().flat_map(|a| a.node_blobs));
 
         // Check test failpoint: BeforePersist
         #[cfg(test)]
@@ -898,5 +956,302 @@ mod tests {
         store.close().unwrap();
         // Reopen should succeed
         let _store2 = MptCommitStore::open(dir.path(), false).unwrap();
+    }
+
+    // ── Phase 4 parallel tests ──
+
+    /// Helper: create a bundle with many accounts each having storage slots.
+    fn make_storage_heavy_bundle(num_accounts: usize, slots_per_account: usize) -> BundleState {
+        let mut accounts = Vec::new();
+        for i in 0..num_accounts {
+            let addr = Address::from_word(B256::from(U256::from(i + 1)));
+            let info = default_info(1, 1000);
+            let storage: Vec<(U256, U256, U256)> = (0..slots_per_account)
+                .map(|s| (U256::from(s), U256::ZERO, U256::from(s + 1)))
+                .collect();
+            accounts.push((addr, Some(info), revm_database::AccountStatus::Changed, storage));
+        }
+        make_bundle(accounts)
+    }
+
+    /// T1.6: set_parallelism_thresholds() can override default values in tests.
+    #[test]
+    fn t1_6_set_parallelism_thresholds() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        assert_eq!(store.parallelism, ParallelismThresholds::default());
+
+        let custom = ParallelismThresholds { storage_tries_min: 1, account_frontier_min: 1 };
+        store.set_parallelism_thresholds(custom);
+        assert_eq!(store.parallelism, custom);
+    }
+
+    /// T3.1: open() initializes parallelism with Default values.
+    #[test]
+    fn t3_1_default_parallelism() {
+        let dir = TempDir::new().unwrap();
+        let store = MptCommitStore::open(dir.path(), false).unwrap();
+        assert_eq!(store.parallelism, ParallelismThresholds::default());
+    }
+
+    /// T3.2: force storage_tries parallel path (threshold=1) -> root matches serial.
+    #[test]
+    fn t3_2_forced_parallel_storage_root_matches_serial() {
+        let dir_serial = TempDir::new().unwrap();
+        let dir_parallel = TempDir::new().unwrap();
+
+        let bundle = make_storage_heavy_bundle(10, 5);
+
+        // Serial path (high threshold)
+        let mut store_s = MptCommitStore::open(dir_serial.path(), false).unwrap();
+        store_s.set_parallelism_thresholds(ParallelismThresholds {
+            storage_tries_min: 99999,
+            account_frontier_min: 99999,
+        });
+        store_s.apply_bundle_state(&bundle).unwrap();
+        let (_, root_serial) = store_s.commit().unwrap();
+
+        // Parallel path (threshold=1)
+        let mut store_p = MptCommitStore::open(dir_parallel.path(), false).unwrap();
+        store_p.set_parallelism_thresholds(ParallelismThresholds {
+            storage_tries_min: 1,
+            account_frontier_min: 99999,
+        });
+        store_p.apply_bundle_state(&bundle).unwrap();
+        let (_, root_parallel) = store_p.commit().unwrap();
+
+        assert_eq!(root_serial, root_parallel);
+    }
+
+    /// T3.3: force storage_tries serial path (high threshold) -> root correct.
+    #[test]
+    fn t3_3_forced_serial_storage_root_correct() {
+        let dir = TempDir::new().unwrap();
+        let bundle = make_storage_heavy_bundle(5, 3);
+
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        store.set_parallelism_thresholds(ParallelismThresholds {
+            storage_tries_min: 99999,
+            account_frontier_min: 99999,
+        });
+        store.apply_bundle_state(&bundle).unwrap();
+        let (ver, root) = store.commit().unwrap();
+        assert_eq!(ver, 1);
+        assert_ne!(root, EMPTY_ROOT_HASH);
+    }
+
+    /// T3.4: force account_trie parallel hash path -> state_root matches serial.
+    #[test]
+    fn t3_4_forced_parallel_account_hash_matches_serial() {
+        let dir_serial = TempDir::new().unwrap();
+        let dir_parallel = TempDir::new().unwrap();
+
+        // Many accounts to get a wide frontier
+        let bundle = make_storage_heavy_bundle(50, 2);
+
+        let mut store_s = MptCommitStore::open(dir_serial.path(), false).unwrap();
+        store_s.set_parallelism_thresholds(ParallelismThresholds {
+            storage_tries_min: 99999,
+            account_frontier_min: 99999,
+        });
+        store_s.apply_bundle_state(&bundle).unwrap();
+        let (_, root_serial) = store_s.commit().unwrap();
+
+        let mut store_p = MptCommitStore::open(dir_parallel.path(), false).unwrap();
+        store_p.set_parallelism_thresholds(ParallelismThresholds {
+            storage_tries_min: 99999,
+            account_frontier_min: 1,
+        });
+        store_p.apply_bundle_state(&bundle).unwrap();
+        let (_, root_parallel) = store_p.commit().unwrap();
+
+        assert_eq!(root_serial, root_parallel);
+    }
+
+    /// T3.5: same blocks, forced serial vs forced parallel -> identical results.
+    #[test]
+    fn t3_5_serial_vs_parallel_identical() {
+        let dir_serial = TempDir::new().unwrap();
+        let dir_parallel = TempDir::new().unwrap();
+
+        let bundles: Vec<BundleState> =
+            (0..3).map(|i| make_storage_heavy_bundle(10 + i * 5, 3)).collect();
+
+        let mut store_s = MptCommitStore::open(dir_serial.path(), false).unwrap();
+        store_s.set_parallelism_thresholds(ParallelismThresholds {
+            storage_tries_min: 99999,
+            account_frontier_min: 99999,
+        });
+
+        let mut store_p = MptCommitStore::open(dir_parallel.path(), false).unwrap();
+        store_p.set_parallelism_thresholds(ParallelismThresholds {
+            storage_tries_min: 1,
+            account_frontier_min: 1,
+        });
+
+        for bundle in &bundles {
+            store_s.apply_bundle_state(bundle).unwrap();
+            let (vs, rs) = store_s.commit().unwrap();
+
+            store_p.apply_bundle_state(bundle).unwrap();
+            let (vp, rp) = store_p.commit().unwrap();
+
+            assert_eq!(vs, vp);
+            assert_eq!(rs, rp);
+        }
+    }
+
+    /// T3.6: multi-account parallel commit + reopen/load_version -> consistent.
+    #[test]
+    fn t3_6_parallel_reopen_consistent() {
+        let dir = TempDir::new().unwrap();
+        let bundle = make_storage_heavy_bundle(20, 4);
+
+        let (version, root);
+        {
+            let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+            store.set_parallelism_thresholds(ParallelismThresholds {
+                storage_tries_min: 1,
+                account_frontier_min: 1,
+            });
+            store.apply_bundle_state(&bundle).unwrap();
+            let result = store.commit().unwrap();
+            version = result.0;
+            root = result.1;
+            store.close().unwrap();
+        }
+
+        {
+            let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+            assert_eq!(store.version(), version);
+
+            // Commit empty block: root should not change
+            store.apply_bundle_state(&BundleState::default()).unwrap();
+            let (_, root_after) = store.commit().unwrap();
+            assert_eq!(root_after, root);
+        }
+    }
+
+    /// T3.7: parallel commit artifacts are fully persisted; reopen/load_version root matches.
+    #[test]
+    fn t3_7_parallel_artifacts_persisted() {
+        let dir = TempDir::new().unwrap();
+        let bundle = make_storage_heavy_bundle(15, 5);
+
+        let root1;
+        {
+            let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+            store.set_parallelism_thresholds(ParallelismThresholds {
+                storage_tries_min: 1,
+                account_frontier_min: 1,
+            });
+            store.apply_bundle_state(&bundle).unwrap();
+            let (_, r) = store.commit().unwrap();
+            root1 = r;
+            store.close().unwrap();
+        }
+
+        {
+            let store = MptCommitStore::open(dir.path(), false).unwrap();
+            assert_eq!(store.version(), 1);
+            // Verify the root from manifest matches what we committed
+            let stored_root = store.manifest.get_root(1).unwrap();
+            assert_eq!(stored_root, root1);
+        }
+    }
+
+    /// T3.8: parallel commit with failpoints -> same behavior as serial.
+    #[test]
+    fn t3_8_parallel_failpoints() {
+        for fp in [
+            CommitFailPoint::BeforePersist,
+            CommitFailPoint::AfterPersistBeforeManifest,
+            CommitFailPoint::ManifestSave,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let bundle = make_storage_heavy_bundle(5, 2);
+
+            let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+            store.set_parallelism_thresholds(ParallelismThresholds {
+                storage_tries_min: 1,
+                account_frontier_min: 1,
+            });
+            store.set_fail_point(Some(fp));
+            store.apply_bundle_state(&bundle).unwrap();
+            let result = store.commit();
+            assert!(result.is_err(), "expected error for failpoint {fp:?}");
+            assert!(store.poisoned);
+            store.close().unwrap();
+        }
+    }
+
+    /// T3.9: after parallel commit success, dirty state is cleared.
+    #[test]
+    fn t3_9_parallel_clears_dirty_state() {
+        let dir = TempDir::new().unwrap();
+        let bundle = make_storage_heavy_bundle(10, 3);
+
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        store.set_parallelism_thresholds(ParallelismThresholds {
+            storage_tries_min: 1,
+            account_frontier_min: 1,
+        });
+        store.apply_bundle_state(&bundle).unwrap();
+        store.commit().unwrap();
+
+        assert!(!store.applied_this_block);
+        assert!(store.dirty_accounts.is_empty());
+        assert!(store.storage_tries.is_empty());
+    }
+
+    /// T3.10: read_only / poisoned / rollback semantics unchanged by parallel path.
+    #[test]
+    fn t3_10_parallel_semantics_unchanged() {
+        let dir = TempDir::new().unwrap();
+
+        // read_only still rejects writes
+        {
+            let mut store = MptCommitStore::open(dir.path(), true).unwrap();
+            assert!(store.apply_bundle_state(&BundleState::default()).is_err());
+        }
+
+        // poisoned still blocks operations
+        {
+            let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+            store.set_parallelism_thresholds(ParallelismThresholds {
+                storage_tries_min: 1,
+                account_frontier_min: 1,
+            });
+            store.set_fail_point(Some(CommitFailPoint::BeforePersist));
+            store.apply_bundle_state(&BundleState::default()).unwrap();
+            assert!(store.commit().is_err());
+            assert!(store.poisoned);
+            assert!(store.commit().is_err());
+            assert!(store.apply_bundle_state(&BundleState::default()).is_err());
+
+            // load_version recovers
+            store.set_fail_point(None);
+            store.load_version().unwrap();
+            assert!(!store.poisoned);
+            store.close().unwrap();
+        }
+
+        // rollback works after parallel commits
+        {
+            let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+            store.set_parallelism_thresholds(ParallelismThresholds {
+                storage_tries_min: 1,
+                account_frontier_min: 1,
+            });
+            let bundle = make_storage_heavy_bundle(5, 2);
+            store.apply_bundle_state(&bundle).unwrap();
+            store.commit().unwrap();
+            store.apply_bundle_state(&bundle).unwrap();
+            store.commit().unwrap();
+            assert_eq!(store.version(), 2);
+            store.rollback(1).unwrap();
+            assert_eq!(store.version(), 1);
+            store.close().unwrap();
+        }
     }
 }
