@@ -2,7 +2,10 @@ use alloy_primitives::B256;
 use alloy_trie::EMPTY_ROOT_HASH;
 use seidb_common::error::{Result, SeiDbError};
 use seidb_engine::engine::RocksDbEngine;
-use seidb_traits::{kv::KvEngine, types::WriteOptions};
+use seidb_traits::{
+    kv::{KvEngine, KvIterator},
+    types::{IterOptions, WriteOptions},
+};
 use std::path::Path;
 
 use super::{
@@ -58,6 +61,41 @@ impl PersistedTrieStore {
             engine.close()?;
         }
         Ok(())
+    }
+
+    /// Iterate all nodes in the store. Caller must call `first()` to begin.
+    pub(crate) fn iter_all_nodes(&self) -> Result<Box<dyn KvIterator>> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| SeiDbError::Other("PersistedTrieStore is closed".to_string()))?;
+        let opts = IterOptions { lower_bound: None, upper_bound: None };
+        engine.new_iter(&opts)
+    }
+
+    /// Atomically delete a batch of nodes by hash with sync=true.
+    pub(crate) fn delete_batch_durable(&self, hashes: &[B256]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| SeiDbError::Other("PersistedTrieStore is closed".to_string()))?;
+        let mut batch = engine.new_batch();
+        for hash in hashes {
+            batch.delete(hash.as_slice())?;
+        }
+        batch.commit(&WriteOptions { sync: true })?;
+        Ok(())
+    }
+
+    /// Check if the store contains no nodes.
+    pub(crate) fn is_empty(&self) -> Result<bool> {
+        let mut iter = self.iter_all_nodes()?;
+        let has_first = iter.first();
+        iter.close()?;
+        Ok(!has_first)
     }
 }
 
@@ -349,5 +387,85 @@ mod tests {
         let (mut store, _dir) = tmp_store();
         store.close().unwrap();
         store.close().unwrap();
+    }
+
+    /// T2.1: iter_all_nodes() on empty store returns empty iteration
+    #[test]
+    fn t2_1_iter_empty() {
+        let (store, _dir) = tmp_store();
+        let mut iter = store.iter_all_nodes().unwrap();
+        assert!(!iter.first());
+        iter.close().unwrap();
+    }
+
+    /// T2.2: persist then iter_all_nodes() enumerates all nodes
+    #[test]
+    fn t2_2_iter_after_persist() {
+        let (store, _dir) = tmp_store();
+        let h1 = B256::repeat_byte(0x01);
+        let h2 = B256::repeat_byte(0x02);
+        store
+            .persist_batch_durable(&[(h1, vec![0xc1, 0x80]), (h2, vec![0xc2, 0x80, 0x80])])
+            .unwrap();
+
+        let mut iter = store.iter_all_nodes().unwrap();
+        let mut count = 0;
+        if iter.first() {
+            count += 1;
+            while iter.next() {
+                count += 1;
+            }
+        }
+        iter.close().unwrap();
+        assert_eq!(count, 2);
+    }
+
+    /// T2.3: delete_batch_durable() removes specified nodes, keeps others
+    #[test]
+    fn t2_3_delete_batch() {
+        let (store, _dir) = tmp_store();
+        let h1 = B256::repeat_byte(0x01);
+        let h2 = B256::repeat_byte(0x02);
+        let h3 = B256::repeat_byte(0x03);
+        store
+            .persist_batch_durable(&[(h1, vec![0xaa]), (h2, vec![0xbb]), (h3, vec![0xcc])])
+            .unwrap();
+
+        store.delete_batch_durable(&[h1, h3]).unwrap();
+        assert!(store.get_node(h1).unwrap().is_none());
+        assert!(store.get_node(h2).unwrap().is_some());
+        assert!(store.get_node(h3).unwrap().is_none());
+    }
+
+    /// T2.4: delete_batch_durable(empty) -> Ok, no side effects
+    #[test]
+    fn t2_4_delete_batch_empty() {
+        let (store, _dir) = tmp_store();
+        store.delete_batch_durable(&[]).unwrap();
+    }
+
+    /// T2.5: is_empty() on fresh store -> true
+    #[test]
+    fn t2_5_is_empty_fresh() {
+        let (store, _dir) = tmp_store();
+        assert!(store.is_empty().unwrap());
+    }
+
+    /// T2.6: is_empty() after write -> false
+    #[test]
+    fn t2_6_is_empty_after_write() {
+        let (store, _dir) = tmp_store();
+        store.persist_batch_durable(&[(B256::repeat_byte(0x01), vec![0x80])]).unwrap();
+        assert!(!store.is_empty().unwrap());
+    }
+
+    /// T2.7: close then iter/delete/is_empty all Err
+    #[test]
+    fn t2_7_closed_errors() {
+        let (mut store, _dir) = tmp_store();
+        store.close().unwrap();
+        assert!(store.iter_all_nodes().is_err());
+        assert!(store.delete_batch_durable(&[B256::ZERO]).is_err());
+        assert!(store.is_empty().is_err());
     }
 }

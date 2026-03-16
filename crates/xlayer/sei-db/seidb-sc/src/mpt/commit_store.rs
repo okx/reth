@@ -1,21 +1,26 @@
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Encodable;
 use alloy_trie::{Nibbles, EMPTY_ROOT_HASH};
 use fs4::fs_std::FileExt;
 use rayon::prelude::*;
+use reth_trie_common::AccountProof;
 use revm_database::BundleState;
 use seidb_common::error::{Result, SeiDbError};
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use super::{
+    gc,
     manifest::VersionManifest,
     parallel::ParallelismThresholds,
     persisted::{self, PersistedTrieStore},
-    r#trait::MptCommitter,
+    proof,
+    r#trait::{MptCommitter, MptGcStats, MptSnapshotExporter, MptSnapshotImporter},
+    snapshot::{SnapshotExporter, SnapshotImporter},
     state::{self, DirtyAccount},
     tree::MptTree,
 };
@@ -47,7 +52,7 @@ pub struct MptCommitStore {
     storage_tries: HashMap<B256, MptTree>,
     dirty_accounts: Vec<DirtyAccount>,
 
-    persisted: PersistedTrieStore,
+    persisted: Arc<PersistedTrieStore>,
     manifest: VersionManifest,
 
     version: i64,
@@ -74,8 +79,8 @@ impl MptCommitStore {
         fs::create_dir_all(&trie_nodes_dir)
             .map_err(|e| SeiDbError::Other(format!("create trie_nodes dir: {e}")))?;
 
-        // Writer lock
-        let file_lock = if !read_only {
+        // Lock: exclusive for writer, shared for reader
+        let file_lock = {
             let lock_path = dir.join("LOCK");
             let lock_file = OpenOptions::new()
                 .write(true)
@@ -83,18 +88,22 @@ impl MptCommitStore {
                 .truncate(false)
                 .open(&lock_path)
                 .map_err(|e| SeiDbError::Other(format!("open LOCK file: {e}")))?;
-            lock_file
-                .try_lock_exclusive()
-                .map_err(|e| SeiDbError::Other(format!("failed to lock db: {e}")))?;
+            if read_only {
+                lock_file.try_lock_shared().map_err(|e| {
+                    SeiDbError::Other(format!("failed to acquire shared lock: {e}"))
+                })?;
+            } else {
+                lock_file
+                    .try_lock_exclusive()
+                    .map_err(|e| SeiDbError::Other(format!("failed to lock db: {e}")))?;
+            }
             Some(lock_file)
-        } else {
-            None
         };
 
         let manifest_path = dir.join("manifest.json");
         let manifest = VersionManifest::load(&manifest_path)?;
 
-        let persisted = PersistedTrieStore::open(&trie_nodes_dir)?;
+        let persisted = Arc::new(PersistedTrieStore::open(&trie_nodes_dir)?);
 
         // Load account trie from latest version's root
         let root = manifest.get_root(manifest.latest_version).unwrap_or(EMPTY_ROOT_HASH);
@@ -167,6 +176,30 @@ impl MptCommitStore {
             ));
         }
         Ok(())
+    }
+
+    fn check_not_applied(&self) -> Result<()> {
+        if self.applied_this_block {
+            return Err(SeiDbError::Other(
+                "cannot perform this operation while a block is being applied".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check if this is a fresh DB (manifest = {0->EMPTY_ROOT_HASH}, no other versions, empty
+    /// store).
+    fn is_fresh_db(&self) -> Result<bool> {
+        if self.manifest.latest_version != 0 {
+            return Ok(false);
+        }
+        if self.manifest.versions.len() != 1 {
+            return Ok(false);
+        }
+        if self.manifest.get_root(0) != Some(EMPTY_ROOT_HASH) {
+            return Ok(false);
+        }
+        self.persisted.is_empty()
     }
 }
 
@@ -254,9 +287,95 @@ impl MptCommitter for MptCommitStore {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.persisted.close()?;
+        if let Some(persisted) = Arc::get_mut(&mut self.persisted) {
+            persisted.close()?;
+        }
         self.file_lock = None;
         Ok(())
+    }
+
+    fn prune_before(&mut self, version: i64) -> Result<()> {
+        self.check_writable()?;
+        self.check_not_poisoned()?;
+        self.check_not_applied()?;
+
+        if version < self.manifest.earliest_version || version > self.manifest.latest_version {
+            return Err(SeiDbError::Other(format!(
+                "prune_before: version {} out of range [{}, {}]",
+                version, self.manifest.earliest_version, self.manifest.latest_version
+            )));
+        }
+
+        // Remove [earliest, version) from manifest, keep version itself
+        let mut new_manifest = self.manifest.clone();
+        let to_remove: Vec<i64> = new_manifest
+            .versions
+            .keys()
+            .copied()
+            .filter(|v| *v >= new_manifest.earliest_version && *v < version)
+            .collect();
+        for v in to_remove {
+            new_manifest.versions.remove(&v);
+        }
+        new_manifest.earliest_version = version;
+        new_manifest.save(&self.manifest_path)?;
+        self.manifest = new_manifest;
+
+        Ok(())
+    }
+
+    fn gc(&mut self) -> Result<MptGcStats> {
+        self.check_writable()?;
+        self.check_not_poisoned()?;
+        self.check_not_applied()?;
+
+        let live_roots: Vec<B256> = self.manifest.versions.values().copied().collect();
+        let live = gc::collect_reachable_hashes(&self.persisted, live_roots)?;
+        gc::gc_unreachable_nodes(&self.persisted, &live)
+    }
+
+    fn account_proof(
+        &self,
+        version: i64,
+        address: Address,
+        slots: &[B256],
+    ) -> Result<AccountProof> {
+        let root = self.manifest.get_root(version).ok_or_else(|| {
+            SeiDbError::Other(format!("account_proof: version {version} not in manifest"))
+        })?;
+        proof::build_account_proof_from_root(&self.persisted, root, address, slots)
+    }
+
+    fn exporter(&self, version: i64) -> Result<Box<dyn MptSnapshotExporter>> {
+        let root = self.manifest.get_root(version).ok_or_else(|| {
+            SeiDbError::Other(format!("exporter: version {version} not in manifest"))
+        })?;
+        let exp = SnapshotExporter::new(self.persisted.clone(), root, version)?;
+        Ok(Box::new(exp))
+    }
+
+    fn importer(
+        &mut self,
+        version: i64,
+        expected_root: B256,
+    ) -> Result<Box<dyn MptSnapshotImporter + '_>> {
+        self.check_writable()?;
+        self.check_not_poisoned()?;
+        self.check_not_applied()?;
+
+        if !self.is_fresh_db()? {
+            return Err(SeiDbError::Other("importer: DB is not fresh, cannot import".to_string()));
+        }
+
+        let imp = SnapshotImporter::new(
+            version,
+            expected_root,
+            self.persisted.clone(),
+            self.manifest_path.clone(),
+        )?;
+
+        // Wrap in a struct that holds &mut self to bind lifetime
+        Ok(Box::new(BoundImporter { inner: imp, store: self }))
     }
 }
 
@@ -445,6 +564,44 @@ fn alloy_rlp_encode_u256(value: &U256) -> Vec<u8> {
     let mut buf = Vec::new();
     value.encode(&mut buf);
     buf
+}
+
+/// Wrapper that binds an importer's lifetime to the MptCommitStore.
+/// On close, it updates the store's internal state to reflect the import.
+struct BoundImporter<'a> {
+    inner: SnapshotImporter,
+    store: &'a mut MptCommitStore,
+}
+
+impl<'a> super::r#trait::MptSnapshotImporter for BoundImporter<'a> {
+    fn add_node(&mut self, node: &super::r#trait::MptSnapshotNode) -> Result<()> {
+        self.inner.add_node(node)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()?;
+
+        // After successful import, update MptCommitStore state
+        // Reload manifest from disk
+        self.store.manifest = VersionManifest::load(&self.store.manifest_path)?;
+        self.store.version = self.store.manifest.latest_version;
+
+        // Reload account trie from imported root
+        let root = self
+            .store
+            .manifest
+            .get_root(self.store.manifest.latest_version)
+            .unwrap_or(EMPTY_ROOT_HASH);
+        self.store.account_trie = persisted::load_tree_from_root(&self.store.persisted, root)?;
+
+        // Reset working state
+        self.store.dirty_accounts.clear();
+        self.store.storage_tries.clear();
+        self.store.applied_this_block = false;
+        self.store.poisoned = false;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1202,6 +1359,315 @@ mod tests {
         assert!(!store.applied_this_block);
         assert!(store.dirty_accounts.is_empty());
         assert!(store.storage_tries.is_empty());
+    }
+
+    // ── Phase 5 tests ──
+
+    /// T6.1: read_only open uses shared lock; verified by: reader close then reopen succeeds
+    /// Note: Two concurrent readers at the same RocksDB path is blocked by RocksDB's internal
+    /// directory lock, so we verify the file-level shared lock semantics via close+reopen.
+    /// Full reader+reader coexistence requires sub-process testing (see integration tests).
+    #[test]
+    fn t6_1_shared_lock_readers() {
+        let dir = TempDir::new().unwrap();
+        // Open reader, verify it acquires shared lock (file_lock is Some)
+        let mut reader1 = MptCommitStore::open(dir.path(), true).unwrap();
+        assert!(reader1.file_lock.is_some());
+        reader1.close().unwrap();
+        // Can reopen as reader after close
+        let _reader2 = MptCommitStore::open(dir.path(), true).unwrap();
+    }
+
+    /// T6.2: writer open then reader open fails
+    #[test]
+    fn t6_2_writer_blocks_reader() {
+        let dir = TempDir::new().unwrap();
+        let _writer = MptCommitStore::open(dir.path(), false).unwrap();
+        let result = MptCommitStore::open(dir.path(), true);
+        assert!(result.is_err());
+    }
+
+    /// T6.3: reader open then writer open fails
+    #[test]
+    fn t6_3_reader_blocks_writer() {
+        let dir = TempDir::new().unwrap();
+        let _reader = MptCommitStore::open(dir.path(), true).unwrap();
+        let result = MptCommitStore::open(dir.path(), false);
+        assert!(result.is_err());
+    }
+
+    /// T6.4: close releases shared/exclusive lock
+    #[test]
+    fn t6_4_close_releases_lock() {
+        let dir = TempDir::new().unwrap();
+        let mut reader = MptCommitStore::open(dir.path(), true).unwrap();
+        reader.close().unwrap();
+        // Writer should succeed now
+        let _writer = MptCommitStore::open(dir.path(), false).unwrap();
+    }
+
+    /// T6.5: prune_before correctly updates manifest earliest_version
+    #[test]
+    fn t6_5_prune_before() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        for _ in 0..5 {
+            store.apply_bundle_state(&BundleState::default()).unwrap();
+            store.commit().unwrap();
+        }
+        assert_eq!(store.version(), 5);
+
+        store.prune_before(3).unwrap();
+        assert_eq!(store.manifest.earliest_version, 3);
+        assert!(store.manifest.get_root(1).is_none());
+        assert!(store.manifest.get_root(2).is_none());
+        assert!(store.manifest.get_root(3).is_some());
+        assert!(store.manifest.get_root(5).is_some());
+    }
+
+    /// T6.6: prune_before(latest) is legal, keeps only latest
+    #[test]
+    fn t6_6_prune_before_latest() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        for _ in 0..3 {
+            store.apply_bundle_state(&BundleState::default()).unwrap();
+            store.commit().unwrap();
+        }
+
+        store.prune_before(3).unwrap();
+        assert_eq!(store.manifest.earliest_version, 3);
+        assert!(store.manifest.get_root(3).is_some());
+        // Only version 3 should remain (version 0 was pruned)
+        assert!(store.manifest.get_root(0).is_none());
+    }
+
+    /// T6.7: prune_before(out of range) -> Err
+    #[test]
+    fn t6_7_prune_before_out_of_range() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        store.apply_bundle_state(&BundleState::default()).unwrap();
+        store.commit().unwrap();
+
+        assert!(store.prune_before(-1).is_err());
+        assert!(store.prune_before(999).is_err());
+    }
+
+    /// T6.8: gc returns stats and doesn't change manifest/latest version
+    #[test]
+    fn t6_8_gc_returns_stats() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        let addr = Address::repeat_byte(0x01);
+        let info = default_info(1, 1000);
+        let bundle =
+            make_bundle(vec![(addr, Some(info), revm_database::AccountStatus::Changed, vec![])]);
+        store.apply_bundle_state(&bundle).unwrap();
+        store.commit().unwrap();
+
+        let ver_before = store.version();
+        let stats = store.gc().unwrap();
+        assert!(stats.scanned_nodes > 0);
+        assert_eq!(stats.deleted_nodes, 0); // no orphans yet
+        assert_eq!(store.version(), ver_before);
+    }
+
+    /// T6.9: read_only prune/gc/importer all Err
+    #[test]
+    fn t6_9_read_only_maintenance_errors() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), true).unwrap();
+        assert!(store.prune_before(0).is_err());
+        assert!(store.gc().is_err());
+        assert!(store.importer(1, B256::ZERO).is_err());
+    }
+
+    /// T6.10: applied_this_block=true blocks prune/gc
+    #[test]
+    fn t6_10_applied_blocks_maintenance() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        store.apply_bundle_state(&BundleState::default()).unwrap();
+        assert!(store.prune_before(0).is_err());
+        assert!(store.gc().is_err());
+    }
+
+    /// T6.11: exporter(valid version) creates and streams
+    #[test]
+    fn t6_11_exporter_valid_version() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        let addr = Address::repeat_byte(0x01);
+        let info = default_info(1, 100);
+        let bundle =
+            make_bundle(vec![(addr, Some(info), revm_database::AccountStatus::Changed, vec![])]);
+        store.apply_bundle_state(&bundle).unwrap();
+        store.commit().unwrap();
+
+        let mut exp = store.exporter(1).unwrap();
+        let meta = exp.meta();
+        assert_eq!(meta.version, 1);
+        // Should produce at least one node
+        assert!(exp.next_node().unwrap().is_some());
+        exp.close().unwrap();
+    }
+
+    /// T6.12: exporter(missing version) -> Err
+    #[test]
+    fn t6_12_exporter_missing_version() {
+        let dir = TempDir::new().unwrap();
+        let store = MptCommitStore::open(dir.path(), false).unwrap();
+        assert!(store.exporter(999).is_err());
+    }
+
+    /// T6.13: importer(fresh DB) succeeds and load_version works after
+    #[test]
+    fn t6_13_importer_fresh_db() {
+        // Build source
+        let src_dir = TempDir::new().unwrap();
+        let mut src_store = MptCommitStore::open(src_dir.path(), false).unwrap();
+
+        let addr = Address::repeat_byte(0x01);
+        let info = default_info(1, 100);
+        let bundle =
+            make_bundle(vec![(addr, Some(info), revm_database::AccountStatus::Changed, vec![])]);
+        src_store.apply_bundle_state(&bundle).unwrap();
+        let (_, root) = src_store.commit().unwrap();
+
+        // Export
+        let mut exp = src_store.exporter(1).unwrap();
+        let mut nodes = Vec::new();
+        while let Some(n) = exp.next_node().unwrap() {
+            nodes.push(n);
+        }
+        exp.close().unwrap();
+        src_store.close().unwrap();
+
+        // Import into fresh DB
+        let dst_dir = TempDir::new().unwrap();
+        let mut dst_store = MptCommitStore::open(dst_dir.path(), false).unwrap();
+
+        {
+            let mut imp = dst_store.importer(1, root).unwrap();
+            for n in &nodes {
+                imp.add_node(n).unwrap();
+            }
+            imp.close().unwrap();
+        }
+
+        // After import, store should reflect new state
+        assert_eq!(dst_store.version(), 1);
+        assert_eq!(dst_store.manifest.get_root(1), Some(root));
+    }
+
+    /// T6.14: importer(non-fresh DB) -> Err
+    #[test]
+    fn t6_14_importer_non_fresh() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        // Commit something first
+        store.apply_bundle_state(&BundleState::default()).unwrap();
+        store.commit().unwrap();
+
+        let result = store.importer(2, B256::ZERO);
+        assert!(result.is_err());
+    }
+
+    /// T6.15: account_proof(version) for specified committed root is correct
+    #[test]
+    fn t6_15_account_proof_version() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        let addr = Address::repeat_byte(0x01);
+        let info = default_info(1, 1000);
+        let bundle =
+            make_bundle(vec![(addr, Some(info), revm_database::AccountStatus::Changed, vec![])]);
+        store.apply_bundle_state(&bundle).unwrap();
+        let (_, root) = store.commit().unwrap();
+
+        let proof = store.account_proof(1, addr, &[]).unwrap();
+        assert!(proof.info.is_some());
+        proof.verify(root).unwrap();
+    }
+
+    /// T6.16: rollback then exporter/proof only sees new latest/kept versions
+    #[test]
+    fn t6_16_rollback_then_proof() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        let addr = Address::repeat_byte(0x01);
+        let info1 = default_info(1, 100);
+        let bundle1 =
+            make_bundle(vec![(addr, Some(info1), revm_database::AccountStatus::Changed, vec![])]);
+        store.apply_bundle_state(&bundle1).unwrap();
+        let (_, root1) = store.commit().unwrap();
+
+        let info2 = default_info(2, 200);
+        let bundle2 =
+            make_bundle(vec![(addr, Some(info2), revm_database::AccountStatus::Changed, vec![])]);
+        store.apply_bundle_state(&bundle2).unwrap();
+        store.commit().unwrap();
+
+        store.rollback(1).unwrap();
+        assert_eq!(store.version(), 1);
+
+        // Version 2 should be gone
+        assert!(store.exporter(2).is_err());
+        assert!(store.account_proof(2, addr, &[]).is_err());
+
+        // Version 1 should work
+        let proof = store.account_proof(1, addr, &[]).unwrap();
+        proof.verify(root1).unwrap();
+    }
+
+    /// T6.17: historical version proof before prune works, after prune+gc -> Err
+    #[test]
+    fn t6_17_historical_proof_prune_gc() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        let addr = Address::repeat_byte(0x01);
+
+        // v1: create account with large storage to ensure hash children
+        let info1 = default_info(1, 100);
+        let slots1: Vec<(U256, U256, U256)> =
+            (0..10).map(|i| (U256::from(i), U256::ZERO, U256::from(i + 100))).collect();
+        let bundle1 =
+            make_bundle(vec![(addr, Some(info1), revm_database::AccountStatus::Changed, slots1)]);
+        store.apply_bundle_state(&bundle1).unwrap();
+        let (_, root1) = store.commit().unwrap();
+
+        // v2: completely different state
+        let addr2 = Address::repeat_byte(0x02);
+        let info2 = default_info(1, 999);
+        let bundle2 =
+            make_bundle(vec![(addr2, Some(info2), revm_database::AccountStatus::Changed, vec![])]);
+        store.apply_bundle_state(&bundle2).unwrap();
+        let (_, root2) = store.commit().unwrap();
+
+        // v1 proof should work before prune
+        let proof1 = store.account_proof(1, addr, &[]).unwrap();
+        proof1.verify(root1).unwrap();
+
+        // Prune v1 + gc
+        store.prune_before(2).unwrap();
+        store.gc().unwrap();
+
+        // v1 should no longer be in manifest
+        assert!(store.account_proof(1, addr, &[]).is_err());
+
+        // v2 should still work
+        let proof2 = store.account_proof(2, addr2, &[]).unwrap();
+        proof2.verify(root2).unwrap();
     }
 
     /// T3.10: read_only / poisoned / rollback semantics unchanged by parallel path.

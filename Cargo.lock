@@ -12906,6 +12906,7 @@ dependencies = [
  "rayon",
  "reth-primitives-traits",
  "reth-trie",
+ "reth-trie-common",
  "revm-database",
  "revm-state 9.0.0",
  "seidb-common",
