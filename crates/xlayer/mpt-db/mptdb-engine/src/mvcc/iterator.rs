@@ -1,4 +1,6 @@
-use crate::mvcc::encoding::{decode_uint64_ascending, mvcc_encode, split_mvcc_key, split_mvcc_value};
+use crate::mvcc::encoding::{
+    decode_uint64_ascending, mvcc_encode, split_mvcc_key, split_mvcc_value,
+};
 use mptdb_common::error::{MptDbError, Result};
 use mptdb_traits::{
     iterator::DbIterator,
@@ -64,16 +66,9 @@ impl MvccIterator {
         };
 
         // Compute MVCC-encoded upper bound.
-        let mvcc_end = if let Some(e) = end {
-            Some(mvcc_encode(e, 0))
-        } else {
-            None
-        };
+        let mvcc_end = if let Some(e) = end { Some(mvcc_encode(e, 0)) } else { None };
 
-        let iter_opts = IterOptions {
-            lower_bound: Some(mvcc_start),
-            upper_bound: mvcc_end,
-        };
+        let iter_opts = IterOptions { lower_bound: Some(mvcc_start), upper_bound: mvcc_end };
 
         let raw = engine.new_iter(&iter_opts)?;
 
@@ -273,15 +268,13 @@ impl MvccIterator {
         self.cached_value = val.to_vec();
     }
 
-    /// Simulate PebbleDB's `SeekLT(target)`: find the largest key strictly
-    /// less than `target`.
+    /// Seek to the largest key strictly less than `target`.
     fn seek_lt(&mut self, target: &[u8]) {
         self.raw.seek_lt(target);
     }
 
-    /// Simulate PebbleDB's `NextPrefix()`: advance past all versions of the
-    /// current user key by seeking to a key that sorts after all MVCC-encoded
-    /// versions of `user_key`.
+    /// Advance past all versions of the current user key by seeking to a key
+    /// that sorts after all MVCC-encoded versions of `user_key`.
     fn seek_next_user_key_forward(&mut self, user_key: &[u8]) {
         let mut next_key = user_key.to_vec();
         next_key.push(0x00);
@@ -530,8 +523,7 @@ mod tests {
         write_mvcc(engine.as_ref(), b"b", b"val_b", 1);
         write_mvcc(engine.as_ref(), b"c", b"val_c", 1);
 
-        let mut iter =
-            MvccIterator::new(engine.as_ref(), None, None, 1, 0, false).unwrap();
+        let mut iter = MvccIterator::new(engine.as_ref(), None, None, 1, 0, false).unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key(), b"a");
@@ -560,8 +552,7 @@ mod tests {
         write_mvcc(engine.as_ref(), b"a", b"val_a_v2", 2);
         write_mvcc(engine.as_ref(), b"b", b"val_b_v1", 1);
 
-        let mut iter =
-            MvccIterator::new(engine.as_ref(), None, None, 1, 0, false).unwrap();
+        let mut iter = MvccIterator::new(engine.as_ref(), None, None, 1, 0, false).unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key(), b"a");
@@ -585,8 +576,7 @@ mod tests {
         write_tombstone(engine.as_ref(), b"a", 2);
         write_mvcc(engine.as_ref(), b"b", b"val_b", 1);
 
-        let mut iter =
-            MvccIterator::new(engine.as_ref(), None, None, 2, 0, false).unwrap();
+        let mut iter = MvccIterator::new(engine.as_ref(), None, None, 2, 0, false).unwrap();
 
         // "a" is tombstoned at version 2, so only "b" should be visible
         assert!(iter.valid());
@@ -662,8 +652,7 @@ mod tests {
 
         // start=b, end=d -> should yield b, c (end is exclusive via upper bound)
         let mut iter =
-            MvccIterator::new(engine.as_ref(), Some(b"b"), Some(b"d"), 1, 0, false)
-                .unwrap();
+            MvccIterator::new(engine.as_ref(), Some(b"b"), Some(b"d"), 1, 0, false).unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key(), b"b");
@@ -687,8 +676,7 @@ mod tests {
         write_mvcc(engine.as_ref(), b"b", b"val_b", 1);
 
         // Range [x, z) has no keys
-        let iter = MvccIterator::new(engine.as_ref(), Some(b"x"), Some(b"z"), 1, 0, false)
-            .unwrap();
+        let iter = MvccIterator::new(engine.as_ref(), Some(b"x"), Some(b"z"), 1, 0, false).unwrap();
 
         assert!(!iter.valid());
     }
@@ -700,8 +688,7 @@ mod tests {
 
         write_mvcc(engine.as_ref(), b"a", b"val_a", 1);
 
-        let mut iter =
-            MvccIterator::new(engine.as_ref(), None, None, 1, 0, false).unwrap();
+        let mut iter = MvccIterator::new(engine.as_ref(), None, None, 1, 0, false).unwrap();
 
         assert!(iter.valid());
         iter.close().unwrap();
@@ -773,8 +760,7 @@ mod tests {
         let engine = open_test_engine(dir.path());
 
         let iter =
-            MvccIterator::new(engine.as_ref(), Some(b"start"), Some(b"end"), 1, 0, false)
-                .unwrap();
+            MvccIterator::new(engine.as_ref(), Some(b"start"), Some(b"end"), 1, 0, false).unwrap();
 
         let (start, end) = iter.domain();
         assert_eq!(start, Some(b"start".as_slice()));

@@ -1,7 +1,7 @@
 use crate::types::{IterOptions, WriteOptions};
 use mptdb_common::error::{MptDbError, Result};
 
-/// Core key-value storage engine trait, mirroring the Go `DBEngine` interface.
+/// Core key-value storage engine trait used by the storage backends.
 pub trait KvEngine: Send + Sync {
     /// Get the value associated with the given key, or `None` if absent.
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;

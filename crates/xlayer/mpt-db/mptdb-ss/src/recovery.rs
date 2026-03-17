@@ -32,10 +32,7 @@ pub fn recover_state_store(changelog_path: &Path, store: &dyn StateStore) -> Res
                 ))
             })?;
             store.set_latest_version(entry.version).map_err(|e| {
-                MptDbError::Other(format!(
-                    "failed to set store version {}: {e}",
-                    entry.version
-                ))
+                MptDbError::Other(format!("failed to set store version {}: {e}", entry.version))
             })?;
         }
         Ok(())
@@ -154,10 +151,7 @@ mod tests {
         Box::new(db)
     }
 
-    fn make_changelog_entry(
-        version: i64,
-        pairs: Vec<(&[u8], &[u8])>,
-    ) -> ChangelogEntry {
+    fn make_changelog_entry(version: i64, pairs: Vec<(&[u8], &[u8])>) -> ChangelogEntry {
         ChangelogEntry {
             version,
             changeset: Some(ChangeSet {
@@ -199,9 +193,7 @@ mod tests {
 
         // Write 5 WAL entries.
         let entries: Vec<_> = (1..=5)
-            .map(|v| {
-                make_changelog_entry(v, vec![(b"key", format!("v{v}").as_bytes())])
-            })
+            .map(|v| make_changelog_entry(v, vec![(b"key", format!("v{v}").as_bytes())]))
             .collect();
         write_wal_entries(&wal_dir, &entries);
 

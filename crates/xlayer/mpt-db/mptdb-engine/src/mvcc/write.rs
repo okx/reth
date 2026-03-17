@@ -13,8 +13,8 @@ use std::sync::{atomic::Ordering, Arc};
 impl MvccDatabase {
     /// Apply a changeset synchronously at `version`.
     ///
-    /// Genesis writes arrive as version 0 but PebbleDB/RocksDB treats version 0
-    /// as special, so they are remapped to version 1.
+    /// Genesis writes arrive as version 0 but the underlying MVCC encoding
+    /// treats version 0 as special, so they are remapped to version 1.
     pub fn apply_changeset_sync(&self, version: i64, changeset: &ChangeSet) -> Result<()> {
         // Genesis compatibility: remap version 0 -> 1
         let version = if version == 0 { 1 } else { version };
@@ -64,8 +64,7 @@ impl MvccDatabase {
     pub fn apply_changeset_async(&self, version: i64, changeset: &ChangeSet) -> Result<()> {
         // Write to WAL for durability
         if let Some(ref wal) = *self.stream_handler.lock() {
-            let entry =
-                ChangelogEntry { version, changeset: Some(changeset.clone()) };
+            let entry = ChangelogEntry { version, changeset: Some(changeset.clone()) };
             wal.write(entry)?;
         }
 
@@ -97,7 +96,11 @@ impl MvccDatabase {
 
         // Send a barrier: version=0, empty changeset, done channel set
         if tx
-            .send(VersionedChangesets { version: 0, changeset: ChangeSet { pairs: vec![] }, done: Some(done_tx) })
+            .send(VersionedChangesets {
+                version: 0,
+                changeset: ChangeSet { pairs: vec![] },
+                done: Some(done_tx),
+            })
             .is_err()
         {
             // Channel closed -- worker already stopped

@@ -170,19 +170,11 @@ mod tests {
             unimplemented!()
         }
 
-        fn reverse_iterator(
-            &self,
-            _: i64,
-            _: &[u8],
-            _: &[u8],
-        ) -> Result<Box<dyn DbIterator>> {
+        fn reverse_iterator(&self, _: i64, _: &[u8], _: &[u8]) -> Result<Box<dyn DbIterator>> {
             unimplemented!()
         }
 
-        fn raw_iterate(
-            &self,
-            _: &mut dyn FnMut(&[u8], &[u8], i64) -> bool,
-        ) -> Result<bool> {
+        fn raw_iterate(&self, _: &mut dyn FnMut(&[u8], &[u8], i64) -> bool) -> Result<bool> {
             Ok(false)
         }
 

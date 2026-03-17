@@ -1,7 +1,6 @@
 //! P1 acceptance test for SS EVMStateStore (B-06).
 //!
-//! Ported from Go TestCodeSizeGoesToLegacyDB in
-//! mpt-db/state_db/ss/evm/db_test.go.
+//! Verifies that CodeSize keys are routed into the legacy EVM sub-DB.
 
 use mptdb_common::{
     config::StateStoreConfig,
@@ -39,8 +38,6 @@ fn make_evm_changeset(pairs: Vec<KvPair>) -> ChangeSet {
 // ===========================================================================
 // B-06: CodeSize key goes to legacy DB
 // ===========================================================================
-// Ported from Go TestCodeSizeGoesToLegacyDB.
-//
 // Create EVMStateStore. Apply a changeset with a CodeSize key (prefix 0x09).
 // Verify:
 // - The key is retrievable via get() with the original key

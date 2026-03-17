@@ -10,7 +10,6 @@ const NUM_CACHE_CHUNKS: usize = 3;
 /// 3-chunk rotation cache for receipts and logs.
 ///
 /// Keeps the two most-recent chunks for reads and prunes the oldest on rotation.
-/// This mirrors the Go `ledgerCache` in mpt-db.
 pub struct LedgerCache {
     receipt_chunks: [RwLock<ReceiptChunk>; NUM_CACHE_CHUNKS],
     receipt_write_slot: AtomicUsize,

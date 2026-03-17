@@ -41,7 +41,7 @@ impl Default for WalConfig {
 
 /// Configuration for the state commit (SC) layer.
 ///
-/// MPT-only: legacy MemIAVL/FlatKV fields have been removed.
+/// MPT-only: legacy state-commit backend fields have been removed.
 #[derive(Debug, Clone)]
 pub struct StateCommitConfig {
     /// Whether the state-commit layer is enabled.

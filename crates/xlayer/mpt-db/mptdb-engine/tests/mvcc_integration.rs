@@ -222,9 +222,11 @@ fn test_iterator_forward() {
     let cfg = test_config(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs = make_changeset(
-        vec![(b"a", Some(b"val_a")), (b"b", Some(b"val_b")), (b"c", Some(b"val_c"))],
-    );
+    let cs = make_changeset(vec![
+        (b"a", Some(b"val_a")),
+        (b"b", Some(b"val_b")),
+        (b"c", Some(b"val_c")),
+    ]);
     StateStore::apply_changeset_sync(&db, 1, &cs).unwrap();
 
     let mut iter = StateStore::iterator(&db, 1, b"", b"").unwrap();
@@ -253,9 +255,11 @@ fn test_iterator_reverse() {
     let cfg = test_config(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs = make_changeset(
-        vec![(b"a", Some(b"val_a")), (b"b", Some(b"val_b")), (b"c", Some(b"val_c"))],
-    );
+    let cs = make_changeset(vec![
+        (b"a", Some(b"val_a")),
+        (b"b", Some(b"val_b")),
+        (b"c", Some(b"val_c")),
+    ]);
     StateStore::apply_changeset_sync(&db, 1, &cs).unwrap();
 
     let mut iter = StateStore::reverse_iterator(&db, 1, b"", b"").unwrap();
@@ -284,9 +288,12 @@ fn test_iterator_range() {
     let cfg = test_config(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs = make_changeset(
-        vec![(b"a", Some(b"va")), (b"b", Some(b"vb")), (b"c", Some(b"vc")), (b"d", Some(b"vd"))],
-    );
+    let cs = make_changeset(vec![
+        (b"a", Some(b"va")),
+        (b"b", Some(b"vb")),
+        (b"c", Some(b"vc")),
+        (b"d", Some(b"vd")),
+    ]);
     StateStore::apply_changeset_sync(&db, 1, &cs).unwrap();
 
     // Range [b, d) should yield b, c.
@@ -334,9 +341,7 @@ fn test_iterator_tombstone_skip() {
     let cfg = test_config(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs1 = make_changeset(
-        vec![(b"a", Some(b"va")), (b"b", Some(b"vb")), (b"c", Some(b"vc"))],
-    );
+    let cs1 = make_changeset(vec![(b"a", Some(b"va")), (b"b", Some(b"vb")), (b"c", Some(b"vc"))]);
     StateStore::apply_changeset_sync(&db, 1, &cs1).unwrap();
 
     // Delete "b" at v2.

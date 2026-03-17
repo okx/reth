@@ -3,16 +3,9 @@ use mptdb_common::{config::StateStoreConfig, error::Result};
 use std::sync::Arc;
 
 /// Create an EVM state store.
-pub fn new_state_store(
-    config: &StateStoreConfig,
-    home_dir: &str,
-) -> Result<Arc<EVMStateStore>> {
+pub fn new_state_store(config: &StateStoreConfig, home_dir: &str) -> Result<Arc<EVMStateStore>> {
     let evm_dir = if config.db_directory.is_empty() {
-        std::path::Path::new(home_dir)
-            .join("data")
-            .join("evm_ss")
-            .to_string_lossy()
-            .to_string()
+        std::path::Path::new(home_dir).join("data").join("evm_ss").to_string_lossy().to_string()
     } else {
         config.db_directory.clone()
     };

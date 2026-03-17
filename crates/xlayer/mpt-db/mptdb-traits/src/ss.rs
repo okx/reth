@@ -13,12 +13,7 @@ pub trait StateStore: Send + Sync {
     fn has(&self, version: i64, key: &[u8]) -> Result<bool>;
 
     /// Create a forward iterator over the key range `[start, end)` at the given version.
-    fn iterator(
-        &self,
-        version: i64,
-        start: &[u8],
-        end: &[u8],
-    ) -> Result<Box<dyn DbIterator>>;
+    fn iterator(&self, version: i64, start: &[u8], end: &[u8]) -> Result<Box<dyn DbIterator>>;
 
     /// Create a reverse iterator over the key range `[start, end)` at the given version.
     fn reverse_iterator(
@@ -31,10 +26,7 @@ pub trait StateStore: Send + Sync {
     /// Iterate over all raw key/value/version triples.
     /// The callback returns `true` to continue, `false` to stop.
     #[allow(clippy::type_complexity)]
-    fn raw_iterate(
-        &self,
-        f: &mut dyn FnMut(&[u8], &[u8], i64) -> bool,
-    ) -> Result<bool>;
+    fn raw_iterate(&self, f: &mut dyn FnMut(&[u8], &[u8], i64) -> bool) -> Result<bool>;
 
     /// Return the latest committed version.
     fn get_latest_version(&self) -> i64;

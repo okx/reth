@@ -13,12 +13,7 @@ impl StateStore for MvccDatabase {
         self.has(version, key)
     }
 
-    fn iterator(
-        &self,
-        version: i64,
-        start: &[u8],
-        end: &[u8],
-    ) -> Result<Box<dyn DbIterator>> {
+    fn iterator(&self, version: i64, start: &[u8], end: &[u8]) -> Result<Box<dyn DbIterator>> {
         let start_opt = if start.is_empty() { None } else { Some(start) };
         let end_opt = if end.is_empty() { None } else { Some(end) };
         let iter = MvccIterator::new(
@@ -51,10 +46,7 @@ impl StateStore for MvccDatabase {
         Ok(Box::new(iter))
     }
 
-    fn raw_iterate(
-        &self,
-        f: &mut dyn FnMut(&[u8], &[u8], i64) -> bool,
-    ) -> Result<bool> {
+    fn raw_iterate(&self, f: &mut dyn FnMut(&[u8], &[u8], i64) -> bool) -> Result<bool> {
         self.raw_iterate(f)
     }
 

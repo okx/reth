@@ -1,19 +1,14 @@
 //! Tests for MVCC key encoding correctness.
 //!
 //! Verifies that `mvcc_encode`, `split_mvcc_key`, and `mvcc_key_compare`
-//! produce correct byte-level output for various key/version combinations.
+//! produce the expected byte-level output for various key/version combinations.
 
 use mptdb_engine::mvcc::encoding::{mvcc_encode, mvcc_key_compare, split_mvcc_key};
 use std::cmp::Ordering;
 
 #[test]
-fn test_mvcc_key_encoding_compat() {
-    // Go MVCCEncode("key", 42):
-    // key bytes: [107, 101, 121]
-    // separator: [0]
-    // version 42 as uint64 big-endian: [0, 0, 0, 0, 0, 0, 0, 42]
-    // length byte: 9 (1 + 8)
-    // Total: [107, 101, 121, 0, 0, 0, 0, 0, 0, 0, 0, 42, 9]
+fn test_mvcc_key_encoding() {
+    // "key" + separator + version(42, big-endian) + length byte
     let encoded = mvcc_encode(b"key", 42);
     assert_eq!(encoded, vec![107, 101, 121, 0, 0, 0, 0, 0, 0, 0, 0, 42, 9]);
 
@@ -25,14 +20,14 @@ fn test_mvcc_key_encoding_compat() {
 
 #[test]
 fn test_mvcc_encode_version_zero() {
-    // Go MVCCEncode("key", 0): key + \x00 (no version bytes, no length byte beyond sentinel)
+    // Version 0 encodes as key + sentinel only.
     let encoded = mvcc_encode(b"key", 0);
     assert_eq!(encoded, vec![107, 101, 121, 0]); // "key" + sentinel
 }
 
 #[test]
-fn test_mvcc_key_compare_compat() {
-    // Go behavior: same user key, different versions — higher version bytes sort later
+fn test_mvcc_key_compare() {
+    // Same user key, different versions — higher version bytes sort later.
     let a = mvcc_encode(b"foo", 1);
     let b = mvcc_encode(b"foo", 2);
     assert_eq!(mvcc_key_compare(&a, &b), Ordering::Less);
@@ -55,7 +50,7 @@ fn test_mvcc_encode_large_version() {
 
 #[test]
 fn test_mvcc_encode_empty_key() {
-    // Go MVCCEncode("", 5): separator + version + length byte
+    // Empty user key still carries the separator, version, and length byte.
     let encoded = mvcc_encode(b"", 5);
     assert_eq!(encoded, vec![0, 0, 0, 0, 0, 0, 0, 0, 5, 9]);
 
@@ -67,15 +62,14 @@ fn test_mvcc_encode_empty_key() {
 
 #[test]
 fn test_mvcc_encode_empty_key_version_zero() {
-    // Go MVCCEncode("", 0): just the sentinel byte
+    // Empty user key at version 0 is just the sentinel byte.
     let encoded = mvcc_encode(b"", 0);
     assert_eq!(encoded, vec![0]);
 }
 
 #[test]
 fn test_mvcc_encode_version_one() {
-    // Go MVCCEncode("abc", 1):
-    // "abc" = [97, 98, 99], separator [0], version 1 BE = [0,0,0,0,0,0,0,1], len byte = 9
+    // "abc" + separator + version 1 (big-endian) + length byte.
     let encoded = mvcc_encode(b"abc", 1);
     assert_eq!(encoded, vec![97, 98, 99, 0, 0, 0, 0, 0, 0, 0, 0, 1, 9]);
 }

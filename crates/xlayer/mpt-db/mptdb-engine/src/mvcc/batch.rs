@@ -31,12 +31,7 @@ impl MvccBatch {
     }
 
     /// Encode and insert a key/value pair with an optional tombstone marker.
-    fn set_internal(
-        &mut self,
-        tombstone: i64,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<()> {
+    fn set_internal(&mut self, tombstone: i64, key: &[u8], value: &[u8]) -> Result<()> {
         let encoded_key = mvcc_encode(key, self.version);
         let encoded_val = mvcc_encode_value(value, tombstone);
         self.batch.set(&encoded_key, &encoded_val)?;
@@ -93,12 +88,7 @@ impl MvccRawBatch {
     }
 
     /// Set a key/value pair at an explicit `version`.
-    pub(crate) fn set(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        version: i64,
-    ) -> Result<()> {
+    pub(crate) fn set(&mut self, key: &[u8], value: &[u8], version: i64) -> Result<()> {
         let encoded_key = mvcc_encode(key, version);
         let encoded_val = mvcc_encode_value(value, 0);
         self.batch.set(&encoded_key, &encoded_val)?;

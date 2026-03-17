@@ -277,23 +277,14 @@ mod tests {
     }
 
     /// Write an MVCC key/value directly into the engine.
-    fn write_mvcc(
-        engine: &dyn mptdb_traits::kv::KvEngine,
-        key: &[u8],
-        value: &[u8],
-        version: i64,
-    ) {
+    fn write_mvcc(engine: &dyn mptdb_traits::kv::KvEngine, key: &[u8], value: &[u8], version: i64) {
         let k = mvcc_encode(key, version);
         let v = mvcc_encode_value(value, 0);
         engine.set(&k, &v, &WriteOptions::default()).unwrap();
     }
 
     /// Write an MVCC tombstone directly into the engine.
-    fn write_mvcc_tombstone(
-        engine: &dyn mptdb_traits::kv::KvEngine,
-        key: &[u8],
-        version: i64,
-    ) {
+    fn write_mvcc_tombstone(engine: &dyn mptdb_traits::kv::KvEngine, key: &[u8], version: i64) {
         use crate::mvcc::constants::TOMBSTONE_VAL;
         let k = mvcc_encode(key, version);
         let v = mvcc_encode_value(TOMBSTONE_VAL, version);
@@ -395,11 +386,7 @@ mod tests {
         // All entries should be pruned (keep_last_version=false).
         for i in 0..100u32 {
             let key = format!("key_{i:04}");
-            assert_eq!(
-                mvcc.get(1, key.as_bytes()).unwrap(),
-                None,
-                "key {key} should be pruned"
-            );
+            assert_eq!(mvcc.get(1, key.as_bytes()).unwrap(), None, "key {key} should be pruned");
         }
     }
 

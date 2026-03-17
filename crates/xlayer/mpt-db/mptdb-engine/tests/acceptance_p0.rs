@@ -1,7 +1,6 @@
 //! P0 acceptance test for MVCC database (A-07).
 //!
-//! Ported from Go TestParallelWrites and TestParallelReadsWrites in
-//! mpt-db/db_engine/test/storage_test_suite.go.
+//! Covers parallel write and mixed read/write behaviour for the MVCC engine.
 
 use mptdb_common::config::StateStoreConfig;
 use mptdb_engine::mvcc::db::MvccDatabase;
@@ -32,8 +31,6 @@ fn kv_set(key: &[u8], value: &[u8]) -> KvPair {
 // ===========================================================================
 // A-07: MVCC parallel reads and writes
 // ===========================================================================
-// Ported from Go TestParallelWrites + TestParallelReadsWrites.
-//
 // Spawn 4 writer threads, each writing different keys concurrently via
 // apply_changeset_sync. Then spawn 4 reader threads + 1 writer thread
 // concurrently. No panics, no data races, final state consistent.
@@ -57,8 +54,7 @@ fn a07_mvcc_parallel_writes() {
                     let version = (writer_id * writes_per_thread + i + 1) as i64;
                     let key = format!("key_{writer_id}_{i}");
                     let value = format!("value_{writer_id}_{i}");
-                    let cs =
-                        make_changeset(vec![kv_set(key.as_bytes(), value.as_bytes())]);
+                    let cs = make_changeset(vec![kv_set(key.as_bytes(), value.as_bytes())]);
                     db_ref.apply_changeset_sync(version, &cs).unwrap();
                 }
             }));

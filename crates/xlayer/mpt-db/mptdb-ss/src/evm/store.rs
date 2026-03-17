@@ -146,12 +146,7 @@ impl StateStore for EVMStateStore {
         db.has(version, &stripped)
     }
 
-    fn iterator(
-        &self,
-        _version: i64,
-        _start: &[u8],
-        _end: &[u8],
-    ) -> Result<Box<dyn DbIterator>> {
+    fn iterator(&self, _version: i64, _start: &[u8], _end: &[u8]) -> Result<Box<dyn DbIterator>> {
         Err(MptDbError::Other("evm state store: cross-type iteration not supported".into()))
     }
 
@@ -164,10 +159,7 @@ impl StateStore for EVMStateStore {
         Err(MptDbError::Other("evm state store: cross-type reverse iteration not supported".into()))
     }
 
-    fn raw_iterate(
-        &self,
-        _f: &mut dyn FnMut(&[u8], &[u8], i64) -> bool,
-    ) -> Result<bool> {
+    fn raw_iterate(&self, _f: &mut dyn FnMut(&[u8], &[u8], i64) -> bool) -> Result<bool> {
         Err(MptDbError::Other("evm state store: RawIterate not supported".into()))
     }
 
@@ -461,10 +453,10 @@ mod tests {
 
     #[test]
     fn test_evm_store_prune() {
-        // EVM sub-DBs use use_default_comparer=true (matching Go's PebbleDB).
-        // The RocksDB MVCC prune seek optimisation requires the custom
-        // comparator, so we open with use_default_comparer=false here to
-        // exercise the prune-delegation logic without hitting the seek issue.
+        // EVM sub-DBs normally use the default comparer. The MVCC prune seek
+        // optimisation requires the custom comparator, so we open with
+        // use_default_comparer=false here to exercise the prune-delegation
+        // logic without hitting the seek issue.
         let dir = tempdir().unwrap();
         let cfg = StateStoreConfig {
             db_directory: dir.path().to_string_lossy().to_string(),

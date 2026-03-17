@@ -207,9 +207,7 @@ impl MvccDatabase {
                 })?;
                 let val = u64::from_le_bytes(arr);
                 if val > i64::MAX as u64 {
-                    return Err(MptDbError::Other(format!(
-                        "earliest version overflows i64: {val}"
-                    )));
+                    return Err(MptDbError::Other(format!("earliest version overflows i64: {val}")));
                 }
                 Ok(val as i64)
             }
@@ -290,9 +288,8 @@ impl MvccDatabase {
             }
         };
 
-        let (val_bytes, tomb_bytes) = split_mvcc_value(&raw).ok_or_else(|| {
-            MptDbError::Other(format!("invalid MVCC value for key={:?}", key))
-        })?;
+        let (val_bytes, tomb_bytes) = split_mvcc_value(&raw)
+            .ok_or_else(|| MptDbError::Other(format!("invalid MVCC value for key={:?}", key)))?;
 
         // No tombstone means the value is live.
         let tomb_bytes = match tomb_bytes {
@@ -321,11 +318,7 @@ impl MvccDatabase {
     /// Seek the latest MVCC entry for the given key up to (and including)
     /// `version`. Uses seek_lt on the upper bound to find the last entry
     /// in the range, which works correctly with both RocksDB and MDBX.
-    fn get_mvcc_slice(
-        engine: &dyn KvEngine,
-        key: &[u8],
-        version: i64,
-    ) -> Result<Vec<u8>> {
+    fn get_mvcc_slice(engine: &dyn KvEngine, key: &[u8], version: i64) -> Result<Vec<u8>> {
         let lower = mvcc_encode(key, 0);
         // Upper bound is exclusive, so use version + 1.
         let upper_version = version.saturating_add(1);

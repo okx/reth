@@ -33,19 +33,13 @@ mod tests {
     #[test]
     fn test_state_store_path() {
         let home = Path::new("/home/user");
-        assert_eq!(
-            get_state_store_path(home, "rocksdb"),
-            PathBuf::from("/home/user/data/rocksdb")
-        );
+        assert_eq!(get_state_store_path(home, "rocksdb"), PathBuf::from("/home/user/data/rocksdb"));
     }
 
     #[test]
     fn test_changelog_path() {
         let db_path = Path::new("/home/user/data/rocksdb");
-        assert_eq!(
-            get_changelog_path(db_path),
-            PathBuf::from("/home/user/data/rocksdb/changelog")
-        );
+        assert_eq!(get_changelog_path(db_path), PathBuf::from("/home/user/data/rocksdb/changelog"));
     }
 
     /// T1.1: get_mpt_commit_store_path produces home/data/mpt_committer.db
