@@ -3,7 +3,13 @@ use mptdb_common::error::Result;
 use rayon::prelude::*;
 use revm_database::BundleState;
 use revm_state::AccountInfo;
-use std::collections::HashMap;
+
+/// Final storage slot override for a single account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageChange {
+    pub hashed_slot: B256,
+    pub value: U256,
+}
 
 /// Represents a single account's dirty state for one block.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -17,10 +23,12 @@ pub struct DirtyAccount {
 
     /// Whether the account's storage was fully wiped (e.g., selfdestruct).
     pub storage_wiped: bool,
+    /// Whether the source BundleAccount guarantees storage starts from an empty baseline.
+    pub storage_known_empty: bool,
 
     /// Final storage slot overrides (including U256::ZERO = delete slot).
     /// Key = keccak256(slot_key).
-    pub storage_changes: HashMap<B256, U256>,
+    pub storage_changes: Vec<StorageChange>,
 }
 
 /// Convert a BundleState into sorted, deduplicated DirtyAccounts.
@@ -37,14 +45,25 @@ pub fn collect_dirty_accounts(bundle: &BundleState) -> Result<Vec<DirtyAccount>>
 
             let info = bundle_account.info.clone();
             let storage_wiped = bundle_account.was_destroyed();
+            let storage_known_empty = bundle_account.status.is_storage_known() && !storage_wiped;
 
-            let mut storage_changes = HashMap::with_capacity(bundle_account.storage.len());
-            for (slot_key, slot) in &bundle_account.storage {
-                let hashed_slot = keccak256(slot_key.to_be_bytes::<32>());
-                storage_changes.insert(hashed_slot, slot.present_value);
+            let storage_changes = bundle_account
+                .storage
+                .iter()
+                .map(|(slot_key, slot)| StorageChange {
+                    hashed_slot: keccak256(slot_key.to_be_bytes::<32>()),
+                    value: slot.present_value,
+                })
+                .collect();
+
+            DirtyAccount {
+                address: *address,
+                hashed_address,
+                info,
+                storage_wiped,
+                storage_known_empty,
+                storage_changes,
             }
-
-            DirtyAccount { address: *address, hashed_address, info, storage_wiped, storage_changes }
         })
         .collect();
 
@@ -139,7 +158,12 @@ mod tests {
         let result = collect_dirty_accounts(&bundle).unwrap();
         assert_eq!(result.len(), 1);
         let hashed_slot = keccak256(slot_key.to_be_bytes::<32>());
-        assert_eq!(*result[0].storage_changes.get(&hashed_slot).unwrap(), U256::from(999));
+        let change = result[0]
+            .storage_changes
+            .iter()
+            .find(|change| change.hashed_slot == hashed_slot)
+            .unwrap();
+        assert_eq!(change.value, U256::from(999));
     }
 
     /// T2.4: storage slot = ZERO is preserved (commit decides delete)
@@ -156,7 +180,12 @@ mod tests {
         );
         let result = collect_dirty_accounts(&bundle).unwrap();
         let hashed_slot = keccak256(slot_key.to_be_bytes::<32>());
-        assert_eq!(*result[0].storage_changes.get(&hashed_slot).unwrap(), U256::ZERO);
+        let change = result[0]
+            .storage_changes
+            .iter()
+            .find(|change| change.hashed_slot == hashed_slot)
+            .unwrap();
+        assert_eq!(change.value, U256::ZERO);
     }
 
     /// T2.5: selfdestruct without rebuild -> info=None, storage_wiped=true

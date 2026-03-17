@@ -9,6 +9,14 @@ use mptdb_sc::mpt::state::collect_dirty_accounts;
 use revm_database::{states::StorageSlot, AccountStatus, BundleAccount, BundleState};
 use revm_state::AccountInfo;
 
+fn storage_value(account: &mptdb_sc::mpt::state::DirtyAccount, hashed_slot: B256) -> Option<U256> {
+    account
+        .storage_changes
+        .iter()
+        .find(|change| change.hashed_slot == hashed_slot)
+        .map(|change| change.value)
+}
+
 fn make_info(nonce: u64, balance: u64) -> AccountInfo {
     AccountInfo {
         nonce,
@@ -74,7 +82,7 @@ fn i6_1_basic_mapping() {
     assert!(!d1.storage_wiped);
     // Storage key is keccak256(slot_key_be_bytes)
     let expected_hashed_slot = keccak256(U256::from(1).to_be_bytes::<32>());
-    assert_eq!(*d1.storage_changes.get(&expected_hashed_slot).unwrap(), U256::from(42));
+    assert_eq!(storage_value(d1, expected_hashed_slot).unwrap(), U256::from(42));
 
     // Find addr2's entry
     let d2 = dirty.iter().find(|d| d.address == addr2).unwrap();
@@ -116,8 +124,8 @@ fn i6_2_destroyed_then_recreated() {
     assert_eq!(d.storage_changes.len(), 2);
     let h100 = keccak256(U256::from(100).to_be_bytes::<32>());
     let h101 = keccak256(U256::from(101).to_be_bytes::<32>());
-    assert_eq!(*d.storage_changes.get(&h100).unwrap(), U256::from(200));
-    assert_eq!(*d.storage_changes.get(&h101).unwrap(), U256::from(201));
+    assert_eq!(storage_value(d, h100).unwrap(), U256::from(200));
+    assert_eq!(storage_value(d, h101).unwrap(), U256::from(201));
 }
 
 /// I6.3: wiped + ZERO slots mapping.
@@ -149,8 +157,8 @@ fn i6_3_wiped_with_zero_slots() {
     let h5 = keccak256(U256::from(5).to_be_bytes::<32>());
     let h6 = keccak256(U256::from(6).to_be_bytes::<32>());
     // ZERO is preserved in storage_changes — commit layer will interpret as delete
-    assert_eq!(*d.storage_changes.get(&h5).unwrap(), U256::ZERO);
-    assert_eq!(*d.storage_changes.get(&h6).unwrap(), U256::from(60));
+    assert_eq!(storage_value(d, h5).unwrap(), U256::ZERO);
+    assert_eq!(storage_value(d, h6).unwrap(), U256::from(60));
 }
 
 /// I6.4: alignment with reth's HashedPostState::from_bundle_state.
@@ -200,7 +208,8 @@ fn i6_4_alignment_with_hashed_post_state() {
     // Compare: for each account, same set of hashed storage keys
     for d in &dirty {
         let reth_storage = hashed.storages.get(&d.hashed_address);
-        let our_keys: std::collections::HashSet<B256> = d.storage_changes.keys().copied().collect();
+        let our_keys: std::collections::HashSet<B256> =
+            d.storage_changes.iter().map(|change| change.hashed_slot).collect();
 
         match reth_storage {
             Some(storage) => {

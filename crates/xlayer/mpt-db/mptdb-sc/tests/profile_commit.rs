@@ -305,6 +305,12 @@ fn profile_reopen_from_checkpoint_baseline() {
 fn print_profile(label: &str, profile: &CommitProfile) {
     println!("\n=== {label} ===");
     println!("apply_bundle_state:     {:>8} µs", profile.apply_bundle_state.as_micros());
+    println!("  collect_dirty:        {:>8} µs", profile.apply_collect_dirty_accounts.as_micros());
+    println!(
+        "  get_or_load_trie:     {:>8} µs",
+        profile.apply_get_or_load_storage_tries.as_micros()
+    );
+    println!("  slot_updates:         {:>8} µs", profile.apply_storage_slot_updates.as_micros());
     println!("storage_roots:          {:>8} µs", profile.storage_roots.as_micros());
     println!("account_updates:        {:>8} µs", profile.account_updates.as_micros());
     println!("account_root_and_blobs: {:>8} µs", profile.account_root_and_blobs.as_micros());
@@ -336,8 +342,18 @@ fn profile_b4_4_large() {
     println!("Pre-pop commit: {}ms", t1.elapsed().as_millis());
 
     println!(
-        "{:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
-        "Block", "Apply", "StorRoot", "AcctUpd", "AcctRoot", "Persist", "Commit", "Total"
+        "{:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+        "Block",
+        "Apply",
+        "Collect",
+        "TrieLd",
+        "SlotUpd",
+        "StorRoot",
+        "AcctUpd",
+        "AcctRoot",
+        "Persist",
+        "Commit",
+        "Total"
     );
 
     for (i, block) in blocks.iter().enumerate() {
@@ -345,9 +361,12 @@ fn profile_b4_4_large() {
         let ((_version, _root), profile) = store.commit_with_profile().unwrap();
 
         println!(
-            "{:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+            "{:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
             i + 1,
             profile.apply_bundle_state.as_millis(),
+            profile.apply_collect_dirty_accounts.as_millis(),
+            profile.apply_get_or_load_storage_tries.as_millis(),
+            profile.apply_storage_slot_updates.as_millis(),
             profile.storage_roots.as_millis(),
             profile.account_updates.as_millis(),
             profile.account_root_and_blobs.as_millis(),

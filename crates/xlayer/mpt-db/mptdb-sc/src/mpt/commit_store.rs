@@ -108,6 +108,9 @@ impl StorageTrieCache {
 #[derive(Debug, Clone, Default)]
 pub struct CommitProfile {
     pub apply_bundle_state: Duration,
+    pub apply_collect_dirty_accounts: Duration,
+    pub apply_get_or_load_storage_tries: Duration,
+    pub apply_storage_slot_updates: Duration,
     pub storage_roots: Duration,
     pub account_updates: Duration,
     pub account_root_and_blobs: Duration,
@@ -159,6 +162,9 @@ pub struct MptCommitStore {
     async_error: Arc<AtomicBool>,
     async_error_detail: Arc<Mutex<Option<String>>>,
     last_apply_duration: Duration,
+    last_apply_collect_dirty_accounts: Duration,
+    last_apply_get_or_load_storage_tries: Duration,
+    last_apply_storage_slot_updates: Duration,
     last_commit_profile: CommitProfile,
     #[cfg(test)]
     loaded_from_checkpoint: bool,
@@ -235,6 +241,43 @@ impl MptCommitStore {
         fs::rename(&tmp, &path)
             .map_err(|e| MptDbError::Other(format!("rename account trie checkpoint: {e}")))?;
         Ok(())
+    }
+
+    fn shutdown(&mut self, best_effort: bool) -> Result<()> {
+        if best_effort {
+            let _ = self.flush_persist();
+            let _ = self.save_checkpoint();
+        } else {
+            self.flush_persist()?;
+            self.save_checkpoint()?;
+        }
+
+        self.persist_tx.take();
+        if let Some(handle) = self.persist_handle.take() {
+            if best_effort {
+                let _ = handle.join();
+            } else {
+                handle
+                    .join()
+                    .map_err(|_| MptDbError::Other("persist worker panicked".to_string()))?;
+            }
+        }
+
+        if let Some(persisted) = Arc::get_mut(&mut self.persisted) {
+            if best_effort {
+                let _ = persisted.close();
+            } else {
+                persisted.close()?;
+            }
+        }
+
+        self.file_lock = None;
+
+        if best_effort {
+            Ok(())
+        } else {
+            self.check_async_error()
+        }
     }
 
     fn reload_account_trie(&mut self) -> Result<()> {
@@ -428,6 +471,9 @@ impl MptCommitStore {
             async_error,
             async_error_detail,
             last_apply_duration: Duration::ZERO,
+            last_apply_collect_dirty_accounts: Duration::ZERO,
+            last_apply_get_or_load_storage_tries: Duration::ZERO,
+            last_apply_storage_slot_updates: Duration::ZERO,
             last_commit_profile: CommitProfile::default(),
             #[cfg(test)]
             loaded_from_checkpoint,
@@ -670,19 +716,7 @@ impl MptCommitter for MptCommitStore {
     }
 
     fn close(&mut self) -> Result<()> {
-        // Drop the sender to signal the background worker to stop, then wait
-        // for it to finish all in-flight persist jobs.
-        self.flush_persist()?;
-        self.save_checkpoint()?;
-        self.persist_tx.take();
-        if let Some(handle) = self.persist_handle.take() {
-            handle.join().map_err(|_| MptDbError::Other("persist worker panicked".to_string()))?;
-        }
-        if let Some(persisted) = Arc::get_mut(&mut self.persisted) {
-            persisted.close()?;
-        }
-        self.file_lock = None;
-        self.check_async_error()
+        self.shutdown(false)
     }
 
     fn prune_before(&mut self, version: i64) -> Result<()> {
@@ -802,7 +836,51 @@ impl MptCommitStore {
     }
 
     fn apply_bundle_state_inner(&mut self, bundle: &BundleState) -> Result<()> {
+        let collect_start = std::time::Instant::now();
         let dirty_accounts = state::collect_dirty_accounts(bundle)?;
+        let collect_elapsed = collect_start.elapsed();
+        let load_start = std::time::Instant::now();
+        let mut storage_loads = Vec::new();
+
+        for dirty in &dirty_accounts {
+            if dirty.storage_wiped || dirty.storage_changes.is_empty() {
+                continue;
+            }
+            if self.storage_tries.contains_key(&dirty.hashed_address) {
+                continue;
+            }
+            if dirty.storage_known_empty {
+                self.storage_tries.insert(dirty.hashed_address, MptTree::new());
+                continue;
+            }
+            if let Some(cached_trie) = self.storage_trie_cache.remove(&dirty.hashed_address) {
+                self.storage_tries.insert(dirty.hashed_address, cached_trie);
+                continue;
+            }
+
+            let existing_root = self.get_existing_storage_root(&dirty.hashed_address);
+            if existing_root == EMPTY_ROOT_HASH {
+                self.storage_tries.insert(dirty.hashed_address, MptTree::new());
+            } else {
+                storage_loads.push((dirty.hashed_address, existing_root));
+            }
+        }
+
+        if !storage_loads.is_empty() {
+            self.flush_persist()?;
+            let persisted = Arc::clone(&self.persisted);
+            let loaded_tries: Vec<(B256, MptTree)> = storage_loads
+                .into_par_iter()
+                .map(|(hashed_address, existing_root)| {
+                    persisted::load_tree_from_root(&persisted, existing_root)
+                        .map(|trie| (hashed_address, trie))
+                })
+                .collect::<Result<_>>()?;
+            self.storage_tries.extend(loaded_tries);
+        }
+
+        let get_or_load_elapsed = load_start.elapsed();
+        let mut slot_updates_elapsed = Duration::ZERO;
 
         for dirty in &dirty_accounts {
             if dirty.storage_wiped {
@@ -810,37 +888,40 @@ impl MptCommitStore {
                 self.storage_trie_cache.remove(&dirty.hashed_address);
                 // Wiped: start from empty storage trie, apply new changes on top
                 let mut new_trie = MptTree::new();
-                for (hashed_slot, value) in &dirty.storage_changes {
-                    let slot_key = Nibbles::unpack(hashed_slot);
-                    if *value == U256::ZERO {
+                let slot_updates_start = std::time::Instant::now();
+                for change in &dirty.storage_changes {
+                    let slot_key = Nibbles::unpack(&change.hashed_slot);
+                    if change.value == U256::ZERO {
                         // ZERO = delete (no-op on empty trie)
                         new_trie.delete(&slot_key);
                     } else {
-                        let encoded = alloy_rlp_encode_u256(value);
+                        let encoded = alloy_rlp_encode_u256(&change.value);
                         new_trie.insert(&slot_key, encoded);
                     }
                 }
+                slot_updates_elapsed += slot_updates_start.elapsed();
                 self.storage_tries.insert(dirty.hashed_address, new_trie);
             } else if !dirty.storage_changes.is_empty() {
-                // Non-wiped but has storage changes: load existing storage trie
-                let existing_root = self.get_existing_storage_root(&dirty.hashed_address);
-                self.get_or_load_storage_trie(&dirty.hashed_address, existing_root)?;
-
                 let trie = self.storage_tries.get_mut(&dirty.hashed_address).unwrap();
-                for (hashed_slot, value) in &dirty.storage_changes {
-                    let slot_key = Nibbles::unpack(hashed_slot);
-                    if *value == U256::ZERO {
+                let slot_updates_start = std::time::Instant::now();
+                for change in &dirty.storage_changes {
+                    let slot_key = Nibbles::unpack(&change.hashed_slot);
+                    if change.value == U256::ZERO {
                         trie.delete(&slot_key);
                     } else {
-                        let encoded = alloy_rlp_encode_u256(value);
+                        let encoded = alloy_rlp_encode_u256(&change.value);
                         trie.insert(&slot_key, encoded);
                     }
                 }
+                slot_updates_elapsed += slot_updates_start.elapsed();
             }
             // If no storage changes and not wiped: no storage trie needed (REUSE)
         }
 
         self.dirty_accounts = dirty_accounts;
+        self.last_apply_collect_dirty_accounts = collect_elapsed;
+        self.last_apply_get_or_load_storage_tries = get_or_load_elapsed;
+        self.last_apply_storage_slot_updates = slot_updates_elapsed;
         Ok(())
     }
 
@@ -951,7 +1032,8 @@ impl MptCommitStore {
 
         // Phase 2b: compute state root and collect dirty blobs in one pass
         let account_root_start = std::time::Instant::now();
-        let (state_root, account_blobs) = self.account_trie.root_hash_and_dirty_blobs();
+        let (state_root, account_blobs) =
+            self.account_trie.root_hash_and_dirty_blobs_parallel(&self.parallelism);
         let account_root_elapsed = account_root_start.elapsed();
 
         // Separate node blobs from tries so we can cache tries after persist
@@ -1000,10 +1082,6 @@ impl MptCommitStore {
 
         let persist_start = std::time::Instant::now();
         if use_async {
-            // Pre-populate the node cache so subsequent reads can find these
-            // nodes even before the background persist writes them to RocksDB.
-            self.persisted.populate_cache(&all_blobs);
-
             let tx = self.persist_tx.as_ref().unwrap();
             let job = PersistJob {
                 barrier_only: false,
@@ -1053,6 +1131,9 @@ impl MptCommitStore {
 
         self.last_commit_profile = CommitProfile {
             apply_bundle_state: self.last_apply_duration,
+            apply_collect_dirty_accounts: self.last_apply_collect_dirty_accounts,
+            apply_get_or_load_storage_tries: self.last_apply_get_or_load_storage_tries,
+            apply_storage_slot_updates: self.last_apply_storage_slot_updates,
             storage_roots: storage_roots_elapsed,
             account_updates: account_updates_elapsed,
             account_root_and_blobs: account_root_elapsed,
@@ -1128,6 +1209,12 @@ impl<'a> super::r#trait::MptSnapshotImporter for BoundImporter<'a> {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for MptCommitStore {
+    fn drop(&mut self) {
+        let _ = self.shutdown(true);
     }
 }
 
@@ -1955,6 +2042,18 @@ mod tests {
         reader.close().unwrap();
         // Writer should succeed now
         let _writer = MptCommitStore::open(dir.path(), false).unwrap();
+    }
+
+    /// T6.4b: implicit drop also releases the writer lock and background resources.
+    #[test]
+    fn t6_4b_drop_releases_lock() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut writer = MptCommitStore::open(dir.path(), false).unwrap();
+            writer.apply_bundle_state(&BundleState::default()).unwrap();
+            writer.commit().unwrap();
+        }
+        let _writer2 = MptCommitStore::open(dir.path(), false).unwrap();
     }
 
     /// T6.5: prune_before correctly updates manifest earliest_version

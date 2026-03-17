@@ -20,6 +20,25 @@ pub struct MptTree {
     pub(crate) root: Option<u32>,
 }
 
+struct CacheUpdate {
+    idx: u32,
+    rlp: Vec<u8>,
+    hash: Option<B256>,
+}
+
+struct ChildArtifacts {
+    embed: Vec<u8>,
+    cache_updates: Vec<CacheUpdate>,
+    dirty_blobs: Vec<(B256, Vec<u8>)>,
+}
+
+struct NodeArtifacts {
+    rlp: Vec<u8>,
+    hash: B256,
+    cache_updates: Vec<CacheUpdate>,
+    dirty_blobs: Vec<(B256, Vec<u8>)>,
+}
+
 impl MptTree {
     /// Create an empty trie.
     pub fn new() -> Self {
@@ -449,9 +468,241 @@ impl MptTree {
         }
     }
 
+    /// Parallelized variant of `root_hash_and_dirty_blobs` for wide account tries.
+    ///
+    /// This parallelizes the independent frontier subtrees under a branch root
+    /// (or extension->branch root), then applies the computed cache updates back
+    /// to the mutable arena in deterministic order.
+    pub(crate) fn root_hash_and_dirty_blobs_parallel(
+        &mut self,
+        thresholds: &ParallelismThresholds,
+    ) -> (B256, Vec<(B256, Vec<u8>)>) {
+        let root_idx = match self.root {
+            Some(idx) => idx,
+            None => return (alloy_trie::EMPTY_ROOT_HASH, vec![]),
+        };
+
+        let frontier_width = self.parallel_frontier_width();
+        if !self.arena.is_dirty(root_idx) ||
+            !thresholds.should_parallelize_account_frontier(frontier_width)
+        {
+            return self.root_hash_and_dirty_blobs();
+        }
+
+        let Some((root_hash, dirty_blobs, cache_updates)) =
+            self.root_hash_and_dirty_blobs_parallel_inner(root_idx)
+        else {
+            return self.root_hash_and_dirty_blobs();
+        };
+
+        for update in cache_updates {
+            self.arena.set_rlp(update.idx, update.rlp);
+            if let Some(hash) = update.hash {
+                self.arena.set_hash(update.idx, hash);
+            }
+        }
+
+        (root_hash, dirty_blobs)
+    }
+
     /// Clear all dirty flags in the arena. Call after successful persist.
     pub(crate) fn clear_dirty(&mut self) {
         self.arena.clear_all_dirty();
+    }
+
+    fn root_hash_and_dirty_blobs_parallel_inner(
+        &self,
+        root_idx: u32,
+    ) -> Option<(B256, Vec<(B256, Vec<u8>)>, Vec<CacheUpdate>)> {
+        match self.arena.get(root_idx) {
+            MptNode::Branch(branch) => {
+                let tasks: Vec<(usize, ChildRef)> = branch
+                    .children
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, child)| child.clone().map(|child| (slot, child)))
+                    .collect();
+
+                let mut results: Vec<(usize, ChildArtifacts)> = tasks
+                    .into_par_iter()
+                    .map(|(slot, child)| {
+                        (slot, self.encode_child_for_parent_collect_readonly(&child))
+                    })
+                    .collect();
+                results.sort_by_key(|(slot, _)| *slot);
+
+                let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
+                let mut cache_updates = Vec::new();
+                let mut dirty_blobs = Vec::new();
+                for (slot, artifacts) in results {
+                    children_bytes[slot] = Some(artifacts.embed);
+                    cache_updates.extend(artifacts.cache_updates);
+                    dirty_blobs.extend(artifacts.dirty_blobs);
+                }
+
+                let root_rlp = encode_branch(&children_bytes, branch.value.as_deref());
+                let root_hash = hash::hash_rlp(&root_rlp);
+
+                let mut all_blobs = Vec::with_capacity(dirty_blobs.len() + 1);
+                all_blobs.push((root_hash, root_rlp.clone()));
+                all_blobs.extend(dirty_blobs);
+
+                let mut all_cache_updates = Vec::with_capacity(cache_updates.len() + 1);
+                all_cache_updates.push(CacheUpdate {
+                    idx: root_idx,
+                    hash: (root_rlp.len() >= 32).then_some(root_hash),
+                    rlp: root_rlp,
+                });
+                all_cache_updates.extend(cache_updates);
+
+                Some((root_hash, all_blobs, all_cache_updates))
+            }
+            MptNode::Extension(ext) => {
+                let ChildRef::Arena(branch_idx) = &ext.child else {
+                    panic!("Phase 1: only Arena child refs in live tree");
+                };
+                let MptNode::Branch(branch) = self.arena.get(*branch_idx) else {
+                    return None;
+                };
+
+                let tasks: Vec<(usize, ChildRef)> = branch
+                    .children
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, child)| child.clone().map(|child| (slot, child)))
+                    .collect();
+
+                let mut results: Vec<(usize, ChildArtifacts)> = tasks
+                    .into_par_iter()
+                    .map(|(slot, child)| {
+                        (slot, self.encode_child_for_parent_collect_readonly(&child))
+                    })
+                    .collect();
+                results.sort_by_key(|(slot, _)| *slot);
+
+                let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
+                let mut cache_updates = Vec::new();
+                let mut child_dirty_blobs = Vec::new();
+                for (slot, artifacts) in results {
+                    children_bytes[slot] = Some(artifacts.embed);
+                    cache_updates.extend(artifacts.cache_updates);
+                    child_dirty_blobs.extend(artifacts.dirty_blobs);
+                }
+
+                let branch_rlp = encode_branch(&children_bytes, branch.value.as_deref());
+                let branch_hash = hash::hash_rlp(&branch_rlp);
+                let branch_embed =
+                    if branch_rlp.len() < 32 { branch_rlp.clone() } else { branch_hash.to_vec() };
+
+                let root_rlp = encode_extension(&ext.nibbles, &branch_embed);
+                let root_hash = hash::hash_rlp(&root_rlp);
+
+                let mut all_blobs = Vec::with_capacity(
+                    child_dirty_blobs.len() + usize::from(self.arena.is_dirty(*branch_idx)) + 1,
+                );
+                all_blobs.push((root_hash, root_rlp.clone()));
+                if self.arena.is_dirty(*branch_idx) {
+                    all_blobs.push((branch_hash, branch_rlp.clone()));
+                }
+                all_blobs.extend(child_dirty_blobs);
+
+                let mut all_cache_updates = Vec::with_capacity(cache_updates.len() + 2);
+                all_cache_updates.push(CacheUpdate {
+                    idx: root_idx,
+                    hash: (root_rlp.len() >= 32).then_some(root_hash),
+                    rlp: root_rlp,
+                });
+                all_cache_updates.push(CacheUpdate {
+                    idx: *branch_idx,
+                    hash: (branch_rlp.len() >= 32).then_some(branch_hash),
+                    rlp: branch_rlp,
+                });
+                all_cache_updates.extend(cache_updates);
+
+                Some((root_hash, all_blobs, all_cache_updates))
+            }
+            _ => None,
+        }
+    }
+
+    fn encode_child_for_parent_collect_readonly(&self, child: &ChildRef) -> ChildArtifacts {
+        match child {
+            ChildRef::Arena(idx) => {
+                let idx = *idx;
+                if !self.arena.is_dirty(idx) {
+                    if let Some(hash) = self.arena.get_hash(idx) {
+                        return ChildArtifacts {
+                            embed: hash.to_vec(),
+                            cache_updates: Vec::new(),
+                            dirty_blobs: Vec::new(),
+                        };
+                    }
+                    if let Some(rlp) = self.arena.get_rlp(idx) {
+                        let hash = hash::hash_rlp(rlp);
+                        return ChildArtifacts {
+                            embed: if rlp.len() < 32 { rlp.clone() } else { hash.to_vec() },
+                            cache_updates: vec![CacheUpdate {
+                                idx,
+                                hash: (rlp.len() >= 32).then_some(hash),
+                                rlp: rlp.clone(),
+                            }],
+                            dirty_blobs: Vec::new(),
+                        };
+                    }
+                }
+
+                let node = self.compute_node_artifacts(idx);
+                ChildArtifacts {
+                    embed: if node.rlp.len() < 32 { node.rlp.clone() } else { node.hash.to_vec() },
+                    cache_updates: node.cache_updates,
+                    dirty_blobs: node.dirty_blobs,
+                }
+            }
+            ChildRef::Inline(rlp) => ChildArtifacts {
+                embed: rlp.clone(),
+                cache_updates: Vec::new(),
+                dirty_blobs: Vec::new(),
+            },
+            ChildRef::Hash(_) => panic!("Phase 1: Hash child refs not supported in encode"),
+        }
+    }
+
+    fn compute_node_artifacts(&self, idx: u32) -> NodeArtifacts {
+        let mut cache_updates = Vec::new();
+        let mut dirty_blobs = Vec::new();
+
+        let rlp = match self.arena.get(idx) {
+            MptNode::Leaf(leaf) => encode_leaf(&leaf.nibbles, &leaf.value),
+            MptNode::Extension(ext) => {
+                let child = self.encode_child_for_parent_collect_readonly(&ext.child);
+                cache_updates.extend(child.cache_updates);
+                dirty_blobs.extend(child.dirty_blobs);
+                encode_extension(&ext.nibbles, &child.embed)
+            }
+            MptNode::Branch(branch) => {
+                let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
+                for (slot, child) in branch.children.iter().enumerate() {
+                    if let Some(child) = child {
+                        let artifacts = self.encode_child_for_parent_collect_readonly(child);
+                        children_bytes[slot] = Some(artifacts.embed);
+                        cache_updates.extend(artifacts.cache_updates);
+                        dirty_blobs.extend(artifacts.dirty_blobs);
+                    }
+                }
+                encode_branch(&children_bytes, branch.value.as_deref())
+            }
+        };
+
+        let node_hash = self.arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
+        cache_updates.insert(
+            0,
+            CacheUpdate { idx, hash: (rlp.len() >= 32).then_some(node_hash), rlp: rlp.clone() },
+        );
+        if self.arena.is_dirty(idx) {
+            dirty_blobs.insert(0, (node_hash, rlp.clone()));
+        }
+
+        NodeArtifacts { rlp, hash: node_hash, cache_updates, dirty_blobs }
     }
 }
 
@@ -822,5 +1073,37 @@ mod tests {
             "after root_hash_and_dirty_blobs, all reachable nodes should have rlp_cache: \
              cached={cache_count_final}, reachable={reachable_count}"
         );
+    }
+
+    #[test]
+    fn t3_6_parallel_root_hash_and_dirty_blobs_matches_serial() {
+        let thresholds = ParallelismThresholds { storage_tries_min: 1, account_frontier_min: 1 };
+
+        let mut serial = MptTree::new();
+        let mut parallel = MptTree::new();
+        for i in 0u64..64 {
+            let key = nibbles_from_bytes(&i.to_be_bytes());
+            let value = format!("val{i}").into_bytes();
+            serial.insert(&key, value.clone());
+            parallel.insert(&key, value);
+        }
+
+        let (_root0, _blobs0) = serial.root_hash_and_dirty_blobs();
+        let (_root1, _blobs1) = parallel.root_hash_and_dirty_blobs_parallel(&thresholds);
+        serial.clear_dirty();
+        parallel.clear_dirty();
+
+        for i in 0u64..16 {
+            let key = nibbles_from_bytes(&i.to_be_bytes());
+            serial.insert(&key, format!("new{i}").into_bytes());
+            parallel.insert(&key, format!("new{i}").into_bytes());
+        }
+
+        let (serial_root, serial_blobs) = serial.root_hash_and_dirty_blobs();
+        let (parallel_root, parallel_blobs) =
+            parallel.root_hash_and_dirty_blobs_parallel(&thresholds);
+
+        assert_eq!(serial_root, parallel_root);
+        assert_eq!(serial_blobs, parallel_blobs);
     }
 }

@@ -18,12 +18,12 @@ pub struct MptConfig {
 impl Default for MptConfig {
     fn default() -> Self {
         Self {
-            storage_trie_cache_capacity: 10_000,
-            persisted_node_cache_capacity: 100_000,
+            storage_trie_cache_capacity: 50_000,
+            persisted_node_cache_capacity: 500_000,
             parallel_storage_tries_min: 64,
             parallel_account_frontier_min: 4,
-            async_queue_depth: 16,
-            async_blob_threshold: 5_000,
+            async_queue_depth: 64,
+            async_blob_threshold: 50_000,
         }
     }
 }
