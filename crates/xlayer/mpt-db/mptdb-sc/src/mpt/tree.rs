@@ -52,7 +52,7 @@ impl MptTree {
             None => alloy_trie::EMPTY_ROOT_HASH,
             Some(root_idx) => {
                 let rlp = self.encode_node(root_idx);
-                hash::hash_rlp(&rlp)
+                self.arena.get_hash(root_idx).unwrap_or_else(|| hash::hash_rlp(&rlp))
             }
         }
     }
@@ -363,7 +363,7 @@ impl MptTree {
 
     fn collect_blobs_recursive(&self, idx: u32, out: &mut Vec<(B256, Vec<u8>)>) {
         let rlp = self.arena.get_rlp(idx).expect("RLP cache must be populated").clone();
-        let node_hash = hash::hash_rlp(&rlp);
+        let node_hash = self.arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
         out.push((node_hash, rlp));
 
         let node = self.arena.get(idx);
@@ -408,7 +408,7 @@ impl MptTree {
         }
 
         let rlp = self.arena.get_rlp(idx).expect("dirty node must have rlp cache").clone();
-        let node_hash = hash::hash_rlp(&rlp);
+        let node_hash = self.arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
         out.push((node_hash, rlp));
 
         // Only recurse into children of dirty nodes
@@ -438,7 +438,8 @@ impl MptTree {
             None => (alloy_trie::EMPTY_ROOT_HASH, vec![]),
             Some(root_idx) => {
                 let rlp = self.encode_node(root_idx);
-                let root_hash = hash::hash_rlp(&rlp);
+                let root_hash =
+                    self.arena.get_hash(root_idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
 
                 let mut blobs = Vec::new();
                 self.collect_dirty_blobs_recursive(root_idx, &mut blobs);

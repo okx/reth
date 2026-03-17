@@ -1,5 +1,6 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
 use mptdb_common::error::Result;
+use rayon::prelude::*;
 use revm_database::BundleState;
 use revm_state::AccountInfo;
 use std::collections::HashMap;
@@ -29,13 +30,15 @@ pub fn collect_dirty_accounts(bundle: &BundleState) -> Result<Vec<DirtyAccount>>
     let mut accounts: Vec<DirtyAccount> = bundle
         .state
         .iter()
+        .collect::<Vec<_>>()
+        .into_par_iter()
         .map(|(address, bundle_account)| {
             let hashed_address = keccak256(address);
 
             let info = bundle_account.info.clone();
             let storage_wiped = bundle_account.was_destroyed();
 
-            let mut storage_changes = HashMap::new();
+            let mut storage_changes = HashMap::with_capacity(bundle_account.storage.len());
             for (slot_key, slot) in &bundle_account.storage {
                 let hashed_slot = keccak256(slot_key.to_be_bytes::<32>());
                 storage_changes.insert(hashed_slot, slot.present_value);

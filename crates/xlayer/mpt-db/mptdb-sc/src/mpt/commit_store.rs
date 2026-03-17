@@ -859,7 +859,8 @@ impl MptCommitStore {
         // RECOMPUTE roots potentially in parallel using mem::take on
         // storage_tries for ownership transfer.
         let profile_start = std::time::Instant::now();
-        let mut storage_roots: HashMap<B256, B256> = HashMap::new();
+        let mut storage_roots: HashMap<B256, B256> =
+            HashMap::with_capacity(self.dirty_accounts.len());
         let storage_start = std::time::Instant::now();
 
         // Pre-fill DELETE and REUSE cases (no trie computation needed)
@@ -881,7 +882,7 @@ impl MptCommitStore {
         let should_parallel =
             self.parallelism.should_parallelize_storage_tries(storage_tries_vec.len());
 
-        let mut storage_artifacts: Vec<StorageTrieCommitArtifacts> = if should_parallel {
+        let storage_artifacts: Vec<StorageTrieCommitArtifacts> = if should_parallel {
             storage_tries_vec
                 .into_par_iter()
                 .map(|(addr, mut trie)| {
@@ -908,9 +909,6 @@ impl MptCommitStore {
                 })
                 .collect()
         };
-
-        // Sort by hashed_address for deterministic ordering
-        storage_artifacts.sort_by_key(|a| a.hashed_address);
 
         // Merge RECOMPUTE roots into storage_roots map
         for artifact in &storage_artifacts {
@@ -959,7 +957,10 @@ impl MptCommitStore {
         // Separate node blobs from tries so we can cache tries after persist
         let mut storage_cache_candidates: Vec<(B256, MptTree)> =
             Vec::with_capacity(storage_artifacts.len());
-        let mut all_blobs = account_blobs;
+        let extra_blob_capacity: usize =
+            storage_artifacts.iter().map(|artifact| artifact.node_blobs.len()).sum();
+        let mut all_blobs = Vec::with_capacity(account_blobs.len() + extra_blob_capacity);
+        all_blobs.extend(account_blobs);
         for artifact in storage_artifacts {
             all_blobs.extend(artifact.node_blobs);
             storage_cache_candidates.push((artifact.hashed_address, artifact.trie));

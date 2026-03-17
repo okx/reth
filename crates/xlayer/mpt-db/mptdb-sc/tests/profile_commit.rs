@@ -335,18 +335,26 @@ fn profile_b4_4_large() {
     store.commit().unwrap();
     println!("Pre-pop commit: {}ms", t1.elapsed().as_millis());
 
-    println!("{:<8} {:<12} {:<12} {:<12}", "Block", "Apply(ms)", "Commit(ms)", "Total(ms)");
+    println!(
+        "{:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+        "Block", "Apply", "StorRoot", "AcctUpd", "AcctRoot", "Persist", "Commit", "Total"
+    );
 
     for (i, block) in blocks.iter().enumerate() {
-        let t0 = Instant::now();
         store.apply_bundle_state(block).unwrap();
-        let apply_ms = t0.elapsed().as_millis();
+        let ((_version, _root), profile) = store.commit_with_profile().unwrap();
 
-        let t1 = Instant::now();
-        store.commit().unwrap();
-        let commit_ms = t1.elapsed().as_millis();
-
-        println!("{:<8} {:<12} {:<12} {:<12}", i + 1, apply_ms, commit_ms, apply_ms + commit_ms);
+        println!(
+            "{:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+            i + 1,
+            profile.apply_bundle_state.as_millis(),
+            profile.storage_roots.as_millis(),
+            profile.account_updates.as_millis(),
+            profile.account_root_and_blobs.as_millis(),
+            profile.persist_and_manifest.as_millis(),
+            profile.total_commit.as_millis(),
+            (profile.apply_bundle_state + profile.total_commit).as_millis()
+        );
     }
 
     store.close().unwrap();
