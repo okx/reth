@@ -137,20 +137,6 @@ fn i3_6_rollback_then_load() {
     assert_eq!(db.version(), 1);
 }
 
-/// I3.7: initialize is no-op, does not affect commit
-#[test]
-fn i3_7_initialize_noop() {
-    let dir = tempdir().unwrap();
-    let home = dir.path().to_string_lossy().to_string();
-    let mut db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();
-
-    db.initialize(&["bank".to_string(), "staking".to_string()]);
-
-    db.sc_mut().apply_bundle_state(&BundleState::default()).unwrap();
-    let (ver, _) = db.sc_mut().commit().unwrap();
-    assert_eq!(ver, 1);
-}
-
 /// I3.8: top-level test uses `mptdb::MptCommitter` for trait methods
 #[test]
 fn i3_8_trait_import() {

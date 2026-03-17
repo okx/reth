@@ -4,14 +4,11 @@ use mptdb_common::{
     config::ReceiptStoreConfig,
     error::{MptDbError, Result},
 };
-use mptdb_proto::{ChangeSet, KvPair, NamedChangeSet};
+use mptdb_proto::{ChangeSet, KvPair};
 use mptdb_traits::{ss::StateStore, wal::Wal};
 use mptdb_wal::changelog::{new_changelog_wal, ChangelogWal};
 use std::{sync::Arc, thread::JoinHandle, time::Duration};
 use tracing::{error, info, warn};
-
-/// Store key used for receipt data within the MVCC database.
-const RECEIPT_STORE_KEY: &str = "receipt";
 
 /// MVCC-backed receipt store with WAL recovery and background pruning.
 ///
@@ -20,8 +17,6 @@ const RECEIPT_STORE_KEY: &str = "receipt";
 /// A background pruning thread removes old versions to bound disk usage.
 pub struct MvccReceiptStore {
     db: Arc<dyn StateStore>,
-    #[allow(dead_code)]
-    store_key: String,
     stop_pruning: Option<Sender<()>>,
     prune_handle: Option<JoinHandle<()>>,
 }
@@ -56,7 +51,7 @@ impl MvccReceiptStore {
                 (None, None)
             };
 
-        Ok(Self { db, store_key: RECEIPT_STORE_KEY.to_string(), stop_pruning, prune_handle })
+        Ok(Self { db, stop_pruning, prune_handle })
     }
 
     /// Recover receipt state from the WAL.
@@ -99,8 +94,10 @@ impl MvccReceiptStore {
         info!(target_start, last_offset, "Replaying changelog to recover receipt store");
 
         if target_start < last_offset {
+            let empty = ChangeSet { pairs: vec![] };
             wal.replay(target_start, last_offset, &mut |_index, entry| {
-                db.apply_changeset_sync(entry.version, &entry.changesets)?;
+                let cs = entry.changeset.as_ref().unwrap_or(&empty);
+                db.apply_changeset_sync(entry.version, cs)?;
                 db.set_latest_version(entry.version)?;
                 Ok(())
             })?;
@@ -178,7 +175,7 @@ impl ReceiptStore for MvccReceiptStore {
 
     fn get_receipt(&self, tx_hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         let lv = self.db.get_latest_version();
-        self.db.get(RECEIPT_STORE_KEY, lv, tx_hash)
+        self.db.get(lv, tx_hash)
     }
 
     fn set_receipts(&self, block_height: u64, receipts: &[ReceiptRecord]) -> Result<()> {
@@ -192,16 +189,13 @@ impl ReceiptStore for MvccReceiptStore {
             })
             .collect();
 
-        let ncs = NamedChangeSet {
-            name: RECEIPT_STORE_KEY.to_string(),
-            changeset: Some(ChangeSet { pairs }),
-        };
+        let cs = ChangeSet { pairs };
 
         // Map genesis block (height 0) to version 1 to avoid zero-version
         // issues in the underlying MVCC store.
         let version = if block_height == 0 { 1 } else { block_height as i64 };
 
-        self.db.apply_changeset_sync(version, &[ncs])?;
+        self.db.apply_changeset_sync(version, &cs)?;
         self.db.set_latest_version(version)?;
 
         Ok(())

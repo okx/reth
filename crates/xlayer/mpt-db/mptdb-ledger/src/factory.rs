@@ -58,8 +58,8 @@ fn new_mvcc_receipt_store(
 
 /// Normalize backend name to the canonical form used by the engine layer.
 ///
-/// PebbleDB and empty strings both map to "rocksdb" since the Rust engine
-/// uses RocksDB as the underlying implementation for both.
+/// Legacy config values ("pebbledb", "pebble") and empty strings all map to
+/// "rocksdb" for backward compatibility.
 pub fn normalize_backend(backend: &str) -> &str {
     match backend {
         "" | "pebbledb" | "pebble" => "rocksdb",
@@ -103,6 +103,7 @@ mod tests {
     #[test]
     fn test_factory_normalize_backend() {
         assert_eq!(normalize_backend(""), "rocksdb");
+        // Legacy config values map to rocksdb for backward compatibility.
         assert_eq!(normalize_backend("pebbledb"), "rocksdb");
         assert_eq!(normalize_backend("pebble"), "rocksdb");
         assert_eq!(normalize_backend("rocksdb"), "rocksdb");

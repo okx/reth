@@ -1,4 +1,4 @@
-use crate::evm_types::{all_evm_store_types, store_type_name, sub_db_config, EVM_STORE_KEY};
+use crate::evm_types::{all_evm_store_types, store_type_name, sub_db_config};
 use crossbeam_channel::Receiver;
 use mptdb_common::{
     config::StateStoreConfig,
@@ -6,7 +6,7 @@ use mptdb_common::{
     evm_keys::{parse_evm_key, EvmKeyKind},
 };
 use mptdb_engine::mvcc::db::MvccDatabase;
-use mptdb_proto::{ChangeSet, KvPair, NamedChangeSet};
+use mptdb_proto::{ChangeSet, KvPair};
 use mptdb_traits::{iterator::DbIterator, ss::StateStore, types::SnapshotNode};
 use std::{collections::HashMap, path::Path};
 
@@ -54,26 +54,18 @@ impl EVMStateStore {
     }
 
     /// Groups changeset pairs by EVM key kind, stripping prefixes.
-    /// Only processes changesets named [`EVM_STORE_KEY`].
-    fn group_by_sub_type(changesets: &[NamedChangeSet]) -> HashMap<EvmKeyKind, Vec<KvPair>> {
+    fn group_by_key_kind(changeset: &ChangeSet) -> HashMap<EvmKeyKind, Vec<KvPair>> {
         let mut grouped = HashMap::<EvmKeyKind, Vec<KvPair>>::new();
-        for cs in changesets {
-            if cs.name != EVM_STORE_KEY {
+        for pair in &changeset.pairs {
+            let (kind, stripped) = parse_evm_key(&pair.key);
+            if kind == EvmKeyKind::Empty {
                 continue;
             }
-            if let Some(ref changeset) = cs.changeset {
-                for pair in &changeset.pairs {
-                    let (kind, stripped) = parse_evm_key(&pair.key);
-                    if kind == EvmKeyKind::Empty {
-                        continue;
-                    }
-                    grouped.entry(kind).or_default().push(KvPair {
-                        key: stripped.to_vec(),
-                        value: pair.value.clone(),
-                        delete: pair.delete,
-                    });
-                }
-            }
+            grouped.entry(kind).or_default().push(KvPair {
+                key: stripped.to_vec(),
+                value: pair.value.clone(),
+                delete: pair.delete,
+            });
         }
         grouped
     }
@@ -108,7 +100,7 @@ impl EVMStateStore {
         Ok(())
     }
 
-    /// Apply pairs to a single sub-DB, constructing the NamedChangeSet wrapper.
+    /// Apply pairs to a single sub-DB, constructing a ChangeSet from the pairs.
     fn apply_to_sub_db(
         &self,
         kind: EvmKeyKind,
@@ -120,11 +112,7 @@ impl EVMStateStore {
             Some(db) => db,
             None => return Ok(()),
         };
-        let sub_store_key = store_type_name(kind);
-        let cs = [NamedChangeSet {
-            name: sub_store_key.to_string(),
-            changeset: Some(ChangeSet { pairs }),
-        }];
+        let cs = ChangeSet { pairs };
         if sync {
             db.apply_changeset_sync(version, &cs)
         } else {
@@ -134,7 +122,7 @@ impl EVMStateStore {
 }
 
 impl StateStore for EVMStateStore {
-    fn get(&self, _store_key: &str, version: i64, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn get(&self, version: i64, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let (kind, stripped) = match self.route_key(key) {
             Some(v) => v,
             None => return Ok(None),
@@ -143,10 +131,10 @@ impl StateStore for EVMStateStore {
             Some(db) => db,
             None => return Ok(None),
         };
-        db.get(store_type_name(kind), version, &stripped)
+        db.get(version, &stripped)
     }
 
-    fn has(&self, _store_key: &str, version: i64, key: &[u8]) -> Result<bool> {
+    fn has(&self, version: i64, key: &[u8]) -> Result<bool> {
         let (kind, stripped) = match self.route_key(key) {
             Some(v) => v,
             None => return Ok(false),
@@ -155,12 +143,11 @@ impl StateStore for EVMStateStore {
             Some(db) => db,
             None => return Ok(false),
         };
-        db.has(store_type_name(kind), version, &stripped)
+        db.has(version, &stripped)
     }
 
     fn iterator(
         &self,
-        _store_key: &str,
         _version: i64,
         _start: &[u8],
         _end: &[u8],
@@ -170,7 +157,6 @@ impl StateStore for EVMStateStore {
 
     fn reverse_iterator(
         &self,
-        _store_key: &str,
         _version: i64,
         _start: &[u8],
         _end: &[u8],
@@ -180,7 +166,6 @@ impl StateStore for EVMStateStore {
 
     fn raw_iterate(
         &self,
-        _store_key: &str,
         _f: &mut dyn FnMut(&[u8], &[u8], i64) -> bool,
     ) -> Result<bool> {
         Err(MptDbError::Other("evm state store: RawIterate not supported".into()))
@@ -230,16 +215,16 @@ impl StateStore for EVMStateStore {
         Ok(())
     }
 
-    fn apply_changeset_sync(&self, version: i64, changesets: &[NamedChangeSet]) -> Result<()> {
-        let grouped = Self::group_by_sub_type(changesets);
+    fn apply_changeset_sync(&self, version: i64, changeset: &ChangeSet) -> Result<()> {
+        let grouped = Self::group_by_key_kind(changeset);
         if grouped.is_empty() {
             return Ok(());
         }
         self.apply_grouped(version, grouped, true)
     }
 
-    fn apply_changeset_async(&self, version: i64, changesets: &[NamedChangeSet]) -> Result<()> {
-        let grouped = Self::group_by_sub_type(changesets);
+    fn apply_changeset_async(&self, version: i64, changeset: &ChangeSet) -> Result<()> {
+        let grouped = Self::group_by_key_kind(changeset);
         if grouped.is_empty() {
             return Ok(());
         }
@@ -371,20 +356,17 @@ mod tests {
         slot
     }
 
-    fn make_evm_changeset(pairs: Vec<(Vec<u8>, Option<&[u8]>)>) -> Vec<NamedChangeSet> {
-        vec![NamedChangeSet {
-            name: EVM_STORE_KEY.to_string(),
-            changeset: Some(ChangeSet {
-                pairs: pairs
-                    .into_iter()
-                    .map(|(k, v)| KvPair {
-                        delete: v.is_none(),
-                        key: k,
-                        value: v.unwrap_or_default().to_vec(),
-                    })
-                    .collect(),
-            }),
-        }]
+    fn make_evm_changeset(pairs: Vec<(Vec<u8>, Option<&[u8]>)>) -> ChangeSet {
+        ChangeSet {
+            pairs: pairs
+                .into_iter()
+                .map(|(k, v)| KvPair {
+                    delete: v.is_none(),
+                    key: k,
+                    value: v.unwrap_or_default().to_vec(),
+                })
+                .collect(),
+        }
     }
 
     fn open_evm_store(dir: &std::path::Path) -> EVMStateStore {
@@ -402,16 +384,16 @@ mod tests {
         let cs = make_evm_changeset(vec![(nonce_key.clone(), Some(b"42"))]);
         store.apply_changeset_sync(1, &cs).unwrap();
 
-        let val = store.get("evm", 1, &nonce_key).unwrap();
+        let val = store.get(1, &nonce_key).unwrap();
         assert_eq!(val, Some(b"42".to_vec()));
 
-        assert!(store.has("evm", 1, &nonce_key).unwrap());
+        assert!(store.has(1, &nonce_key).unwrap());
 
         // Non-existent key
         let addr2 = [0xffu8; 20];
         let missing_key = make_nonce_key(&addr2);
-        assert_eq!(store.get("evm", 1, &missing_key).unwrap(), None);
-        assert!(!store.has("evm", 1, &missing_key).unwrap());
+        assert_eq!(store.get(1, &missing_key).unwrap(), None);
+        assert!(!store.has(1, &missing_key).unwrap());
     }
 
     #[test]
@@ -436,11 +418,11 @@ mod tests {
         ]);
         store.apply_changeset_sync(1, &cs).unwrap();
 
-        assert_eq!(store.get("evm", 1, &nonce_key).unwrap(), Some(b"1".to_vec()));
-        assert_eq!(store.get("evm", 1, &codehash_key).unwrap(), Some(b"hash_val".to_vec()));
-        assert_eq!(store.get("evm", 1, &code_key).unwrap(), Some(b"bytecode".to_vec()));
-        assert_eq!(store.get("evm", 1, &storage_key).unwrap(), Some(b"slot_val".to_vec()));
-        assert_eq!(store.get("evm", 1, &legacy_key).unwrap(), Some(b"legacy_val".to_vec()));
+        assert_eq!(store.get(1, &nonce_key).unwrap(), Some(b"1".to_vec()));
+        assert_eq!(store.get(1, &codehash_key).unwrap(), Some(b"hash_val".to_vec()));
+        assert_eq!(store.get(1, &code_key).unwrap(), Some(b"bytecode".to_vec()));
+        assert_eq!(store.get(1, &storage_key).unwrap(), Some(b"slot_val".to_vec()));
+        assert_eq!(store.get(1, &legacy_key).unwrap(), Some(b"legacy_val".to_vec()));
     }
 
     #[test]
@@ -468,13 +450,13 @@ mod tests {
         // Write
         let cs = make_evm_changeset(vec![(nonce_key.clone(), Some(b"42"))]);
         store.apply_changeset_sync(1, &cs).unwrap();
-        assert!(store.has("evm", 1, &nonce_key).unwrap());
+        assert!(store.has(1, &nonce_key).unwrap());
 
         // Delete (tombstone)
         let cs = make_evm_changeset(vec![(nonce_key.clone(), None)]);
         store.apply_changeset_sync(2, &cs).unwrap();
-        assert!(!store.has("evm", 2, &nonce_key).unwrap());
-        assert_eq!(store.get("evm", 2, &nonce_key).unwrap(), None);
+        assert!(!store.has(2, &nonce_key).unwrap());
+        assert_eq!(store.get(2, &nonce_key).unwrap(), None);
     }
 
     #[test]
@@ -515,31 +497,7 @@ mod tests {
         store.prune(1).unwrap();
 
         // Version 2 should still be available
-        assert_eq!(store.get("evm", 2, &nonce_key).unwrap(), Some(b"v2".to_vec()));
-    }
-
-    #[test]
-    fn test_evm_store_non_evm_ignored() {
-        let dir = tempdir().unwrap();
-        let store = open_evm_store(dir.path());
-        let addr = test_addr();
-        let nonce_key = make_nonce_key(&addr);
-
-        // Changeset with non-EVM store name should be ignored
-        let cs = vec![NamedChangeSet {
-            name: "bank".to_string(),
-            changeset: Some(ChangeSet {
-                pairs: vec![KvPair {
-                    delete: false,
-                    key: nonce_key.clone(),
-                    value: b"100".to_vec(),
-                }],
-            }),
-        }];
-        store.apply_changeset_sync(1, &cs).unwrap();
-
-        // Key should not exist
-        assert_eq!(store.get("evm", 1, &nonce_key).unwrap(), None);
+        assert_eq!(store.get(2, &nonce_key).unwrap(), Some(b"v2".to_vec()));
     }
 
     #[test]
@@ -547,9 +505,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_evm_store(dir.path());
 
-        assert!(store.iterator("evm", 1, b"a", b"z").is_err());
-        assert!(store.reverse_iterator("evm", 1, b"a", b"z").is_err());
-        assert!(store.raw_iterate("evm", &mut |_, _, _| true).is_err());
+        assert!(store.iterator(1, b"a", b"z").is_err());
+        assert!(store.reverse_iterator(1, b"a", b"z").is_err());
+        assert!(store.raw_iterate(&mut |_, _, _| true).is_err());
     }
 
     #[test]
@@ -571,9 +529,9 @@ mod tests {
         ]);
         store.apply_changeset_sync(1, &cs).unwrap();
 
-        assert_eq!(store.get("evm", 1, &nonce_key).unwrap(), Some(b"10".to_vec()));
-        assert_eq!(store.get("evm", 1, &storage_key).unwrap(), Some(b"slot_data".to_vec()));
-        assert_eq!(store.get("evm", 1, &code_key).unwrap(), Some(b"0xdeadbeef".to_vec()));
+        assert_eq!(store.get(1, &nonce_key).unwrap(), Some(b"10".to_vec()));
+        assert_eq!(store.get(1, &storage_key).unwrap(), Some(b"slot_data".to_vec()));
+        assert_eq!(store.get(1, &code_key).unwrap(), Some(b"0xdeadbeef".to_vec()));
     }
 
     #[test]

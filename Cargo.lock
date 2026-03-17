@@ -6370,7 +6370,6 @@ version = "0.1.0"
 dependencies = [
  "codspeed-criterion-compat",
  "crossbeam-channel",
- "hex",
  "mptdb-common",
  "mptdb-proto",
  "mptdb-traits",
@@ -6378,7 +6377,6 @@ dependencies = [
  "parking_lot",
  "reth-libmdbx",
  "rocksdb",
- "serde_json",
  "tempfile",
  "tracing",
 ]

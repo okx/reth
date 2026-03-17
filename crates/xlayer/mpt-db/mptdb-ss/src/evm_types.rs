@@ -1,8 +1,5 @@
 use mptdb_common::{config::StateStoreConfig, evm_keys::EvmKeyKind};
 
-/// EVM module's store key in the Cosmos module system.
-pub const EVM_STORE_KEY: &str = "evm";
-
 /// Number of active EVM store types with separate DBs.
 pub const NUM_EVM_STORE_TYPES: usize = 5;
 
@@ -29,7 +26,7 @@ pub fn store_type_name(st: EvmKeyKind) -> &'static str {
     }
 }
 
-/// Clone a StateStoreConfig for EVM sub-DB use, forcing use_default_comparer = true.
+/// Clone a `StateStoreConfig` for EVM sub-DB use, forcing `use_default_comparer = true`.
 pub fn sub_db_config(base: &StateStoreConfig) -> StateStoreConfig {
     let mut cfg = base.clone();
     cfg.use_default_comparer = true;

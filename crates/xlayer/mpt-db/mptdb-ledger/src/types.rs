@@ -1,6 +1,6 @@
 use mptdb_common::error::Result;
 
-/// Receipt type decoupled from Cosmos SDK.
+/// Receipt types for the ledger store.
 #[derive(Clone, Debug)]
 pub struct Receipt {
     pub tx_hash: [u8; 32],

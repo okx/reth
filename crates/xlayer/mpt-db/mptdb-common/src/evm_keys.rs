@@ -1,6 +1,5 @@
 //! EVM key parsing and construction for the mpt-db keyspace.
 //!
-//! Mirrors the Go implementation in `mpt-db/common/evm/keys.go`.
 //! These are immutable on-disk format markers; changing them would break
 //! all existing state.
 
@@ -42,7 +41,7 @@ pub enum EvmKeyKind {
     Legacy = 5,
 }
 
-/// Parses an EVM key from the x/evm store keyspace.
+/// Parses an EVM key and returns its kind and the stripped key bytes.
 ///
 /// For optimised keys (nonce, code, codehash, storage), the returned slice is
 /// the key with its one-byte prefix stripped. For legacy keys the full original

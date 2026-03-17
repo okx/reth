@@ -1,7 +1,4 @@
 pub const VERSION_SIZE: usize = 8;
-pub const PREFIX_STORE: &str = "s/k:";
-pub const LEN_PREFIX_STORE: usize = 4;
-pub const STORE_PREFIX_TPL: &str = "s/k:{}/";
 pub const LATEST_VERSION_KEY: &[u8] = b"s/_latest";
 pub const EARLIEST_VERSION_KEY: &[u8] = b"s/_earliest";
 pub const TOMBSTONE_VAL: &[u8] = b"TOMBSTONE";

@@ -158,21 +158,20 @@ mod tests {
     }
 
     impl StateStore for MockStateStore {
-        fn get(&self, _: &str, _: i64, _: &[u8]) -> Result<Option<Vec<u8>>> {
+        fn get(&self, _: i64, _: &[u8]) -> Result<Option<Vec<u8>>> {
             Ok(None)
         }
 
-        fn has(&self, _: &str, _: i64, _: &[u8]) -> Result<bool> {
+        fn has(&self, _: i64, _: &[u8]) -> Result<bool> {
             Ok(false)
         }
 
-        fn iterator(&self, _: &str, _: i64, _: &[u8], _: &[u8]) -> Result<Box<dyn DbIterator>> {
+        fn iterator(&self, _: i64, _: &[u8], _: &[u8]) -> Result<Box<dyn DbIterator>> {
             unimplemented!()
         }
 
         fn reverse_iterator(
             &self,
-            _: &str,
             _: i64,
             _: &[u8],
             _: &[u8],
@@ -182,7 +181,6 @@ mod tests {
 
         fn raw_iterate(
             &self,
-            _: &str,
             _: &mut dyn FnMut(&[u8], &[u8], i64) -> bool,
         ) -> Result<bool> {
             Ok(false)
@@ -206,11 +204,11 @@ mod tests {
             Ok(())
         }
 
-        fn apply_changeset_sync(&self, _: i64, _: &[mptdb_proto::NamedChangeSet]) -> Result<()> {
+        fn apply_changeset_sync(&self, _: i64, _: &mptdb_proto::ChangeSet) -> Result<()> {
             Ok(())
         }
 
-        fn apply_changeset_async(&self, _: i64, _: &[mptdb_proto::NamedChangeSet]) -> Result<()> {
+        fn apply_changeset_async(&self, _: i64, _: &mptdb_proto::ChangeSet) -> Result<()> {
             Ok(())
         }
 

@@ -1,8 +1,7 @@
 //! Shared utilities for snapshot directory management.
 //!
-//! Both FlatKV and MemIAVL use a common on-disk layout where versioned
-//! snapshots live under a root directory and a `current` symlink points
-//! to the active snapshot. This module provides the low-level helpers
+//! Versioned snapshots live under a root directory and a `current` symlink
+//! points to the active snapshot. This module provides the low-level helpers
 //! for creating, discovering, and removing those snapshot directories.
 
 use std::{

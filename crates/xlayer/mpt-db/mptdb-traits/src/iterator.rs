@@ -1,7 +1,6 @@
 use mptdb_common::error::{MptDbError, Result};
 
 /// A higher-level iterator used by the database layer (e.g. state-store, state-commitment).
-/// Mirrors the Go `Iterator` interface from mpt-db.
 pub trait DbIterator: Send {
     /// Return the lower and upper bounds of the iterator's domain.
     fn domain(&self) -> (Option<&[u8]>, Option<&[u8]>);

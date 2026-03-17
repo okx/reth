@@ -1,65 +1,10 @@
-//! Data format compatibility tests for MVCC key encoding.
+//! Tests for MVCC key encoding correctness.
 //!
-//! These tests verify that the Rust MVCC encoding produces byte-identical output
-//! to the Go `MVCCEncode` implementation. The Go-generated fixture file
-//! `testdata/mvcc_encoding.json` is loaded and verified against Rust output.
+//! Verifies that `mvcc_encode`, `split_mvcc_key`, and `mvcc_key_compare`
+//! produce correct byte-level output for various key/version combinations.
 
 use mptdb_engine::mvcc::encoding::{mvcc_encode, mvcc_key_compare, split_mvcc_key};
 use std::cmp::Ordering;
-
-// -------------------------------------------------------------------
-// Round 3: Cross-language verification using Go-generated fixtures
-// -------------------------------------------------------------------
-
-#[test]
-fn test_mvcc_go_fixture_roundtrip() {
-    // Load Go-generated fixture: testdata/mvcc_encoding.json
-    let fixture_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/mvcc_encoding.json");
-    let data = std::fs::read_to_string(fixture_path)
-        .expect("Failed to read mvcc_encoding.json — run Go fixture generator first");
-    let vectors: Vec<serde_json::Value> = serde_json::from_str(&data).unwrap();
-
-    for (i, v) in vectors.iter().enumerate() {
-        let key_hex = v["key"].as_str().unwrap();
-        let version = v["version"].as_i64().unwrap();
-        let expected_hex = v["encoded"].as_str().unwrap();
-
-        let key_bytes = hex::decode(key_hex).unwrap();
-        let expected_bytes = hex::decode(expected_hex).unwrap();
-
-        // Verify encoding matches Go output
-        let encoded = mvcc_encode(&key_bytes, version);
-        assert_eq!(
-            encoded, expected_bytes,
-            "vector {i}: MVCCEncode({key_hex:?}, {version}) mismatch"
-        );
-
-        // Verify split roundtrip
-        let (user_key, version_bytes) =
-            split_mvcc_key(&encoded).unwrap_or_else(|| panic!("vector {i}: split_mvcc_key failed"));
-        assert_eq!(user_key, &key_bytes[..], "vector {i}: user_key mismatch after split");
-
-        if version > 0 {
-            let vb = version_bytes.expect("expected version bytes for version > 0");
-            assert_eq!(vb.len(), 8, "vector {i}: version bytes should be 8 bytes");
-            let decoded = u64::from_be_bytes(vb.try_into().unwrap());
-            assert_eq!(decoded, version as u64, "vector {i}: version roundtrip failed");
-        } else {
-            // version == 0 means no version bytes in the encoding
-            assert!(
-                version_bytes.is_none() || version_bytes.unwrap().is_empty(),
-                "vector {i}: version 0 should have no version bytes"
-            );
-        }
-    }
-
-    // Sanity check that we tested all expected vectors
-    assert_eq!(vectors.len(), 8, "expected 8 vectors from Go fixture");
-}
-
-// -------------------------------------------------------------------
-// Original inline tests (retained for fast CI without Go dependency)
-// -------------------------------------------------------------------
 
 #[test]
 fn test_mvcc_key_encoding_compat() {

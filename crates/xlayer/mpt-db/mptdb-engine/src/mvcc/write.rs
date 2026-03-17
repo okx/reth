@@ -2,40 +2,51 @@ use crate::mvcc::{
     batch::MvccBatch,
     constants::DELETE_COMMIT_BATCH_SIZE,
     db::{MvccDatabase, VersionedChangesets},
-    encoding::{decode_uint64_ascending, mvcc_encode, split_mvcc_key},
+    encoding::{decode_uint64_ascending, split_mvcc_key},
 };
 use crossbeam_channel::Receiver;
 use mptdb_common::error::{MptDbError, Result};
-use mptdb_proto::{ChangelogEntry, NamedChangeSet};
+use mptdb_proto::{ChangeSet, ChangelogEntry};
 use mptdb_traits::{types::IterOptions, wal::Wal};
 use std::sync::{atomic::Ordering, Arc};
 
 impl MvccDatabase {
-    /// Apply a set of named changesets synchronously at `version`.
+    /// Apply a changeset synchronously at `version`.
     ///
     /// Genesis writes arrive as version 0 but PebbleDB/RocksDB treats version 0
     /// as special, so they are remapped to version 1.
-    pub fn apply_changeset_sync(&self, version: i64, changesets: &[NamedChangeSet]) -> Result<()> {
+    pub fn apply_changeset_sync(&self, version: i64, changeset: &ChangeSet) -> Result<()> {
         // Genesis compatibility: remap version 0 -> 1
         let version = if version == 0 { 1 } else { version };
 
         let mut batch = MvccBatch::new(self.engine.as_ref(), version)?;
 
-        for cs in changesets {
-            if let Some(ref changeset) = cs.changeset {
-                for kv_pair in &changeset.pairs {
-                    if kv_pair.delete {
-                        batch.delete(&cs.name, &kv_pair.key)?;
-                    } else {
-                        batch.set(&cs.name, &kv_pair.key, &kv_pair.value)?;
-                    }
-                }
+        for kv_pair in &changeset.pairs {
+            if kv_pair.delete {
+                batch.delete(&kv_pair.key)?;
+            } else {
+                batch.set(&kv_pair.key, &kv_pair.value)?;
             }
-            // Mark the store as updated
-            self.store_key_dirty.write().insert(cs.name.clone(), version);
         }
 
         batch.write()?;
+
+        // Track latest dirty version globally
+        loop {
+            let current = self.latest_dirty_version.load(Ordering::Relaxed);
+            if version <= current {
+                break;
+            }
+            match self.latest_dirty_version.compare_exchange(
+                current,
+                version,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
 
         // Update latest version only if higher (avoid lowering on out-of-order writes)
         let current = self.latest_version.load(Ordering::Relaxed);
@@ -46,15 +57,15 @@ impl MvccDatabase {
         Ok(())
     }
 
-    /// Apply a set of named changesets asynchronously.
+    /// Apply a changeset asynchronously.
     ///
     /// Writes are first durably recorded to the WAL, then enqueued for the
     /// background consumer which calls [`apply_changeset_sync`].
-    pub fn apply_changeset_async(&self, version: i64, changesets: &[NamedChangeSet]) -> Result<()> {
+    pub fn apply_changeset_async(&self, version: i64, changeset: &ChangeSet) -> Result<()> {
         // Write to WAL for durability
         if let Some(ref wal) = *self.stream_handler.lock() {
             let entry =
-                ChangelogEntry { version, changesets: changesets.to_vec(), upgrades: vec![] };
+                ChangelogEntry { version, changeset: Some(changeset.clone()) };
             wal.write(entry)?;
         }
 
@@ -66,7 +77,7 @@ impl MvccDatabase {
             .cloned()
             .ok_or_else(|| MptDbError::Other("async writer not initialized".to_string()))?;
 
-        tx.send(VersionedChangesets { version, changesets: changesets.to_vec(), done: None })
+        tx.send(VersionedChangesets { version, changeset: changeset.clone(), done: None })
             .map_err(|e| MptDbError::Other(format!("failed to send to async writer: {e}")))?;
 
         Ok(())
@@ -84,12 +95,12 @@ impl MvccDatabase {
 
         let (done_tx, done_rx) = crossbeam_channel::bounded(0);
 
-        // Send a barrier: version=0, empty changesets, done channel set
+        // Send a barrier: version=0, empty changeset, done channel set
         if tx
-            .send(VersionedChangesets { version: 0, changesets: vec![], done: Some(done_tx) })
+            .send(VersionedChangesets { version: 0, changeset: ChangeSet { pairs: vec![] }, done: Some(done_tx) })
             .is_err()
         {
-            // Channel closed — worker already stopped
+            // Channel closed -- worker already stopped
             return;
         }
 
@@ -111,23 +122,19 @@ impl MvccDatabase {
                 let _ = done.send(());
                 continue;
             }
-            if let Err(e) = db.apply_changeset_sync(msg.version, &msg.changesets) {
+            if let Err(e) = db.apply_changeset_sync(msg.version, &msg.changeset) {
                 tracing::warn!(version = msg.version, error = %e, "async write failed");
             }
         }
     }
 
-    /// Physically remove all MVCC entries for `module` at a specific `version`.
+    /// Physically remove all MVCC entries at a specific `version`.
     ///
-    /// Iterates over the module's key space using a KvEngine iterator,
+    /// Iterates over the entire key space using a KvEngine iterator,
     /// identifies entries whose MVCC version matches `version`, and hard-deletes
     /// them in batches of [`DELETE_COMMIT_BATCH_SIZE`].
-    pub fn delete_keys_at_version(&self, module: &str, version: i64) -> Result<()> {
-        let prefix = Self::store_prefix(module);
-        let lower = mvcc_encode(&Self::prepend_store_key(module, &[]), 0);
-        let upper = Self::prefix_end(&prefix).map(|pe| mvcc_encode(&pe, 0));
-
-        let iter_opts = IterOptions { lower_bound: Some(lower), upper_bound: upper };
+    pub fn delete_keys_at_version(&self, version: i64) -> Result<()> {
+        let iter_opts = IterOptions { lower_bound: None, upper_bound: None };
 
         let mut iter = self.engine.new_iter(&iter_opts)?;
         iter.first();
@@ -142,7 +149,7 @@ impl MvccDatabase {
             }
 
             // Skip metadata keys
-            if Self::is_metadata_key(raw_key) {
+            if raw_key.starts_with(b"s/_") {
                 iter.next();
                 continue;
             }
@@ -168,14 +175,7 @@ impl MvccDatabase {
             };
 
             if entry_version == version {
-                // Strip the store prefix to get the user key for hard_delete
-                let user_key_stripped = if user_key.starts_with(&prefix) {
-                    &user_key[prefix.len()..]
-                } else {
-                    user_key
-                };
-
-                batch.hard_delete(module, user_key_stripped)?;
+                batch.hard_delete(user_key)?;
                 delete_counter += 1;
 
                 if delete_counter >= DELETE_COMMIT_BATCH_SIZE {
@@ -201,7 +201,7 @@ impl MvccDatabase {
 mod tests {
     use super::*;
     use mptdb_common::config::StateStoreConfig;
-    use mptdb_proto::{ChangeSet, KvPair, NamedChangeSet};
+    use mptdb_proto::KvPair;
     use tempfile::TempDir;
 
     /// Helper: build a minimal StateStoreConfig pointing at the given dir.
@@ -213,9 +213,9 @@ mod tests {
         }
     }
 
-    /// Helper: build a NamedChangeSet with the given name and key/value pairs.
-    fn make_changeset(name: &str, pairs: Vec<KvPair>) -> NamedChangeSet {
-        NamedChangeSet { name: name.to_string(), changeset: Some(ChangeSet { pairs }) }
+    /// Helper: build a ChangeSet from key/value pairs.
+    fn make_changeset(pairs: Vec<KvPair>) -> ChangeSet {
+        ChangeSet { pairs }
     }
 
     /// Helper: build a set KvPair.
@@ -234,16 +234,17 @@ mod tests {
         let cfg = test_config(dir.path());
         let db = MvccDatabase::open_db(&cfg).unwrap();
 
-        let changesets = vec![
-            make_changeset("bank", vec![kv_set(b"addr1", b"100"), kv_set(b"addr2", b"200")]),
-            make_changeset("staking", vec![kv_set(b"val1", b"power50")]),
-        ];
+        let changeset = make_changeset(vec![
+            kv_set(b"addr1", b"100"),
+            kv_set(b"addr2", b"200"),
+            kv_set(b"val1", b"power50"),
+        ]);
 
-        db.apply_changeset_sync(1, &changesets).unwrap();
+        db.apply_changeset_sync(1, &changeset).unwrap();
 
-        assert_eq!(db.get("bank", 1, b"addr1").unwrap(), Some(b"100".to_vec()));
-        assert_eq!(db.get("bank", 1, b"addr2").unwrap(), Some(b"200".to_vec()));
-        assert_eq!(db.get("staking", 1, b"val1").unwrap(), Some(b"power50".to_vec()));
+        assert_eq!(db.get(1, b"addr1").unwrap(), Some(b"100".to_vec()));
+        assert_eq!(db.get(1, b"addr2").unwrap(), Some(b"200".to_vec()));
+        assert_eq!(db.get(1, b"val1").unwrap(), Some(b"power50".to_vec()));
         assert_eq!(db.get_latest_version(), 1);
     }
 
@@ -253,13 +254,13 @@ mod tests {
         let cfg = test_config(dir.path());
         let db = MvccDatabase::open_db(&cfg).unwrap();
 
-        let changesets = vec![make_changeset("bank", vec![kv_set(b"genesis_key", b"genesis_val")])];
+        let changeset = make_changeset(vec![kv_set(b"genesis_key", b"genesis_val")]);
 
         // Version 0 should be remapped to 1
-        db.apply_changeset_sync(0, &changesets).unwrap();
+        db.apply_changeset_sync(0, &changeset).unwrap();
 
         // Should be readable at version 1 (not 0)
-        assert_eq!(db.get("bank", 1, b"genesis_key").unwrap(), Some(b"genesis_val".to_vec()));
+        assert_eq!(db.get(1, b"genesis_key").unwrap(), Some(b"genesis_val".to_vec()));
         assert_eq!(db.get_latest_version(), 1);
     }
 
@@ -270,37 +271,31 @@ mod tests {
         let db = MvccDatabase::open_db(&cfg).unwrap();
 
         // Write a value at version 1
-        let cs1 = vec![make_changeset("bank", vec![kv_set(b"key", b"alive")])];
+        let cs1 = make_changeset(vec![kv_set(b"key", b"alive")]);
         db.apply_changeset_sync(1, &cs1).unwrap();
-        assert_eq!(db.get("bank", 1, b"key").unwrap(), Some(b"alive".to_vec()));
+        assert_eq!(db.get(1, b"key").unwrap(), Some(b"alive".to_vec()));
 
         // Delete at version 2 via changeset
-        let cs2 = vec![make_changeset("bank", vec![kv_delete(b"key")])];
+        let cs2 = make_changeset(vec![kv_delete(b"key")]);
         db.apply_changeset_sync(2, &cs2).unwrap();
 
         // At version 2 the key should be gone
-        assert_eq!(db.get("bank", 2, b"key").unwrap(), None);
+        assert_eq!(db.get(2, b"key").unwrap(), None);
         // At version 1 the key should still be alive
-        assert_eq!(db.get("bank", 1, b"key").unwrap(), Some(b"alive".to_vec()));
+        assert_eq!(db.get(1, b"key").unwrap(), Some(b"alive".to_vec()));
     }
 
     #[test]
-    fn test_store_key_dirty_tracking() {
+    fn test_dirty_version_tracking() {
         let dir = TempDir::new().unwrap();
         let cfg = test_config(dir.path());
         let db = MvccDatabase::open_db(&cfg).unwrap();
 
-        let changesets = vec![
-            make_changeset("bank", vec![kv_set(b"k1", b"v1")]),
-            make_changeset("staking", vec![kv_set(b"k2", b"v2")]),
-        ];
+        let changeset = make_changeset(vec![kv_set(b"k1", b"v1"), kv_set(b"k2", b"v2")]);
 
-        db.apply_changeset_sync(5, &changesets).unwrap();
+        db.apply_changeset_sync(5, &changeset).unwrap();
 
-        let dirty = db.store_key_dirty.read();
-        assert_eq!(dirty.get("bank"), Some(&5));
-        assert_eq!(dirty.get("staking"), Some(&5));
-        assert_eq!(dirty.get("missing"), None);
+        assert_eq!(db.latest_dirty_version.load(Ordering::Relaxed), 5);
     }
 
     #[test]
@@ -310,23 +305,23 @@ mod tests {
         let db = MvccDatabase::open_db(&cfg).unwrap();
 
         // Write key at version 1 and version 2
-        let cs1 = vec![make_changeset("bank", vec![kv_set(b"key", b"v1")])];
+        let cs1 = make_changeset(vec![kv_set(b"key", b"v1")]);
         db.apply_changeset_sync(1, &cs1).unwrap();
 
-        let cs2 = vec![make_changeset("bank", vec![kv_set(b"key", b"v2")])];
+        let cs2 = make_changeset(vec![kv_set(b"key", b"v2")]);
         db.apply_changeset_sync(2, &cs2).unwrap();
 
         // Verify both versions exist
-        assert_eq!(db.get("bank", 1, b"key").unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(db.get("bank", 2, b"key").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(db.get(1, b"key").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(db.get(2, b"key").unwrap(), Some(b"v2".to_vec()));
 
         // Delete all entries at version 1
-        db.delete_keys_at_version("bank", 1).unwrap();
+        db.delete_keys_at_version(1).unwrap();
 
         // Version 1 should be gone
-        assert_eq!(db.get("bank", 1, b"key").unwrap(), None);
+        assert_eq!(db.get(1, b"key").unwrap(), None);
         // Version 2 should still be present
-        assert_eq!(db.get("bank", 2, b"key").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(db.get(2, b"key").unwrap(), Some(b"v2".to_vec()));
     }
 
     #[test]
@@ -348,14 +343,14 @@ mod tests {
         });
 
         // Send an async changeset (no WAL in this test)
-        let changesets = vec![make_changeset("bank", vec![kv_set(b"async_key", b"async_val")])];
-        db.apply_changeset_async(1, &changesets).unwrap();
+        let changeset = make_changeset(vec![kv_set(b"async_key", b"async_val")]);
+        db.apply_changeset_async(1, &changeset).unwrap();
 
         // Wait for the write to complete
         db.wait_for_pending_writes();
 
         // Verify the data was written
-        assert_eq!(db.get("bank", 1, b"async_key").unwrap(), Some(b"async_val".to_vec()));
+        assert_eq!(db.get(1, b"async_key").unwrap(), Some(b"async_val".to_vec()));
 
         // Clean up: drop sender to stop worker
         db.pending_changes_tx.lock().take();

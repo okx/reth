@@ -1,21 +1,20 @@
 use crate::{iterator::DbIterator, types::SnapshotNode};
 use crossbeam_channel::Receiver;
 use mptdb_common::error::Result;
-use mptdb_proto::NamedChangeSet;
+use mptdb_proto::ChangeSet;
 
 /// State-store trait: versioned key-value storage with changeset application,
-/// pruning, and import/export support. Mirrors the Go `StateStore` interface.
+/// pruning, and import/export support.
 pub trait StateStore: Send + Sync {
     /// Get the value for a key at a given version.
-    fn get(&self, store_key: &str, version: i64, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    fn get(&self, version: i64, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     /// Check whether a key exists at a given version.
-    fn has(&self, store_key: &str, version: i64, key: &[u8]) -> Result<bool>;
+    fn has(&self, version: i64, key: &[u8]) -> Result<bool>;
 
     /// Create a forward iterator over the key range `[start, end)` at the given version.
     fn iterator(
         &self,
-        store_key: &str,
         version: i64,
         start: &[u8],
         end: &[u8],
@@ -24,18 +23,16 @@ pub trait StateStore: Send + Sync {
     /// Create a reverse iterator over the key range `[start, end)` at the given version.
     fn reverse_iterator(
         &self,
-        store_key: &str,
         version: i64,
         start: &[u8],
         end: &[u8],
     ) -> Result<Box<dyn DbIterator>>;
 
-    /// Iterate over all raw key/value/version triples for a store.
+    /// Iterate over all raw key/value/version triples.
     /// The callback returns `true` to continue, `false` to stop.
     #[allow(clippy::type_complexity)]
     fn raw_iterate(
         &self,
-        store_key: &str,
         f: &mut dyn FnMut(&[u8], &[u8], i64) -> bool,
     ) -> Result<bool>;
 
@@ -53,11 +50,11 @@ pub trait StateStore: Send + Sync {
     /// version is earlier than the current one.
     fn set_earliest_version(&self, version: i64, ignore_version: bool) -> Result<()>;
 
-    /// Apply changesets synchronously, blocking until persisted.
-    fn apply_changeset_sync(&self, version: i64, changesets: &[NamedChangeSet]) -> Result<()>;
+    /// Apply a changeset synchronously, blocking until persisted.
+    fn apply_changeset_sync(&self, version: i64, changeset: &ChangeSet) -> Result<()>;
 
-    /// Apply changesets asynchronously (fire-and-forget).
-    fn apply_changeset_async(&self, version: i64, changesets: &[NamedChangeSet]) -> Result<()>;
+    /// Apply a changeset asynchronously (fire-and-forget).
+    fn apply_changeset_async(&self, version: i64, changeset: &ChangeSet) -> Result<()>;
 
     /// Prune all versions up to (and including) the given version.
     fn prune(&self, version: i64) -> Result<()>;

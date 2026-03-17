@@ -1,3 +1,9 @@
+> **Historical Document** — This gap analysis was written during the sei-db → mpt-db migration.
+> The `memiavl`, `flatkv`, `composite`, multistore concepts discussed below have been removed from
+> the current codebase. The current architecture is EVM-only / MPT-only.
+
+---
+
 # mpt-db Rust 与 Go 功能对比与缺口分析
 
 > 基于对 Go 版 mpt-db（`megaEth/sei-chain/mpt-db`）与 Rust 版（`crates/xlayer/mpt-db`）的逐项对比，列出**会影响迁移后 Rust 版 DB 使用**的未实现或未接入功能。

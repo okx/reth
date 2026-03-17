@@ -10,7 +10,7 @@ use mptdb_common::{
         STATE_KEY_PREFIX,
     },
 };
-use mptdb_proto::{ChangeSet, KvPair, NamedChangeSet};
+use mptdb_proto::{ChangeSet, KvPair};
 use mptdb_ss::evm::store::EVMStateStore;
 use mptdb_traits::ss::StateStore;
 use tempfile::tempdir;
@@ -18,8 +18,6 @@ use tempfile::tempdir;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-const EVM_STORE_KEY: &str = "evm";
 
 fn test_config(dir: &std::path::Path) -> StateStoreConfig {
     StateStoreConfig {
@@ -34,8 +32,8 @@ fn open_evm_store(dir: &std::path::Path) -> EVMStateStore {
     EVMStateStore::new(&dir.to_string_lossy(), &cfg).unwrap()
 }
 
-fn make_evm_changeset(pairs: Vec<KvPair>) -> Vec<NamedChangeSet> {
-    vec![NamedChangeSet { name: EVM_STORE_KEY.to_string(), changeset: Some(ChangeSet { pairs }) }]
+fn make_evm_changeset(pairs: Vec<KvPair>) -> ChangeSet {
+    ChangeSet { pairs }
 }
 
 // ===========================================================================
@@ -71,11 +69,11 @@ fn b06_codesize_key_goes_to_legacy_db() {
     store.apply_changeset_sync(1, &cs).unwrap();
 
     // Verify: get() with the original key returns the value.
-    let val = store.get(EVM_STORE_KEY, 1, &code_size_key).unwrap();
+    let val = store.get(1, &code_size_key).unwrap();
     assert_eq!(val, Some(code_size_value.clone()), "CodeSize key should be retrievable via get()");
 
     // Verify: has() returns true for the CodeSize key.
-    let has = store.has(EVM_STORE_KEY, 1, &code_size_key).unwrap();
+    let has = store.has(1, &code_size_key).unwrap();
     assert!(has, "CodeSize key should exist via has()");
 
     // Verify: the key is NOT accessible when constructed as nonce/codehash/code/storage keys.
@@ -83,17 +81,17 @@ fn b06_codesize_key_goes_to_legacy_db() {
     // same address would find it. It should NOT.
     let mut nonce_key = vec![NONCE_KEY_PREFIX];
     nonce_key.extend_from_slice(&addr);
-    let nonce_val = store.get(EVM_STORE_KEY, 1, &nonce_key).unwrap();
+    let nonce_val = store.get(1, &nonce_key).unwrap();
     assert!(nonce_val.is_none(), "CodeSize value should NOT be in nonce sub-DB");
 
     let mut codehash_key = vec![CODE_HASH_KEY_PREFIX];
     codehash_key.extend_from_slice(&addr);
-    let codehash_val = store.get(EVM_STORE_KEY, 1, &codehash_key).unwrap();
+    let codehash_val = store.get(1, &codehash_key).unwrap();
     assert!(codehash_val.is_none(), "CodeSize value should NOT be in codehash sub-DB");
 
     let mut code_key = vec![CODE_KEY_PREFIX];
     code_key.extend_from_slice(&addr);
-    let code_val = store.get(EVM_STORE_KEY, 1, &code_key).unwrap();
+    let code_val = store.get(1, &code_key).unwrap();
     assert!(code_val.is_none(), "CodeSize value should NOT be in code sub-DB");
 
     // Storage key would need addr + 32-byte slot; just verify the CodeSize key
@@ -101,6 +99,6 @@ fn b06_codesize_key_goes_to_legacy_db() {
     let mut storage_key = vec![STATE_KEY_PREFIX];
     storage_key.extend_from_slice(&addr);
     storage_key.extend_from_slice(&[0u8; 32]);
-    let storage_val = store.get(EVM_STORE_KEY, 1, &storage_key).unwrap();
+    let storage_val = store.get(1, &storage_key).unwrap();
     assert!(storage_val.is_none(), "CodeSize value should NOT be in storage sub-DB");
 }

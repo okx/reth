@@ -34,17 +34,17 @@ mod tests {
     fn test_state_store_path() {
         let home = Path::new("/home/user");
         assert_eq!(
-            get_state_store_path(home, "pebbledb"),
-            PathBuf::from("/home/user/data/pebbledb")
+            get_state_store_path(home, "rocksdb"),
+            PathBuf::from("/home/user/data/rocksdb")
         );
     }
 
     #[test]
     fn test_changelog_path() {
-        let db_path = Path::new("/home/user/data/pebbledb");
+        let db_path = Path::new("/home/user/data/rocksdb");
         assert_eq!(
             get_changelog_path(db_path),
-            PathBuf::from("/home/user/data/pebbledb/changelog")
+            PathBuf::from("/home/user/data/rocksdb/changelog")
         );
     }
 

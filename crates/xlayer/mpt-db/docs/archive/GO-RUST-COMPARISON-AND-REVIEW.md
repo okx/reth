@@ -1,3 +1,9 @@
+> **Historical Document** — This is a historical comparison from the sei-db → mpt-db migration period.
+> The `memiavl`, `flatkv`, `composite`, `CosmosOnly`, `DualWrite`, `SplitWrite` concepts discussed below
+> have been removed from the current codebase. The current architecture is EVM-only / MPT-only.
+
+---
+
 # Go mpt-db 与 Rust mpt-db 对比与 Rust 代码 Review
 
 > 基于对 `megaEth/sei-chain/mpt-db`（Go）与 `crates/xlayer/mpt-db`（Rust）的逐模块对比与代码审阅。

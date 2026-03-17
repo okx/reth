@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use mptdb_common::config::StateStoreConfig;
 use mptdb_engine::mvcc::db::MvccDatabase;
-use mptdb_proto::{ChangeSet, KvPair, NamedChangeSet};
+use mptdb_proto::{ChangeSet, KvPair};
 use mptdb_traits::ss::StateStore;
 use tempfile::tempdir;
 
@@ -19,16 +19,13 @@ fn bench_mvcc_sequential_write(c: &mut Criterion) {
             },
             |(dir, db)| {
                 for v in 1..=1000 {
-                    let cs = vec![NamedChangeSet {
-                        name: "bench".into(),
-                        changeset: Some(ChangeSet {
-                            pairs: vec![KvPair {
-                                delete: false,
-                                key: format!("key_{v:06}").into_bytes(),
-                                value: vec![0u8; 100],
-                            }],
-                        }),
-                    }];
+                    let cs = ChangeSet {
+                        pairs: vec![KvPair {
+                            delete: false,
+                            key: format!("key_{v:06}").into_bytes(),
+                            value: vec![0u8; 100],
+                        }],
+                    };
                     db.apply_changeset_sync(v, &cs).unwrap();
                 }
                 drop(db);
@@ -55,8 +52,7 @@ fn bench_mvcc_random_read(c: &mut Criterion) {
                 value: vec![0u8; 100],
             })
             .collect();
-        let cs =
-            vec![NamedChangeSet { name: "bench".into(), changeset: Some(ChangeSet { pairs }) }];
+        let cs = ChangeSet { pairs };
         db.apply_changeset_sync(v, &cs).unwrap();
     }
 
@@ -64,7 +60,7 @@ fn bench_mvcc_random_read(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             i = (i + 7919) % 10000; // pseudo-random
-            let _ = db.get("bench", 100, &format!("key_{i:06}").into_bytes());
+            let _ = db.get(100, &format!("key_{i:06}").into_bytes());
         });
     });
 }
@@ -84,14 +80,13 @@ fn bench_mvcc_iterator_forward(c: &mut Criterion) {
                 value: vec![0u8; 64],
             })
             .collect();
-        let cs =
-            vec![NamedChangeSet { name: "bench".into(), changeset: Some(ChangeSet { pairs }) }];
+        let cs = ChangeSet { pairs };
         db.apply_changeset_sync(v, &cs).unwrap();
     }
 
     c.bench_function("mvcc_iterator_forward_10k", |b| {
         b.iter(|| {
-            let mut iter = db.iterator("bench", 10, &[], &[]).unwrap();
+            let mut iter = StateStore::iterator(&db, 10, &[], &[]).unwrap();
             let mut count = 0;
             while iter.valid() {
                 count += 1;
@@ -114,16 +109,13 @@ fn bench_mvcc_prune(c: &mut Criterion) {
                 };
                 let db = MvccDatabase::open_db(&config).unwrap();
                 for v in 1..=100 {
-                    let cs = vec![NamedChangeSet {
-                        name: "bench".into(),
-                        changeset: Some(ChangeSet {
-                            pairs: vec![KvPair {
-                                delete: false,
-                                key: b"prune_key".to_vec(),
-                                value: format!("val_{v}").into_bytes(),
-                            }],
-                        }),
-                    }];
+                    let cs = ChangeSet {
+                        pairs: vec![KvPair {
+                            delete: false,
+                            key: b"prune_key".to_vec(),
+                            value: format!("val_{v}").into_bytes(),
+                        }],
+                    };
                     db.apply_changeset_sync(v, &cs).unwrap();
                 }
                 (dir, db)

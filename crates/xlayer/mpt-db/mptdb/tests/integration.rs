@@ -54,8 +54,7 @@ fn default_info(nonce: u64, balance: u64) -> AccountInfo {
 fn default_ss_config(dir: &std::path::Path) -> StateStoreConfig {
     StateStoreConfig {
         enable: true,
-        db_directory: dir.join("cosmos_ss").to_string_lossy().to_string(),
-        evm_db_directory: dir.join("evm_ss").to_string_lossy().to_string(),
+        db_directory: dir.join("evm_ss").to_string_lossy().to_string(),
         keep_last_version: true,
         ..Default::default()
     }

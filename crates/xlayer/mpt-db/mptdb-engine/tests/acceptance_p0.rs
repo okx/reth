@@ -5,7 +5,7 @@
 
 use mptdb_common::config::StateStoreConfig;
 use mptdb_engine::mvcc::db::MvccDatabase;
-use mptdb_proto::{ChangeSet, KvPair, NamedChangeSet};
+use mptdb_proto::{ChangeSet, KvPair};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -21,8 +21,8 @@ fn test_config(dir: &std::path::Path) -> StateStoreConfig {
     }
 }
 
-fn make_changeset(store: &str, pairs: Vec<KvPair>) -> Vec<NamedChangeSet> {
-    vec![NamedChangeSet { name: store.to_string(), changeset: Some(ChangeSet { pairs }) }]
+fn make_changeset(pairs: Vec<KvPair>) -> ChangeSet {
+    ChangeSet { pairs }
 }
 
 fn kv_set(key: &[u8], value: &[u8]) -> KvPair {
@@ -34,7 +34,7 @@ fn kv_set(key: &[u8], value: &[u8]) -> KvPair {
 // ===========================================================================
 // Ported from Go TestParallelWrites + TestParallelReadsWrites.
 //
-// Spawn 4 writer threads, each writing different store keys concurrently via
+// Spawn 4 writer threads, each writing different keys concurrently via
 // apply_changeset_sync. Then spawn 4 reader threads + 1 writer thread
 // concurrently. No panics, no data races, final state consistent.
 
@@ -47,19 +47,18 @@ fn a07_mvcc_parallel_writes() {
     let num_writers = 4;
     let writes_per_thread = 50;
 
-    // Phase 1: 4 writer threads writing different store keys concurrently
+    // Phase 1: 4 writer threads writing different keys concurrently
     std::thread::scope(|s| {
         let mut handles = Vec::new();
         for writer_id in 0..num_writers {
             let db_ref = Arc::clone(&db);
             handles.push(s.spawn(move || {
-                let store_key = format!("store{}", writer_id);
                 for i in 0..writes_per_thread {
                     let version = (writer_id * writes_per_thread + i + 1) as i64;
                     let key = format!("key_{writer_id}_{i}");
                     let value = format!("value_{writer_id}_{i}");
                     let cs =
-                        make_changeset(&store_key, vec![kv_set(key.as_bytes(), value.as_bytes())]);
+                        make_changeset(vec![kv_set(key.as_bytes(), value.as_bytes())]);
                     db_ref.apply_changeset_sync(version, &cs).unwrap();
                 }
             }));
@@ -71,12 +70,11 @@ fn a07_mvcc_parallel_writes() {
 
     // Verify all writes landed correctly
     for writer_id in 0..num_writers {
-        let store_key = format!("store{}", writer_id);
         for i in 0..writes_per_thread {
             let version = (writer_id * writes_per_thread + i + 1) as i64;
             let key = format!("key_{writer_id}_{i}");
             let expected = format!("value_{writer_id}_{i}");
-            let val = db.get(&store_key, version, key.as_bytes()).unwrap();
+            let val = db.get(version, key.as_bytes()).unwrap();
             assert_eq!(
                 val,
                 Some(expected.into_bytes()),
@@ -100,7 +98,7 @@ fn a07_mvcc_parallel_reads_and_writes() {
             kv_set(key.as_bytes(), value.as_bytes())
         })
         .collect();
-    db.apply_changeset_sync(1, &make_changeset("test", seed_pairs)).unwrap();
+    db.apply_changeset_sync(1, &make_changeset(seed_pairs)).unwrap();
     db.set_latest_version(1).unwrap();
 
     // Phase 2: concurrent readers + 1 writer
@@ -113,7 +111,7 @@ fn a07_mvcc_parallel_reads_and_writes() {
             handles.push(s.spawn(move || {
                 for i in 0..100 {
                     let key = format!("seed_key_{i}");
-                    let val = db_ref.get("test", 1, key.as_bytes()).unwrap();
+                    let val = db_ref.get(1, key.as_bytes()).unwrap();
                     assert!(
                         val.is_some(),
                         "reader {reader_id}: seed_key_{i} should exist at version 1"
@@ -131,7 +129,7 @@ fn a07_mvcc_parallel_reads_and_writes() {
                 for i in 0..50 {
                     let key = format!("new_key_{i}");
                     let value = format!("new_value_{i}");
-                    let cs = make_changeset("test", vec![kv_set(key.as_bytes(), value.as_bytes())]);
+                    let cs = make_changeset(vec![kv_set(key.as_bytes(), value.as_bytes())]);
                     db_ref.apply_changeset_sync(2, &cs).unwrap();
                 }
             }));
@@ -146,7 +144,7 @@ fn a07_mvcc_parallel_reads_and_writes() {
     for i in 0..50 {
         let key = format!("new_key_{i}");
         let expected = format!("new_value_{i}");
-        let val = db.get("test", 2, key.as_bytes()).unwrap();
+        let val = db.get(2, key.as_bytes()).unwrap();
         assert_eq!(val, Some(expected.into_bytes()), "new_key_{i} should exist at version 2");
     }
 
@@ -154,7 +152,7 @@ fn a07_mvcc_parallel_reads_and_writes() {
     for i in 0..100 {
         let key = format!("seed_key_{i}");
         let expected = format!("seed_value_{i}");
-        let val = db.get("test", 1, key.as_bytes()).unwrap();
+        let val = db.get(1, key.as_bytes()).unwrap();
         assert_eq!(
             val,
             Some(expected.into_bytes()),

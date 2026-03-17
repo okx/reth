@@ -55,7 +55,7 @@ impl PhaseTimer {
 
 /// Database operation metrics counters.
 ///
-/// Mirrors the Go `otelMetrics` struct from PebbleDB's MVCC layer. Thread-safe
+/// OpenTelemetry metrics for the MVCC layer. Thread-safe
 /// via atomics so any number of readers/writers can record concurrently.
 /// Collected by external monitoring systems or sampled via [`DbMetrics::snapshot`].
 pub mod db_metrics {

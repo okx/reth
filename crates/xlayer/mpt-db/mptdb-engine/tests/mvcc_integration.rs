@@ -2,7 +2,7 @@
 
 use mptdb_common::config::StateStoreConfig;
 use mptdb_engine::mvcc::db::MvccDatabase;
-use mptdb_proto::{ChangeSet, KvPair, NamedChangeSet};
+use mptdb_proto::{ChangeSet, KvPair};
 use mptdb_traits::ss::StateStore;
 use tempfile::tempdir;
 
@@ -26,20 +26,17 @@ fn test_config_no_keep(dir: &std::path::Path) -> StateStoreConfig {
     }
 }
 
-fn make_changeset(store: &str, pairs: Vec<(&[u8], Option<&[u8]>)>) -> Vec<NamedChangeSet> {
-    vec![NamedChangeSet {
-        name: store.to_string(),
-        changeset: Some(ChangeSet {
-            pairs: pairs
-                .into_iter()
-                .map(|(k, v)| KvPair {
-                    delete: v.is_none(),
-                    key: k.to_vec(),
-                    value: v.unwrap_or_default().to_vec(),
-                })
-                .collect(),
-        }),
-    }]
+fn make_changeset(pairs: Vec<(&[u8], Option<&[u8]>)>) -> ChangeSet {
+    ChangeSet {
+        pairs: pairs
+            .into_iter()
+            .map(|(k, v)| KvPair {
+                delete: v.is_none(),
+                key: k.to_vec(),
+                value: v.unwrap_or_default().to_vec(),
+            })
+            .collect(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +80,7 @@ fn test_versioned_keys() {
     // Write 10 versions of the same key.
     for v in 1..=10 {
         let val = format!("val_{v}");
-        let cs = make_changeset("store", vec![(b"key", Some(val.as_bytes()))]);
+        let cs = make_changeset(vec![(b"key", Some(val.as_bytes()))]);
         StateStore::apply_changeset_sync(&db, v, &cs).unwrap();
     }
 
@@ -91,7 +88,7 @@ fn test_versioned_keys() {
     for v in 1..=10 {
         let expected = format!("val_{v}");
         assert_eq!(
-            StateStore::get(&db, "store", v, b"key").unwrap(),
+            StateStore::get(&db, v, b"key").unwrap(),
             Some(expected.into_bytes()),
             "mismatch at version {v}"
         );
@@ -104,16 +101,16 @@ fn test_get_versioned_key() {
     let cfg = test_config(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs1 = make_changeset("store", vec![(b"key", Some(b"first"))]);
+    let cs1 = make_changeset(vec![(b"key", Some(b"first"))]);
     StateStore::apply_changeset_sync(&db, 1, &cs1).unwrap();
 
-    let cs2 = make_changeset("store", vec![(b"key", Some(b"second"))]);
+    let cs2 = make_changeset(vec![(b"key", Some(b"second"))]);
     StateStore::apply_changeset_sync(&db, 5, &cs2).unwrap();
 
     // Version 1 returns first, version 5 returns second, version 3 returns first (latest <= 3).
-    assert_eq!(StateStore::get(&db, "store", 1, b"key").unwrap(), Some(b"first".to_vec()));
-    assert_eq!(StateStore::get(&db, "store", 3, b"key").unwrap(), Some(b"first".to_vec()));
-    assert_eq!(StateStore::get(&db, "store", 5, b"key").unwrap(), Some(b"second".to_vec()));
+    assert_eq!(StateStore::get(&db, 1, b"key").unwrap(), Some(b"first".to_vec()));
+    assert_eq!(StateStore::get(&db, 3, b"key").unwrap(), Some(b"first".to_vec()));
+    assert_eq!(StateStore::get(&db, 5, b"key").unwrap(), Some(b"second".to_vec()));
 }
 
 #[test]
@@ -123,35 +120,30 @@ fn test_changeset_with_delete() {
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
     // Set at v1, delete at v2 via changeset.
-    let cs1 = make_changeset("store", vec![(b"key", Some(b"alive"))]);
+    let cs1 = make_changeset(vec![(b"key", Some(b"alive"))]);
     StateStore::apply_changeset_sync(&db, 1, &cs1).unwrap();
 
-    let cs2 = make_changeset("store", vec![(b"key", None)]);
+    let cs2 = make_changeset(vec![(b"key", None)]);
     StateStore::apply_changeset_sync(&db, 2, &cs2).unwrap();
 
-    assert_eq!(StateStore::get(&db, "store", 1, b"key").unwrap(), Some(b"alive".to_vec()));
-    assert_eq!(StateStore::get(&db, "store", 2, b"key").unwrap(), None);
-    assert_eq!(StateStore::get(&db, "store", 3, b"key").unwrap(), None);
+    assert_eq!(StateStore::get(&db, 1, b"key").unwrap(), Some(b"alive".to_vec()));
+    assert_eq!(StateStore::get(&db, 2, b"key").unwrap(), None);
+    assert_eq!(StateStore::get(&db, 3, b"key").unwrap(), None);
 }
 
 #[test]
-fn test_changeset_multi_store() {
+fn test_changeset_flat_namespace() {
     let dir = tempdir().unwrap();
     let cfg = test_config(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs_bank = make_changeset("bank", vec![(b"addr1", Some(b"100"))]);
-    let cs_staking = make_changeset("staking", vec![(b"val1", Some(b"power"))]);
+    // In the flat namespace model, all keys share the same physical namespace.
+    let cs = make_changeset(vec![(b"addr1", Some(b"100")), (b"val1", Some(b"power"))]);
 
-    StateStore::apply_changeset_sync(&db, 1, &cs_bank).unwrap();
-    StateStore::apply_changeset_sync(&db, 1, &cs_staking).unwrap();
+    StateStore::apply_changeset_sync(&db, 1, &cs).unwrap();
 
-    assert_eq!(StateStore::get(&db, "bank", 1, b"addr1").unwrap(), Some(b"100".to_vec()));
-    assert_eq!(StateStore::get(&db, "staking", 1, b"val1").unwrap(), Some(b"power".to_vec()));
-
-    // Cross-store isolation: bank key not in staking and vice versa.
-    assert_eq!(StateStore::get(&db, "bank", 1, b"val1").unwrap(), None);
-    assert_eq!(StateStore::get(&db, "staking", 1, b"addr1").unwrap(), None);
+    assert_eq!(StateStore::get(&db, 1, b"addr1").unwrap(), Some(b"100".to_vec()));
+    assert_eq!(StateStore::get(&db, 1, b"val1").unwrap(), Some(b"power".to_vec()));
 }
 
 #[test]
@@ -160,11 +152,11 @@ fn test_has() {
     let cfg = test_config(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs = make_changeset("store", vec![(b"key", Some(b"val"))]);
+    let cs = make_changeset(vec![(b"key", Some(b"val"))]);
     StateStore::apply_changeset_sync(&db, 1, &cs).unwrap();
 
-    assert!(StateStore::has(&db, "store", 1, b"key").unwrap());
-    assert!(!StateStore::has(&db, "store", 1, b"missing").unwrap());
+    assert!(StateStore::has(&db, 1, b"key").unwrap());
+    assert!(!StateStore::has(&db, 1, b"missing").unwrap());
 }
 
 #[test]
@@ -180,7 +172,6 @@ fn test_import() {
     let producer = std::thread::spawn(move || {
         for i in 0..100u32 {
             tx.send(SnapshotNode {
-                store_key: "store".to_string(),
                 key: format!("key_{i:04}").into_bytes(),
                 value: format!("val_{i}").into_bytes(),
             })
@@ -197,7 +188,7 @@ fn test_import() {
         let key = format!("key_{i:04}");
         let expected = format!("val_{i}");
         assert_eq!(
-            StateStore::get(&db, "store", 10, key.as_bytes()).unwrap(),
+            StateStore::get(&db, 10, key.as_bytes()).unwrap(),
             Some(expected.into_bytes()),
             "missing key {key}"
         );
@@ -211,18 +202,18 @@ fn test_tombstone_handling() {
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
     // Write at v1, delete at v2, re-write at v3.
-    let cs1 = make_changeset("store", vec![(b"key", Some(b"first"))]);
+    let cs1 = make_changeset(vec![(b"key", Some(b"first"))]);
     StateStore::apply_changeset_sync(&db, 1, &cs1).unwrap();
 
-    let cs2 = make_changeset("store", vec![(b"key", None)]);
+    let cs2 = make_changeset(vec![(b"key", None)]);
     StateStore::apply_changeset_sync(&db, 2, &cs2).unwrap();
 
-    let cs3 = make_changeset("store", vec![(b"key", Some(b"revived"))]);
+    let cs3 = make_changeset(vec![(b"key", Some(b"revived"))]);
     StateStore::apply_changeset_sync(&db, 3, &cs3).unwrap();
 
-    assert_eq!(StateStore::get(&db, "store", 1, b"key").unwrap(), Some(b"first".to_vec()));
-    assert_eq!(StateStore::get(&db, "store", 2, b"key").unwrap(), None);
-    assert_eq!(StateStore::get(&db, "store", 3, b"key").unwrap(), Some(b"revived".to_vec()));
+    assert_eq!(StateStore::get(&db, 1, b"key").unwrap(), Some(b"first".to_vec()));
+    assert_eq!(StateStore::get(&db, 2, b"key").unwrap(), None);
+    assert_eq!(StateStore::get(&db, 3, b"key").unwrap(), Some(b"revived".to_vec()));
 }
 
 #[test]
@@ -232,12 +223,11 @@ fn test_iterator_forward() {
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
     let cs = make_changeset(
-        "store",
         vec![(b"a", Some(b"val_a")), (b"b", Some(b"val_b")), (b"c", Some(b"val_c"))],
     );
     StateStore::apply_changeset_sync(&db, 1, &cs).unwrap();
 
-    let mut iter = StateStore::iterator(&db, "store", 1, b"", b"").unwrap();
+    let mut iter = StateStore::iterator(&db, 1, b"", b"").unwrap();
 
     assert!(iter.valid());
     assert_eq!(iter.key(), b"a");
@@ -264,12 +254,11 @@ fn test_iterator_reverse() {
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
     let cs = make_changeset(
-        "store",
         vec![(b"a", Some(b"val_a")), (b"b", Some(b"val_b")), (b"c", Some(b"val_c"))],
     );
     StateStore::apply_changeset_sync(&db, 1, &cs).unwrap();
 
-    let mut iter = StateStore::reverse_iterator(&db, "store", 1, b"", b"").unwrap();
+    let mut iter = StateStore::reverse_iterator(&db, 1, b"", b"").unwrap();
 
     assert!(iter.valid());
     assert_eq!(iter.key(), b"c");
@@ -296,13 +285,12 @@ fn test_iterator_range() {
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
     let cs = make_changeset(
-        "store",
         vec![(b"a", Some(b"va")), (b"b", Some(b"vb")), (b"c", Some(b"vc")), (b"d", Some(b"vd"))],
     );
     StateStore::apply_changeset_sync(&db, 1, &cs).unwrap();
 
     // Range [b, d) should yield b, c.
-    let mut iter = StateStore::iterator(&db, "store", 1, b"b", b"d").unwrap();
+    let mut iter = StateStore::iterator(&db, 1, b"b", b"d").unwrap();
 
     assert!(iter.valid());
     assert_eq!(iter.key(), b"b");
@@ -321,20 +309,20 @@ fn test_iterator_version_aware() {
     let cfg = test_config(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs1 = make_changeset("store", vec![(b"a", Some(b"a_v1")), (b"b", Some(b"b_v1"))]);
+    let cs1 = make_changeset(vec![(b"a", Some(b"a_v1")), (b"b", Some(b"b_v1"))]);
     StateStore::apply_changeset_sync(&db, 1, &cs1).unwrap();
 
-    let cs2 = make_changeset("store", vec![(b"a", Some(b"a_v2"))]);
+    let cs2 = make_changeset(vec![(b"a", Some(b"a_v2"))]);
     StateStore::apply_changeset_sync(&db, 2, &cs2).unwrap();
 
     // At version 1, should see a_v1.
-    let iter = StateStore::iterator(&db, "store", 1, b"", b"").unwrap();
+    let iter = StateStore::iterator(&db, 1, b"", b"").unwrap();
     assert!(iter.valid());
     assert_eq!(iter.key(), b"a");
     assert_eq!(iter.value(), b"a_v1");
 
     // At version 2, should see a_v2.
-    let iter = StateStore::iterator(&db, "store", 2, b"", b"").unwrap();
+    let iter = StateStore::iterator(&db, 2, b"", b"").unwrap();
     assert!(iter.valid());
     assert_eq!(iter.key(), b"a");
     assert_eq!(iter.value(), b"a_v2");
@@ -347,17 +335,16 @@ fn test_iterator_tombstone_skip() {
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
     let cs1 = make_changeset(
-        "store",
         vec![(b"a", Some(b"va")), (b"b", Some(b"vb")), (b"c", Some(b"vc"))],
     );
     StateStore::apply_changeset_sync(&db, 1, &cs1).unwrap();
 
     // Delete "b" at v2.
-    let cs2 = make_changeset("store", vec![(b"b", None)]);
+    let cs2 = make_changeset(vec![(b"b", None)]);
     StateStore::apply_changeset_sync(&db, 2, &cs2).unwrap();
 
     // Iterator at v2 should skip "b".
-    let mut iter = StateStore::iterator(&db, "store", 2, b"", b"").unwrap();
+    let mut iter = StateStore::iterator(&db, 2, b"", b"").unwrap();
 
     assert!(iter.valid());
     assert_eq!(iter.key(), b"a");
@@ -377,7 +364,7 @@ fn test_iterator_empty() {
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
     // No data written - iterator should be immediately invalid.
-    let iter = StateStore::iterator(&db, "store", 1, b"", b"").unwrap();
+    let iter = StateStore::iterator(&db, 1, b"", b"").unwrap();
     assert!(!iter.valid());
 }
 
@@ -390,7 +377,7 @@ fn test_prune_basic() {
     // Write three versions.
     for v in 1..=3 {
         let val = format!("v{v}");
-        let cs = make_changeset("store", vec![(b"key", Some(val.as_bytes()))]);
+        let cs = make_changeset(vec![(b"key", Some(val.as_bytes()))]);
         StateStore::apply_changeset_sync(&db, v, &cs).unwrap();
     }
 
@@ -400,7 +387,7 @@ fn test_prune_basic() {
     assert_eq!(StateStore::get_earliest_version(&db), 3);
 
     // Version 3 should still be readable.
-    assert_eq!(StateStore::get(&db, "store", 3, b"key").unwrap(), Some(b"v3".to_vec()));
+    assert_eq!(StateStore::get(&db, 3, b"key").unwrap(), Some(b"v3".to_vec()));
 }
 
 #[test]
@@ -410,14 +397,14 @@ fn test_prune_keep_last_version() {
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
     // Single version at prune height.
-    let cs = make_changeset("store", vec![(b"solo", Some(b"only"))]);
+    let cs = make_changeset(vec![(b"solo", Some(b"only"))]);
     StateStore::apply_changeset_sync(&db, 2, &cs).unwrap();
 
     StateStore::prune(&db, 2).unwrap();
 
     // With keep_last_version=true, the last version should survive.
     // earliest_version is now 3, so query at v3 which finds v2 entry.
-    assert_eq!(StateStore::get(&db, "store", 3, b"solo").unwrap(), Some(b"only".to_vec()));
+    assert_eq!(StateStore::get(&db, 3, b"solo").unwrap(), Some(b"only".to_vec()));
 }
 
 #[test]
@@ -426,17 +413,17 @@ fn test_prune_tombstone() {
     let cfg = test_config(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs1 = make_changeset("store", vec![(b"key", Some(b"alive"))]);
+    let cs1 = make_changeset(vec![(b"key", Some(b"alive"))]);
     StateStore::apply_changeset_sync(&db, 1, &cs1).unwrap();
 
-    let cs2 = make_changeset("store", vec![(b"key", None)]);
+    let cs2 = make_changeset(vec![(b"key", None)]);
     StateStore::apply_changeset_sync(&db, 2, &cs2).unwrap();
 
     StateStore::prune(&db, 2).unwrap();
 
     // Both the value and tombstone should be physically removed.
     // earliest_version is now 3. Any query should return None.
-    assert_eq!(StateStore::get(&db, "store", 3, b"key").unwrap(), None);
+    assert_eq!(StateStore::get(&db, 3, b"key").unwrap(), None);
 }
 
 #[test]
@@ -445,14 +432,14 @@ fn test_raw_iterate() {
     let cfg = test_config(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs1 = make_changeset("store", vec![(b"a", Some(b"a_v1"))]);
+    let cs1 = make_changeset(vec![(b"a", Some(b"a_v1"))]);
     StateStore::apply_changeset_sync(&db, 1, &cs1).unwrap();
 
-    let cs2 = make_changeset("store", vec![(b"a", Some(b"a_v2")), (b"b", Some(b"b_v1"))]);
+    let cs2 = make_changeset(vec![(b"a", Some(b"a_v2")), (b"b", Some(b"b_v1"))]);
     StateStore::apply_changeset_sync(&db, 2, &cs2).unwrap();
 
     let mut entries: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
-    let stopped = StateStore::raw_iterate(&db, "store", &mut |key, val, ver| {
+    let stopped = StateStore::raw_iterate(&db, &mut |key, val, ver| {
         entries.push((key.to_vec(), val.to_vec(), ver));
         false
     })
@@ -477,7 +464,7 @@ fn test_persistence_after_close() {
     // Write data, close, reopen, verify.
     {
         let mut db = MvccDatabase::open_db(&cfg).unwrap();
-        let cs = make_changeset("store", vec![(b"key1", Some(b"val1")), (b"key2", Some(b"val2"))]);
+        let cs = make_changeset(vec![(b"key1", Some(b"val1")), (b"key2", Some(b"val2"))]);
         StateStore::apply_changeset_sync(&db, 1, &cs).unwrap();
         StateStore::set_latest_version(&db, 1).unwrap();
         db.close().unwrap();
@@ -486,8 +473,8 @@ fn test_persistence_after_close() {
     {
         let db = MvccDatabase::open_db(&cfg).unwrap();
         assert_eq!(StateStore::get_latest_version(&db), 1);
-        assert_eq!(StateStore::get(&db, "store", 1, b"key1").unwrap(), Some(b"val1".to_vec()));
-        assert_eq!(StateStore::get(&db, "store", 1, b"key2").unwrap(), Some(b"val2".to_vec()));
+        assert_eq!(StateStore::get(&db, 1, b"key1").unwrap(), Some(b"val1".to_vec()));
+        assert_eq!(StateStore::get(&db, 1, b"key2").unwrap(), Some(b"val2".to_vec()));
     }
 }
 
@@ -515,12 +502,12 @@ fn test_prune_no_keep_last_version() {
     let cfg = test_config_no_keep(dir.path());
     let db = MvccDatabase::open_db(&cfg).unwrap();
 
-    let cs = make_changeset("store", vec![(b"key", Some(b"val"))]);
+    let cs = make_changeset(vec![(b"key", Some(b"val"))]);
     StateStore::apply_changeset_sync(&db, 2, &cs).unwrap();
 
     StateStore::prune(&db, 2).unwrap();
 
     // With keep_last_version=false, even the last version at prune height
     // should be deleted.
-    assert_eq!(StateStore::get(&db, "store", 2, b"key").unwrap(), None);
+    assert_eq!(StateStore::get(&db, 2, b"key").unwrap(), None);
 }

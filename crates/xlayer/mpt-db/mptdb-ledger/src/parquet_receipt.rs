@@ -18,13 +18,6 @@ impl ParquetReceiptStore {
         Ok(Self { store: Mutex::new(store) })
     }
 
-    /// Replay WAL entries into the store.  Currently a no-op placeholder
-    /// since the binary-file backend doesn't use a separate WAL; data is
-    /// written directly to files.  Kept for API parity with the Go version.
-    pub fn replay_wal(&self) -> Result<()> {
-        Ok(())
-    }
-
     /// Return recently buffered receipts for cache warming.
     pub fn warmup_receipts(&self) -> Vec<ReceiptRecord> {
         self.store.lock().warmup_receipts()

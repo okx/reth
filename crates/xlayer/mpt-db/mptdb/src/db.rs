@@ -4,14 +4,14 @@ use mptdb_common::{
     path::resolve_sc_path,
 };
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
-use mptdb_ss::{composite::store::CompositeStateStore, factory::new_state_store};
+use mptdb_ss::{evm::store::EVMStateStore, factory::new_state_store};
 use std::{path::Path, sync::Arc};
 
 /// Top-level entry point for the mpt-db library.
 /// Holds both SC (State Commitment via MPT) and SS (State Store) layers.
 pub struct MptDb {
     sc: MptCommitStore,
-    ss: Option<Arc<CompositeStateStore>>,
+    ss: Option<Arc<EVMStateStore>>,
     #[allow(dead_code)]
     home_dir: String,
 }
@@ -57,14 +57,8 @@ impl MptDb {
     }
 
     /// Returns a reference to the SS (State Store) layer, if configured.
-    pub fn ss(&self) -> Option<&Arc<CompositeStateStore>> {
+    pub fn ss(&self) -> Option<&Arc<EVMStateStore>> {
         self.ss.as_ref()
-    }
-
-    /// Initializes the SC layer with the given module/store names.
-    /// In the MPT architecture this is a no-op, retained for compatibility.
-    pub fn initialize(&mut self, _initial_stores: &[String]) {
-        // no-op: MPT does not use named stores
     }
 
     /// Loads the latest committed version of the SC database.
@@ -134,8 +128,7 @@ mod tests {
     fn default_ss_config(dir: &std::path::Path) -> StateStoreConfig {
         StateStoreConfig {
             enable: true,
-            db_directory: dir.join("cosmos_ss").to_string_lossy().to_string(),
-            evm_db_directory: dir.join("evm_ss").to_string_lossy().to_string(),
+            db_directory: dir.join("evm_ss").to_string_lossy().to_string(),
             keep_last_version: true,
             ..Default::default()
         }
@@ -156,16 +149,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let home = dir.path().to_string_lossy().to_string();
         let db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();
-        assert_eq!(db.version(), 0);
-    }
-
-    /// T2.3: initialize() is no-op, does not panic
-    #[test]
-    fn t2_3_initialize_noop() {
-        let dir = tempdir().unwrap();
-        let home = dir.path().to_string_lossy().to_string();
-        let mut db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();
-        db.initialize(&["bank".to_string(), "staking".to_string()]);
         assert_eq!(db.version(), 0);
     }
 
@@ -195,16 +178,6 @@ mod tests {
         let home = dir.path().to_string_lossy().to_string();
         let mut db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();
         assert!(db.close().is_ok());
-    }
-
-    /// T2.7: SS config does not affect ss() construction
-    #[test]
-    fn t2_7_with_ss() {
-        let dir = tempdir().unwrap();
-        let home = dir.path().to_string_lossy().to_string();
-        let ss_config = default_ss_config(dir.path());
-        let db = MptDb::open(&home, StateCommitConfig::default(), Some(ss_config)).unwrap();
-        assert!(db.ss().is_some());
     }
 
     /// T2.8: sc()/sc_mut() directly expose MptCommitStore

@@ -1,29 +1,25 @@
 //! Phase 2 integration tests (T2.CP).
 
 use mptdb_common::config::WalConfig;
-use mptdb_proto::{ChangeSet, ChangelogEntry, KvPair, NamedChangeSet};
+use mptdb_proto::{ChangeSet, ChangelogEntry, KvPair};
 use mptdb_traits::wal::Wal;
 use mptdb_wal::{changelog::new_changelog_wal, wal::WalImpl};
 use std::time::Duration;
 use tempfile::tempdir;
 
-/// Helper: build a ChangelogEntry with `n` changesets, each containing one KV pair.
+/// Helper: build a ChangelogEntry with `n` KV pairs in a single changeset.
 fn make_entry(version: i64, n: usize) -> ChangelogEntry {
     ChangelogEntry {
         version,
-        changesets: (0..n)
-            .map(|i| NamedChangeSet {
-                changeset: Some(ChangeSet {
-                    pairs: vec![KvPair {
-                        delete: false,
-                        key: format!("key-{version}-{i}").into_bytes(),
-                        value: format!("val-{version}-{i}").into_bytes(),
-                    }],
-                }),
-                name: format!("store_{i}"),
-            })
-            .collect(),
-        upgrades: vec![],
+        changeset: Some(ChangeSet {
+            pairs: (0..n)
+                .map(|i| KvPair {
+                    delete: false,
+                    key: format!("key-{version}-{i}").into_bytes(),
+                    value: format!("val-{version}-{i}").into_bytes(),
+                })
+                .collect(),
+        }),
     }
 }
 
@@ -71,7 +67,7 @@ fn test_corruption_recovery_end_to_end() {
         for v in 1..=4 {
             let entry = wal.read_at(v as u64).unwrap();
             assert_eq!(entry.version, v);
-            assert_eq!(entry.changesets.len(), 2);
+            assert_eq!(entry.changeset.as_ref().unwrap().pairs.len(), 2);
         }
     }
 }
