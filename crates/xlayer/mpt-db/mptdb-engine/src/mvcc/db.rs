@@ -17,7 +17,7 @@ use mptdb_traits::{kv::KvEngine, types::IterOptions, wal::Wal};
 use mptdb_wal::changelog::{new_changelog_wal, ChangelogWal};
 use parking_lot::Mutex;
 use std::sync::{
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
     Arc,
 };
 
@@ -42,6 +42,8 @@ pub struct MvccDatabase {
     pub(crate) pending_changes_tx: Mutex<Option<Sender<VersionedChangesets>>>,
     pub(crate) worker_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub(crate) stream_handler: Mutex<Option<ChangelogWal>>,
+    pub(crate) async_error: AtomicBool,
+    pub(crate) async_error_detail: Mutex<Option<String>>,
 }
 
 /// Async write channel message body.
@@ -49,7 +51,7 @@ pub struct MvccDatabase {
 pub(crate) struct VersionedChangesets {
     pub version: i64,
     pub changeset: ChangeSet,
-    pub done: Option<crossbeam_channel::Sender<()>>,
+    pub done: Option<crossbeam_channel::Sender<Result<()>>>,
 }
 
 impl MvccDatabase {
@@ -109,6 +111,8 @@ impl MvccDatabase {
             pending_changes_tx: Mutex::new(None),
             worker_handle: Mutex::new(None),
             stream_handler: Mutex::new(stream_handler),
+            async_error: AtomicBool::new(false),
+            async_error_detail: Mutex::new(None),
         })
     }
 
@@ -157,13 +161,29 @@ impl MvccDatabase {
             wal.close()?;
         }
 
-        Ok(())
+        self.check_async_error()
     }
 
     /// Shut down the database: drain the async writer, join the worker thread,
     /// and close the WAL stream handler.
     pub fn close(&mut self) -> Result<()> {
         self.shutdown()
+    }
+
+    pub(crate) fn check_async_error(&self) -> Result<()> {
+        if self.async_error.load(Ordering::Relaxed) {
+            let detail = self.async_error_detail.lock();
+            Err(MptDbError::Other(
+                detail.clone().unwrap_or_else(|| "mvcc async write failed".to_string()),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn report_async_error(&self, err: &MptDbError) {
+        *self.async_error_detail.lock() = Some(format!("mvcc async write failed: {err}"));
+        self.async_error.store(true, Ordering::Relaxed);
     }
 
     /// Retrieve the latest version stored in the database.
@@ -225,6 +245,7 @@ impl MvccDatabase {
 
     /// Set the latest version atomically and persist to the database.
     pub fn set_latest_version(&self, version: i64) -> Result<()> {
+        self.check_async_error()?;
         self.latest_version.store(version, Ordering::Relaxed);
         let bytes = (version as u64).to_le_bytes();
         self.engine
@@ -241,6 +262,7 @@ impl MvccDatabase {
     /// if the new version is greater than the current earliest. Uses CAS
     /// to avoid races.
     pub fn set_earliest_version(&self, version: i64, ignore_version: bool) -> Result<()> {
+        self.check_async_error()?;
         loop {
             let current = self.earliest_version.load(Ordering::Relaxed);
             if !ignore_version && version <= current {
@@ -274,6 +296,7 @@ impl MvccDatabase {
     /// Returns `Ok(None)` when the key does not exist or has been tombstoned
     /// at the requested version.
     pub fn get(&self, version: i64, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.check_async_error()?;
         if version < self.get_earliest_version() {
             return Ok(None);
         }
@@ -359,6 +382,14 @@ impl MvccDatabase {
     /// Expose the inner KvEngine handle.
     pub fn engine(&self) -> &Arc<dyn KvEngine> {
         &self.engine
+    }
+}
+
+#[cfg(test)]
+impl MvccDatabase {
+    pub(crate) fn inject_async_error_for_test(&self, msg: &str) {
+        *self.async_error_detail.lock() = Some(msg.to_string());
+        self.async_error.store(true, Ordering::Relaxed);
     }
 }
 

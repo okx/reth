@@ -21,6 +21,6 @@ pub use config::MptConfig;
 pub use manifest::VersionManifest;
 pub use persisted::PersistedTrieStore;
 pub use r#trait::{
-    MptCommitter, MptGcStats, MptSnapshotExporter, MptSnapshotImporter, MptSnapshotMeta,
-    MptSnapshotNode,
+    CommitFrontier, MptCommitter, MptGcStats, MptSnapshotExporter, MptSnapshotImporter,
+    MptSnapshotMeta, MptSnapshotNode,
 };

@@ -3,6 +3,20 @@ use mptdb_common::error::Result;
 use reth_trie_common::AccountProof;
 use revm_database::BundleState;
 
+/// Metadata about the current commit state, distinguishing between logical
+/// (in-memory), durable (on-disk), and working (uncommitted) frontiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFrontier {
+    /// Latest version that commit() returned successfully (in-memory).
+    pub logical_version: i64,
+    /// Latest version whose nodes and manifest are confirmed on stable storage.
+    pub durable_version: i64,
+    /// Root hash of the latest logical version.
+    pub committed_root: B256,
+    /// Root hash of the latest durable version.
+    pub durable_root: B256,
+}
+
 /// GC statistics returned by `MptCommitter::gc()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MptGcStats {
@@ -78,6 +92,9 @@ pub trait MptCommitter: Send {
 
     /// Create a streaming snapshot exporter for the given committed version.
     fn exporter(&self, version: i64) -> Result<Box<dyn MptSnapshotExporter>>;
+
+    /// Return the current commit frontier metadata.
+    fn frontier(&self) -> CommitFrontier;
 
     /// Create a streaming snapshot importer. Only allowed on fresh DB.
     fn importer(

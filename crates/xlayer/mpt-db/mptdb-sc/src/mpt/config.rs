@@ -9,6 +9,10 @@ pub struct MptConfig {
     pub parallel_storage_tries_min: usize,
     /// Minimum account trie frontier width before parallelizing root hash.
     pub parallel_account_frontier_min: usize,
+    /// Depth of the async persist queue (bounded channel capacity).
+    pub async_queue_depth: usize,
+    /// Threshold: blobs below this count use async persist, above use sync.
+    pub async_blob_threshold: usize,
 }
 
 impl Default for MptConfig {
@@ -18,6 +22,8 @@ impl Default for MptConfig {
             persisted_node_cache_capacity: 100_000,
             parallel_storage_tries_min: 64,
             parallel_account_frontier_min: 4,
+            async_queue_depth: 16,
+            async_blob_threshold: 5_000,
         }
     }
 }

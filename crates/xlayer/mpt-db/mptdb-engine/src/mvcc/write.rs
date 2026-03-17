@@ -1,5 +1,5 @@
 use crate::mvcc::{
-    batch::MvccBatch,
+    batch::{MvccBatch, MvccRawBatch},
     constants::DELETE_COMMIT_BATCH_SIZE,
     db::{MvccDatabase, VersionedChangesets},
     encoding::{decode_uint64_ascending, split_mvcc_key},
@@ -11,11 +11,50 @@ use mptdb_traits::{types::IterOptions, wal::Wal};
 use std::sync::{atomic::Ordering, Arc};
 
 impl MvccDatabase {
+    pub fn apply_changeset_data_only(&self, version: i64, changeset: &ChangeSet) -> Result<()> {
+        self.check_async_error()?;
+
+        let version = if version == 0 { 1 } else { version };
+        let mut batch = MvccRawBatch::new(self.engine.as_ref());
+
+        for kv_pair in &changeset.pairs {
+            if kv_pair.delete {
+                batch.delete(&kv_pair.key, version)?;
+            } else {
+                batch.set(&kv_pair.key, &kv_pair.value, version)?;
+            }
+        }
+
+        if batch.size() > 0 {
+            batch.write()?;
+        }
+
+        loop {
+            let current = self.latest_dirty_version.load(Ordering::Relaxed);
+            if version <= current {
+                break;
+            }
+            match self.latest_dirty_version.compare_exchange(
+                current,
+                version,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+
+        Ok(())
+    }
+
     /// Apply a changeset synchronously at `version`.
     ///
     /// Genesis writes arrive as version 0 but the underlying MVCC encoding
     /// treats version 0 as special, so they are remapped to version 1.
     pub fn apply_changeset_sync(&self, version: i64, changeset: &ChangeSet) -> Result<()> {
+        self.check_async_error()?;
+
         // Genesis compatibility: remap version 0 -> 1
         let version = if version == 0 { 1 } else { version };
 
@@ -62,6 +101,8 @@ impl MvccDatabase {
     /// Writes are first durably recorded to the WAL, then enqueued for the
     /// background consumer which calls [`apply_changeset_sync`].
     pub fn apply_changeset_async(&self, version: i64, changeset: &ChangeSet) -> Result<()> {
+        self.check_async_error()?;
+
         // Write to WAL for durability
         if let Some(ref wal) = *self.stream_handler.lock() {
             let entry = ChangelogEntry { version, changeset: Some(changeset.clone()) };
@@ -86,10 +127,12 @@ impl MvccDatabase {
     ///
     /// Sends a barrier message through the channel and waits for the background
     /// consumer to acknowledge it.
-    pub fn wait_for_pending_writes(&self) {
+    pub fn wait_for_pending_writes(&self) -> Result<()> {
+        self.check_async_error()?;
+
         let tx = match self.pending_changes_tx.lock().as_ref().cloned() {
             Some(tx) => tx,
-            None => return,
+            None => return Ok(()),
         };
 
         let (done_tx, done_rx) = crossbeam_channel::bounded(0);
@@ -104,11 +147,14 @@ impl MvccDatabase {
             .is_err()
         {
             // Channel closed -- worker already stopped
-            return;
+            return self.check_async_error();
         }
 
         // Block until the background worker processes the barrier
-        let _ = done_rx.recv();
+        match done_rx.recv() {
+            Ok(result) => result,
+            Err(_) => self.check_async_error(),
+        }
     }
 
     /// Background consumer loop for async writes.
@@ -121,12 +167,19 @@ impl MvccDatabase {
         rx: Receiver<VersionedChangesets>,
     ) {
         for msg in rx {
+            if db.async_error.load(Ordering::Relaxed) {
+                if let Some(done) = msg.done {
+                    let _ = done.send(db.check_async_error());
+                }
+                continue;
+            }
             if let Some(done) = msg.done {
-                let _ = done.send(());
+                let _ = done.send(db.check_async_error());
                 continue;
             }
             if let Err(e) = db.apply_changeset_sync(msg.version, &msg.changeset) {
-                tracing::warn!(version = msg.version, error = %e, "async write failed");
+                db.report_async_error(&e);
+                tracing::error!(version = msg.version, error = %e, "async write failed");
             }
         }
     }
@@ -331,32 +384,33 @@ mod tests {
     fn test_apply_changeset_async_and_wait() {
         let dir = TempDir::new().unwrap();
         let cfg = test_config(dir.path());
-        let db = MvccDatabase::open_db(&cfg).unwrap();
-
-        // Initialize the async writer
-        let db = Arc::new(db);
-        let (tx, rx) = crossbeam_channel::bounded(16);
-
-        db.pending_changes_tx.lock().replace(tx);
-
-        // Spawn the background worker
-        let db_clone = Arc::clone(&db);
-        let handle = std::thread::spawn(move || {
-            MvccDatabase::write_async_in_background(db_clone, rx);
-        });
+        let db = Arc::new(MvccDatabase::open_db(&cfg).unwrap());
+        db.init_async_writer().unwrap();
 
         // Send an async changeset (no WAL in this test)
         let changeset = make_changeset(vec![kv_set(b"async_key", b"async_val")]);
         db.apply_changeset_async(1, &changeset).unwrap();
 
         // Wait for the write to complete
-        db.wait_for_pending_writes();
+        db.wait_for_pending_writes().unwrap();
 
         // Verify the data was written
         assert_eq!(db.get(1, b"async_key").unwrap(), Some(b"async_val".to_vec()));
 
-        // Clean up: drop sender to stop worker
-        db.pending_changes_tx.lock().take();
-        handle.join().unwrap();
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_wait_for_pending_writes_reports_async_error() {
+        let dir = TempDir::new().unwrap();
+        let cfg = test_config(dir.path());
+        let db = Arc::new(MvccDatabase::open_db(&cfg).unwrap());
+        db.init_async_writer().unwrap();
+
+        db.inject_async_error_for_test("synthetic async failure");
+
+        let err = db.wait_for_pending_writes().unwrap_err();
+        assert!(err.to_string().contains("synthetic async failure"));
+        assert!(db.apply_changeset_async(1, &make_changeset(vec![kv_set(b"k", b"v")])).is_err());
     }
 }

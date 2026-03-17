@@ -25,6 +25,8 @@ impl MvccDatabase {
     ///
     /// After pruning, the earliest version is advanced to `version + 1`.
     pub fn prune(&self, version: i64) -> Result<()> {
+        self.check_async_error()?;
+
         // If nothing has been dirtied since the earliest version, skip entirely.
         let dirty_ver = self.latest_dirty_version.load(Ordering::Relaxed);
         if dirty_ver > 0 && dirty_ver < self.get_earliest_version() {
@@ -130,6 +132,8 @@ impl MvccDatabase {
     /// Import snapshot nodes from a channel into the database at the given
     /// version, using multiple worker threads for parallelism.
     pub fn import(&self, version: i64, nodes: Receiver<SnapshotNode>) -> Result<()> {
+        self.check_async_error()?;
+
         let num_workers = self.config.import_num_workers.max(1);
         let engine = Arc::clone(&self.engine);
 
@@ -197,6 +201,8 @@ impl MvccDatabase {
     /// returns `Ok(true)`. Returns `Ok(false)` when all entries were visited
     /// without the callback requesting a stop.
     pub fn raw_iterate(&self, f: RawIterateFn<'_>) -> Result<bool> {
+        self.check_async_error()?;
+
         let iter_opts = IterOptions { lower_bound: None, upper_bound: None };
 
         let mut iter = self.engine.new_iter(&iter_opts)?;

@@ -3,6 +3,7 @@ use alloy_rlp::Encodable;
 use alloy_trie::{Nibbles, EMPTY_ROOT_HASH};
 use fs4::fs_std::FileExt;
 use mptdb_common::error::{MptDbError, Result};
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use reth_trie_common::AccountProof;
 use revm_database::BundleState;
@@ -10,7 +11,10 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicI64, Ordering},
+        Arc,
+    },
     thread::JoinHandle,
 };
 
@@ -21,7 +25,7 @@ use super::{
     parallel::ParallelismThresholds,
     persisted::{self, PersistedTrieStore},
     proof,
-    r#trait::{MptCommitter, MptGcStats, MptSnapshotExporter, MptSnapshotImporter},
+    r#trait::{CommitFrontier, MptCommitter, MptGcStats, MptSnapshotExporter, MptSnapshotImporter},
     snapshot::{SnapshotExporter, SnapshotImporter},
     state::{self, DirtyAccount},
     tree::MptTree,
@@ -47,12 +51,15 @@ struct StorageTrieCommitArtifacts {
 
 /// A persist job sent to the background worker thread.
 struct PersistJob {
+    barrier_only: bool,
     blobs: Vec<(B256, Vec<u8>)>,
     manifest: VersionManifest,
     manifest_path: PathBuf,
+    /// The version this persist job makes durable. Used to update `durable_version`.
+    version: i64,
     /// If set, the background worker signals completion on this channel after
     /// finishing the persist. Used by `flush_persist()` to wait for drain.
-    done: Option<crossbeam_channel::Sender<()>>,
+    done: Option<crossbeam_channel::Sender<Result<()>>>,
 }
 
 /// MPT-based commit store with persistence, rollback, and recovery support.
@@ -81,16 +88,46 @@ pub struct MptCommitStore {
     parallelism: ParallelismThresholds,
     config: MptConfig,
 
+    /// Latest version whose nodes and manifest are confirmed on stable storage.
+    durable_version: Arc<AtomicI64>,
+
     /// Channel to send persist jobs to the background worker.
     persist_tx: Option<crossbeam_channel::Sender<PersistJob>>,
     /// Handle to the background persist worker thread.
     persist_handle: Option<JoinHandle<()>>,
+    async_error: Arc<AtomicBool>,
+    async_error_detail: Arc<Mutex<Option<String>>>,
 
     #[cfg(test)]
     fail_point: Option<CommitFailPoint>,
+    #[cfg(test)]
+    async_fail_mode: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl MptCommitStore {
+    fn current_async_error(detail: &Mutex<Option<String>>) -> MptDbError {
+        MptDbError::Other(
+            detail.lock().clone().unwrap_or_else(|| "mpt async persist failed".to_string()),
+        )
+    }
+
+    fn report_async_error(
+        async_error: &AtomicBool,
+        detail: &Mutex<Option<String>>,
+        err: &MptDbError,
+    ) {
+        *detail.lock() = Some(format!("mpt async persist failed: {err}"));
+        async_error.store(true, Ordering::Relaxed);
+    }
+
+    fn check_async_error(&self) -> Result<()> {
+        if self.async_error.load(Ordering::Relaxed) {
+            Err(Self::current_async_error(&self.async_error_detail))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Open an MptCommitStore at the given directory with default configuration.
     ///
     /// `read_only=true` disables writes and does not acquire the exclusive lock.
@@ -149,27 +186,89 @@ impl MptCommitStore {
             account_frontier_min: config.parallel_account_frontier_min,
         };
 
+        let async_error = Arc::new(AtomicBool::new(false));
+        let async_error_detail = Arc::new(Mutex::new(None));
+        let durable_version = Arc::new(AtomicI64::new(version));
+        #[cfg(test)]
+        let async_fail_mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+
         // Spawn background persist worker for writable stores.
-        // Bounded channel capacity of 2 provides natural backpressure: at most
-        // 2 uncommitted persist jobs can be in flight before send() blocks.
+        // The bounded channel provides natural backpressure: once it fills,
+        // commit() will block on enqueue until the worker catches up.
         let (persist_tx, persist_handle) = if !read_only {
-            let (tx, rx) = crossbeam_channel::bounded::<PersistJob>(16);
+            let (tx, rx) = crossbeam_channel::bounded::<PersistJob>(config.async_queue_depth);
             let persisted_clone = Arc::clone(&persisted);
+            let async_error_clone = Arc::clone(&async_error);
+            let async_error_detail_clone = Arc::clone(&async_error_detail);
+            let durable_version_clone = Arc::clone(&durable_version);
+            #[cfg(test)]
+            let async_fail_mode_clone = Arc::clone(&async_fail_mode);
             let handle = std::thread::Builder::new()
                 .name("mpt-persist".to_string())
                 .spawn(move || {
                     for job in rx {
-                        // Persist nodes (durable=true: fsync)
-                        if let Err(e) = persisted_clone.persist_batch(&job.blobs, true) {
-                            tracing::error!(?e, "background persist failed");
+                        if async_error_clone.load(Ordering::Relaxed) {
+                            if let Some(done) = job.done {
+                                let _ = done.send(Err(Self::current_async_error(
+                                    &async_error_detail_clone,
+                                )));
+                            }
+                            continue;
                         }
-                        // Save manifest (atomic file swap)
-                        if let Err(e) = job.manifest.save(&job.manifest_path) {
-                            tracing::error!(?e, "background manifest save failed");
+
+                        if !job.barrier_only {
+                            #[cfg(test)]
+                            let forced_error = match async_fail_mode_clone.load(Ordering::Relaxed) {
+                                1 => Some(MptDbError::Other(
+                                    "forced async persist failure".to_string(),
+                                )),
+                                2 => Some(MptDbError::Other(
+                                    "forced async manifest failure".to_string(),
+                                )),
+                                _ => None,
+                            };
+
+                            #[cfg(not(test))]
+                            let forced_error: Option<MptDbError> = None;
+
+                            let result = if let Some(err) = forced_error {
+                                Err(err)
+                            } else {
+                                persisted_clone
+                                    .persist_batch(&job.blobs, true)
+                                    .and_then(|_| job.manifest.save(&job.manifest_path))
+                            };
+
+                            if let Err(e) = result {
+                                Self::report_async_error(
+                                    &async_error_clone,
+                                    &async_error_detail_clone,
+                                    &e,
+                                );
+                                tracing::error!(?e, "background persist failed");
+                            } else {
+                                // Update durable_version via CAS (only advance forward)
+                                let _ = durable_version_clone.fetch_update(
+                                    Ordering::Release,
+                                    Ordering::Relaxed,
+                                    |cur| {
+                                        if job.version > cur {
+                                            Some(job.version)
+                                        } else {
+                                            None
+                                        }
+                                    },
+                                );
+                            }
                         }
-                        // Signal completion if requested (used by flush_persist)
+
                         if let Some(done) = job.done {
-                            let _ = done.send(());
+                            let result = if async_error_clone.load(Ordering::Relaxed) {
+                                Err(Self::current_async_error(&async_error_detail_clone))
+                            } else {
+                                Ok(())
+                            };
+                            let _ = done.send(result);
                         }
                     }
                 })
@@ -195,10 +294,15 @@ impl MptCommitStore {
             file_lock,
             parallelism,
             config,
+            durable_version,
             persist_tx,
             persist_handle,
+            async_error,
+            async_error_detail,
             #[cfg(test)]
             fail_point: None,
+            #[cfg(test)]
+            async_fail_mode,
         })
     }
 
@@ -239,6 +343,7 @@ impl MptCommitStore {
             return Ok(());
         }
         // Fall through to RocksDB (or node cache populated by prior commit)
+        self.flush_persist()?;
         let trie = persisted::load_tree_from_root(&self.persisted, existing_root)?;
         self.storage_tries.insert(*hashed_address, trie);
         Ok(())
@@ -257,7 +362,7 @@ impl MptCommitStore {
                 "store is poisoned, call load_version() to recover".to_string(),
             ));
         }
-        Ok(())
+        self.check_async_error()
     }
 
     fn check_not_applied(&self) -> Result<()> {
@@ -271,22 +376,35 @@ impl MptCommitStore {
 
     /// Wait for all in-flight background persist jobs to complete.
     ///
-    /// Sends a no-op barrier job through the channel and waits for it to be
+    /// Sends a barrier job through the channel and waits for it to be
     /// processed. Since the channel is FIFO, all previously sent jobs will
-    /// have been completed by the time the barrier finishes.
-    pub fn flush_persist(&self) {
+    /// have been completed by the time the barrier finishes. The barrier
+    /// itself does not perform any extra RocksDB or manifest writes.
+    pub fn flush_persist(&self) -> Result<()> {
+        self.check_async_error()?;
         if let Some(ref tx) = self.persist_tx {
-            let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(0);
+            let (done_tx, done_rx) = crossbeam_channel::bounded::<Result<()>>(0);
             let job = PersistJob {
+                barrier_only: true,
                 blobs: vec![],
                 manifest: self.manifest.clone(),
                 manifest_path: self.manifest_path.clone(),
+                version: self.version,
                 done: Some(done_tx),
             };
             if tx.send(job).is_ok() {
-                let _ = done_rx.recv();
+                match done_rx.recv() {
+                    Ok(result) => {
+                        result?;
+                        // After barrier completes, all prior jobs are durable
+                        self.durable_version.store(self.version, Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(_) => return self.check_async_error(),
+                }
             }
         }
+        self.check_async_error()
     }
 
     /// Check if this is a fresh DB (manifest = {0->EMPTY_ROOT_HASH}, no other versions, empty
@@ -309,6 +427,10 @@ impl MptCommitStore {
 impl MptCommitStore {
     pub(crate) fn set_fail_point(&mut self, fail: Option<CommitFailPoint>) {
         self.fail_point = fail;
+    }
+
+    pub(crate) fn set_async_fail_mode(&self, mode: u8) {
+        self.async_fail_mode.store(mode, Ordering::Relaxed);
     }
 
     pub(crate) fn set_parallelism_thresholds(&mut self, thresholds: ParallelismThresholds) {
@@ -358,7 +480,7 @@ impl MptCommitter for MptCommitStore {
 
     fn load_version(&mut self) -> Result<()> {
         // Wait for any in-flight persist jobs to complete before reloading from disk
-        self.flush_persist();
+        self.flush_persist()?;
         // Always reload manifest from disk
         self.manifest = VersionManifest::load(&self.manifest_path)?;
         let root = self.manifest.get_root(self.manifest.latest_version).unwrap_or(EMPTY_ROOT_HASH);
@@ -375,7 +497,7 @@ impl MptCommitter for MptCommitStore {
     fn rollback(&mut self, target_version: i64) -> Result<()> {
         self.check_writable()?;
         // Wait for any in-flight persist jobs before modifying manifest
-        self.flush_persist();
+        self.flush_persist()?;
 
         if target_version < self.manifest.earliest_version ||
             target_version > self.manifest.latest_version
@@ -398,13 +520,13 @@ impl MptCommitter for MptCommitStore {
         // for it to finish all in-flight persist jobs.
         self.persist_tx.take();
         if let Some(handle) = self.persist_handle.take() {
-            let _ = handle.join();
+            handle.join().map_err(|_| MptDbError::Other("persist worker panicked".to_string()))?;
         }
         if let Some(persisted) = Arc::get_mut(&mut self.persisted) {
             persisted.close()?;
         }
         self.file_lock = None;
-        Ok(())
+        self.check_async_error()
     }
 
     fn prune_before(&mut self, version: i64) -> Result<()> {
@@ -412,7 +534,7 @@ impl MptCommitter for MptCommitStore {
         self.check_not_poisoned()?;
         self.check_not_applied()?;
         // Wait for any in-flight persist jobs before modifying manifest
-        self.flush_persist();
+        self.flush_persist()?;
 
         if version < self.manifest.earliest_version || version > self.manifest.latest_version {
             return Err(MptDbError::Other(format!(
@@ -444,7 +566,7 @@ impl MptCommitter for MptCommitStore {
         self.check_not_poisoned()?;
         self.check_not_applied()?;
         // Wait for any in-flight persist jobs before GC scans reachable nodes
-        self.flush_persist();
+        self.flush_persist()?;
 
         let live_roots: Vec<B256> = self.manifest.versions.values().copied().collect();
         let live = gc::collect_reachable_hashes(&self.persisted, live_roots)?;
@@ -458,7 +580,7 @@ impl MptCommitter for MptCommitStore {
         slots: &[B256],
     ) -> Result<AccountProof> {
         // Wait for any in-flight persist jobs to ensure latest nodes are on disk
-        self.flush_persist();
+        self.flush_persist()?;
         let root = self.manifest.get_root(version).ok_or_else(|| {
             MptDbError::Other(format!("account_proof: version {version} not in manifest"))
         })?;
@@ -467,12 +589,25 @@ impl MptCommitter for MptCommitStore {
 
     fn exporter(&self, version: i64) -> Result<Box<dyn MptSnapshotExporter>> {
         // Wait for any in-flight persist jobs to ensure all nodes are on disk
-        self.flush_persist();
+        self.flush_persist()?;
         let root = self.manifest.get_root(version).ok_or_else(|| {
             MptDbError::Other(format!("exporter: version {version} not in manifest"))
         })?;
         let exp = SnapshotExporter::new(self.persisted.clone(), root, version)?;
         Ok(Box::new(exp))
+    }
+
+    fn frontier(&self) -> CommitFrontier {
+        let logical = self.version;
+        let durable = self.durable_version.load(Ordering::Relaxed);
+        let committed_root = self.manifest.get_root(logical).unwrap_or(EMPTY_ROOT_HASH);
+        let durable_root = self.manifest.get_root(durable).unwrap_or(EMPTY_ROOT_HASH);
+        CommitFrontier {
+            logical_version: logical,
+            durable_version: durable,
+            committed_root,
+            durable_root,
+        }
     }
 
     fn importer(
@@ -546,15 +681,12 @@ impl MptCommitStore {
 
     /// Core commit logic: compute roots, persist nodes, update manifest.
     ///
-    /// ## Durability Protocol
+    /// ## Persistence Protocol
     ///
-    /// The commit follows a strict ordering:
-    /// 1. Persist all dirty trie nodes (durable write via RocksDB sync)
-    /// 2. Save manifest with new version and state root (atomic file swap)
-    ///
-    /// This ensures: if the manifest references a version, all its nodes are
-    /// on stable storage. On crash between steps 1 and 2, the manifest stays
-    /// at the old version, and the orphaned nodes are harmless (cleaned by GC).
+    /// Synchronous commits durably persist dirty trie nodes before atomically
+    /// saving the manifest. Asynchronous commits publish the new logical
+    /// version immediately and rely on the background worker to make that
+    /// version durable; callers that need durability must call `flush_persist`.
     fn commit_inner(&mut self) -> Result<(i64, B256)> {
         // Phase 1: compute storage roots for all dirty accounts.
         //
@@ -689,8 +821,8 @@ impl MptCommitStore {
         // Decide async vs sync based on batch size: async for small-to-medium
         // batches (saves fsync latency), sync for large batches (avoids the
         // cache clone overhead that exceeds fsync savings).
-        const ASYNC_BLOB_THRESHOLD: usize = 5_000;
-        let use_async = all_blobs.len() < ASYNC_BLOB_THRESHOLD && self.persist_tx.is_some();
+        let use_async =
+            all_blobs.len() < self.config.async_blob_threshold && self.persist_tx.is_some();
 
         if use_async {
             // Pre-populate the node cache so subsequent reads can find these
@@ -699,9 +831,11 @@ impl MptCommitStore {
 
             let tx = self.persist_tx.as_ref().unwrap();
             let job = PersistJob {
+                barrier_only: false,
                 blobs: all_blobs,
                 manifest: manifest_copy.clone(),
                 manifest_path: self.manifest_path.clone(),
+                version: new_version,
                 done: None,
             };
             tx.send(job).map_err(|e| MptDbError::Other(format!("send persist job: {e}")))?;
@@ -709,6 +843,8 @@ impl MptCommitStore {
             // Synchronous persist for large batches or when no background worker
             self.persisted.persist_batch(&all_blobs, true)?;
             manifest_copy.save(&self.manifest_path)?;
+            // Sync persist is immediately durable
+            self.durable_version.store(new_version, Ordering::Release);
         }
 
         // Collect deleted accounts before clearing dirty_accounts, so we can
@@ -766,12 +902,32 @@ impl<'a> super::r#trait::MptSnapshotImporter for BoundImporter<'a> {
     }
 
     fn close(&mut self) -> Result<()> {
+        // Drop the persist channel so the background thread finishes and
+        // releases its Arc<PersistedTrieStore>. Then close the old store
+        // to release the RocksDB lock before the atomic rename in inner.close().
+        self.store.persist_tx.take();
+        if let Some(handle) = self.store.persist_handle.take() {
+            let _ = handle.join();
+        }
+        // Now self.store.persisted should be the only Arc reference
+        if let Some(old_store) = Arc::get_mut(&mut self.store.persisted) {
+            old_store.close()?;
+        }
+
         self.inner.close()?;
 
-        // After successful import, update MptCommitStore state
+        // After successful import with atomic install, the live trie_nodes dir
+        // has been replaced. Reopen the PersistedTrieStore at the new directory.
+        let trie_nodes_dir = self.store.dir.join("trie_nodes");
+        self.store.persisted = Arc::new(PersistedTrieStore::open_with_capacity(
+            &trie_nodes_dir,
+            self.store.config.persisted_node_cache_capacity,
+        )?);
+
         // Reload manifest from disk
         self.store.manifest = VersionManifest::load(&self.store.manifest_path)?;
         self.store.version = self.store.manifest.latest_version;
+        self.store.durable_version.store(self.store.version, Ordering::Release);
 
         // Reload account trie from imported root
         let root = self
@@ -2109,5 +2265,34 @@ mod tests {
             assert_eq!(store.version(), 1);
             store.close().unwrap();
         }
+    }
+
+    #[test]
+    fn t_async_flush_reports_background_persist_failure() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        store.set_async_fail_mode(1);
+
+        store.apply_bundle_state(&BundleState::default()).unwrap();
+        store.commit().unwrap();
+
+        let err = store.flush_persist().unwrap_err();
+        assert!(err.to_string().contains("forced async persist failure"));
+        assert!(store.apply_bundle_state(&BundleState::default()).is_err());
+        assert!(store.close().is_err());
+    }
+
+    #[test]
+    fn t_async_flush_is_true_barrier() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        store.apply_bundle_state(&BundleState::default()).unwrap();
+        store.commit().unwrap();
+        store.flush_persist().unwrap();
+
+        let manifest = VersionManifest::load(&dir.path().join("manifest.json")).unwrap();
+        assert_eq!(manifest.latest_version, 1);
+        store.close().unwrap();
     }
 }

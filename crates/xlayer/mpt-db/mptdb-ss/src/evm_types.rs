@@ -30,6 +30,7 @@ pub fn store_type_name(st: EvmKeyKind) -> &'static str {
 pub fn sub_db_config(base: &StateStoreConfig) -> StateStoreConfig {
     let mut cfg = base.clone();
     cfg.use_default_comparer = true;
+    cfg.async_write_buffer = 0;
     cfg
 }
 
@@ -63,6 +64,7 @@ mod tests {
         let base = StateStoreConfig { use_default_comparer: false, ..Default::default() };
         let sub = sub_db_config(&base);
         assert!(sub.use_default_comparer);
+        assert_eq!(sub.async_write_buffer, 0);
         // Other fields should be preserved
         assert_eq!(sub.backend, base.backend);
         assert_eq!(sub.keep_recent, base.keep_recent);
