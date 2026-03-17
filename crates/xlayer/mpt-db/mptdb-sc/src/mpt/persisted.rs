@@ -1,5 +1,5 @@
 use alloy_primitives::B256;
-use alloy_trie::EMPTY_ROOT_HASH;
+use alloy_trie::{Nibbles, EMPTY_ROOT_HASH};
 use mptdb_common::error::{MptDbError, Result};
 use mptdb_engine::engine::RocksDbEngine;
 use mptdb_traits::{
@@ -216,6 +216,32 @@ pub fn load_tree_from_root(store: &PersistedTrieStore, root: B256) -> Result<Mpt
     Ok(MptTree { arena, root: Some(root_idx) })
 }
 
+/// Load only the paths needed for the provided keys, keeping untouched subtrees
+/// as Hash/Inline child refs until they are actually traversed.
+pub fn load_tree_paths_from_root(
+    store: &PersistedTrieStore,
+    root: B256,
+    keys: &[Nibbles],
+) -> Result<MptTree> {
+    if root == EMPTY_ROOT_HASH {
+        return Ok(MptTree::new());
+    }
+
+    let root_rlp = store
+        .get_node(root)?
+        .ok_or_else(|| MptDbError::Other(format!("root node not found: {root}")))?;
+    let root_node =
+        decode_node(&root_rlp).map_err(|e| MptDbError::Other(format!("decode root node: {e}")))?;
+
+    let mut arena = MutableTrieArena::new();
+    let root_idx = arena.alloc_clean(root_node);
+    let mut tree = MptTree { arena, root: Some(root_idx) };
+    for key in keys {
+        tree.ensure_path_loaded(store, key)?;
+    }
+    Ok(tree)
+}
+
 /// Recursively materialize a decoded node and all its children into the arena.
 fn materialize_node(
     store: &PersistedTrieStore,
@@ -391,6 +417,38 @@ mod tests {
         let reloaded = load_tree_from_root(&store, root_hash).unwrap();
         // DFS check: all children must be Arena
         check_all_arena(&reloaded.arena, reloaded.root.unwrap());
+    }
+
+    /// T4.7b: path-only load preserves root and materializes fewer nodes than full load.
+    #[test]
+    fn t4_7b_path_load_roundtrip() {
+        let (store, _dir) = tmp_store();
+
+        let mut tree = MptTree::new();
+        let mut touched_key = None;
+        for i in 0u8..32 {
+            let key = Nibbles::unpack(keccak256(&[i]));
+            if i == 7 {
+                touched_key = Some(key.clone());
+            }
+            tree.insert(&key, vec![i; 40]);
+        }
+        let root_hash = tree.root_hash();
+        let blobs = tree.collect_node_blobs();
+        store.persist_batch(&blobs, true).unwrap();
+
+        let key = touched_key.unwrap();
+        let mut partial =
+            load_tree_paths_from_root(&store, root_hash, std::slice::from_ref(&key)).unwrap();
+        let mut full = load_tree_from_root(&store, root_hash).unwrap();
+
+        assert_eq!(partial.root_hash(), root_hash);
+        assert_eq!(partial.root_hash(), full.root_hash());
+        assert!(partial.arena.len() < full.arena.len());
+
+        partial.insert_from_persisted(&store, &key, b"updated".to_vec()).unwrap();
+        full.insert(&key, b"updated".to_vec());
+        assert_eq!(partial.root_hash(), full.root_hash());
     }
 
     fn check_all_arena(arena: &MutableTrieArena, idx: u32) {

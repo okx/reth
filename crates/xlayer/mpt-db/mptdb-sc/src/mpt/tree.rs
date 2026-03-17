@@ -1,14 +1,16 @@
 use alloy_primitives::B256;
 use alloy_trie::Nibbles;
+use mptdb_common::error::{MptDbError, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::{
     arena::MutableTrieArena,
-    encoding::{encode_branch, encode_extension, encode_leaf},
+    encoding::{decode_node, encode_branch, encode_extension, encode_leaf},
     hash,
     node::{ChildRef, MptNode},
     parallel::ParallelismThresholds,
+    persisted::PersistedTrieStore,
     tree_algo,
 };
 
@@ -51,11 +53,33 @@ impl MptTree {
         self.root = Some(new_root);
     }
 
+    /// Insert into a partially materialized trie, lazily loading the touched path.
+    pub fn insert_from_persisted(
+        &mut self,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        self.ensure_path_loaded(store, key)?;
+        self.insert(key, value);
+        Ok(())
+    }
+
     /// Delete a key. Returns true if the key existed.
     pub fn delete(&mut self, key: &Nibbles) -> bool {
         let (deleted, new_root) = tree_algo::delete_recursive(&mut self.arena, self.root, key, 0);
         self.root = new_root;
         deleted
+    }
+
+    /// Delete from a partially materialized trie, lazily loading the touched path.
+    pub fn delete_from_persisted(
+        &mut self,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+    ) -> Result<bool> {
+        self.ensure_path_loaded(store, key)?;
+        Ok(self.delete(key))
     }
 
     /// Look up a key. Returns the value if found.
@@ -145,7 +169,7 @@ impl MptTree {
                         ChildRef::Arena(child_idx) => {
                             self.get_recursive(*child_idx, key, offset + ext_len)
                         }
-                        _ => panic!("Phase 1: only Arena child refs in live tree"),
+                        ChildRef::Hash(_) | ChildRef::Inline(_) => None,
                     }
                 } else {
                     None
@@ -160,7 +184,7 @@ impl MptTree {
                         Some(ChildRef::Arena(child_idx)) => {
                             self.get_recursive(*child_idx, key, offset + 1)
                         }
-                        Some(_) => panic!("Phase 1: only Arena child refs in live tree"),
+                        Some(ChildRef::Hash(_)) | Some(ChildRef::Inline(_)) => None,
                         None => None,
                     }
                 }
@@ -225,7 +249,7 @@ impl MptTree {
                 }
             }
             ChildRef::Inline(rlp) => rlp.clone(),
-            ChildRef::Hash(_) => panic!("Phase 1: Hash child refs not supported in encode"),
+            ChildRef::Hash(hash) => hash.to_vec(),
         }
     }
 
@@ -267,7 +291,7 @@ impl MptTree {
                 }
             }
             ChildRef::Inline(rlp) => rlp.clone(),
-            ChildRef::Hash(_) => panic!("Phase 1: Hash child refs not supported in encode"),
+            ChildRef::Hash(hash) => hash.to_vec(),
         }
     }
 
@@ -508,6 +532,87 @@ impl MptTree {
     /// Clear all dirty flags in the arena. Call after successful persist.
     pub(crate) fn clear_dirty(&mut self) {
         self.arena.clear_all_dirty();
+    }
+
+    pub(crate) fn ensure_path_loaded(
+        &mut self,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+    ) -> Result<()> {
+        if let Some(root_idx) = self.root {
+            self.ensure_path_loaded_recursive(store, root_idx, key, 0)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_path_loaded_recursive(
+        &mut self,
+        store: &PersistedTrieStore,
+        idx: u32,
+        key: &Nibbles,
+        offset: usize,
+    ) -> Result<()> {
+        let node = self.arena.get(idx).clone();
+        match node {
+            MptNode::Leaf(_) => Ok(()),
+            MptNode::Extension(ext) => {
+                let remaining = key.slice(offset..);
+                let ext_len = ext.nibbles.len();
+                if remaining.len() < ext_len || remaining.slice(..ext_len) != ext.nibbles {
+                    return Ok(());
+                }
+
+                let child_idx = self.materialize_child_on_path(store, idx, None, ext.child)?;
+                self.ensure_path_loaded_recursive(store, child_idx, key, offset + ext_len)
+            }
+            MptNode::Branch(branch) => {
+                if offset >= key.len() {
+                    return Ok(());
+                }
+                let nibble = key.get_unchecked(offset) as usize;
+                let Some(child) = branch.children[nibble].clone() else {
+                    return Ok(());
+                };
+                let child_idx = self.materialize_child_on_path(store, idx, Some(nibble), child)?;
+                self.ensure_path_loaded_recursive(store, child_idx, key, offset + 1)
+            }
+        }
+    }
+
+    fn materialize_child_on_path(
+        &mut self,
+        store: &PersistedTrieStore,
+        parent_idx: u32,
+        branch_slot: Option<usize>,
+        child: ChildRef,
+    ) -> Result<u32> {
+        let child_idx = match child {
+            ChildRef::Arena(idx) => idx,
+            ChildRef::Hash(hash) => {
+                let rlp = store
+                    .get_node(hash)?
+                    .ok_or_else(|| MptDbError::Other(format!("child node not found: {hash}")))?;
+                let node = decode_node(&rlp)
+                    .map_err(|e| MptDbError::Other(format!("decode child node: {e}")))?;
+                self.arena.alloc_clean(node)
+            }
+            ChildRef::Inline(rlp) => {
+                let node = decode_node(&rlp)
+                    .map_err(|e| MptDbError::Other(format!("decode inline child: {e}")))?;
+                self.arena.alloc_clean(node)
+            }
+        };
+
+        match self.arena.get_mut(parent_idx) {
+            MptNode::Extension(ext) => ext.child = ChildRef::Arena(child_idx),
+            MptNode::Branch(branch) => {
+                let slot = branch_slot.expect("branch child materialization requires slot");
+                branch.children[slot] = Some(ChildRef::Arena(child_idx));
+            }
+            MptNode::Leaf(_) => unreachable!("leaf cannot own child ref"),
+        }
+
+        Ok(child_idx)
     }
 
     fn root_hash_and_dirty_blobs_parallel_inner(

@@ -862,7 +862,12 @@ impl MptCommitStore {
             if existing_root == EMPTY_ROOT_HASH {
                 self.storage_tries.insert(dirty.hashed_address, MptTree::new());
             } else {
-                storage_loads.push((dirty.hashed_address, existing_root));
+                let touched_slots = dirty
+                    .storage_changes
+                    .iter()
+                    .map(|change| Nibbles::unpack(&change.hashed_slot))
+                    .collect::<Vec<_>>();
+                storage_loads.push((dirty.hashed_address, existing_root, touched_slots));
             }
         }
 
@@ -871,8 +876,8 @@ impl MptCommitStore {
             let persisted = Arc::clone(&self.persisted);
             let loaded_tries: Vec<(B256, MptTree)> = storage_loads
                 .into_par_iter()
-                .map(|(hashed_address, existing_root)| {
-                    persisted::load_tree_from_root(&persisted, existing_root)
+                .map(|(hashed_address, existing_root, touched_slots)| {
+                    persisted::load_tree_paths_from_root(&persisted, existing_root, &touched_slots)
                         .map(|trie| (hashed_address, trie))
                 })
                 .collect::<Result<_>>()?;
