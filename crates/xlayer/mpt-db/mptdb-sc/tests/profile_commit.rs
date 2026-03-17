@@ -1,0 +1,305 @@
+//! Profiling test: detailed timing breakdown of mpt-db commit phases.
+//!
+//! Run with: cargo test -p mptdb-sc --release --test profile_commit -- --nocapture
+
+use alloy_primitives::{keccak256, map::HashMap as PrimitivesHashMap, Address, B256, U256};
+use alloy_trie::KECCAK_EMPTY;
+use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
+use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
+use revm_database::{states::StorageSlot, AccountStatus, StorageWithOriginalValues};
+use revm_state::AccountInfo;
+use std::time::Instant;
+use tempfile::TempDir;
+
+fn generate_accounts(
+    num: usize,
+    slots_per: usize,
+    rng: &mut StdRng,
+) -> (revm_database::BundleState, Vec<Address>) {
+    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+        PrimitivesHashMap::default();
+    let mut addresses = Vec::with_capacity(num);
+    let mut addr_buf = [0u8; 20];
+
+    for i in 0..num {
+        rng.fill_bytes(&mut addr_buf);
+        let addr = Address::from(addr_buf);
+        addresses.push(addr);
+
+        let info = AccountInfo {
+            nonce: i as u64,
+            balance: U256::from(1_000_000 * (i + 1)),
+            code_hash: KECCAK_EMPTY,
+            account_id: None,
+            code: None,
+        };
+
+        let mut storage = StorageWithOriginalValues::default();
+        for j in 0..slots_per {
+            let mut slot_bytes = [0u8; 32];
+            slot_bytes[24..32].copy_from_slice(&(j as u64).to_be_bytes());
+            storage.insert(
+                B256::from(slot_bytes).into(),
+                StorageSlot::new_changed(U256::ZERO, U256::from(j + 1)),
+            );
+        }
+
+        state.insert(
+            addr,
+            revm_database::BundleAccount {
+                info: Some(info),
+                original_info: None,
+                status: AccountStatus::Changed,
+                storage,
+            },
+        );
+    }
+
+    let bundle = revm_database::BundleState {
+        state,
+        contracts: Default::default(),
+        reverts: Default::default(),
+        state_size: 0,
+        reverts_size: 0,
+    };
+    (bundle, addresses)
+}
+
+fn generate_updates(
+    addresses: &[Address],
+    count: usize,
+    slots_per: usize,
+    block_idx: usize,
+    rng: &mut StdRng,
+) -> revm_database::BundleState {
+    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+        PrimitivesHashMap::default();
+
+    for i in 0..count {
+        let idx = rng.random_range(0..addresses.len());
+        let addr = addresses[idx];
+        let nonce = (block_idx * count + i) as u64;
+        let balance = U256::from(1_000_000 * (block_idx * count + i + 1));
+
+        let info =
+            AccountInfo { nonce, balance, code_hash: KECCAK_EMPTY, account_id: None, code: None };
+
+        let mut storage = StorageWithOriginalValues::default();
+        for j in 0..slots_per {
+            let mut slot_bytes = [0u8; 32];
+            slot_bytes[24..32].copy_from_slice(&(j as u64).to_be_bytes());
+            storage.insert(
+                B256::from(slot_bytes).into(),
+                StorageSlot::new_changed(U256::ZERO, U256::from((block_idx + j) as u128 + 1)),
+            );
+        }
+
+        state.insert(
+            addr,
+            revm_database::BundleAccount {
+                info: Some(info),
+                original_info: None,
+                status: AccountStatus::Changed,
+                storage,
+            },
+        );
+    }
+
+    revm_database::BundleState {
+        state,
+        contracts: Default::default(),
+        reverts: Default::default(),
+        state_size: 0,
+        reverts_size: 0,
+    }
+}
+
+/// Profile apply_bundle_state breakdown: how much time is spent in
+/// collect_dirty_accounts vs storage trie loading/modification.
+///
+/// Since we can't instrument library internals from a test, we measure
+/// the BundleState→DirtyAccount conversion separately by calling keccak256
+/// on all addresses+slots (which is what collect_dirty_accounts does).
+#[test]
+fn profile_b4_2_breakdown() {
+    let mut rng = StdRng::seed_from_u64(4200);
+    let (pre_pop, addrs) = generate_accounts(1_000, 10, &mut rng);
+
+    let mut rng_block = StdRng::seed_from_u64(4201);
+    let block = generate_updates(&addrs, 200, 10, 0, &mut rng_block);
+
+    // Measure the cost of keccak256 hashing (what collect_dirty_accounts does)
+    let t_hash = Instant::now();
+    for _ in 0..200 {
+        for (addr, acct) in block.state() {
+            let _ = keccak256(addr);
+            for (slot, _) in &acct.storage {
+                let _ = keccak256(B256::from(*slot));
+            }
+        }
+    }
+    let hash_us = t_hash.elapsed().as_micros() / 200;
+
+    // Count total keccak256 calls per block
+    let mut num_hash = 0usize;
+    for (_addr, acct) in block.state() {
+        num_hash += 1; // address hash
+        num_hash += acct.storage.len(); // slot hashes
+    }
+
+    println!("\n=== B4.2 Breakdown ===");
+    println!("Unique accounts in block: {}", block.state().len());
+    println!("Total keccak256 calls per apply: {num_hash}");
+    println!("keccak256 cost: {hash_us}µs ({num_hash} hashes)");
+
+    // Now profile the full pipeline
+    let iterations = 50;
+    let mut apply_times = Vec::new();
+    let mut commit_times = Vec::new();
+
+    for _ in 0..iterations {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        store.apply_bundle_state(&pre_pop).unwrap();
+        store.commit().unwrap();
+
+        let t0 = Instant::now();
+        store.apply_bundle_state(&block).unwrap();
+        apply_times.push(t0.elapsed().as_micros());
+
+        let t1 = Instant::now();
+        store.commit().unwrap();
+        commit_times.push(t1.elapsed().as_micros());
+
+        store.close().unwrap();
+    }
+
+    apply_times.sort();
+    commit_times.sort();
+
+    let p50 = |v: &[u128]| v[v.len() / 2];
+    let p10 = |v: &[u128]| v[v.len() / 10];
+
+    println!("apply_bundle_state: p10={}µs p50={}µs", p10(&apply_times), p50(&apply_times));
+    println!("commit:             p10={}µs p50={}µs", p10(&commit_times), p50(&commit_times));
+    println!(
+        "total:              p10={}µs p50={}µs",
+        p10(&apply_times) + p10(&commit_times),
+        p50(&apply_times) + p50(&commit_times)
+    );
+
+    // Also profile what reth-equivalent hashing would cost
+    // (BundleState → HashedPostState is essentially keccak256 on all keys)
+    println!("\nFor reference:");
+    println!("  keccak256 per address: ~{}ns", {
+        let t = Instant::now();
+        let dummy = [0u8; 20];
+        for _ in 0..100_000 {
+            let _ = keccak256(dummy);
+        }
+        t.elapsed().as_nanos() / 100_000
+    });
+    println!("  keccak256 per slot:    ~{}ns", {
+        let t = Instant::now();
+        let dummy = [0u8; 32];
+        for _ in 0..100_000 {
+            let _ = keccak256(dummy);
+        }
+        t.elapsed().as_nanos() / 100_000
+    });
+}
+
+/// Profile B4.3 with per-block breakdown.
+#[test]
+fn profile_b4_3_per_block() {
+    let mut rng = StdRng::seed_from_u64(4300);
+    let (pre_pop, addrs) = generate_accounts(1_000, 10, &mut rng);
+
+    let mut rng_blocks = StdRng::seed_from_u64(4301);
+    let blocks: Vec<_> =
+        (0..10).map(|i| generate_updates(&addrs, 200, 10, i, &mut rng_blocks)).collect();
+
+    let dir = TempDir::new().unwrap();
+    let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+    store.apply_bundle_state(&pre_pop).unwrap();
+    store.commit().unwrap();
+
+    println!("\n=== B4.3 Per-Block Profile (release mode) ===");
+    println!("{:<8} {:<12} {:<12} {:<12}", "Block", "Apply(µs)", "Commit(µs)", "Total(µs)");
+
+    let mut total_apply = 0u128;
+    let mut total_commit = 0u128;
+
+    for (i, block) in blocks.iter().enumerate() {
+        let t0 = Instant::now();
+        store.apply_bundle_state(block).unwrap();
+        let apply_us = t0.elapsed().as_micros();
+
+        let t1 = Instant::now();
+        store.commit().unwrap();
+        let commit_us = t1.elapsed().as_micros();
+
+        total_apply += apply_us;
+        total_commit += commit_us;
+
+        println!("{:<8} {:<12} {:<12} {:<12}", i + 1, apply_us, commit_us, apply_us + commit_us);
+    }
+
+    println!(
+        "{:<8} {:<12} {:<12} {:<12}",
+        "TOTAL",
+        total_apply,
+        total_commit,
+        total_apply + total_commit
+    );
+    println!(
+        "{:<8} {:<12} {:<12} {:<12}",
+        "AVG",
+        total_apply / 10,
+        total_commit / 10,
+        (total_apply + total_commit) / 10
+    );
+
+    store.close().unwrap();
+}
+
+/// Profile B4.4 large scale.
+#[test]
+#[ignore]
+fn profile_b4_4_large() {
+    let mut rng = StdRng::seed_from_u64(4400);
+    let (pre_pop, addrs) = generate_accounts(200_000, 10, &mut rng);
+
+    let mut rng_blocks = StdRng::seed_from_u64(4401);
+    let blocks: Vec<_> =
+        (0..10).map(|i| generate_updates(&addrs, 2_000, 10, i, &mut rng_blocks)).collect();
+
+    let dir = TempDir::new().unwrap();
+    let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+    let t0 = Instant::now();
+    store.apply_bundle_state(&pre_pop).unwrap();
+    println!("\n=== B4.4 Profile (200K pre-pop, 10 x 2K updates) ===");
+    println!("Pre-pop apply: {}ms", t0.elapsed().as_millis());
+    let t1 = Instant::now();
+    store.commit().unwrap();
+    println!("Pre-pop commit: {}ms", t1.elapsed().as_millis());
+
+    println!("{:<8} {:<12} {:<12} {:<12}", "Block", "Apply(ms)", "Commit(ms)", "Total(ms)");
+
+    for (i, block) in blocks.iter().enumerate() {
+        let t0 = Instant::now();
+        store.apply_bundle_state(block).unwrap();
+        let apply_ms = t0.elapsed().as_millis();
+
+        let t1 = Instant::now();
+        store.commit().unwrap();
+        let commit_ms = t1.elapsed().as_millis();
+
+        println!("{:<8} {:<12} {:<12} {:<12}", i + 1, apply_ms, commit_ms, apply_ms + commit_ms);
+    }
+
+    store.close().unwrap();
+}

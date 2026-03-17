@@ -171,20 +171,36 @@ impl MptTree {
             }
         };
 
+        // Cache both the RLP and its hash for future fast lookups
+        if rlp.len() >= 32 {
+            self.arena.set_hash(idx, hash::hash_rlp(&rlp));
+        }
         self.arena.set_rlp(idx, rlp.clone());
         rlp
     }
 
     /// Layer 2: encode a child reference for embedding in parent.
+    ///
+    /// Optimization: if the child is clean and has a cached hash, return the
+    /// hash directly without recursing into the subtree. This avoids traversing
+    /// clean subtrees during root computation.
     fn encode_child_for_parent(&mut self, child: &ChildRef) -> Vec<u8> {
         match child {
             ChildRef::Arena(idx) => {
                 let idx = *idx;
+                // Fast path: clean node with cached hash — skip recursion entirely
+                if !self.arena.is_dirty(idx) {
+                    if let Some(h) = self.arena.get_hash(idx) {
+                        return h.to_vec();
+                    }
+                }
                 let rlp = self.encode_node(idx);
                 if rlp.len() < 32 {
                     rlp
                 } else {
-                    hash::hash_rlp(&rlp).to_vec()
+                    let h = hash::hash_rlp(&rlp);
+                    self.arena.set_hash(idx, h);
+                    h.to_vec()
                 }
             }
             ChildRef::Inline(rlp) => rlp.clone(),

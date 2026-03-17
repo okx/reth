@@ -7,6 +7,9 @@ pub struct MutableTrieArena {
     /// RLP encoding cache aligned with nodes.
     /// After insert/delete, caches on the path from modified node to root must be cleared.
     rlp_cache: Vec<Option<Vec<u8>>>,
+    /// Hash cache: keccak256(rlp) for nodes whose RLP >= 32 bytes.
+    /// Used to avoid re-entering clean subtrees during encode_child_for_parent.
+    hash_cache: Vec<Option<alloy_primitives::B256>>,
     /// Dirty tracking: true if the node was modified since last `clear_all_dirty()`.
     /// New nodes allocated via `alloc()` are dirty by default.
     /// Nodes loaded from persisted storage via `alloc_clean()` are clean.
@@ -15,13 +18,14 @@ pub struct MutableTrieArena {
 
 impl MutableTrieArena {
     pub fn new() -> Self {
-        Self { nodes: Vec::new(), rlp_cache: Vec::new(), dirty: Vec::new() }
+        Self { nodes: Vec::new(), rlp_cache: Vec::new(), hash_cache: Vec::new(), dirty: Vec::new() }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             nodes: Vec::with_capacity(cap),
             rlp_cache: Vec::with_capacity(cap),
+            hash_cache: Vec::with_capacity(cap),
             dirty: Vec::with_capacity(cap),
         }
     }
@@ -31,6 +35,7 @@ impl MutableTrieArena {
         let idx = self.nodes.len() as u32;
         self.nodes.push(node);
         self.rlp_cache.push(None);
+        self.hash_cache.push(None);
         self.dirty.push(true);
         idx
     }
@@ -40,6 +45,7 @@ impl MutableTrieArena {
         let idx = self.nodes.len() as u32;
         self.nodes.push(node);
         self.rlp_cache.push(None);
+        self.hash_cache.push(None);
         self.dirty.push(false);
         idx
     }
@@ -79,9 +85,20 @@ impl MutableTrieArena {
         self.rlp_cache[index as usize] = Some(rlp);
     }
 
-    /// Clear cached RLP for a node (cache invalidation).
+    /// Clear cached RLP and hash for a node (cache invalidation on modification).
     pub fn clear_rlp(&mut self, index: u32) {
         self.rlp_cache[index as usize] = None;
+        self.hash_cache[index as usize] = None;
+    }
+
+    /// Get cached hash for a node (keccak256 of its RLP).
+    pub fn get_hash(&self, index: u32) -> Option<alloy_primitives::B256> {
+        self.hash_cache[index as usize]
+    }
+
+    /// Set cached hash for a node.
+    pub fn set_hash(&mut self, index: u32, hash: alloy_primitives::B256) {
+        self.hash_cache[index as usize] = Some(hash);
     }
 
     /// Number of nodes in the arena.

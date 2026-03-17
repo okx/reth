@@ -153,7 +153,7 @@ impl MptCommitStore {
         // Bounded channel capacity of 2 provides natural backpressure: at most
         // 2 uncommitted persist jobs can be in flight before send() blocks.
         let (persist_tx, persist_handle) = if !read_only {
-            let (tx, rx) = crossbeam_channel::bounded::<PersistJob>(2);
+            let (tx, rx) = crossbeam_channel::bounded::<PersistJob>(16);
             let persisted_clone = Arc::clone(&persisted);
             let handle = std::thread::Builder::new()
                 .name("mpt-persist".to_string())
