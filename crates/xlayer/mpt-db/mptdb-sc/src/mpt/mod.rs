@@ -16,7 +16,7 @@ pub mod r#trait;
 pub mod tree;
 pub mod tree_algo;
 
-pub use commit_store::MptCommitStore;
+pub use commit_store::{CommitProfile, MptCommitStore};
 pub use config::MptConfig;
 pub use manifest::VersionManifest;
 pub use persisted::PersistedTrieStore;

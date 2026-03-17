@@ -1,8 +1,25 @@
 use alloy_primitives::B256;
 use alloy_trie::Nibbles;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+fn serialize_nibbles<S>(nibbles: &Nibbles, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let bytes: Vec<u8> = nibbles.iter().collect();
+    bytes.serialize(serializer)
+}
+
+fn deserialize_nibbles<'de, D>(deserializer: D) -> Result<Nibbles, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let bytes = Vec::<u8>::deserialize(deserializer)?;
+    Ok(Nibbles::from_nibbles(&bytes))
+}
 
 /// MPT node, stored in an arena.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MptNode {
     /// 16-way branch with optional value.
     Branch(BranchNode),
@@ -12,20 +29,22 @@ pub enum MptNode {
     Leaf(LeafNode),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BranchNode {
     pub children: [Option<ChildRef>; 16],
     pub value: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExtensionNode {
+    #[serde(serialize_with = "serialize_nibbles", deserialize_with = "deserialize_nibbles")]
     pub nibbles: Nibbles,
     pub child: ChildRef,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LeafNode {
+    #[serde(serialize_with = "serialize_nibbles", deserialize_with = "deserialize_nibbles")]
     pub nibbles: Nibbles,
     pub value: Vec<u8>,
 }
@@ -33,7 +52,7 @@ pub struct LeafNode {
 /// Child node reference: three forms.
 /// In Phase 1 live tree, only Arena(u32) is used.
 /// Hash and Inline are produced by decode_node (Phase 5 disk loading).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ChildRef {
     /// Node in the current mutable arena.
     Arena(u32),

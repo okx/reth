@@ -1,7 +1,9 @@
 use super::node::MptNode;
+use serde::{Deserialize, Serialize};
 
 /// Mutable trie arena for the current block.
 /// Phase 1: pure mutable arena, no generation/frozen/hash cache.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MutableTrieArena {
     nodes: Vec<MptNode>,
     /// RLP encoding cache aligned with nodes.

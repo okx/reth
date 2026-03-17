@@ -4,7 +4,7 @@
 
 use alloy_primitives::{keccak256, map::HashMap as PrimitivesHashMap, Address, B256, U256};
 use alloy_trie::KECCAK_EMPTY;
-use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
+use mptdb_sc::mpt::{CommitProfile, MptCommitStore, MptCommitter};
 use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use revm_database::{states::StorageSlot, AccountStatus, StorageWithOriginalValues};
 use revm_state::AccountInfo;
@@ -168,9 +168,8 @@ fn profile_b4_2_breakdown() {
         store.apply_bundle_state(&block).unwrap();
         apply_times.push(t0.elapsed().as_micros());
 
-        let t1 = Instant::now();
-        store.commit().unwrap();
-        commit_times.push(t1.elapsed().as_micros());
+        let ((_version, _root), profile) = store.commit_with_profile().unwrap();
+        commit_times.push(profile.total_commit.as_micros());
 
         store.close().unwrap();
     }
@@ -237,9 +236,8 @@ fn profile_b4_3_per_block() {
         store.apply_bundle_state(block).unwrap();
         let apply_us = t0.elapsed().as_micros();
 
-        let t1 = Instant::now();
-        store.commit().unwrap();
-        let commit_us = t1.elapsed().as_micros();
+        let ((_version, _root), profile) = store.commit_with_profile().unwrap();
+        let commit_us = profile.total_commit.as_micros();
 
         total_apply += apply_us;
         total_commit += commit_us;
@@ -263,6 +261,56 @@ fn profile_b4_3_per_block() {
     );
 
     store.close().unwrap();
+}
+
+#[test]
+fn profile_commit_phases_structured() {
+    let mut rng = StdRng::seed_from_u64(5200);
+    let (pre_pop, addrs) = generate_accounts(1_000, 10, &mut rng);
+
+    let mut rng_block = StdRng::seed_from_u64(5201);
+    let block = generate_updates(&addrs, 200, 10, 0, &mut rng_block);
+
+    let dir = TempDir::new().unwrap();
+    let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+    store.apply_bundle_state(&pre_pop).unwrap();
+    store.commit().unwrap();
+
+    store.apply_bundle_state(&block).unwrap();
+    let ((_version, _root), profile) = store.commit_with_profile().unwrap();
+    print_profile("B4.2 single-block commit profile", &profile);
+    store.close().unwrap();
+}
+
+#[test]
+fn profile_reopen_from_checkpoint_baseline() {
+    let mut rng = StdRng::seed_from_u64(5300);
+    let (pre_pop, _addrs) = generate_accounts(10_000, 4, &mut rng);
+
+    let dir = TempDir::new().unwrap();
+    let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+    store.apply_bundle_state(&pre_pop).unwrap();
+    store.commit().unwrap();
+    store.close().unwrap();
+
+    let t = Instant::now();
+    let reopened = MptCommitStore::open(dir.path(), false).unwrap();
+    let reopen_ms = t.elapsed().as_millis();
+
+    println!("\n=== Reopen Checkpoint Baseline ===");
+    println!("reopen from checkpoint-backed account trie: {reopen_ms} ms");
+    println!("frontier: {:?}", reopened.frontier());
+}
+
+fn print_profile(label: &str, profile: &CommitProfile) {
+    println!("\n=== {label} ===");
+    println!("apply_bundle_state:     {:>8} µs", profile.apply_bundle_state.as_micros());
+    println!("storage_roots:          {:>8} µs", profile.storage_roots.as_micros());
+    println!("account_updates:        {:>8} µs", profile.account_updates.as_micros());
+    println!("account_root_and_blobs: {:>8} µs", profile.account_root_and_blobs.as_micros());
+    println!("persist_and_manifest:   {:>8} µs", profile.persist_and_manifest.as_micros());
+    println!("cache_publish:          {:>8} µs", profile.cache_publish.as_micros());
+    println!("total_commit:           {:>8} µs", profile.total_commit.as_micros());
 }
 
 /// Profile B4.4 large scale.

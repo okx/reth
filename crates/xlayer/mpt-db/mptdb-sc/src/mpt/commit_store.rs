@@ -7,8 +7,10 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use reth_trie_common::AccountProof;
 use revm_database::BundleState;
+use schnellru::{ByLength, LruMap};
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
@@ -16,6 +18,7 @@ use std::{
         Arc,
     },
     thread::JoinHandle,
+    time::Duration,
 };
 
 use super::{
@@ -62,6 +65,64 @@ struct PersistJob {
     done: Option<crossbeam_channel::Sender<Result<()>>>,
 }
 
+struct StorageTrieCache {
+    inner: LruMap<B256, MptTree, ByLength>,
+    capacity: usize,
+}
+
+impl StorageTrieCache {
+    fn new(capacity: usize) -> Self {
+        let limit = capacity.max(1) as u32;
+        Self { inner: LruMap::new(ByLength::new(limit)), capacity }
+    }
+
+    fn remove(&mut self, key: &B256) -> Option<MptTree> {
+        self.inner.remove(key)
+    }
+
+    fn insert(&mut self, key: B256, trie: MptTree) {
+        if self.capacity == 0 {
+            return;
+        }
+        self.inner.remove(&key);
+        let _ = self.inner.get_or_insert(key, || trie);
+    }
+
+    fn contains_key(&self, key: &B256) -> bool {
+        self.inner.peek(key).is_some()
+    }
+
+    fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CommitProfile {
+    pub apply_bundle_state: Duration,
+    pub storage_roots: Duration,
+    pub account_updates: Duration,
+    pub account_root_and_blobs: Duration,
+    pub persist_and_manifest: Duration,
+    pub cache_publish: Duration,
+    pub total_commit: Duration,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AccountTrieCheckpoint {
+    version: i64,
+    root: B256,
+    trie: MptTree,
+}
+
 /// MPT-based commit store with persistence, rollback, and recovery support.
 pub struct MptCommitStore {
     #[allow(dead_code)]
@@ -73,7 +134,7 @@ pub struct MptCommitStore {
     storage_tries: HashMap<B256, MptTree>,
     /// Cross-block LRU cache for storage tries. After commit, clean tries are moved here
     /// so the next block can reuse them without reloading from RocksDB.
-    storage_trie_cache: HashMap<B256, MptTree>,
+    storage_trie_cache: StorageTrieCache,
     dirty_accounts: Vec<DirtyAccount>,
 
     persisted: Arc<PersistedTrieStore>,
@@ -97,6 +158,10 @@ pub struct MptCommitStore {
     persist_handle: Option<JoinHandle<()>>,
     async_error: Arc<AtomicBool>,
     async_error_detail: Arc<Mutex<Option<String>>>,
+    last_apply_duration: Duration,
+    last_commit_profile: CommitProfile,
+    #[cfg(test)]
+    loaded_from_checkpoint: bool,
 
     #[cfg(test)]
     fail_point: Option<CommitFailPoint>,
@@ -126,6 +191,60 @@ impl MptCommitStore {
         } else {
             Ok(())
         }
+    }
+
+    fn checkpoint_path(dir: &Path) -> PathBuf {
+        dir.join("account_trie_checkpoint.bin")
+    }
+
+    fn try_load_checkpoint(dir: &Path, version: i64, root: B256) -> Result<Option<MptTree>> {
+        let path = Self::checkpoint_path(dir);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+        let checkpoint: AccountTrieCheckpoint = match bincode::deserialize(&bytes) {
+            Ok(cp) => cp,
+            Err(_) => return Ok(None),
+        };
+        if checkpoint.version != version || checkpoint.root != root {
+            return Ok(None);
+        }
+        Ok(Some(checkpoint.trie))
+    }
+
+    fn save_checkpoint(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        if self.applied_this_block {
+            return Ok(());
+        }
+        let root = self.manifest.get_root(self.version).unwrap_or(EMPTY_ROOT_HASH);
+        let checkpoint =
+            AccountTrieCheckpoint { version: self.version, root, trie: self.account_trie.clone() };
+        let bytes = bincode::serialize(&checkpoint)
+            .map_err(|e| MptDbError::Other(format!("serialize account trie checkpoint: {e}")))?;
+        let path = Self::checkpoint_path(&self.dir);
+        let tmp = path.with_extension("bin.tmp");
+        fs::write(&tmp, bytes)
+            .map_err(|e| MptDbError::Other(format!("write account trie checkpoint tmp: {e}")))?;
+        fs::rename(&tmp, &path)
+            .map_err(|e| MptDbError::Other(format!("rename account trie checkpoint: {e}")))?;
+        Ok(())
+    }
+
+    fn reload_account_trie(&mut self) -> Result<()> {
+        let root = self.manifest.get_root(self.manifest.latest_version).unwrap_or(EMPTY_ROOT_HASH);
+        self.account_trie =
+            match Self::try_load_checkpoint(&self.dir, self.manifest.latest_version, root)? {
+                Some(trie) => trie,
+                None => persisted::load_tree_from_root(&self.persisted, root)?,
+            };
+        Ok(())
     }
 
     /// Open an MptCommitStore at the given directory with default configuration.
@@ -175,9 +294,18 @@ impl MptCommitStore {
             config.persisted_node_cache_capacity,
         )?);
 
-        // Load account trie from latest version's root
         let root = manifest.get_root(manifest.latest_version).unwrap_or(EMPTY_ROOT_HASH);
-        let account_trie = persisted::load_tree_from_root(&persisted, root)?;
+        #[cfg(test)]
+        let (account_trie, loaded_from_checkpoint) =
+            match Self::try_load_checkpoint(dir, manifest.latest_version, root)? {
+                Some(trie) => (trie, true),
+                None => (persisted::load_tree_from_root(&persisted, root)?, false),
+            };
+        #[cfg(not(test))]
+        let account_trie = match Self::try_load_checkpoint(dir, manifest.latest_version, root)? {
+            Some(trie) => trie,
+            None => persisted::load_tree_from_root(&persisted, root)?,
+        };
 
         let version = manifest.latest_version;
 
@@ -283,7 +411,7 @@ impl MptCommitStore {
             manifest_path,
             account_trie,
             storage_tries: HashMap::new(),
-            storage_trie_cache: HashMap::new(),
+            storage_trie_cache: StorageTrieCache::new(config.storage_trie_cache_capacity),
             dirty_accounts: Vec::new(),
             persisted,
             manifest,
@@ -299,6 +427,10 @@ impl MptCommitStore {
             persist_handle,
             async_error,
             async_error_detail,
+            last_apply_duration: Duration::ZERO,
+            last_commit_profile: CommitProfile::default(),
+            #[cfg(test)]
+            loaded_from_checkpoint,
             #[cfg(test)]
             fail_point: None,
             #[cfg(test)]
@@ -335,6 +467,13 @@ impl MptCommitStore {
         existing_root: B256,
     ) -> Result<()> {
         if self.storage_tries.contains_key(hashed_address) {
+            return Ok(());
+        }
+        // Fresh accounts and empty storage roots do not need a disk lookup.
+        // Materializing an empty trie in memory is equivalent and avoids
+        // forcing a persist barrier on the first touched block.
+        if existing_root == EMPTY_ROOT_HASH {
+            self.storage_tries.insert(*hashed_address, MptTree::new());
             return Ok(());
         }
         // Check cross-block cache before hitting RocksDB
@@ -382,6 +521,9 @@ impl MptCommitStore {
     /// itself does not perform any extra RocksDB or manifest writes.
     pub fn flush_persist(&self) -> Result<()> {
         self.check_async_error()?;
+        if self.durable_version.load(Ordering::Acquire) >= self.version {
+            return Ok(());
+        }
         if let Some(ref tx) = self.persist_tx {
             let (done_tx, done_rx) = crossbeam_channel::bounded::<Result<()>>(0);
             let job = PersistJob {
@@ -436,6 +578,10 @@ impl MptCommitStore {
     pub(crate) fn set_parallelism_thresholds(&mut self, thresholds: ParallelismThresholds) {
         self.parallelism = thresholds;
     }
+
+    pub(crate) fn loaded_from_checkpoint(&self) -> bool {
+        self.loaded_from_checkpoint
+    }
 }
 
 impl MptCommitter for MptCommitStore {
@@ -449,12 +595,14 @@ impl MptCommitter for MptCommitStore {
             ));
         }
 
+        let start = std::time::Instant::now();
         let apply_result = self.apply_bundle_state_inner(bundle);
         if apply_result.is_err() {
             self.poisoned = true;
             return apply_result;
         }
 
+        self.last_apply_duration = start.elapsed();
         self.applied_this_block = true;
         Ok(())
     }
@@ -483,14 +631,20 @@ impl MptCommitter for MptCommitStore {
         self.flush_persist()?;
         // Always reload manifest from disk
         self.manifest = VersionManifest::load(&self.manifest_path)?;
-        let root = self.manifest.get_root(self.manifest.latest_version).unwrap_or(EMPTY_ROOT_HASH);
-        self.account_trie = persisted::load_tree_from_root(&self.persisted, root)?;
+        self.reload_account_trie()?;
         self.version = self.manifest.latest_version;
         self.dirty_accounts.clear();
         self.storage_tries.clear();
         self.storage_trie_cache.clear();
         self.applied_this_block = false;
         self.poisoned = false;
+        #[cfg(test)]
+        {
+            let root =
+                self.manifest.get_root(self.manifest.latest_version).unwrap_or(EMPTY_ROOT_HASH);
+            self.loaded_from_checkpoint =
+                Self::try_load_checkpoint(&self.dir, self.manifest.latest_version, root)?.is_some();
+        }
         Ok(())
     }
 
@@ -518,6 +672,8 @@ impl MptCommitter for MptCommitStore {
     fn close(&mut self) -> Result<()> {
         // Drop the sender to signal the background worker to stop, then wait
         // for it to finish all in-flight persist jobs.
+        self.flush_persist()?;
+        self.save_checkpoint()?;
         self.persist_tx.take();
         if let Some(handle) = self.persist_handle.take() {
             handle.join().map_err(|_| MptDbError::Other("persist worker panicked".to_string()))?;
@@ -636,6 +792,15 @@ impl MptCommitter for MptCommitStore {
 }
 
 impl MptCommitStore {
+    pub fn last_commit_profile(&self) -> &CommitProfile {
+        &self.last_commit_profile
+    }
+
+    pub fn commit_with_profile(&mut self) -> Result<((i64, B256), CommitProfile)> {
+        let result = self.commit()?;
+        Ok((result, self.last_commit_profile.clone()))
+    }
+
     fn apply_bundle_state_inner(&mut self, bundle: &BundleState) -> Result<()> {
         let dirty_accounts = state::collect_dirty_accounts(bundle)?;
 
@@ -693,7 +858,9 @@ impl MptCommitStore {
         // Collect DELETE/REUSE roots serially (cheap lookups), then compute
         // RECOMPUTE roots potentially in parallel using mem::take on
         // storage_tries for ownership transfer.
+        let profile_start = std::time::Instant::now();
         let mut storage_roots: HashMap<B256, B256> = HashMap::new();
+        let storage_start = std::time::Instant::now();
 
         // Pre-fill DELETE and REUSE cases (no trie computation needed)
         for dirty in &self.dirty_accounts {
@@ -750,7 +917,10 @@ impl MptCommitStore {
             storage_roots.insert(artifact.hashed_address, artifact.storage_root);
         }
 
+        let storage_roots_elapsed = storage_start.elapsed();
+
         // Phase 2: update account trie
+        let account_updates_start = std::time::Instant::now();
         for dirty in &self.dirty_accounts {
             let key = Nibbles::unpack(&dirty.hashed_address);
             let storage_root = storage_roots[&dirty.hashed_address];
@@ -779,9 +949,12 @@ impl MptCommitStore {
                 }
             }
         }
+        let account_updates_elapsed = account_updates_start.elapsed();
 
         // Phase 2b: compute state root and collect dirty blobs in one pass
+        let account_root_start = std::time::Instant::now();
         let (state_root, account_blobs) = self.account_trie.root_hash_and_dirty_blobs();
+        let account_root_elapsed = account_root_start.elapsed();
 
         // Separate node blobs from tries so we can cache tries after persist
         let mut storage_cache_candidates: Vec<(B256, MptTree)> =
@@ -824,6 +997,7 @@ impl MptCommitStore {
         let use_async =
             all_blobs.len() < self.config.async_blob_threshold && self.persist_tx.is_some();
 
+        let persist_start = std::time::Instant::now();
         if use_async {
             // Pre-populate the node cache so subsequent reads can find these
             // nodes even before the background persist writes them to RocksDB.
@@ -846,10 +1020,11 @@ impl MptCommitStore {
             // Sync persist is immediately durable
             self.durable_version.store(new_version, Ordering::Release);
         }
+        let persist_elapsed = persist_start.elapsed();
 
         // Collect deleted accounts before clearing dirty_accounts, so we can
         // exclude them from the storage trie cache.
-        let deleted_accounts: std::collections::HashSet<B256> = self
+        let deleted_accounts: HashSet<B256> = self
             .dirty_accounts
             .iter()
             .filter(|d| d.info.is_none() && d.storage_wiped)
@@ -865,6 +1040,7 @@ impl MptCommitStore {
 
         // Move committed storage tries into the cross-block cache so the next
         // block can reuse them without reloading from RocksDB.
+        let cache_publish_start = std::time::Instant::now();
         for (addr, mut trie) in storage_cache_candidates {
             if deleted_accounts.contains(&addr) {
                 continue;
@@ -872,11 +1048,17 @@ impl MptCommitStore {
             trie.clear_dirty();
             self.storage_trie_cache.insert(addr, trie);
         }
+        let cache_publish_elapsed = cache_publish_start.elapsed();
 
-        // Evict if cache exceeds capacity: simple strategy — clear entire cache
-        if self.storage_trie_cache.len() > self.config.storage_trie_cache_capacity {
-            self.storage_trie_cache.clear();
-        }
+        self.last_commit_profile = CommitProfile {
+            apply_bundle_state: self.last_apply_duration,
+            storage_roots: storage_roots_elapsed,
+            account_updates: account_updates_elapsed,
+            account_root_and_blobs: account_root_elapsed,
+            persist_and_manifest: persist_elapsed,
+            cache_publish: cache_publish_elapsed,
+            total_commit: profile_start.elapsed(),
+        };
 
         Ok((new_version, state_root))
     }
@@ -930,19 +1112,19 @@ impl<'a> super::r#trait::MptSnapshotImporter for BoundImporter<'a> {
         self.store.durable_version.store(self.store.version, Ordering::Release);
 
         // Reload account trie from imported root
-        let root = self
-            .store
-            .manifest
-            .get_root(self.store.manifest.latest_version)
-            .unwrap_or(EMPTY_ROOT_HASH);
-        self.store.account_trie = persisted::load_tree_from_root(&self.store.persisted, root)?;
+        self.store.reload_account_trie()?;
 
         // Reset working state
         self.store.dirty_accounts.clear();
         self.store.storage_tries.clear();
-        self.store.storage_trie_cache.clear();
+        self.store.storage_trie_cache =
+            StorageTrieCache::new(self.store.config.storage_trie_cache_capacity);
         self.store.applied_this_block = false;
         self.store.poisoned = false;
+        #[cfg(test)]
+        {
+            self.store.loaded_from_checkpoint = true;
+        }
 
         Ok(())
     }
@@ -1457,6 +1639,30 @@ mod tests {
         store.close().unwrap();
         // Reopen should succeed
         let _store2 = MptCommitStore::open(dir.path(), false).unwrap();
+    }
+
+    #[test]
+    fn t5_20_checkpoint_written_and_used_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let checkpoint_path = MptCommitStore::checkpoint_path(dir.path());
+
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        let addr = Address::repeat_byte(0x44);
+        let info = default_info(1, 123);
+        let bundle = make_bundle(vec![(
+            addr,
+            Some(info),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(9))],
+        )]);
+        store.apply_bundle_state(&bundle).unwrap();
+        store.commit().unwrap();
+        store.close().unwrap();
+
+        assert!(checkpoint_path.exists(), "checkpoint should be written on close");
+
+        let store2 = MptCommitStore::open(dir.path(), false).unwrap();
+        assert!(store2.loaded_from_checkpoint(), "reopen should load account trie checkpoint");
     }
 
     // ── Phase 4 parallel tests ──

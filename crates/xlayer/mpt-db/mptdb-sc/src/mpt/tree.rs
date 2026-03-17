@@ -1,6 +1,7 @@
 use alloy_primitives::B256;
 use alloy_trie::Nibbles;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use super::{
     arena::MutableTrieArena,
@@ -12,6 +13,7 @@ use super::{
 };
 
 /// Phase 1: Pure mutable arena MPT, no frozen/generation.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MptTree {
     pub(crate) arena: MutableTrieArena,
     /// Root node index (None = empty trie).
