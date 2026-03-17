@@ -131,7 +131,7 @@ mod tests {
         }
         let root = tree.root_hash();
         let blobs = tree.collect_node_blobs();
-        store.persist_batch_durable(&blobs).unwrap();
+        store.persist_batch(&blobs, true).unwrap();
         root
     }
 
@@ -215,7 +215,7 @@ mod tests {
         let (store, _dir) = tmp_store();
         let fake_root = B256::repeat_byte(0xab);
         // Write garbage data under a valid-looking hash
-        store.persist_batch_durable(&[(fake_root, vec![0xff, 0xfe, 0xfd])]).unwrap();
+        store.persist_batch(&[(fake_root, vec![0xff, 0xfe, 0xfd])], true).unwrap();
 
         let result = collect_reachable_hashes(&store, [fake_root]);
         assert!(result.is_err());

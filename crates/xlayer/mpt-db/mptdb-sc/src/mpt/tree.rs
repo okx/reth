@@ -365,6 +365,75 @@ impl MptTree {
             }
         }
     }
+
+    /// Collect only dirty (modified) node blobs. Requires RLP cache to be populated first
+    /// (e.g., via `encode_node`). Returns a subset of what `collect_node_blobs()` would return.
+    pub(crate) fn collect_dirty_blobs(&mut self) -> Vec<(B256, Vec<u8>)> {
+        let root_idx = match self.root {
+            Some(idx) => idx,
+            None => return vec![],
+        };
+
+        // Ensure all RLP caches are populated
+        self.encode_node(root_idx);
+
+        let mut result = Vec::new();
+        self.collect_dirty_blobs_recursive(root_idx, &mut result);
+        result
+    }
+
+    fn collect_dirty_blobs_recursive(&self, idx: u32, out: &mut Vec<(B256, Vec<u8>)>) {
+        if !self.arena.is_dirty(idx) {
+            // Clean node: all descendants are also clean (dirty propagates from
+            // leaf to root on every insert/delete), so skip this entire subtree.
+            return;
+        }
+
+        let rlp = self.arena.get_rlp(idx).expect("dirty node must have rlp cache").clone();
+        let node_hash = hash::hash_rlp(&rlp);
+        out.push((node_hash, rlp));
+
+        // Only recurse into children of dirty nodes
+        let node = self.arena.get(idx);
+        match node {
+            MptNode::Leaf(_) => {}
+            MptNode::Extension(ext) => {
+                if let ChildRef::Arena(child_idx) = &ext.child {
+                    self.collect_dirty_blobs_recursive(*child_idx, out);
+                }
+            }
+            MptNode::Branch(branch) => {
+                for child in &branch.children {
+                    if let Some(ChildRef::Arena(child_idx)) = child {
+                        self.collect_dirty_blobs_recursive(*child_idx, out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compute root hash and collect dirty blobs in a single pass.
+    /// The `encode_node` call populates the RLP cache, then we traverse
+    /// only dirty nodes to collect their (hash, rlp) pairs.
+    pub(crate) fn root_hash_and_dirty_blobs(&mut self) -> (B256, Vec<(B256, Vec<u8>)>) {
+        match self.root {
+            None => (alloy_trie::EMPTY_ROOT_HASH, vec![]),
+            Some(root_idx) => {
+                let rlp = self.encode_node(root_idx);
+                let root_hash = hash::hash_rlp(&rlp);
+
+                let mut blobs = Vec::new();
+                self.collect_dirty_blobs_recursive(root_idx, &mut blobs);
+
+                (root_hash, blobs)
+            }
+        }
+    }
+
+    /// Clear all dirty flags in the arena. Call after successful persist.
+    pub(crate) fn clear_dirty(&mut self) {
+        self.arena.clear_all_dirty();
+    }
 }
 
 impl Default for MptTree {
@@ -520,5 +589,219 @@ mod tests {
         // And serial root_hash should still work
         let hash = tree.root_hash();
         assert_ne!(hash, EMPTY_ROOT_HASH);
+    }
+
+    /// T3.1: Insert 10 keys, collect dirty blobs, then insert 1 more.
+    /// Second collect_dirty_blobs should export fewer nodes than total.
+    #[test]
+    fn t3_1_dirty_insert_only_exports_path() {
+        let mut tree = MptTree::new();
+        for i in 0u8..10 {
+            let key = nibbles_from_bytes(&[i]);
+            tree.insert(&key, vec![i; 32]);
+        }
+
+        // First commit: all nodes are dirty
+        let all_blobs = tree.collect_dirty_blobs();
+        let total_nodes = tree.collect_node_blobs().len();
+        assert_eq!(
+            all_blobs.len(),
+            total_nodes,
+            "first collect_dirty_blobs should export all nodes"
+        );
+
+        // Clear dirty flags (simulates successful persist)
+        tree.clear_dirty();
+
+        // Insert one more key
+        let new_key = nibbles_from_bytes(&[99u8]);
+        tree.insert(&new_key, vec![99; 32]);
+
+        let dirty_blobs = tree.collect_dirty_blobs();
+        let total_blobs = tree.collect_node_blobs();
+        assert!(
+            dirty_blobs.len() < total_blobs.len(),
+            "dirty blobs ({}) should be fewer than total blobs ({})",
+            dirty_blobs.len(),
+            total_blobs.len()
+        );
+        assert!(!dirty_blobs.is_empty(), "inserting a key must produce some dirty blobs");
+    }
+
+    /// T3.2: After clear_dirty with no mutations, collect_dirty_blobs returns empty.
+    #[test]
+    fn t3_2_dirty_empty_commit_exports_nothing() {
+        let mut tree = MptTree::new();
+        for i in 0u8..5 {
+            let key = nibbles_from_bytes(&[i]);
+            tree.insert(&key, vec![i; 32]);
+        }
+        let _ = tree.root_hash();
+        tree.clear_dirty();
+
+        let dirty_blobs = tree.collect_dirty_blobs();
+        assert!(
+            dirty_blobs.is_empty(),
+            "no mutations after clear_dirty should produce empty blobs"
+        );
+    }
+
+    /// T3.3: Insert keys, clear dirty, delete one key, collect_dirty_blobs.
+    /// Should only export nodes on the deletion path.
+    #[test]
+    fn t3_3_dirty_delete_exports_affected_nodes() {
+        let mut tree = MptTree::new();
+        let mut keys = Vec::new();
+        for i in 0u8..10 {
+            let key = nibbles_from_bytes(&[i]);
+            tree.insert(&key, vec![i; 32]);
+            keys.push(key);
+        }
+        let _ = tree.root_hash();
+        tree.clear_dirty();
+
+        // Delete one key
+        tree.delete(&keys[0]);
+
+        let dirty_blobs = tree.collect_dirty_blobs();
+        let total_blobs = tree.collect_node_blobs();
+        assert!(
+            dirty_blobs.len() < total_blobs.len(),
+            "dirty blobs ({}) should be fewer than total blobs ({}) after single delete",
+            dirty_blobs.len(),
+            total_blobs.len()
+        );
+        assert!(!dirty_blobs.is_empty(), "deleting a key must produce some dirty blobs");
+    }
+
+    /// T3.4: root_hash_and_dirty_blobs produces same root as root_hash.
+    #[test]
+    fn t3_4_root_hash_and_dirty_blobs_consistent() {
+        let mut tree1 = MptTree::new();
+        let mut tree2 = MptTree::new();
+        for i in 0u8..20 {
+            let key = nibbles_from_bytes(&[i]);
+            let val = vec![i; 32];
+            tree1.insert(&key, val.clone());
+            tree2.insert(&key, val);
+        }
+
+        let root1 = tree1.root_hash();
+        let (root2, blobs) = tree2.root_hash_and_dirty_blobs();
+        assert_eq!(root1, root2);
+        assert!(!blobs.is_empty());
+    }
+
+    /// T3.5: dirty blobs are a subset of all blobs.
+    #[test]
+    fn t3_5_dirty_blobs_subset_of_all() {
+        let mut tree = MptTree::new();
+        for i in 0u8..10 {
+            let key = nibbles_from_bytes(&[i]);
+            tree.insert(&key, vec![i; 32]);
+        }
+        let _ = tree.root_hash();
+        tree.clear_dirty();
+
+        // Modify a few keys
+        let key_mod = nibbles_from_bytes(&[3u8]);
+        tree.insert(&key_mod, vec![33; 32]);
+        let key_new = nibbles_from_bytes(&[200u8]);
+        tree.insert(&key_new, vec![200; 32]);
+
+        let dirty_blobs = tree.collect_dirty_blobs();
+        let all_blobs = tree.collect_node_blobs();
+
+        let all_hashes: std::collections::HashSet<B256> =
+            all_blobs.iter().map(|(h, _)| *h).collect();
+        for (h, _) in &dirty_blobs {
+            assert!(all_hashes.contains(h), "dirty blob hash {h} must exist in all blobs");
+        }
+    }
+
+    /// Warm layer test: rlp_cache survives clear_dirty, and only modified path nodes
+    /// have their cache invalidated on subsequent mutations.
+    #[test]
+    fn test_warm_layer_rlp_cache_survives_clear_dirty() {
+        let mut tree = MptTree::new();
+
+        // Step 1: Insert 20 keys and compute root hash (fills rlp_cache for all nodes)
+        for i in 0u64..20 {
+            let key = nibbles_from_bytes(&i.to_be_bytes());
+            tree.insert(&key, format!("val{i}").into_bytes());
+        }
+        let (root1, _blobs1) = tree.root_hash_and_dirty_blobs();
+        assert_ne!(root1, EMPTY_ROOT_HASH);
+
+        // Count rlp_cache entries after first root computation
+        let cache_count_after_hash =
+            (0..tree.arena.len() as u32).filter(|&i| tree.arena.get_rlp(i).is_some()).count();
+        assert!(cache_count_after_hash > 0, "root_hash_and_dirty_blobs must populate rlp_cache");
+
+        // Step 2: clear_dirty (simulates successful persist)
+        tree.clear_dirty();
+
+        // Step 3: Verify rlp_cache entries survived clear_dirty
+        let cache_count_after_clear =
+            (0..tree.arena.len() as u32).filter(|&i| tree.arena.get_rlp(i).is_some()).count();
+        assert_eq!(
+            cache_count_after_hash, cache_count_after_clear,
+            "clear_dirty must NOT clear rlp_cache: before={cache_count_after_hash}, after={cache_count_after_clear}"
+        );
+
+        // Step 4: Insert 1 more key (only clears rlp on the affected path)
+        let new_key = nibbles_from_bytes(&100u64.to_be_bytes());
+        tree.insert(&new_key, b"new_value".to_vec());
+
+        let cache_count_after_insert =
+            (0..tree.arena.len() as u32).filter(|&i| tree.arena.get_rlp(i).is_some()).count();
+        // Some cache entries should have been invalidated on the modified path,
+        // but most should survive from the previous computation.
+        // The new node itself has no cache yet, and nodes on the path were cleared.
+        // So cache_count_after_insert < cache_count_after_clear (some path nodes lost cache)
+        // but cache_count_after_insert > 0 (most nodes kept their cache).
+        assert!(
+            cache_count_after_insert > 0,
+            "most rlp_cache entries should survive a single insert"
+        );
+        // Specifically: at most ~4-5 nodes are on the insertion path (root + branch + ext + leaf),
+        // so the vast majority of the original cached entries should still be present.
+        let lost = cache_count_after_clear as isize - cache_count_after_insert as isize;
+        // We may gain new nodes from structural changes but we should not lose more than
+        // a small fraction. The new node doesn't have cache yet but path nodes were invalidated.
+        // Allow some slack for structural rearrangements.
+        assert!(
+            lost < (cache_count_after_clear as isize / 2),
+            "inserting one key should not invalidate more than half the cache: lost={lost}, total={cache_count_after_clear}"
+        );
+
+        // Step 5: Compute root hash again
+        let (root2, blobs2) = tree.root_hash_and_dirty_blobs();
+
+        // Step 6: Root must be correct (different from root1 since we added a key)
+        assert_ne!(root2, root1, "root must change after inserting a new key");
+        assert!(!blobs2.is_empty(), "dirty blobs should be non-empty for the modified path");
+
+        // Verify the new root is consistent by building a fresh tree and comparing
+        let mut fresh_tree = MptTree::new();
+        for i in 0u64..20 {
+            let key = nibbles_from_bytes(&i.to_be_bytes());
+            fresh_tree.insert(&key, format!("val{i}").into_bytes());
+        }
+        fresh_tree.insert(&new_key, b"new_value".to_vec());
+        let fresh_root = fresh_tree.root_hash();
+        assert_eq!(root2, fresh_root, "warm-layer root must match a fresh tree built from scratch");
+
+        // Verify that after the second root_hash_and_dirty_blobs, all reachable nodes
+        // have rlp_cache populated. Note: the arena may contain orphaned nodes from
+        // structural changes (the arena only grows, old nodes are not reclaimed).
+        let reachable_count = tree.collect_node_blobs().len();
+        let cache_count_final =
+            (0..tree.arena.len() as u32).filter(|&i| tree.arena.get_rlp(i).is_some()).count();
+        assert!(
+            cache_count_final >= reachable_count,
+            "after root_hash_and_dirty_blobs, all reachable nodes should have rlp_cache: \
+             cached={cache_count_final}, reachable={reachable_count}"
+        );
     }
 }

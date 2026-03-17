@@ -251,7 +251,7 @@ mod tests {
         tree.insert(&key, rlp_buf);
         let root = tree.root_hash();
         let blobs = tree.collect_node_blobs();
-        store.persist_batch_durable(&blobs).unwrap();
+        store.persist_batch(&blobs, true).unwrap();
         root
     }
 
@@ -266,7 +266,7 @@ mod tests {
         }
         let root = tree.root_hash();
         let blobs = tree.collect_node_blobs();
-        store.persist_batch_durable(&blobs).unwrap();
+        store.persist_batch(&blobs, true).unwrap();
         root
     }
 

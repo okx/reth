@@ -6413,6 +6413,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-trie",
  "codspeed-criterion-compat",
+ "crossbeam-channel",
  "fs4",
  "mptdb-common",
  "mptdb-engine",

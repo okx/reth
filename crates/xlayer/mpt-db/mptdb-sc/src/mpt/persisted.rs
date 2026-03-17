@@ -6,7 +6,8 @@ use mptdb_traits::{
     kv::{KvEngine, KvIterator},
     types::{IterOptions, WriteOptions},
 };
-use std::path::Path;
+use parking_lot::Mutex;
+use std::{collections::HashMap, path::Path};
 
 use super::{
     arena::MutableTrieArena,
@@ -15,34 +16,82 @@ use super::{
     tree::MptTree,
 };
 
+/// Default maximum number of entries in the node cache before it is cleared.
+const DEFAULT_NODE_CACHE_CAPACITY: usize = 100_000;
+
 /// Minimal persisted trie node store backed by RocksDB.
 ///
 /// Key: node_hash (B256, 32 bytes)
 /// Value: RLP-encoded node bytes
+///
+/// An application-level LRU-style cache sits in front of RocksDB to avoid
+/// repeated reads for hot nodes (top-level account trie nodes, frequently
+/// accessed storage trie roots). The cache uses a simple clear-on-overflow
+/// eviction strategy.
 pub struct PersistedTrieStore {
     engine: Option<RocksDbEngine>,
+    cache: Mutex<HashMap<B256, Vec<u8>>>,
+    cache_capacity: usize,
 }
 
 impl PersistedTrieStore {
-    /// Open a persisted trie store at the given directory.
+    /// Open a persisted trie store at the given directory with default cache capacity.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_capacity(path, DEFAULT_NODE_CACHE_CAPACITY)
+    }
+
+    /// Open a persisted trie store with a custom node cache capacity.
+    pub fn open_with_capacity(path: &Path, cache_capacity: usize) -> Result<Self> {
         std::fs::create_dir_all(path)
             .map_err(|e| MptDbError::Other(format!("create trie_nodes dir: {e}")))?;
         let engine = RocksDbEngine::open_plain(path)?;
-        Ok(Self { engine: Some(engine) })
+        Ok(Self { engine: Some(engine), cache: Mutex::new(HashMap::new()), cache_capacity })
     }
 
     /// Get a node's RLP bytes by its hash.
+    ///
+    /// Checks the in-memory cache first; on miss, reads from RocksDB and
+    /// populates the cache for subsequent lookups.
     pub fn get_node(&self, hash: B256) -> Result<Option<Vec<u8>>> {
+        // Fast path: cache hit
+        {
+            let cache = self.cache.lock();
+            if let Some(data) = cache.get(&hash) {
+                return Ok(Some(data.clone()));
+            }
+        }
+
+        // Slow path: read from RocksDB
         let engine = self
             .engine
             .as_ref()
             .ok_or_else(|| MptDbError::Other("PersistedTrieStore is closed".to_string()))?;
-        engine.get(hash.as_slice())
+        let result = engine.get(hash.as_slice())?;
+
+        // Populate cache on hit
+        if let Some(ref data) = result {
+            let mut cache = self.cache.lock();
+            if cache.len() >= self.cache_capacity {
+                cache.clear();
+            }
+            cache.insert(hash, data.clone());
+        }
+
+        Ok(result)
     }
 
-    /// Atomically persist a batch of nodes with sync=true.
-    pub fn persist_batch_durable(&self, nodes: &[(B256, Vec<u8>)]) -> Result<()> {
+    /// Atomically persist a batch of nodes.
+    ///
+    /// ## Durability Contract
+    ///
+    /// When `durable=true`, the write is fsynced before returning. This guarantees
+    /// that if the subsequent manifest save succeeds, all referenced nodes are on
+    /// stable storage.
+    ///
+    /// When `durable=false`, the write relies on RocksDB's WAL for crash recovery
+    /// but does not force an fsync. This is suitable when the caller manages
+    /// durability at a higher level (e.g., grouped commits during snapshot import).
+    pub fn persist_batch(&self, nodes: &[(B256, Vec<u8>)], durable: bool) -> Result<()> {
         let engine = self
             .engine
             .as_ref()
@@ -51,8 +100,35 @@ impl PersistedTrieStore {
         for (hash, rlp) in nodes {
             batch.set(hash.as_slice(), rlp)?;
         }
-        batch.commit(&WriteOptions { sync: true })?;
+        batch.commit(&WriteOptions { sync: durable })?;
+
+        // Populate cache with newly written nodes so subsequent reads are fast
+        {
+            let mut cache = self.cache.lock();
+            for (hash, rlp) in nodes {
+                if cache.len() >= self.cache_capacity {
+                    cache.clear();
+                }
+                cache.insert(*hash, rlp.clone());
+            }
+        }
+
         Ok(())
+    }
+
+    /// Populate the in-memory node cache without writing to disk.
+    ///
+    /// Used by the async persist path: nodes are cached in memory immediately
+    /// so subsequent reads (e.g., `load_tree_from_root`) can find them without
+    /// waiting for the background disk write to complete.
+    pub fn populate_cache(&self, nodes: &[(B256, Vec<u8>)]) {
+        let mut cache = self.cache.lock();
+        for (hash, rlp) in nodes {
+            if cache.len() >= self.cache_capacity {
+                cache.clear();
+            }
+            cache.insert(*hash, rlp.clone());
+        }
     }
 
     /// Close the store (idempotent).
@@ -87,7 +163,27 @@ impl PersistedTrieStore {
             batch.delete(hash.as_slice())?;
         }
         batch.commit(&WriteOptions { sync: true })?;
+
+        // Evict deleted nodes from cache
+        {
+            let mut cache = self.cache.lock();
+            for hash in hashes {
+                cache.remove(hash);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Clear the in-memory node cache. Useful for testing or forced reset.
+    pub fn clear_cache(&self) {
+        self.cache.lock().clear();
+    }
+
+    /// Return the current number of entries in the node cache.
+    #[cfg(test)]
+    fn cache_len(&self) -> usize {
+        self.cache.lock().len()
     }
 
     /// Check if the store contains no nodes.
@@ -127,14 +223,14 @@ fn materialize_node(
     node: MptNode,
 ) -> Result<u32> {
     match node {
-        MptNode::Leaf(leaf) => Ok(arena.alloc(MptNode::Leaf(leaf))),
+        MptNode::Leaf(leaf) => Ok(arena.alloc_clean(MptNode::Leaf(leaf))),
         MptNode::Extension(ext) => {
             let child_idx = materialize_child(store, arena, ext.child)?;
             let ext_node = MptNode::Extension(super::node::ExtensionNode {
                 nibbles: ext.nibbles,
                 child: ChildRef::Arena(child_idx),
             });
-            Ok(arena.alloc(ext_node))
+            Ok(arena.alloc_clean(ext_node))
         }
         MptNode::Branch(branch) => {
             let mut new_children: [Option<ChildRef>; 16] = std::array::from_fn(|_| None);
@@ -148,7 +244,7 @@ fn materialize_node(
                 children: new_children,
                 value: branch.value,
             });
-            Ok(arena.alloc(branch_node))
+            Ok(arena.alloc_clean(branch_node))
         }
     }
 }
@@ -190,13 +286,13 @@ mod tests {
         (store, dir)
     }
 
-    /// T4.1: persist_batch_durable + get_node roundtrip
+    /// T4.1: persist_batch + get_node roundtrip
     #[test]
     fn t4_1_persist_and_get() {
         let (store, _dir) = tmp_store();
         let hash = B256::repeat_byte(0x11);
         let data = vec![0xc1, 0x80];
-        store.persist_batch_durable(&[(hash, data.clone())]).unwrap();
+        store.persist_batch(&[(hash, data.clone())], true).unwrap();
         let result = store.get_node(hash).unwrap();
         assert_eq!(result, Some(data));
     }
@@ -207,8 +303,8 @@ mod tests {
         let (store, _dir) = tmp_store();
         let hash = B256::repeat_byte(0x22);
         let data = vec![0xc2, 0x80, 0x80];
-        store.persist_batch_durable(&[(hash, data.clone())]).unwrap();
-        store.persist_batch_durable(&[(hash, data.clone())]).unwrap();
+        store.persist_batch(&[(hash, data.clone())], true).unwrap();
+        store.persist_batch(&[(hash, data.clone())], true).unwrap();
         assert_eq!(store.get_node(hash).unwrap(), Some(data));
     }
 
@@ -231,7 +327,7 @@ mod tests {
         let original_hash = tree.root_hash();
 
         let blobs = tree.collect_node_blobs();
-        store.persist_batch_durable(&blobs).unwrap();
+        store.persist_batch(&blobs, true).unwrap();
 
         let mut reloaded = load_tree_from_root(&store, original_hash).unwrap();
         assert_eq!(reloaded.root_hash(), original_hash);
@@ -251,7 +347,7 @@ mod tests {
         let original_hash = tree.root_hash();
 
         let blobs = tree.collect_node_blobs();
-        store.persist_batch_durable(&blobs).unwrap();
+        store.persist_batch(&blobs, true).unwrap();
 
         let mut reloaded = load_tree_from_root(&store, original_hash).unwrap();
         assert_eq!(reloaded.root_hash(), original_hash);
@@ -271,7 +367,7 @@ mod tests {
         let original_hash = tree.root_hash();
 
         let blobs = tree.collect_node_blobs();
-        store.persist_batch_durable(&blobs).unwrap();
+        store.persist_batch(&blobs, true).unwrap();
 
         let mut reloaded = load_tree_from_root(&store, original_hash).unwrap();
         assert_eq!(reloaded.root_hash(), original_hash);
@@ -290,7 +386,7 @@ mod tests {
         let root_hash = tree.root_hash();
 
         let blobs = tree.collect_node_blobs();
-        store.persist_batch_durable(&blobs).unwrap();
+        store.persist_batch(&blobs, true).unwrap();
 
         let reloaded = load_tree_from_root(&store, root_hash).unwrap();
         // DFS check: all children must be Arena
@@ -342,7 +438,7 @@ mod tests {
         let blobs = tree.collect_node_blobs();
         // Only persist the root blob (first one)
         if let Some(first) = blobs.first() {
-            store.persist_batch_durable(&[first.clone()]).unwrap();
+            store.persist_batch(&[first.clone()], true).unwrap();
         }
 
         let result = load_tree_from_root(&store, root_hash);
@@ -355,7 +451,7 @@ mod tests {
         let (store, _dir) = tmp_store();
         let hash = B256::repeat_byte(0xbb);
         // Write garbage data
-        store.persist_batch_durable(&[(hash, vec![0xff, 0xfe, 0xfd])]).unwrap();
+        store.persist_batch(&[(hash, vec![0xff, 0xfe, 0xfd])], true).unwrap();
         let result = load_tree_from_root(&store, hash);
         assert!(result.is_err());
     }
@@ -404,9 +500,7 @@ mod tests {
         let (store, _dir) = tmp_store();
         let h1 = B256::repeat_byte(0x01);
         let h2 = B256::repeat_byte(0x02);
-        store
-            .persist_batch_durable(&[(h1, vec![0xc1, 0x80]), (h2, vec![0xc2, 0x80, 0x80])])
-            .unwrap();
+        store.persist_batch(&[(h1, vec![0xc1, 0x80]), (h2, vec![0xc2, 0x80, 0x80])], true).unwrap();
 
         let mut iter = store.iter_all_nodes().unwrap();
         let mut count = 0;
@@ -427,9 +521,7 @@ mod tests {
         let h1 = B256::repeat_byte(0x01);
         let h2 = B256::repeat_byte(0x02);
         let h3 = B256::repeat_byte(0x03);
-        store
-            .persist_batch_durable(&[(h1, vec![0xaa]), (h2, vec![0xbb]), (h3, vec![0xcc])])
-            .unwrap();
+        store.persist_batch(&[(h1, vec![0xaa]), (h2, vec![0xbb]), (h3, vec![0xcc])], true).unwrap();
 
         store.delete_batch_durable(&[h1, h3]).unwrap();
         assert!(store.get_node(h1).unwrap().is_none());
@@ -455,7 +547,7 @@ mod tests {
     #[test]
     fn t2_6_is_empty_after_write() {
         let (store, _dir) = tmp_store();
-        store.persist_batch_durable(&[(B256::repeat_byte(0x01), vec![0x80])]).unwrap();
+        store.persist_batch(&[(B256::repeat_byte(0x01), vec![0x80])], true).unwrap();
         assert!(!store.is_empty().unwrap());
     }
 
@@ -467,5 +559,100 @@ mod tests {
         assert!(store.iter_all_nodes().is_err());
         assert!(store.delete_batch_durable(&[B256::ZERO]).is_err());
         assert!(store.is_empty().is_err());
+    }
+
+    // ---- Node cache tests ----
+
+    /// Cache is populated by persist_batch, subsequent get_node hits cache
+    #[test]
+    fn cache_hit_after_persist() {
+        let (store, _dir) = tmp_store();
+        let hash = B256::repeat_byte(0xca);
+        let data = vec![0xc1, 0x80];
+        store.persist_batch(&[(hash, data.clone())], true).unwrap();
+
+        // Cache should contain the node after persist
+        assert_eq!(store.cache_len(), 1);
+        assert_eq!(store.get_node(hash).unwrap(), Some(data));
+    }
+
+    /// Cache miss for an unknown hash returns None
+    #[test]
+    fn cache_miss_unknown_hash() {
+        let (store, _dir) = tmp_store();
+        let hash = B256::repeat_byte(0xde);
+        assert_eq!(store.get_node(hash).unwrap(), None);
+        // Cache should remain empty on miss
+        assert_eq!(store.cache_len(), 0);
+    }
+
+    /// get_node populates cache on RocksDB hit when cache is empty
+    #[test]
+    fn cache_populated_by_get_on_miss() {
+        let (store, _dir) = tmp_store();
+        let hash = B256::repeat_byte(0xab);
+        let data = vec![0xc2, 0x80, 0x80];
+
+        // Write directly, then clear cache to simulate cold start
+        store.persist_batch(&[(hash, data.clone())], true).unwrap();
+        store.clear_cache();
+        assert_eq!(store.cache_len(), 0);
+
+        // First get_node should read from RocksDB and populate cache
+        assert_eq!(store.get_node(hash).unwrap(), Some(data));
+        assert_eq!(store.cache_len(), 1);
+    }
+
+    /// Cache is cleared when it exceeds capacity
+    #[test]
+    fn cache_cleared_on_overflow() {
+        let dir = TempDir::new().unwrap();
+        // Use a small capacity to make the test fast
+        let store = PersistedTrieStore::open_with_capacity(dir.path(), 10).unwrap();
+
+        // Fill cache to capacity via persist_batch
+        let mut nodes: Vec<(B256, Vec<u8>)> = Vec::with_capacity(10);
+        for i in 0..10u64 {
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[0..8].copy_from_slice(&i.to_le_bytes());
+            nodes.push((B256::from(hash_bytes), vec![0xc1, 0x80]));
+        }
+        store.persist_batch(&nodes, false).unwrap();
+        assert_eq!(store.cache_len(), 10);
+
+        // One more persist should trigger clear + insert the new node
+        let overflow_hash = B256::repeat_byte(0xff);
+        store.persist_batch(&[(overflow_hash, vec![0x80])], false).unwrap();
+        // Cache was cleared then 1 entry inserted
+        assert_eq!(store.cache_len(), 1);
+        assert_eq!(store.get_node(overflow_hash).unwrap(), Some(vec![0x80]));
+    }
+
+    /// clear_cache() empties the cache
+    #[test]
+    fn cache_clear_works() {
+        let (store, _dir) = tmp_store();
+        let hash = B256::repeat_byte(0x01);
+        store.persist_batch(&[(hash, vec![0x80])], true).unwrap();
+        assert!(store.cache_len() > 0);
+        store.clear_cache();
+        assert_eq!(store.cache_len(), 0);
+    }
+
+    /// delete_batch_durable evicts deleted nodes from cache
+    #[test]
+    fn cache_evict_on_delete() {
+        let (store, _dir) = tmp_store();
+        let h1 = B256::repeat_byte(0x01);
+        let h2 = B256::repeat_byte(0x02);
+        store.persist_batch(&[(h1, vec![0xaa]), (h2, vec![0xbb])], true).unwrap();
+        assert_eq!(store.cache_len(), 2);
+
+        store.delete_batch_durable(&[h1]).unwrap();
+        assert_eq!(store.cache_len(), 1);
+        // h1 gone from cache and DB
+        assert_eq!(store.get_node(h1).unwrap(), None);
+        // h2 still present
+        assert_eq!(store.get_node(h2).unwrap(), Some(vec![0xbb]));
     }
 }

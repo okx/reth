@@ -24,6 +24,7 @@ pub(crate) fn insert_recursive(
         }
         Some(idx) => {
             arena.clear_rlp(idx);
+            arena.mark_dirty(idx);
             let node = arena.get(idx).clone();
 
             match node {
@@ -205,6 +206,7 @@ pub(crate) fn delete_recursive(
     };
 
     arena.clear_rlp(idx);
+    arena.mark_dirty(idx);
     let node = arena.get(idx).clone();
 
     match node {

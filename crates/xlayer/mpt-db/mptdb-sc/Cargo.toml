@@ -8,6 +8,7 @@ mptdb-common = { workspace = true }
 mptdb-traits = { workspace = true }
 mptdb-engine = { workspace = true }
 rayon = { workspace = true }
+crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 fs4 = { workspace = true }

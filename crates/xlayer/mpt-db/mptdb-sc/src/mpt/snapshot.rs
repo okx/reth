@@ -157,7 +157,7 @@ impl SnapshotImporter {
 
     fn flush_buffer(&mut self) -> Result<()> {
         if !self.batch_buffer.is_empty() {
-            self.store.persist_batch_durable(&self.batch_buffer)?;
+            self.store.persist_batch(&self.batch_buffer, false)?;
             self.batch_buffer.clear();
         }
         Ok(())
@@ -249,7 +249,7 @@ mod tests {
         }
         let root = tree.root_hash();
         let blobs = tree.collect_node_blobs();
-        store.persist_batch_durable(&blobs).unwrap();
+        store.persist_batch(&blobs, true).unwrap();
         root
     }
 
@@ -330,7 +330,7 @@ mod tests {
         let store = Arc::new(PersistedTrieStore::open(&nodes_dir).unwrap());
 
         // Make it non-fresh by writing a node
-        store.persist_batch_durable(&[(B256::repeat_byte(0x01), vec![0x80])]).unwrap();
+        store.persist_batch(&[(B256::repeat_byte(0x01), vec![0x80])], true).unwrap();
 
         let manifest_path = import_dir.join("manifest.json");
         let result = SnapshotImporter::new(1, B256::repeat_byte(0xaa), store, manifest_path);

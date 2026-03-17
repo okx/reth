@@ -1,5 +1,6 @@
 pub mod arena;
 pub mod commit_store;
+pub mod config;
 pub mod encoding;
 pub mod gc;
 pub mod hash;
@@ -16,6 +17,7 @@ pub mod tree;
 pub mod tree_algo;
 
 pub use commit_store::MptCommitStore;
+pub use config::MptConfig;
 pub use manifest::VersionManifest;
 pub use persisted::PersistedTrieStore;
 pub use r#trait::{

@@ -7,23 +7,56 @@ pub struct MutableTrieArena {
     /// RLP encoding cache aligned with nodes.
     /// After insert/delete, caches on the path from modified node to root must be cleared.
     rlp_cache: Vec<Option<Vec<u8>>>,
+    /// Dirty tracking: true if the node was modified since last `clear_all_dirty()`.
+    /// New nodes allocated via `alloc()` are dirty by default.
+    /// Nodes loaded from persisted storage via `alloc_clean()` are clean.
+    dirty: Vec<bool>,
 }
 
 impl MutableTrieArena {
     pub fn new() -> Self {
-        Self { nodes: Vec::new(), rlp_cache: Vec::new() }
+        Self { nodes: Vec::new(), rlp_cache: Vec::new(), dirty: Vec::new() }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        Self { nodes: Vec::with_capacity(cap), rlp_cache: Vec::with_capacity(cap) }
+        Self {
+            nodes: Vec::with_capacity(cap),
+            rlp_cache: Vec::with_capacity(cap),
+            dirty: Vec::with_capacity(cap),
+        }
     }
 
-    /// Allocate a new node, returns its index.
+    /// Allocate a new node, returns its index. New nodes are dirty by default.
     pub fn alloc(&mut self, node: MptNode) -> u32 {
         let idx = self.nodes.len() as u32;
         self.nodes.push(node);
         self.rlp_cache.push(None);
+        self.dirty.push(true);
         idx
+    }
+
+    /// Allocate a node that is already persisted (clean). Used when loading from storage.
+    pub fn alloc_clean(&mut self, node: MptNode) -> u32 {
+        let idx = self.nodes.len() as u32;
+        self.nodes.push(node);
+        self.rlp_cache.push(None);
+        self.dirty.push(false);
+        idx
+    }
+
+    /// Mark a node as dirty (modified in current block).
+    pub fn mark_dirty(&mut self, idx: u32) {
+        self.dirty[idx as usize] = true;
+    }
+
+    /// Check if a node is dirty.
+    pub fn is_dirty(&self, idx: u32) -> bool {
+        self.dirty[idx as usize]
+    }
+
+    /// Clear all dirty flags (call after successful persist).
+    pub fn clear_all_dirty(&mut self) {
+        self.dirty.iter_mut().for_each(|d| *d = false);
     }
 
     /// Read a node by index.
@@ -118,6 +151,33 @@ mod tests {
 
         arena.clear_rlp(idx);
         assert!(arena.get_rlp(idx).is_none());
+    }
+
+    #[test]
+    fn t4_4_dirty_tracking() {
+        let mut arena = MutableTrieArena::new();
+        let idx = arena.alloc(MptNode::Leaf(LeafNode {
+            nibbles: alloy_trie::Nibbles::from_nibbles(&[1]),
+            value: vec![1],
+        }));
+        // New nodes from alloc() are dirty by default
+        assert!(arena.is_dirty(idx));
+
+        // alloc_clean produces clean nodes
+        let clean_idx = arena.alloc_clean(MptNode::Leaf(LeafNode {
+            nibbles: alloy_trie::Nibbles::from_nibbles(&[2]),
+            value: vec![2],
+        }));
+        assert!(!arena.is_dirty(clean_idx));
+
+        // mark_dirty
+        arena.mark_dirty(clean_idx);
+        assert!(arena.is_dirty(clean_idx));
+
+        // clear_all_dirty
+        arena.clear_all_dirty();
+        assert!(!arena.is_dirty(idx));
+        assert!(!arena.is_dirty(clean_idx));
     }
 
     #[test]
