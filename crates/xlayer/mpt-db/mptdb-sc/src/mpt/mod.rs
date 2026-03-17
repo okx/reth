@@ -2,6 +2,7 @@ pub mod arena;
 pub mod commit_store;
 pub mod config;
 pub mod encoding;
+pub mod fast_store;
 pub mod gc;
 pub mod hash;
 pub mod manifest;
@@ -18,6 +19,7 @@ pub mod tree_algo;
 
 pub use commit_store::{CommitProfile, MptCommitStore};
 pub use config::MptConfig;
+pub use fast_store::{FastStorageTrieStore, StorageTrieImage};
 pub use manifest::VersionManifest;
 pub use persisted::PersistedTrieStore;
 pub use r#trait::{

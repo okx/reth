@@ -103,6 +103,23 @@ impl MutableTrieArena {
         self.hash_cache[index as usize] = Some(hash);
     }
 
+    /// Read-only access to the underlying node slice.
+    pub fn nodes(&self) -> &[MptNode] {
+        &self.nodes
+    }
+
+    /// Read-only access to the hash cache slice.
+    pub fn hash_cache_slice(&self) -> &[Option<alloy_primitives::B256>] {
+        &self.hash_cache
+    }
+
+    /// Reconstruct an arena from a lean image: nodes + hash_cache only,
+    /// with empty rlp_cache and all-clean dirty flags.
+    pub fn from_lean(nodes: Vec<MptNode>, hash_cache: Vec<Option<alloy_primitives::B256>>) -> Self {
+        let len = nodes.len();
+        Self { nodes, rlp_cache: vec![None; len], hash_cache, dirty: vec![false; len] }
+    }
+
     /// Number of nodes in the arena.
     pub fn len(&self) -> usize {
         self.nodes.len()

@@ -23,6 +23,7 @@ use std::{
 
 use super::{
     config::MptConfig,
+    fast_store::{FastStorageTrieStore, StorageTrieImage},
     gc,
     manifest::VersionManifest,
     parallel::ParallelismThresholds,
@@ -141,6 +142,9 @@ pub struct MptCommitStore {
     dirty_accounts: Vec<DirtyAccount>,
 
     persisted: Arc<PersistedTrieStore>,
+    /// L3 persistent hot cache for storage trie images. One read + deserialize
+    /// replaces ~20 recursive RocksDB reads on cache miss.
+    fast_store: Option<Arc<FastStorageTrieStore>>,
     manifest: VersionManifest,
 
     version: i64,
@@ -247,9 +251,15 @@ impl MptCommitStore {
         if best_effort {
             let _ = self.flush_persist();
             let _ = self.save_checkpoint();
+            if let Some(ref fs) = self.fast_store {
+                let _ = fs.flush_to_disk();
+            }
         } else {
             self.flush_persist()?;
             self.save_checkpoint()?;
+            if let Some(ref fs) = self.fast_store {
+                let _ = fs.flush_to_disk();
+            }
         }
 
         self.persist_tx.take();
@@ -336,6 +346,21 @@ impl MptCommitStore {
             &trie_nodes_dir,
             config.persisted_node_cache_capacity,
         )?);
+
+        // Open L3 fast storage trie store (best-effort: failures are non-fatal)
+        let fast_store = {
+            let fast_store_dir = dir.join("fast_storage");
+            match FastStorageTrieStore::open(&fast_store_dir) {
+                Ok(fs) => Some(Arc::new(fs)),
+                Err(e) => {
+                    tracing::warn!(
+                        ?e,
+                        "failed to open fast storage trie store, continuing without L3 cache"
+                    );
+                    None
+                }
+            }
+        };
 
         let root = manifest.get_root(manifest.latest_version).unwrap_or(EMPTY_ROOT_HASH);
         #[cfg(test)]
@@ -457,6 +482,7 @@ impl MptCommitStore {
             storage_trie_cache: StorageTrieCache::new(config.storage_trie_cache_capacity),
             dirty_accounts: Vec::new(),
             persisted,
+            fast_store,
             manifest,
             version,
             applied_this_block: false,
@@ -682,6 +708,10 @@ impl MptCommitter for MptCommitStore {
         self.dirty_accounts.clear();
         self.storage_tries.clear();
         self.storage_trie_cache.clear();
+        // Clear L3 fast store on reload (state may have changed)
+        if let Some(ref fs) = self.fast_store {
+            fs.clear();
+        }
         self.applied_this_block = false;
         self.poisoned = false;
         #[cfg(test)]
@@ -862,12 +892,26 @@ impl MptCommitStore {
             if existing_root == EMPTY_ROOT_HASH {
                 self.storage_tries.insert(dirty.hashed_address, MptTree::new());
             } else {
-                let touched_slots = dirty
-                    .storage_changes
-                    .iter()
-                    .map(|change| Nibbles::unpack(&change.hashed_slot))
-                    .collect::<Vec<_>>();
-                storage_loads.push((dirty.hashed_address, existing_root, touched_slots));
+                // Check L3: fast storage trie store (single-read whole trie image)
+                let mut l3_hit = false;
+                if let Some(ref fs) = self.fast_store {
+                    if let Ok(Some(image)) = fs.load_latest(&dirty.hashed_address) {
+                        if image.root == existing_root {
+                            let trie = image.into_tree();
+                            self.storage_tries.insert(dirty.hashed_address, trie);
+                            l3_hit = true;
+                        }
+                        // Stale image: root mismatch, fall through to RocksDB
+                    }
+                }
+                if !l3_hit {
+                    let touched_slots = dirty
+                        .storage_changes
+                        .iter()
+                        .map(|change| Nibbles::unpack(&change.hashed_slot))
+                        .collect::<Vec<_>>();
+                    storage_loads.push((dirty.hashed_address, existing_root, touched_slots));
+                }
             }
         }
 
@@ -891,6 +935,10 @@ impl MptCommitStore {
             if dirty.storage_wiped {
                 // Evict from cache: selfdestruct invalidates any cached trie
                 self.storage_trie_cache.remove(&dirty.hashed_address);
+                // Evict from L3 fast store
+                if let Some(ref fs) = self.fast_store {
+                    fs.delete_latest(&dirty.hashed_address);
+                }
                 // Wiped: start from empty storage trie, apply new changes on top
                 let mut new_trie = MptTree::new();
                 let slot_updates_start = std::time::Instant::now();
@@ -1124,12 +1172,21 @@ impl MptCommitStore {
 
         // Move committed storage tries into the cross-block cache so the next
         // block can reuse them without reloading from RocksDB.
+        // Also write L3 fast store images (best-effort, non-fatal).
         let cache_publish_start = std::time::Instant::now();
         for (addr, mut trie) in storage_cache_candidates {
             if deleted_accounts.contains(&addr) {
                 continue;
             }
+            let storage_root = storage_roots.get(&addr).copied();
             trie.clear_dirty();
+            // Best-effort L3 fast store write (skip empty roots)
+            if let (Some(fs), Some(root)) = (&self.fast_store, storage_root) {
+                if root != EMPTY_ROOT_HASH {
+                    let image = StorageTrieImage::from_tree(&trie, root);
+                    let _ = fs.save_latest(addr, &image);
+                }
+            }
             self.storage_trie_cache.insert(addr, trie);
         }
         let cache_publish_elapsed = cache_publish_start.elapsed();

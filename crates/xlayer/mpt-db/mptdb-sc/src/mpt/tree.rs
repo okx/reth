@@ -529,6 +529,31 @@ impl MptTree {
         (root_hash, dirty_blobs)
     }
 
+    /// Read-only access to the arena's node slice (for fast store serialization).
+    pub fn arena_nodes(&self) -> &[MptNode] {
+        self.arena.nodes()
+    }
+
+    /// Read-only access to the arena's hash cache (for fast store serialization).
+    pub fn arena_hash_cache(&self) -> &[Option<B256>] {
+        self.arena.hash_cache_slice()
+    }
+
+    /// The root node index (None = empty trie).
+    pub fn root_index(&self) -> Option<u32> {
+        self.root
+    }
+
+    /// Reconstruct an MptTree from a lean image (nodes + hash_cache + root index).
+    /// Used by FastStorageTrieStore to restore a cached trie.
+    pub fn from_lean_image(
+        nodes: Vec<MptNode>,
+        hash_cache: Vec<Option<B256>>,
+        root: Option<u32>,
+    ) -> Self {
+        Self { arena: MutableTrieArena::from_lean(nodes, hash_cache), root }
+    }
+
     /// Clear all dirty flags in the arena. Call after successful persist.
     pub(crate) fn clear_dirty(&mut self) {
         self.arena.clear_all_dirty();
