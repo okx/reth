@@ -375,13 +375,7 @@ impl MptCommitStore {
     }
 
     fn maybe_refresh_published_view(&mut self) -> Result<()> {
-        let expected_root = self.manifest.get_root(self.version).unwrap_or(EMPTY_ROOT_HASH);
-        let current_matches = self
-            .published_meta
-            .as_ref()
-            .map(|meta| meta.version == self.version && meta.root == expected_root)
-            .unwrap_or(false);
-        if current_matches {
+        if self.has_current_published_view() {
             return Ok(());
         }
 
@@ -391,6 +385,15 @@ impl MptCommitStore {
         }
 
         self.reload_published_view()
+    }
+
+    fn has_current_published_view(&self) -> bool {
+        let expected_root = self.manifest.get_root(self.version).unwrap_or(EMPTY_ROOT_HASH);
+        self.published_meta
+            .as_ref()
+            .zip(self.published_store.as_ref())
+            .map(|(meta, _store)| meta.version == self.version && meta.root == expected_root)
+            .unwrap_or(false)
     }
 
     fn shutdown(&mut self, best_effort: bool) -> Result<()> {
@@ -1107,7 +1110,7 @@ impl MptCommitStore {
     }
 
     fn apply_bundle_state_inner(&mut self, bundle: &BundleState) -> Result<()> {
-        let mut published_refreshes = 0u64;
+        let published_refreshes = 0u64;
         let mut l2_hits = 0u64;
         let mut l3_latest_hits = 0u64;
         let mut l3_published_hits = 0u64;
@@ -1117,18 +1120,13 @@ impl MptCommitStore {
         let mut l3_published_load = Duration::ZERO;
         let mut l3_into_tree = Duration::ZERO;
 
-        let had_published_before = self.published_meta.is_some();
-        self.maybe_refresh_published_view()?;
-        if self.published_meta.is_some() && !had_published_before {
-            published_refreshes += 1;
-        }
         let collect_start = std::time::Instant::now();
         let dirty_accounts = state::collect_dirty_accounts(bundle)?;
         let collect_elapsed = collect_start.elapsed();
         let load_start = std::time::Instant::now();
         let mut storage_loads = Vec::new();
         let mut published_candidates = Vec::new();
-        let published_current = self.published_store.is_some();
+        let published_current = self.has_current_published_view();
 
         for dirty in &dirty_accounts {
             if dirty.storage_wiped || dirty.storage_changes.is_empty() {
@@ -1188,7 +1186,7 @@ impl MptCommitStore {
                     }
                 }
                 if !l3_hit {
-                    if self.published_store.is_some() {
+                    if published_current {
                         published_candidates.push((
                             dirty.hashed_address,
                             existing_root,
@@ -1256,48 +1254,49 @@ impl MptCommitStore {
 
         if !storage_loads.is_empty() {
             self.flush_persist()?;
-            let had_published_before = self.published_meta.is_some();
-            self.maybe_refresh_published_view()?;
-            if self.published_meta.is_some() && !had_published_before {
-                published_refreshes += 1;
-            }
             let mut remaining_loads = Vec::new();
-            if let Some(ref store) = self.published_store {
-                let resolved = storage_loads
-                    .into_par_iter()
-                    .map(|(hashed_address, existing_root, touched_slots)| {
-                        match store.materialize_touched_paths(
-                            &hashed_address,
-                            existing_root,
-                            &touched_slots,
-                        )? {
-                            Some(loaded) => Ok((
-                                Some((
-                                    hashed_address,
-                                    loaded.trace,
-                                    loaded.lookup_elapsed,
-                                    loaded.materialize_elapsed,
+            if published_current {
+                if let Some(ref store) = self.published_store {
+                    let resolved = storage_loads
+                        .into_par_iter()
+                        .map(|(hashed_address, existing_root, touched_slots)| {
+                            match store.materialize_touched_paths(
+                                &hashed_address,
+                                existing_root,
+                                &touched_slots,
+                            )? {
+                                Some(loaded) => Ok((
+                                    Some((
+                                        hashed_address,
+                                        loaded.trace,
+                                        loaded.lookup_elapsed,
+                                        loaded.materialize_elapsed,
+                                    )),
+                                    None,
                                 )),
-                                None,
-                            )),
-                            None => {
-                                Ok((None, Some((hashed_address, existing_root, touched_slots))))
+                                None => {
+                                    Ok((None, Some((hashed_address, existing_root, touched_slots))))
+                                }
                             }
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    for (loaded, fallback) in resolved {
+                        if let Some((hashed_address, trace, load_elapsed, into_tree_elapsed)) =
+                            loaded
+                        {
+                            self.insert_working_overlay(
+                                hashed_address,
+                                StorageOverlay::from_trace(trace),
+                            );
+                            l3_published_post_flush_hits += 1;
+                            l3_published_load += load_elapsed;
+                            l3_into_tree += into_tree_elapsed;
+                        } else if let Some(load) = fallback {
+                            remaining_loads.push(load);
                         }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                for (loaded, fallback) in resolved {
-                    if let Some((hashed_address, trace, load_elapsed, into_tree_elapsed)) = loaded {
-                        self.insert_working_overlay(
-                            hashed_address,
-                            StorageOverlay::from_trace(trace),
-                        );
-                        l3_published_post_flush_hits += 1;
-                        l3_published_load += load_elapsed;
-                        l3_into_tree += into_tree_elapsed;
-                    } else if let Some(load) = fallback {
-                        remaining_loads.push(load);
                     }
+                } else {
+                    remaining_loads = storage_loads;
                 }
             } else {
                 remaining_loads = storage_loads;
