@@ -3,14 +3,18 @@ pub mod commit_store;
 pub mod config;
 pub mod encoding;
 pub mod fast_store;
+pub mod flat_layout;
 pub mod gc;
 pub mod hash;
 pub mod manifest;
 pub mod nibbles;
 pub mod node;
+pub mod overlay;
 pub(crate) mod parallel;
 pub mod persisted;
 pub mod proof;
+pub mod published_baseline;
+pub mod segment;
 pub mod snapshot;
 pub mod state;
 pub mod r#trait;
@@ -19,10 +23,12 @@ pub mod tree_algo;
 
 pub use commit_store::{CommitProfile, MptCommitStore};
 pub use config::MptConfig;
-pub use fast_store::{FastStorageTrieStore, StorageTrieImage};
+pub use fast_store::FastStorageTrieStore;
 pub use manifest::VersionManifest;
 pub use persisted::PersistedTrieStore;
+pub use published_baseline::{PublishedBaselineManager, PublishedBaselineMeta};
 pub use r#trait::{
     CommitFrontier, MptCommitter, MptGcStats, MptSnapshotExporter, MptSnapshotImporter,
     MptSnapshotMeta, MptSnapshotNode,
 };
+pub use segment::StorageTrieSegment;

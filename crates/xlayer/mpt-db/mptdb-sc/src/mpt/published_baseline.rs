@@ -1,0 +1,772 @@
+use alloy_primitives::B256;
+use alloy_trie::Nibbles;
+use memmap2::{Mmap, MmapOptions};
+use mptdb_common::error::{MptDbError, Result};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::{self, File},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use super::{
+    fast_store::FastStorageTrieStore,
+    flat_layout::{
+        append_page as append_flat_page, data_path as pages_data_path,
+        index_path as pages_index_path, open_data_file as open_pages_data_file,
+        open_index_file as open_pages_index_file_handle, read_page_header, write_full_page_index,
+        FlatPageIndexEntry,
+    },
+    manifest::VersionManifest,
+    segment::{
+        StoragePathTrace, StorageSegmentLocator, StorageTrieSegment, StorageTrieSegmentReader,
+    },
+};
+
+const DELTA_MAGIC: &[u8; 8] = b"pbldlt01";
+const DELTA_RECORD_LEN: usize = 1 + 32 + 32 + 8 + 4 + 2;
+const DELTA_OP_PUT: u8 = 1;
+const DELTA_OP_DELETE: u8 = 2;
+const REWRITE_INTERVAL: usize = 64;
+pub(crate) const PUBLISHED_REWRITE_INTERVAL: usize = REWRITE_INTERVAL;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishedBaselineMeta {
+    pub generation: u64,
+    pub version: i64,
+    pub root: B256,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GenerationMeta {
+    generation: u64,
+    version: i64,
+    root: B256,
+    parent_generation: Option<u64>,
+    depth: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeltaEntry {
+    page_off: u64,
+    record_off: u32,
+    root: B256,
+    format_version: u16,
+}
+
+#[derive(Clone)]
+pub struct PublishedGenerationResult {
+    pub meta: PublishedBaselineMeta,
+    pub latest_updates: Vec<(B256, super::segment::StorageSegmentLocator)>,
+}
+
+pub struct PublishedBaselineReader {
+    index: HashMap<B256, DeltaEntry>,
+    data_mmap: Mmap,
+}
+
+pub struct PublishedTrieMaterialized {
+    pub trace: StoragePathTrace,
+    pub lookup_elapsed: Duration,
+    pub materialize_elapsed: Duration,
+}
+
+impl PublishedBaselineReader {
+    pub fn materialize_touched_paths(
+        &self,
+        hashed_address: &B256,
+        expected_root: B256,
+        keys: &[Nibbles],
+    ) -> Result<Option<PublishedTrieMaterialized>> {
+        let lookup_start = std::time::Instant::now();
+        let entry = match self.index.get(hashed_address).copied() {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
+        if entry.root != expected_root {
+            return Ok(None);
+        }
+        let mmap = &self.data_mmap;
+        let start = entry.page_off as usize;
+        if start >= mmap.len() {
+            return Ok(None);
+        }
+        let page_header = read_page_header(&mmap[start..])?;
+        let end = start.saturating_add(page_header.total_len as usize);
+        if end > mmap.len() || page_header.root_record_off != entry.record_off {
+            return Ok(None);
+        }
+        let reader = StorageTrieSegmentReader::open_page(
+            &mmap[start..end],
+            expected_root,
+            entry.record_off,
+        )?;
+        let lookup_elapsed = lookup_start.elapsed();
+        let materialize_start = std::time::Instant::now();
+        let trace = reader.cursor().trace_paths(keys)?;
+        let materialize_elapsed = materialize_start.elapsed();
+        Ok(Some(PublishedTrieMaterialized { trace, lookup_elapsed, materialize_elapsed }))
+    }
+}
+
+pub struct PublishedBaselineManager {
+    base_dir: PathBuf,
+}
+
+impl PublishedBaselineManager {
+    pub fn open(base_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(Self::published_dir(base_dir))
+            .map_err(|e| MptDbError::Other(format!("create published baseline dir: {e}")))?;
+        fs::create_dir_all(Self::meta_dir(base_dir))
+            .map_err(|e| MptDbError::Other(format!("create published baseline meta dir: {e}")))?;
+        let _ = Self::open_data_file(base_dir)?;
+        Ok(Self { base_dir: base_dir.to_path_buf() })
+    }
+
+    pub fn load_meta(&self) -> Result<Option<PublishedBaselineMeta>> {
+        let path = self.meta_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes =
+            fs::read(&path).map_err(|e| MptDbError::Other(format!("read baseline meta: {e}")))?;
+        let meta = serde_json::from_slice(&bytes)
+            .map_err(|e| MptDbError::Other(format!("parse baseline meta: {e}")))?;
+        Ok(Some(meta))
+    }
+
+    pub fn open_published_store(
+        &self,
+        meta: &PublishedBaselineMeta,
+    ) -> Result<Option<PublishedBaselineReader>> {
+        let gen_meta = match self.load_generation_meta(meta.generation)? {
+            Some(gen_meta) if gen_meta.version == meta.version && gen_meta.root == meta.root => {
+                gen_meta
+            }
+            _ => return Ok(None),
+        };
+        let index = self.load_merged_index(&gen_meta)?;
+        let data_file = Self::open_data_file(&self.base_dir)?;
+        let data_mmap = unsafe {
+            MmapOptions::new()
+                .map(&data_file)
+                .map_err(|e| MptDbError::Other(format!("mmap published baseline data: {e}")))?
+        };
+        Ok(Some(PublishedBaselineReader { index, data_mmap }))
+    }
+
+    pub fn publish_generation(
+        &self,
+        prev: Option<&PublishedBaselineMeta>,
+        version: i64,
+        root: B256,
+        puts: &[(B256, StorageTrieSegment)],
+        deletes: &[B256],
+    ) -> Result<PublishedGenerationResult> {
+        let generation = version as u64;
+        let prev_meta = match prev {
+            Some(meta) => self.load_generation_meta(meta.generation)?,
+            None => None,
+        };
+
+        let mut rewritten_index = None;
+        let parent_generation = if let Some(prev_meta) = prev_meta.as_ref() {
+            if prev_meta.depth + 1 >= REWRITE_INTERVAL {
+                rewritten_index = Some(self.load_merged_index(prev_meta)?);
+                None
+            } else {
+                Some(prev_meta.generation)
+            }
+        } else {
+            None
+        };
+
+        let mut data_file = Self::open_data_file(&self.base_dir)?;
+        let mut pages_index_file = Self::open_pages_index_file(&self.base_dir)?;
+        let mut delta_records = Vec::new();
+        let mut latest_updates = Vec::with_capacity(puts.len());
+
+        if let Some(mut full_index) = rewritten_index {
+            for hashed_address in deletes {
+                full_index.remove(hashed_address);
+            }
+            for (hashed_address, image) in puts {
+                let page = Self::append_page(&mut data_file, &mut pages_index_file, image)?;
+                full_index.insert(
+                    *hashed_address,
+                    DeltaEntry {
+                        page_off: page.page_off,
+                        record_off: page.root_record_off,
+                        root: image.root(),
+                        format_version: page.layout_version,
+                    },
+                );
+                latest_updates.push((
+                    *hashed_address,
+                    super::segment::StorageSegmentLocator {
+                        root: image.root(),
+                        page_off: page.page_off,
+                        record_off: page.root_record_off,
+                        format_version: page.layout_version,
+                    },
+                ));
+            }
+            delta_records.reserve(full_index.len());
+            for (hashed_address, entry) in full_index {
+                delta_records.push((
+                    DELTA_OP_PUT,
+                    hashed_address,
+                    entry.root,
+                    entry.page_off,
+                    entry.record_off,
+                    entry.format_version,
+                ));
+            }
+        } else {
+            delta_records.reserve(puts.len() + deletes.len());
+            for hashed_address in deletes {
+                delta_records.push((DELTA_OP_DELETE, *hashed_address, B256::ZERO, 0, 0, 0));
+            }
+            for (hashed_address, image) in puts {
+                let page = Self::append_page(&mut data_file, &mut pages_index_file, image)?;
+                delta_records.push((
+                    DELTA_OP_PUT,
+                    *hashed_address,
+                    image.root(),
+                    page.page_off,
+                    page.root_record_off,
+                    page.layout_version,
+                ));
+                latest_updates.push((
+                    *hashed_address,
+                    super::segment::StorageSegmentLocator {
+                        root: image.root(),
+                        page_off: page.page_off,
+                        record_off: page.root_record_off,
+                        format_version: page.layout_version,
+                    },
+                ));
+            }
+        }
+
+        Self::write_delta_file(&self.delta_path(generation), &delta_records)?;
+        let generation_meta = GenerationMeta {
+            generation,
+            version,
+            root,
+            parent_generation,
+            depth: parent_generation
+                .and_then(|g| self.load_generation_meta(g).ok().flatten().map(|m| m.depth + 1))
+                .unwrap_or(0),
+        };
+        self.save_generation_meta(&generation_meta)?;
+
+        let meta = PublishedBaselineMeta { generation, version, root };
+        self.save_meta(&meta)?;
+        Ok(PublishedGenerationResult { meta, latest_updates })
+    }
+
+    pub fn activate_published_version(&self, version: i64, root: B256) -> Result<()> {
+        let generation = version as u64;
+        let meta = match self.load_generation_meta(generation)? {
+            Some(meta) if meta.version == version && meta.root == root => meta,
+            _ => {
+                self.clear_meta()?;
+                return Ok(());
+            }
+        };
+        self.save_meta(&PublishedBaselineMeta {
+            generation: meta.generation,
+            version: meta.version,
+            root: meta.root,
+        })
+    }
+
+    pub fn clear_meta(&self) -> Result<()> {
+        let path = self.meta_path();
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(MptDbError::Other(format!("remove baseline meta: {err}"))),
+        }
+    }
+
+    pub fn compact_for_manifest(
+        &self,
+        manifest: &VersionManifest,
+        fast_store: Option<&FastStorageTrieStore>,
+    ) -> Result<bool> {
+        let keep_generations: HashSet<u64> = manifest.versions.keys().map(|v| *v as u64).collect();
+        let latest_snapshot = fast_store.map(|store| store.snapshot_index()).unwrap_or_default();
+
+        let current_meta = self.load_meta()?;
+        if let Some(meta) = current_meta.as_ref() {
+            if !keep_generations.contains(&meta.generation) {
+                self.clear_meta()?;
+            }
+        }
+
+        let all_generations = self.list_generations()?;
+        let kept_generations: Vec<u64> =
+            all_generations.iter().copied().filter(|g| keep_generations.contains(g)).collect();
+
+        let data_file = Self::open_data_file(&self.base_dir)?;
+        let data_mmap = unsafe {
+            MmapOptions::new()
+                .map(&data_file)
+                .map_err(|e| MptDbError::Other(format!("mmap compact source data: {e}")))?
+        };
+
+        let old_data_path = Self::data_path(&self.base_dir);
+        let old_pages_index_path = Self::pages_index_path(&self.base_dir);
+        let new_data_tmp = old_data_path.with_extension("data.tmp");
+        let mut new_data = File::create(&new_data_tmp)
+            .map_err(|e| MptDbError::Other(format!("create compacted data tmp: {e}")))?;
+        let new_pages_index_tmp = old_pages_index_path.with_extension("index.tmp");
+        let mut new_pages_index = File::create(&new_pages_index_tmp)
+            .map_err(|e| MptDbError::Other(format!("create compacted pages index tmp: {e}")))?;
+        new_data
+            .write_all(super::flat_layout::SHARED_PAGES_DATA_MAGIC)
+            .map_err(|e| MptDbError::Other(format!("write compacted data header: {e}")))?;
+        new_pages_index
+            .write_all(super::flat_layout::SHARED_PAGES_INDEX_MAGIC)
+            .map_err(|e| MptDbError::Other(format!("write compacted pages index header: {e}")))?;
+
+        let mut remap: HashMap<(u64, B256), StorageSegmentLocator> = HashMap::new();
+        let mut rewritten_pages = Vec::<FlatPageIndexEntry>::new();
+        let mut rewrite_delta_records: Vec<(u64, Vec<(u8, B256, B256, u64, u32, u16)>)> =
+            Vec::new();
+        let mut rewrite_generation_metas: Vec<GenerationMeta> = Vec::new();
+
+        for generation in &kept_generations {
+            let gen_meta = self.load_generation_meta(*generation)?.ok_or_else(|| {
+                MptDbError::Other(format!("missing published generation metadata for {generation}"))
+            })?;
+            let merged = self.load_merged_index(&gen_meta)?;
+            let mut rewritten = Vec::with_capacity(merged.len());
+            for (key, entry) in merged {
+                let locator = Self::remap_segment(
+                    &mut new_data,
+                    &mut new_pages_index,
+                    &data_mmap,
+                    &mut remap,
+                    &mut rewritten_pages,
+                    StorageSegmentLocator {
+                        root: entry.root,
+                        page_off: entry.page_off,
+                        record_off: entry.record_off,
+                        format_version: entry.format_version,
+                    },
+                )?;
+                rewritten.push((
+                    DELTA_OP_PUT,
+                    key,
+                    entry.root,
+                    locator.page_off,
+                    locator.record_off,
+                    locator.format_version,
+                ));
+            }
+            rewrite_delta_records.push((*generation, rewritten));
+            rewrite_generation_metas.push(GenerationMeta {
+                generation: gen_meta.generation,
+                version: gen_meta.version,
+                root: gen_meta.root,
+                parent_generation: None,
+                depth: 0,
+            });
+        }
+
+        let mut rewritten_latest = HashMap::with_capacity(latest_snapshot.len());
+        for (key, locator) in &latest_snapshot {
+            let new_locator = Self::remap_segment(
+                &mut new_data,
+                &mut new_pages_index,
+                &data_mmap,
+                &mut remap,
+                &mut rewritten_pages,
+                *locator,
+            )?;
+            rewritten_latest.insert(*key, new_locator);
+        }
+
+        new_data
+            .flush()
+            .map_err(|e| MptDbError::Other(format!("flush compacted data tmp: {e}")))?;
+        write_full_page_index(&new_pages_index_tmp, &rewritten_pages)?;
+
+        let mut delta_tmps = Vec::new();
+        let mut meta_tmps = Vec::new();
+        for (generation, records) in &rewrite_delta_records {
+            let path = self.delta_path(*generation);
+            let tmp = path.with_extension("delta.tmp");
+            Self::write_delta_file(&tmp, records)?;
+            delta_tmps.push((path, tmp));
+        }
+        for meta in &rewrite_generation_metas {
+            let path = self.generation_meta_path(meta.generation);
+            let tmp = path.with_extension("json.tmp");
+            let bytes = serde_json::to_vec_pretty(meta).map_err(|e| {
+                MptDbError::Other(format!("serialize compacted generation meta: {e}"))
+            })?;
+            fs::write(&tmp, bytes)
+                .map_err(|e| MptDbError::Other(format!("write compacted generation meta: {e}")))?;
+            meta_tmps.push((path, tmp));
+        }
+
+        fs::rename(&new_data_tmp, &old_data_path)
+            .map_err(|e| MptDbError::Other(format!("rename compacted data file: {e}")))?;
+        fs::rename(&new_pages_index_tmp, &old_pages_index_path)
+            .map_err(|e| MptDbError::Other(format!("rename compacted pages index file: {e}")))?;
+        for (path, tmp) in delta_tmps {
+            fs::rename(&tmp, &path)
+                .map_err(|e| MptDbError::Other(format!("rename compacted delta file: {e}")))?;
+        }
+        for (path, tmp) in meta_tmps {
+            fs::rename(&tmp, &path)
+                .map_err(|e| MptDbError::Other(format!("rename compacted generation meta: {e}")))?;
+        }
+
+        for generation in all_generations {
+            if !keep_generations.contains(&generation) {
+                let _ = fs::remove_file(self.delta_path(generation));
+                let _ = fs::remove_file(self.generation_meta_path(generation));
+            }
+        }
+
+        if let Some(store) = fast_store {
+            store.replace_latest_index(&rewritten_latest)?;
+        }
+
+        Ok(true)
+    }
+
+    fn load_merged_index(&self, meta: &GenerationMeta) -> Result<HashMap<B256, DeltaEntry>> {
+        let mut by_generation = Vec::new();
+        let mut cursor = Some(meta.generation);
+        while let Some(generation) = cursor {
+            let gen_meta = self.load_generation_meta(generation)?.ok_or_else(|| {
+                MptDbError::Other(format!("missing published generation metadata for {generation}"))
+            })?;
+            by_generation.push(gen_meta.clone());
+            cursor = gen_meta.parent_generation;
+        }
+
+        let mut seen = HashSet::new();
+        let mut merged = HashMap::new();
+        for gen_meta in by_generation {
+            for (op, key, root, page_off, record_off, format_version) in
+                Self::read_delta_file(&self.delta_path(gen_meta.generation))?
+            {
+                if !seen.insert(key) {
+                    continue;
+                }
+                match op {
+                    DELTA_OP_PUT => {
+                        merged
+                            .insert(key, DeltaEntry { page_off, record_off, root, format_version });
+                    }
+                    DELTA_OP_DELETE => {}
+                    _ => {}
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    fn published_dir(base: &Path) -> PathBuf {
+        base.join("published")
+    }
+
+    fn meta_dir(base: &Path) -> PathBuf {
+        base.join("meta")
+    }
+
+    fn data_path(base: &Path) -> PathBuf {
+        pages_data_path(base)
+    }
+
+    fn pages_index_path(base: &Path) -> PathBuf {
+        pages_index_path(base)
+    }
+
+    fn meta_path(&self) -> PathBuf {
+        Self::meta_dir(&self.base_dir).join("published.json")
+    }
+
+    fn delta_path(&self, generation: u64) -> PathBuf {
+        Self::published_dir(&self.base_dir).join(format!("gen-{generation}.delta"))
+    }
+
+    fn generation_meta_path(&self, generation: u64) -> PathBuf {
+        Self::published_dir(&self.base_dir).join(format!("gen-{generation}.json"))
+    }
+
+    fn open_data_file(base_dir: &Path) -> Result<File> {
+        let path = Self::data_path(base_dir);
+        open_pages_data_file(&path)
+    }
+
+    fn open_pages_index_file(base_dir: &Path) -> Result<File> {
+        open_pages_index_file_handle(&Self::pages_index_path(base_dir))
+    }
+
+    fn append_page(
+        data_file: &mut File,
+        pages_index_file: &mut File,
+        segment: &StorageTrieSegment,
+    ) -> Result<FlatPageIndexEntry> {
+        append_flat_page(
+            data_file,
+            pages_index_file,
+            segment.as_bytes(),
+            segment.root(),
+            segment.root_record_off(),
+        )
+    }
+
+    fn write_delta_file(path: &Path, records: &[(u8, B256, B256, u64, u32, u16)]) -> Result<()> {
+        let tmp = path.with_extension("delta.tmp");
+        let mut file = File::create(&tmp)
+            .map_err(|e| MptDbError::Other(format!("create published delta file: {e}")))?;
+        file.write_all(DELTA_MAGIC)
+            .map_err(|e| MptDbError::Other(format!("write published delta header: {e}")))?;
+        for (op, key, root, page_off, record_off, format_version) in records {
+            let mut record = [0u8; DELTA_RECORD_LEN];
+            let mut pos = 0usize;
+            record[pos] = *op;
+            pos += 1;
+            record[pos..pos + 32].copy_from_slice(key.as_slice());
+            pos += 32;
+            record[pos..pos + 32].copy_from_slice(root.as_slice());
+            pos += 32;
+            record[pos..pos + 8].copy_from_slice(&page_off.to_le_bytes());
+            pos += 8;
+            record[pos..pos + 4].copy_from_slice(&record_off.to_le_bytes());
+            pos += 4;
+            record[pos..pos + 2].copy_from_slice(&format_version.to_le_bytes());
+            file.write_all(&record)
+                .map_err(|e| MptDbError::Other(format!("write published delta record: {e}")))?;
+        }
+        file.flush().map_err(|e| MptDbError::Other(format!("flush published delta file: {e}")))?;
+        fs::rename(&tmp, path)
+            .map_err(|e| MptDbError::Other(format!("rename published delta file: {e}")))?;
+        Ok(())
+    }
+
+    fn read_delta_file(path: &Path) -> Result<Vec<(u8, B256, B256, u64, u32, u16)>> {
+        let mut file =
+            File::open(path).map_err(|e| MptDbError::Other(format!("open delta file: {e}")))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| MptDbError::Other(format!("read delta file: {e}")))?;
+        if bytes.len() < DELTA_MAGIC.len() || &bytes[..DELTA_MAGIC.len()] != DELTA_MAGIC {
+            return Err(MptDbError::Other("invalid published delta header".to_string()));
+        }
+
+        let mut out = Vec::new();
+        let mut pos = DELTA_MAGIC.len();
+        while pos + DELTA_RECORD_LEN <= bytes.len() {
+            let op = bytes[pos];
+            pos += 1;
+            let key = B256::from_slice(&bytes[pos..pos + 32]);
+            pos += 32;
+            let root = B256::from_slice(&bytes[pos..pos + 32]);
+            pos += 32;
+            let mut page_off_bytes = [0u8; 8];
+            page_off_bytes.copy_from_slice(&bytes[pos..pos + 8]);
+            let page_off = u64::from_le_bytes(page_off_bytes);
+            pos += 8;
+            let mut record_off_bytes = [0u8; 4];
+            record_off_bytes.copy_from_slice(&bytes[pos..pos + 4]);
+            let record_off = u32::from_le_bytes(record_off_bytes);
+            pos += 4;
+            let mut format_bytes = [0u8; 2];
+            format_bytes.copy_from_slice(&bytes[pos..pos + 2]);
+            let format_version = u16::from_le_bytes(format_bytes);
+            pos += 2;
+            out.push((op, key, root, page_off, record_off, format_version));
+        }
+        Ok(out)
+    }
+
+    fn save_meta(&self, meta: &PublishedBaselineMeta) -> Result<()> {
+        let path = self.meta_path();
+        let tmp = path.with_extension("tmp");
+        let bytes = serde_json::to_vec_pretty(meta)
+            .map_err(|e| MptDbError::Other(format!("serialize baseline meta: {e}")))?;
+        fs::write(&tmp, bytes)
+            .map_err(|e| MptDbError::Other(format!("write baseline meta: {e}")))?;
+        fs::rename(&tmp, &path)
+            .map_err(|e| MptDbError::Other(format!("rename baseline meta: {e}")))?;
+        Ok(())
+    }
+
+    fn save_generation_meta(&self, meta: &GenerationMeta) -> Result<()> {
+        let path = self.generation_meta_path(meta.generation);
+        let tmp = path.with_extension("tmp");
+        let bytes = serde_json::to_vec_pretty(meta)
+            .map_err(|e| MptDbError::Other(format!("serialize generation meta: {e}")))?;
+        fs::write(&tmp, bytes)
+            .map_err(|e| MptDbError::Other(format!("write generation meta: {e}")))?;
+        fs::rename(&tmp, &path)
+            .map_err(|e| MptDbError::Other(format!("rename generation meta: {e}")))?;
+        Ok(())
+    }
+
+    fn load_generation_meta(&self, generation: u64) -> Result<Option<GenerationMeta>> {
+        let path = self.generation_meta_path(generation);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes =
+            fs::read(&path).map_err(|e| MptDbError::Other(format!("read generation meta: {e}")))?;
+        let meta = serde_json::from_slice(&bytes)
+            .map_err(|e| MptDbError::Other(format!("parse generation meta: {e}")))?;
+        Ok(Some(meta))
+    }
+
+    fn list_generations(&self) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(Self::published_dir(&self.base_dir))
+            .map_err(|e| MptDbError::Other(format!("read published dir: {e}")))?
+        {
+            let entry =
+                entry.map_err(|e| MptDbError::Other(format!("read published dir entry: {e}")))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(rest) = name.strip_prefix("gen-") {
+                if let Some(num) = rest.strip_suffix(".json") {
+                    if let Ok(generation) = num.parse::<u64>() {
+                        out.push(generation);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    fn remap_segment(
+        new_data: &mut File,
+        new_pages_index: &mut File,
+        old_data: &[u8],
+        remap: &mut HashMap<(u64, B256), StorageSegmentLocator>,
+        rewritten_pages: &mut Vec<FlatPageIndexEntry>,
+        locator: StorageSegmentLocator,
+    ) -> Result<StorageSegmentLocator> {
+        let key = (locator.page_off, locator.root);
+        if let Some(existing) = remap.get(&key).copied() {
+            return Ok(existing);
+        }
+
+        let start = locator.page_off as usize;
+        let page_header =
+            read_page_header(old_data.get(start..).ok_or_else(|| {
+                MptDbError::Other("segment remap page out of bounds".to_string())
+            })?)?;
+        if page_header.root_record_off != locator.record_off {
+            return Err(MptDbError::Other("segment remap root record offset mismatch".to_string()));
+        }
+        let end = start.saturating_add(page_header.total_len as usize);
+        let bytes = old_data
+            .get(start..end)
+            .ok_or_else(|| MptDbError::Other("segment remap slice out of bounds".to_string()))?;
+        let entry =
+            append_flat_page(new_data, new_pages_index, bytes, locator.root, locator.record_off)?;
+        rewritten_pages.push(entry);
+        let new_locator = StorageSegmentLocator {
+            root: locator.root,
+            page_off: entry.page_off,
+            record_off: entry.root_record_off,
+            format_version: entry.layout_version,
+        };
+        remap.insert(key, new_locator);
+        Ok(new_locator)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_trie::Nibbles;
+    use tempfile::TempDir;
+
+    use crate::mpt::tree::MptTree;
+
+    fn make_tree(byte: u8) -> (MptTree, B256) {
+        let mut tree = MptTree::new();
+        let key = Nibbles::unpack(B256::with_last_byte(byte));
+        tree.insert(&key, vec![byte]);
+        let root = tree.root_hash();
+        (tree, root)
+    }
+
+    #[test]
+    fn publish_and_reload_generation() {
+        let dir = TempDir::new().unwrap();
+        let mgr = PublishedBaselineManager::open(dir.path()).unwrap();
+        let (tree, root) = make_tree(1);
+        let image = StorageTrieSegment::from_tree(&tree, root).unwrap();
+        let result = mgr
+            .publish_generation(None, 1, root, &[(B256::with_last_byte(0x11), image)], &[])
+            .unwrap();
+        assert_eq!(result.meta.version, 1);
+        let loaded = mgr.load_meta().unwrap().unwrap();
+        assert_eq!(loaded, result.meta);
+        let store = mgr.open_published_store(&loaded).unwrap().unwrap();
+        let key = Nibbles::unpack(B256::with_last_byte(1));
+        let loaded =
+            store.materialize_touched_paths(&B256::with_last_byte(0x11), root, &[key]).unwrap();
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().trace.into_tree().root_hash(), root);
+    }
+
+    #[test]
+    fn delta_publish_overlays_parent_without_copying_directory() {
+        let dir = TempDir::new().unwrap();
+        let mgr = PublishedBaselineManager::open(dir.path()).unwrap();
+
+        let (tree1, root1) = make_tree(1);
+        let image1 = StorageTrieSegment::from_tree(&tree1, root1).unwrap();
+        let meta1 = mgr
+            .publish_generation(None, 1, root1, &[(B256::with_last_byte(0x11), image1)], &[])
+            .unwrap()
+            .meta;
+
+        let (tree2, root2) = make_tree(2);
+        let image2 = StorageTrieSegment::from_tree(&tree2, root2).unwrap();
+        let meta2 = mgr
+            .publish_generation(
+                Some(&meta1),
+                2,
+                root2,
+                &[(B256::with_last_byte(0x22), image2)],
+                &[],
+            )
+            .unwrap()
+            .meta;
+
+        let store = mgr.open_published_store(&meta2).unwrap().unwrap();
+        let key1 = Nibbles::unpack(B256::with_last_byte(1));
+        let key2 = Nibbles::unpack(B256::with_last_byte(2));
+        assert!(store
+            .materialize_touched_paths(&B256::with_last_byte(0x11), root1, &[key1])
+            .unwrap()
+            .is_some());
+        assert!(store
+            .materialize_touched_paths(&B256::with_last_byte(0x22), root2, &[key2])
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn activate_or_clear_meta() {
+        let dir = TempDir::new().unwrap();
+        let mgr = PublishedBaselineManager::open(dir.path()).unwrap();
+        mgr.clear_meta().unwrap();
+        assert!(mgr.load_meta().unwrap().is_none());
+    }
+}

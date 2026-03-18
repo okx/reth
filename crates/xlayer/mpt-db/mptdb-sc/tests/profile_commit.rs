@@ -311,6 +311,15 @@ fn print_profile(label: &str, profile: &CommitProfile) {
         profile.apply_get_or_load_storage_tries.as_micros()
     );
     println!("  slot_updates:         {:>8} µs", profile.apply_storage_slot_updates.as_micros());
+    println!("  l3_latest_load:       {:>8} µs", profile.apply_l3_latest_load.as_micros());
+    println!("  l3_published_load:    {:>8} µs", profile.apply_l3_published_load.as_micros());
+    println!("  l3_into_tree:         {:>8} µs", profile.apply_l3_into_tree.as_micros());
+    println!("  published_refreshes:  {:>8}", profile.apply_published_refreshes);
+    println!("  l2_hits:              {:>8}", profile.apply_l2_hits);
+    println!("  l3_latest_hits:       {:>8}", profile.apply_l3_latest_hits);
+    println!("  l3_published_hits:    {:>8}", profile.apply_l3_published_hits);
+    println!("  l3_published_post:    {:>8}", profile.apply_l3_published_post_flush_hits);
+    println!("  node_fallback_loads:  {:>8}", profile.apply_node_fallback_loads);
     println!("storage_roots:          {:>8} µs", profile.storage_roots.as_micros());
     println!("account_updates:        {:>8} µs", profile.account_updates.as_micros());
     println!("account_root_and_blobs: {:>8} µs", profile.account_root_and_blobs.as_micros());
@@ -342,12 +351,18 @@ fn profile_b4_4_large() {
     println!("Pre-pop commit: {}ms", t1.elapsed().as_millis());
 
     println!(
-        "{:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+        "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
         "Block",
         "Apply",
         "Collect",
         "TrieLd",
         "SlotUpd",
+        "LtLd",
+        "PbLd",
+        "ToTree",
+        "L2Hit",
+        "L3Hit",
+        "NDFall",
         "StorRoot",
         "AcctUpd",
         "AcctRoot",
@@ -361,12 +376,20 @@ fn profile_b4_4_large() {
         let ((_version, _root), profile) = store.commit_with_profile().unwrap();
 
         println!(
-            "{:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+            "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
             i + 1,
             profile.apply_bundle_state.as_millis(),
             profile.apply_collect_dirty_accounts.as_millis(),
             profile.apply_get_or_load_storage_tries.as_millis(),
             profile.apply_storage_slot_updates.as_millis(),
+            profile.apply_l3_latest_load.as_millis(),
+            profile.apply_l3_published_load.as_millis(),
+            profile.apply_l3_into_tree.as_millis(),
+            profile.apply_l2_hits,
+            profile.apply_l3_latest_hits
+                + profile.apply_l3_published_hits
+                + profile.apply_l3_published_post_flush_hits,
+            profile.apply_node_fallback_loads,
             profile.storage_roots.as_millis(),
             profile.account_updates.as_millis(),
             profile.account_root_and_blobs.as_millis(),

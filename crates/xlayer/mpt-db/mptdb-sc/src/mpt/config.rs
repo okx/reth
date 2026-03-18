@@ -18,7 +18,7 @@ pub struct MptConfig {
 impl Default for MptConfig {
     fn default() -> Self {
         Self {
-            storage_trie_cache_capacity: 50_000,
+            storage_trie_cache_capacity: 250_000,
             persisted_node_cache_capacity: 500_000,
             parallel_storage_tries_min: 64,
             parallel_account_frontier_min: 4,

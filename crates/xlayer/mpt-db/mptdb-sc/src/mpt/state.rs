@@ -1,4 +1,5 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_trie::Nibbles;
 use mptdb_common::error::Result;
 use rayon::prelude::*;
 use revm_database::BundleState;
@@ -8,7 +9,9 @@ use revm_state::AccountInfo;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageChange {
     pub hashed_slot: B256,
+    pub slot_key: Nibbles,
     pub value: U256,
+    pub encoded_value: Option<Vec<u8>>,
 }
 
 /// Represents a single account's dirty state for one block.
@@ -17,6 +20,7 @@ pub struct DirtyAccount {
     /// Original address (for debugging/testing); trie key uses keccak256(address).
     pub address: Address,
     pub hashed_address: B256,
+    pub account_key: Nibbles,
 
     /// Final account info after block execution; None means account does not exist.
     pub info: Option<AccountInfo>,
@@ -42,6 +46,7 @@ pub fn collect_dirty_accounts(bundle: &BundleState) -> Result<Vec<DirtyAccount>>
         .into_par_iter()
         .map(|(address, bundle_account)| {
             let hashed_address = keccak256(address);
+            let account_key = Nibbles::unpack(&hashed_address);
 
             let info = bundle_account.info.clone();
             let storage_wiped = bundle_account.was_destroyed();
@@ -50,15 +55,22 @@ pub fn collect_dirty_accounts(bundle: &BundleState) -> Result<Vec<DirtyAccount>>
             let storage_changes = bundle_account
                 .storage
                 .iter()
-                .map(|(slot_key, slot)| StorageChange {
-                    hashed_slot: keccak256(slot_key.to_be_bytes::<32>()),
-                    value: slot.present_value,
+                .map(|(slot_key, slot)| {
+                    let hashed_slot = keccak256(slot_key.to_be_bytes::<32>());
+                    StorageChange {
+                        hashed_slot,
+                        slot_key: Nibbles::unpack(&hashed_slot),
+                        value: slot.present_value,
+                        encoded_value: (slot.present_value != U256::ZERO)
+                            .then(|| alloy_rlp::encode(slot.present_value)),
+                    }
                 })
                 .collect();
 
             DirtyAccount {
                 address: *address,
                 hashed_address,
+                account_key,
                 info,
                 storage_wiped,
                 storage_known_empty,

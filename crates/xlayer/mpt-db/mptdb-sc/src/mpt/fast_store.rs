@@ -1,290 +1,431 @@
 use alloy_primitives::B256;
+use alloy_trie::Nibbles;
+use memmap2::{Mmap, MmapOptions};
 use mptdb_common::error::{MptDbError, Result};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-use super::{arena::MutableTrieArena, node::MptNode, tree::MptTree};
+use super::{
+    flat_layout::{
+        data_path as pages_data_path, index_path as pages_index_path, load_page_index,
+        open_data_file as open_pages_data_file, open_index_file as open_pages_index_file,
+        read_page_header, FlatPageIndexEntry,
+    },
+    segment::{StoragePathTrace, StorageSegmentLocator, StorageTrieSegmentReader},
+};
 
-/// A lean storage trie image that omits rlp_cache and dirty flags but
-/// retains hash_cache for clean-subtree skipping during encode.
-#[derive(Serialize, Deserialize)]
-pub struct StorageTrieImage {
-    pub root: B256,
-    nodes: Vec<MptNode>,
-    hash_cache: Vec<Option<B256>>,
-    root_idx: Option<u32>,
+const LATEST_INDEX_MAGIC: &[u8; 8] = b"lstidx03";
+const INDEX_RECORD_LEN: usize = 1 + 32 + 32 + 8 + 4 + 2;
+const INDEX_OP_PUT: u8 = 1;
+const INDEX_OP_DELETE: u8 = 2;
+
+pub struct LatestPathTraceLoaded {
+    pub trace: StoragePathTrace,
+    pub lookup_elapsed: Duration,
+    pub materialize_elapsed: Duration,
 }
 
-impl StorageTrieImage {
-    /// Create from an MptTree, stripping rlp_cache and dirty.
-    pub fn from_tree(tree: &MptTree, root: B256) -> Self {
-        Self {
-            root,
-            nodes: tree.arena_nodes().to_vec(),
-            hash_cache: tree.arena_hash_cache().to_vec(),
-            root_idx: tree.root_index(),
-        }
-    }
-
-    /// Restore into an MptTree with clean dirty flags and empty rlp_cache.
-    pub fn into_tree(self) -> MptTree {
-        MptTree::from_lean_image(self.nodes, self.hash_cache, self.root_idx)
-    }
+struct FastStoreState {
+    index_path: PathBuf,
+    data_path: PathBuf,
+    pages_index_path: PathBuf,
+    index: HashMap<B256, StorageSegmentLocator>,
+    index_file: File,
+    data_file: File,
+    pages_index_file: File,
+    pages: HashMap<u64, FlatPageIndexEntry>,
+    data_mmap: Option<Mmap>,
 }
 
-/// Persistent hot cache for storage trie images.
-///
-/// Key: hashed_address, Value: serialized StorageTrieImage.
-/// Uses a single bincode file for simplicity in Phase A.
-/// One read + one deserialize replaces ~20 recursive RocksDB reads
-/// when a storage trie has a cache miss in L1 (working set) and L2 (LRU).
+/// Latest-only best-effort locator index over the shared storage segment data file.
 pub struct FastStorageTrieStore {
-    dir: PathBuf,
-    cache: Mutex<HashMap<B256, Vec<u8>>>,
+    state: Mutex<FastStoreState>,
 }
 
 impl FastStorageTrieStore {
-    /// Open (or create) the fast store directory, loading any existing data from disk.
     pub fn open(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir)
             .map_err(|e| MptDbError::Other(format!("create fast store dir: {e}")))?;
-        let store = Self { dir: dir.to_path_buf(), cache: Mutex::new(HashMap::new()) };
-        store.load_from_disk()?;
-        Ok(store)
+
+        let index_path = Self::index_path(dir);
+        let data_path = Self::data_path(dir);
+        let pages_index_path = Self::pages_index_path(dir);
+        let mut index_file = Self::open_with_magic(&index_path, LATEST_INDEX_MAGIC)?;
+        let data_file = open_pages_data_file(&data_path)?;
+        let mut pages_index_file = open_pages_index_file(&pages_index_path)?;
+        let pages_entries = load_page_index(&mut pages_index_file)?;
+        let pages = pages_entries.into_iter().map(|entry| (entry.page_off, entry)).collect();
+        let index = Self::load_index(&mut index_file)?;
+
+        Ok(Self {
+            state: Mutex::new(FastStoreState {
+                index_path,
+                data_path,
+                pages_index_path,
+                index,
+                index_file,
+                data_file,
+                pages_index_file,
+                pages,
+                data_mmap: None,
+            }),
+        })
     }
 
-    /// Load the latest image for a hashed address. Returns None on miss.
-    pub fn load_latest(&self, hashed_address: &B256) -> Result<Option<StorageTrieImage>> {
-        let cache = self.cache.lock();
-        match cache.get(hashed_address) {
-            Some(bytes) => {
-                let image: StorageTrieImage = bincode::deserialize(bytes)
-                    .map_err(|e| MptDbError::Other(format!("deserialize trie image: {e}")))?;
-                Ok(Some(image))
+    pub fn trace_touched_paths(
+        &self,
+        hashed_address: &B256,
+        expected_root: B256,
+        keys: &[Nibbles],
+    ) -> Result<Option<LatestPathTraceLoaded>> {
+        let lookup_start = std::time::Instant::now();
+        let mut state = self.state.lock();
+        let locator = match state.index.get(hashed_address).copied() {
+            Some(locator) => locator,
+            None => return Ok(None),
+        };
+        if locator.root != expected_root {
+            return Ok(None);
+        }
+
+        let page = match state.pages.get(&locator.page_off).copied() {
+            Some(page) => page,
+            None => return Ok(None),
+        };
+        let mmap = Self::ensure_data_mmap(&mut state)?;
+        let start = locator.page_off as usize;
+        let end = start.saturating_add(page.total_len as usize);
+        if end > mmap.len() {
+            return Ok(None);
+        }
+        let page_bytes = &mmap[start..end];
+        let page_header = read_page_header(page_bytes)?;
+        if page_header.root != expected_root || page_header.root_record_off != locator.record_off {
+            return Ok(None);
+        }
+        let reader =
+            StorageTrieSegmentReader::open_page(page_bytes, expected_root, locator.record_off)?;
+        let lookup_elapsed = lookup_start.elapsed();
+        let materialize_start = std::time::Instant::now();
+        let trace = reader.cursor().trace_paths(keys)?;
+        let materialize_elapsed = materialize_start.elapsed();
+        Ok(Some(LatestPathTraceLoaded { trace, lookup_elapsed, materialize_elapsed }))
+    }
+
+    pub fn apply_latest_updates(
+        &self,
+        puts: &[(B256, StorageSegmentLocator)],
+        deletes: &[B256],
+    ) -> Result<()> {
+        let mut state = self.state.lock();
+        for hashed_address in deletes {
+            Self::append_index_record(
+                &mut state.index_file,
+                INDEX_OP_DELETE,
+                *hashed_address,
+                StorageSegmentLocator::new(B256::ZERO, 0, 0),
+            )?;
+            state.index.remove(hashed_address);
+        }
+        for (hashed_address, locator) in puts {
+            Self::append_index_record(
+                &mut state.index_file,
+                INDEX_OP_PUT,
+                *hashed_address,
+                *locator,
+            )?;
+            state.index.insert(*hashed_address, *locator);
+        }
+        Ok(())
+    }
+
+    pub fn delete_latest(&self, hashed_address: &B256) -> Result<()> {
+        self.apply_latest_updates(&[], &[*hashed_address])
+    }
+
+    pub fn clear_memory(&self) {
+        self.state.lock().data_mmap = None;
+    }
+
+    pub fn snapshot_index(&self) -> HashMap<B256, StorageSegmentLocator> {
+        self.state.lock().index.clone()
+    }
+
+    pub fn replace_latest_index(
+        &self,
+        new_index: &HashMap<B256, StorageSegmentLocator>,
+    ) -> Result<()> {
+        let mut state = self.state.lock();
+        let tmp = state.index_path.with_extension("index.tmp");
+        Self::write_full_index(&tmp, new_index)?;
+        fs::rename(&tmp, &state.index_path)
+            .map_err(|e| MptDbError::Other(format!("rename latest index: {e}")))?;
+        state.index_file = Self::open_with_magic(&state.index_path, LATEST_INDEX_MAGIC)?;
+        state.data_file = open_pages_data_file(&state.data_path)?;
+        state.pages_index_file = open_pages_index_file(&state.pages_index_path)?;
+        state.pages = load_page_index(&mut state.pages_index_file)?
+            .into_iter()
+            .map(|entry| (entry.page_off, entry))
+            .collect();
+        state.data_mmap = None;
+        state.index = new_index.clone();
+        Ok(())
+    }
+
+    pub(crate) fn index_path(dir: &Path) -> PathBuf {
+        dir.join("latest.index")
+    }
+
+    pub(crate) fn pages_index_path(dir: &Path) -> PathBuf {
+        pages_index_path(dir)
+    }
+
+    pub(crate) fn data_path(dir: &Path) -> PathBuf {
+        pages_data_path(dir)
+    }
+
+    fn open_with_magic(path: &Path, magic: &[u8; 8]) -> Result<File> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| {
+                MptDbError::Other(format!("open fast store file {}: {e}", path.display()))
+            })?;
+
+        let len = file
+            .metadata()
+            .map_err(|e| {
+                MptDbError::Other(format!("stat fast store file {}: {e}", path.display()))
+            })?
+            .len();
+
+        if len == 0 {
+            file.write_all(magic)
+                .map_err(|e| MptDbError::Other(format!("write fast store header: {e}")))?;
+            file.flush().map_err(|e| MptDbError::Other(format!("flush fast store header: {e}")))?;
+        } else {
+            let mut header = [0u8; 8];
+            file.seek(SeekFrom::Start(0))
+                .map_err(|e| MptDbError::Other(format!("seek fast store header: {e}")))?;
+            file.read_exact(&mut header)
+                .map_err(|e| MptDbError::Other(format!("read fast store header: {e}")))?;
+            if &header != magic {
+                return Err(MptDbError::Other(format!(
+                    "unexpected fast store header in {}",
+                    path.display()
+                )));
             }
-            None => Ok(None),
         }
+
+        Ok(file)
     }
 
-    /// Save a trie image for a hashed address (in-memory only until flush_to_disk).
-    pub fn save_latest(&self, hashed_address: B256, image: &StorageTrieImage) -> Result<()> {
-        let bytes = bincode::serialize(image)
-            .map_err(|e| MptDbError::Other(format!("serialize trie image: {e}")))?;
-        self.cache.lock().insert(hashed_address, bytes);
+    fn load_index(index_file: &mut File) -> Result<HashMap<B256, StorageSegmentLocator>> {
+        index_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| MptDbError::Other(format!("seek latest index: {e}")))?;
+        let mut bytes = Vec::new();
+        index_file
+            .read_to_end(&mut bytes)
+            .map_err(|e| MptDbError::Other(format!("read latest index: {e}")))?;
+        if bytes.len() < LATEST_INDEX_MAGIC.len() ||
+            &bytes[..LATEST_INDEX_MAGIC.len()] != LATEST_INDEX_MAGIC
+        {
+            return Err(MptDbError::Other("invalid latest index header".to_string()));
+        }
+
+        let mut index = HashMap::new();
+        let mut pos = LATEST_INDEX_MAGIC.len();
+        while pos + INDEX_RECORD_LEN <= bytes.len() {
+            let op = bytes[pos];
+            pos += 1;
+            let key = B256::from_slice(&bytes[pos..pos + 32]);
+            pos += 32;
+            let root = B256::from_slice(&bytes[pos..pos + 32]);
+            pos += 32;
+
+            let mut page_off_bytes = [0u8; 8];
+            page_off_bytes.copy_from_slice(&bytes[pos..pos + 8]);
+            let page_off = u64::from_le_bytes(page_off_bytes);
+            pos += 8;
+
+            let mut record_off_bytes = [0u8; 4];
+            record_off_bytes.copy_from_slice(&bytes[pos..pos + 4]);
+            let record_off = u32::from_le_bytes(record_off_bytes);
+            pos += 4;
+            let mut version_bytes = [0u8; 2];
+            version_bytes.copy_from_slice(&bytes[pos..pos + 2]);
+            let format_version = u16::from_le_bytes(version_bytes);
+            pos += 2;
+
+            match op {
+                INDEX_OP_PUT => {
+                    index.insert(
+                        key,
+                        StorageSegmentLocator { root, page_off, record_off, format_version },
+                    );
+                }
+                INDEX_OP_DELETE => {
+                    index.remove(&key);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(index)
+    }
+
+    fn append_index_record(
+        index_file: &mut File,
+        op: u8,
+        key: B256,
+        locator: StorageSegmentLocator,
+    ) -> Result<()> {
+        index_file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| MptDbError::Other(format!("seek latest index append: {e}")))?;
+        let mut record = [0u8; INDEX_RECORD_LEN];
+        let mut pos = 0usize;
+        record[pos] = op;
+        pos += 1;
+        record[pos..pos + 32].copy_from_slice(key.as_slice());
+        pos += 32;
+        record[pos..pos + 32].copy_from_slice(locator.root.as_slice());
+        pos += 32;
+        record[pos..pos + 8].copy_from_slice(&locator.page_off.to_le_bytes());
+        pos += 8;
+        record[pos..pos + 4].copy_from_slice(&locator.record_off.to_le_bytes());
+        pos += 4;
+        record[pos..pos + 2].copy_from_slice(&locator.format_version.to_le_bytes());
+        index_file
+            .write_all(&record)
+            .map_err(|e| MptDbError::Other(format!("append latest index record: {e}")))?;
+        index_file
+            .flush()
+            .map_err(|e| MptDbError::Other(format!("flush latest index record: {e}")))?;
         Ok(())
     }
 
-    /// Remove a trie image (e.g. on selfdestruct / storage wipe).
-    pub fn delete_latest(&self, hashed_address: &B256) {
-        self.cache.lock().remove(hashed_address);
-    }
-
-    /// Clear all entries from the in-memory cache.
-    pub fn clear(&self) {
-        self.cache.lock().clear();
-    }
-
-    /// Number of cached images.
-    pub fn len(&self) -> usize {
-        self.cache.lock().len()
-    }
-
-    /// Whether the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.cache.lock().is_empty()
-    }
-
-    /// Persist the in-memory cache to disk atomically (write-tmp then rename).
-    /// Called from the async persist worker or on close.
-    pub fn flush_to_disk(&self) -> Result<()> {
-        let cache = self.cache.lock();
-        let data: Vec<(B256, Vec<u8>)> = cache.iter().map(|(k, v)| (*k, v.clone())).collect();
-        drop(cache);
-
-        let tmp = self.dir.join("images.bin.tmp");
-        let target = self.dir.join("images.bin");
-        let bytes = bincode::serialize(&data)
-            .map_err(|e| MptDbError::Other(format!("serialize fast store: {e}")))?;
-        fs::write(&tmp, bytes).map_err(|e| MptDbError::Other(format!("write fast store: {e}")))?;
-        fs::rename(&tmp, &target)
-            .map_err(|e| MptDbError::Other(format!("rename fast store: {e}")))?;
+    fn write_full_index(path: &Path, index: &HashMap<B256, StorageSegmentLocator>) -> Result<()> {
+        let mut file = File::create(path)
+            .map_err(|e| MptDbError::Other(format!("create latest index tmp: {e}")))?;
+        file.write_all(LATEST_INDEX_MAGIC)
+            .map_err(|e| MptDbError::Other(format!("write latest index header: {e}")))?;
+        for (key, locator) in index {
+            let mut record = [0u8; INDEX_RECORD_LEN];
+            let mut pos = 0usize;
+            record[pos] = INDEX_OP_PUT;
+            pos += 1;
+            record[pos..pos + 32].copy_from_slice(key.as_slice());
+            pos += 32;
+            record[pos..pos + 32].copy_from_slice(locator.root.as_slice());
+            pos += 32;
+            record[pos..pos + 8].copy_from_slice(&locator.page_off.to_le_bytes());
+            pos += 8;
+            record[pos..pos + 4].copy_from_slice(&locator.record_off.to_le_bytes());
+            pos += 4;
+            record[pos..pos + 2].copy_from_slice(&locator.format_version.to_le_bytes());
+            file.write_all(&record)
+                .map_err(|e| MptDbError::Other(format!("write latest index record: {e}")))?;
+        }
+        file.flush().map_err(|e| MptDbError::Other(format!("flush latest index tmp: {e}")))?;
         Ok(())
     }
 
-    /// Load persisted data from disk into the in-memory cache.
-    fn load_from_disk(&self) -> Result<()> {
-        let path = self.dir.join("images.bin");
-        if !path.exists() {
-            return Ok(());
+    fn ensure_data_mmap(state: &mut FastStoreState) -> Result<&Mmap> {
+        if state.data_mmap.is_none() {
+            let mmap = unsafe {
+                MmapOptions::new()
+                    .map(&state.data_file)
+                    .map_err(|e| MptDbError::Other(format!("mmap latest flat data: {e}")))?
+            };
+            state.data_mmap = Some(mmap);
         }
-        let bytes =
-            fs::read(&path).map_err(|e| MptDbError::Other(format!("read fast store: {e}")))?;
-        let data: Vec<(B256, Vec<u8>)> = bincode::deserialize(&bytes)
-            .map_err(|e| MptDbError::Other(format!("deserialize fast store: {e}")))?;
-        let mut cache = self.cache.lock();
-        for (k, v) in data {
-            cache.insert(k, v);
-        }
-        Ok(())
+        Ok(state.data_mmap.as_ref().unwrap())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::B256;
+    use alloy_primitives::{B256, U256};
     use alloy_trie::Nibbles;
     use tempfile::TempDir;
 
-    fn make_test_tree() -> MptTree {
+    use crate::mpt::{flat_layout, tree::MptTree, StorageTrieSegment};
+
+    #[test]
+    fn test_latest_segment_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let store = FastStorageTrieStore::open(dir.path()).unwrap();
+
         let mut tree = MptTree::new();
         let key = Nibbles::unpack(B256::with_last_byte(1));
-        tree.insert(&key, vec![0xaa, 0xbb]);
-        let key2 = Nibbles::unpack(B256::with_last_byte(2));
-        tree.insert(&key2, vec![0xcc, 0xdd]);
-        tree
-    }
+        tree.insert(&key, alloy_rlp::encode(U256::from(7u64)));
+        let (root, _) = tree.root_hash_and_dirty_blobs();
+        let segment = StorageTrieSegment::from_tree(&tree, root).unwrap();
 
-    fn tree_root(tree: &mut MptTree) -> B256 {
-        tree.root_hash()
+        let data_path = FastStorageTrieStore::data_path(dir.path());
+        let pages_index_path = FastStorageTrieStore::pages_index_path(dir.path());
+        let mut data_file = open_pages_data_file(&data_path).unwrap();
+        let mut pages_index_file = open_pages_index_file(&pages_index_path).unwrap();
+        let entry = flat_layout::append_page(
+            &mut data_file,
+            &mut pages_index_file,
+            segment.as_bytes(),
+            root,
+            segment.root_record_off(),
+        )
+        .unwrap();
+        let locator = StorageSegmentLocator::new(root, entry.page_off, entry.root_record_off);
+        store.apply_latest_updates(&[(B256::with_last_byte(0x11), locator)], &[]).unwrap();
+        store.replace_latest_index(&store.snapshot_index()).unwrap();
+        store.clear_memory();
+
+        let mut loaded = store
+            .trace_touched_paths(&B256::with_last_byte(0x11), root, &[key.clone()])
+            .unwrap()
+            .expect("latest segment should materialize");
+        assert_eq!(loaded.trace.into_tree().root_hash(), root);
     }
 
     #[test]
-    fn test_l3_hit() {
+    fn test_delete_latest() {
         let dir = TempDir::new().unwrap();
-        let store = FastStorageTrieStore::open(&dir.path().join("fast")).unwrap();
+        let store = FastStorageTrieStore::open(dir.path()).unwrap();
 
-        let mut tree = make_test_tree();
-        let root = tree_root(&mut tree);
-        let addr = B256::with_last_byte(0x42);
-
-        let image = StorageTrieImage::from_tree(&tree, root);
-        store.save_latest(addr, &image).unwrap();
-
-        // Load and verify
-        let loaded = store.load_latest(&addr).unwrap().expect("should find image");
-        assert_eq!(loaded.root, root);
-
-        // Restore trie and verify content matches
-        let restored = loaded.into_tree();
+        let mut tree = MptTree::new();
         let key = Nibbles::unpack(B256::with_last_byte(1));
-        assert_eq!(restored.get(&key), Some(&[0xaa, 0xbb][..]));
-        let key2 = Nibbles::unpack(B256::with_last_byte(2));
-        assert_eq!(restored.get(&key2), Some(&[0xcc, 0xdd][..]));
-    }
+        tree.insert(&key, alloy_rlp::encode(U256::from(7u64)));
+        let (root, _) = tree.root_hash_and_dirty_blobs();
+        let segment = StorageTrieSegment::from_tree(&tree, root).unwrap();
 
-    #[test]
-    fn test_l3_stale() {
-        let dir = TempDir::new().unwrap();
-        let store = FastStorageTrieStore::open(&dir.path().join("fast")).unwrap();
-
-        let mut tree = make_test_tree();
-        let root = tree_root(&mut tree);
-        let addr = B256::with_last_byte(0x42);
-
-        let image = StorageTrieImage::from_tree(&tree, root);
-        store.save_latest(addr, &image).unwrap();
-
-        // Load with a different expected root -> stale
-        let loaded = store.load_latest(&addr).unwrap().expect("image exists");
-        let different_root = B256::with_last_byte(0xff);
-        assert_ne!(loaded.root, different_root, "should be stale (root mismatch)");
-    }
-
-    #[test]
-    fn test_l3_miss() {
-        let dir = TempDir::new().unwrap();
-        let store = FastStorageTrieStore::open(&dir.path().join("fast")).unwrap();
-
-        let addr = B256::with_last_byte(0x99);
-        let loaded = store.load_latest(&addr).unwrap();
-        assert!(loaded.is_none(), "should be None on miss");
-    }
-
-    #[test]
-    fn test_l3_selfdestruct() {
-        let dir = TempDir::new().unwrap();
-        let store = FastStorageTrieStore::open(&dir.path().join("fast")).unwrap();
-
-        let mut tree = make_test_tree();
-        let root = tree_root(&mut tree);
-        let addr = B256::with_last_byte(0x42);
-
-        let image = StorageTrieImage::from_tree(&tree, root);
-        store.save_latest(addr, &image).unwrap();
-        assert!(!store.is_empty());
-
-        // Simulate selfdestruct
-        store.delete_latest(&addr);
-        let loaded = store.load_latest(&addr).unwrap();
-        assert!(loaded.is_none(), "should be gone after delete");
-    }
-
-    #[test]
-    fn test_flush_and_reload() {
-        let dir = TempDir::new().unwrap();
-        let fast_dir = dir.path().join("fast");
-
-        let mut tree = make_test_tree();
-        let root = tree_root(&mut tree);
-        let addr = B256::with_last_byte(0x42);
-
-        // Save and flush
-        {
-            let store = FastStorageTrieStore::open(&fast_dir).unwrap();
-            let image = StorageTrieImage::from_tree(&tree, root);
-            store.save_latest(addr, &image).unwrap();
-            store.flush_to_disk().unwrap();
-        }
-
-        // Reload from a fresh store instance
-        {
-            let store = FastStorageTrieStore::open(&fast_dir).unwrap();
-            assert_eq!(store.len(), 1);
-            let loaded = store.load_latest(&addr).unwrap().expect("should persist across reload");
-            assert_eq!(loaded.root, root);
-
-            let restored = loaded.into_tree();
-            let key = Nibbles::unpack(B256::with_last_byte(1));
-            assert_eq!(restored.get(&key), Some(&[0xaa, 0xbb][..]));
-        }
-    }
-
-    #[test]
-    fn test_clear() {
-        let dir = TempDir::new().unwrap();
-        let store = FastStorageTrieStore::open(&dir.path().join("fast")).unwrap();
-
-        let mut tree = make_test_tree();
-        let root = tree_root(&mut tree);
-        let addr1 = B256::with_last_byte(0x01);
-        let addr2 = B256::with_last_byte(0x02);
-
-        let image = StorageTrieImage::from_tree(&tree, root);
-        store.save_latest(addr1, &image).unwrap();
-        store.save_latest(addr2, &image).unwrap();
-        assert_eq!(store.len(), 2);
-
-        store.clear();
-        assert!(store.is_empty());
-        assert!(store.load_latest(&addr1).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_from_tree_into_tree_roundtrip() {
-        let mut tree = make_test_tree();
-        let root = tree_root(&mut tree);
-
-        let image = StorageTrieImage::from_tree(&tree, root);
-        let mut restored = image.into_tree();
-
-        // Root hash should match after recomputation
-        let restored_root = restored.root_hash();
-        assert_eq!(restored_root, root, "roundtrip root must match");
+        let data_path = FastStorageTrieStore::data_path(dir.path());
+        let pages_index_path = FastStorageTrieStore::pages_index_path(dir.path());
+        let mut data_file = open_pages_data_file(&data_path).unwrap();
+        let mut pages_index_file = open_pages_index_file(&pages_index_path).unwrap();
+        let entry = flat_layout::append_page(
+            &mut data_file,
+            &mut pages_index_file,
+            segment.as_bytes(),
+            root,
+            segment.root_record_off(),
+        )
+        .unwrap();
+        let locator = StorageSegmentLocator::new(root, entry.page_off, entry.root_record_off);
+        let addr = B256::with_last_byte(0x22);
+        store.apply_latest_updates(&[(addr, locator)], &[]).unwrap();
+        store.replace_latest_index(&store.snapshot_index()).unwrap();
+        store.delete_latest(&addr).unwrap();
+        assert!(store.trace_touched_paths(&addr, root, &[key]).unwrap().is_none());
     }
 }

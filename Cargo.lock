@@ -6416,6 +6416,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "crossbeam-channel",
  "fs4",
+ "memmap2",
  "mptdb-common",
  "mptdb-engine",
  "mptdb-traits",

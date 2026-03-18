@@ -19,6 +19,24 @@ pub struct MutableTrieArena {
 }
 
 impl MutableTrieArena {
+    fn ensure_rlp_len(&mut self, len: usize) {
+        if self.rlp_cache.len() < len {
+            self.rlp_cache.resize_with(len, || None);
+        }
+    }
+
+    fn ensure_dirty_len(&mut self, len: usize) {
+        if self.dirty.len() < len {
+            self.dirty.resize(len, false);
+        }
+    }
+
+    fn ensure_aux_aligned_for_existing_nodes(&mut self) {
+        let len = self.nodes.len();
+        self.ensure_rlp_len(len);
+        self.ensure_dirty_len(len);
+    }
+
     pub fn new() -> Self {
         Self { nodes: Vec::new(), rlp_cache: Vec::new(), hash_cache: Vec::new(), dirty: Vec::new() }
     }
@@ -34,6 +52,7 @@ impl MutableTrieArena {
 
     /// Allocate a new node, returns its index. New nodes are dirty by default.
     pub fn alloc(&mut self, node: MptNode) -> u32 {
+        self.ensure_aux_aligned_for_existing_nodes();
         let idx = self.nodes.len() as u32;
         self.nodes.push(node);
         self.rlp_cache.push(None);
@@ -44,6 +63,7 @@ impl MutableTrieArena {
 
     /// Allocate a node that is already persisted (clean). Used when loading from storage.
     pub fn alloc_clean(&mut self, node: MptNode) -> u32 {
+        self.ensure_aux_aligned_for_existing_nodes();
         let idx = self.nodes.len() as u32;
         self.nodes.push(node);
         self.rlp_cache.push(None);
@@ -54,12 +74,13 @@ impl MutableTrieArena {
 
     /// Mark a node as dirty (modified in current block).
     pub fn mark_dirty(&mut self, idx: u32) {
+        self.ensure_dirty_len(idx as usize + 1);
         self.dirty[idx as usize] = true;
     }
 
     /// Check if a node is dirty.
     pub fn is_dirty(&self, idx: u32) -> bool {
-        self.dirty[idx as usize]
+        self.dirty.get(idx as usize).copied().unwrap_or(false)
     }
 
     /// Clear all dirty flags (call after successful persist).
@@ -79,16 +100,18 @@ impl MutableTrieArena {
 
     /// Get cached RLP for a node.
     pub fn get_rlp(&self, index: u32) -> Option<&Vec<u8>> {
-        self.rlp_cache[index as usize].as_ref()
+        self.rlp_cache.get(index as usize).and_then(|cached| cached.as_ref())
     }
 
     /// Set cached RLP for a node.
     pub fn set_rlp(&mut self, index: u32, rlp: Vec<u8>) {
+        self.ensure_rlp_len(index as usize + 1);
         self.rlp_cache[index as usize] = Some(rlp);
     }
 
     /// Clear cached RLP and hash for a node (cache invalidation on modification).
     pub fn clear_rlp(&mut self, index: u32) {
+        self.ensure_rlp_len(index as usize + 1);
         self.rlp_cache[index as usize] = None;
         self.hash_cache[index as usize] = None;
     }
@@ -116,8 +139,7 @@ impl MutableTrieArena {
     /// Reconstruct an arena from a lean image: nodes + hash_cache only,
     /// with empty rlp_cache and all-clean dirty flags.
     pub fn from_lean(nodes: Vec<MptNode>, hash_cache: Vec<Option<alloy_primitives::B256>>) -> Self {
-        let len = nodes.len();
-        Self { nodes, rlp_cache: vec![None; len], hash_cache, dirty: vec![false; len] }
+        Self { nodes, rlp_cache: Vec::new(), hash_cache, dirty: Vec::new() }
     }
 
     /// Number of nodes in the arena.
@@ -230,5 +252,32 @@ mod tests {
             value: vec![1],
         }));
         assert_eq!(arena.len(), 2);
+    }
+
+    #[test]
+    fn t4_5_from_lean_uses_sparse_aux_vectors() {
+        let nodes = vec![MptNode::Leaf(LeafNode {
+            nibbles: alloy_trie::Nibbles::from_nibbles(&[1]),
+            value: vec![0xaa],
+        })];
+        let hash_cache = vec![Some(alloy_primitives::B256::with_last_byte(0x42))];
+        let mut arena = MutableTrieArena::from_lean(nodes, hash_cache);
+
+        assert_eq!(arena.len(), 1);
+        assert!(arena.get_rlp(0).is_none());
+        assert!(!arena.is_dirty(0));
+
+        arena.set_rlp(0, vec![0xc1, 0x80]);
+        assert_eq!(arena.get_rlp(0).unwrap(), &vec![0xc1, 0x80]);
+
+        arena.mark_dirty(0);
+        assert!(arena.is_dirty(0));
+
+        let idx = arena.alloc(MptNode::Leaf(LeafNode {
+            nibbles: alloy_trie::Nibbles::from_nibbles(&[2]),
+            value: vec![0xbb],
+        }));
+        assert_eq!(idx, 1);
+        assert!(arena.is_dirty(idx));
     }
 }
