@@ -58,6 +58,68 @@ struct DeltaEntry {
     format_version: u16,
 }
 
+enum DeltaLookup {
+    Hit(DeltaEntry),
+    Deleted,
+    Miss,
+}
+
+struct PublishedDeltaMmap {
+    mmap: Mmap,
+}
+
+impl PublishedDeltaMmap {
+    fn open(path: &Path) -> Result<Self> {
+        let file =
+            File::open(path).map_err(|e| MptDbError::Other(format!("open delta file: {e}")))?;
+        let mmap = unsafe {
+            MmapOptions::new()
+                .map(&file)
+                .map_err(|e| MptDbError::Other(format!("mmap delta file: {e}")))?
+        };
+        if mmap.len() < DELTA_MAGIC.len() || &mmap[..DELTA_MAGIC.len()] != DELTA_MAGIC {
+            return Err(MptDbError::Other("invalid published delta header".to_string()));
+        }
+        Ok(Self { mmap })
+    }
+
+    fn lookup(&self, needle: &B256) -> DeltaLookup {
+        let mut pos = DELTA_MAGIC.len();
+        while pos + DELTA_RECORD_LEN <= self.mmap.len() {
+            let op = self.mmap[pos];
+            pos += 1;
+            let key = B256::from_slice(&self.mmap[pos..pos + 32]);
+            pos += 32;
+            let root = B256::from_slice(&self.mmap[pos..pos + 32]);
+            pos += 32;
+            let mut page_off_bytes = [0u8; 8];
+            page_off_bytes.copy_from_slice(&self.mmap[pos..pos + 8]);
+            let page_off = u64::from_le_bytes(page_off_bytes);
+            pos += 8;
+            let mut record_off_bytes = [0u8; 4];
+            record_off_bytes.copy_from_slice(&self.mmap[pos..pos + 4]);
+            let record_off = u32::from_le_bytes(record_off_bytes);
+            pos += 4;
+            let mut format_bytes = [0u8; 2];
+            format_bytes.copy_from_slice(&self.mmap[pos..pos + 2]);
+            let format_version = u16::from_le_bytes(format_bytes);
+            pos += 2;
+
+            if key != *needle {
+                continue;
+            }
+            return match op {
+                DELTA_OP_PUT => {
+                    DeltaLookup::Hit(DeltaEntry { page_off, record_off, root, format_version })
+                }
+                DELTA_OP_DELETE => DeltaLookup::Deleted,
+                _ => DeltaLookup::Miss,
+            };
+        }
+        DeltaLookup::Miss
+    }
+}
+
 #[derive(Clone)]
 pub struct PublishedGenerationResult {
     pub meta: PublishedBaselineMeta,
@@ -66,10 +128,10 @@ pub struct PublishedGenerationResult {
 
 pub struct PublishedBaselineReader {
     meta: PublishedBaselineMeta,
-    index: HashMap<B256, DeltaEntry>,
+    deltas: Vec<PublishedDeltaMmap>,
     data_mmap: Mmap,
     leases: Arc<Mutex<HashMap<u64, usize>>>,
-    pinned_records: Vec<(u64, u32)>,
+    pinned_records: Mutex<HashSet<(u64, u32)>>,
     record_pins: Arc<Mutex<HashMap<(u64, u32), usize>>>,
 }
 
@@ -91,7 +153,7 @@ impl PublishedBaselineReader {
         keys: &[Nibbles],
     ) -> Result<Option<PublishedTrieMaterialized>> {
         let lookup_start = std::time::Instant::now();
-        let entry = match self.index.get(hashed_address).copied() {
+        let entry = match self.lookup_entry(hashed_address)? {
             Some(entry) => entry,
             None => return Ok(None),
         };
@@ -117,7 +179,29 @@ impl PublishedBaselineReader {
         let materialize_start = std::time::Instant::now();
         let trace = reader.cursor().trace_paths(keys)?;
         let materialize_elapsed = materialize_start.elapsed();
+        self.pin_record((entry.page_off, entry.record_off));
         Ok(Some(PublishedTrieMaterialized { trace, lookup_elapsed, materialize_elapsed }))
+    }
+
+    fn lookup_entry(&self, hashed_address: &B256) -> Result<Option<DeltaEntry>> {
+        for delta in &self.deltas {
+            match delta.lookup(hashed_address) {
+                DeltaLookup::Hit(entry) => return Ok(Some(entry)),
+                DeltaLookup::Deleted => return Ok(None),
+                DeltaLookup::Miss => {}
+            }
+        }
+        Ok(None)
+    }
+
+    fn pin_record(&self, record: (u64, u32)) {
+        let mut local = self.pinned_records.lock();
+        if !local.insert(record) {
+            return;
+        }
+        drop(local);
+        let mut global = self.record_pins.lock();
+        *global.entry(record).or_insert(0) += 1;
     }
 }
 
@@ -135,7 +219,7 @@ impl Drop for PublishedBaselineReader {
         }
         {
             let mut record_pins = self.record_pins.lock();
-            for record in &self.pinned_records {
+            for record in self.pinned_records.lock().iter() {
                 match record_pins.get_mut(record) {
                     Some(count) if *count > 1 => *count -= 1,
                     Some(_) => {
@@ -190,7 +274,7 @@ impl PublishedBaselineManager {
             }
             _ => return Ok(None),
         };
-        let index = self.load_merged_index(&gen_meta)?;
+        let deltas = self.load_delta_chain(&gen_meta)?;
         let data_file = Self::open_data_file(&self.base_dir)?;
         let data_mmap = unsafe {
             MmapOptions::new()
@@ -198,14 +282,12 @@ impl PublishedBaselineManager {
                 .map_err(|e| MptDbError::Other(format!("mmap published baseline data: {e}")))?
         };
         self.acquire_generation_lease(meta.generation);
-        let pinned_records = Self::collect_pinned_records(&index);
-        self.acquire_record_pins(&pinned_records);
         Ok(Some(PublishedBaselineReader {
             meta: meta.clone(),
-            index,
+            deltas,
             data_mmap,
             leases: Arc::clone(&self.leases),
-            pinned_records,
+            pinned_records: Mutex::new(HashSet::new()),
             record_pins: Arc::clone(&self.record_pins),
         }))
     }
@@ -353,6 +435,7 @@ impl PublishedBaselineManager {
     ) -> Result<bool> {
         let mut keep_generations: HashSet<u64> =
             manifest.versions.keys().map(|v| *v as u64).collect();
+        keep_generations.extend(self.active_generation_leases());
         keep_generations.extend(self.generations_with_pinned_records()?);
         let latest_snapshot = fast_store.map(|store| store.snapshot_index()).unwrap_or_default();
 
@@ -564,6 +647,19 @@ impl PublishedBaselineManager {
             }
         }
         Ok(merged)
+    }
+
+    fn load_delta_chain(&self, meta: &GenerationMeta) -> Result<Vec<PublishedDeltaMmap>> {
+        let mut deltas = Vec::new();
+        let mut cursor = Some(meta.generation);
+        while let Some(generation) = cursor {
+            let gen_meta = self.load_generation_meta(generation)?.ok_or_else(|| {
+                MptDbError::Other(format!("missing published generation metadata for {generation}"))
+            })?;
+            deltas.push(PublishedDeltaMmap::open(&self.delta_path(gen_meta.generation))?);
+            cursor = gen_meta.parent_generation;
+        }
+        Ok(deltas)
     }
 
     fn published_dir(base: &Path) -> PathBuf {
@@ -782,6 +878,7 @@ impl PublishedBaselineManager {
         *leases.entry(generation).or_insert(0) += 1;
     }
 
+    #[cfg(test)]
     fn acquire_record_pins(&self, records: &[(u64, u32)]) {
         let mut pins = self.record_pins.lock();
         for record in records {
@@ -789,6 +886,7 @@ impl PublishedBaselineManager {
         }
     }
 
+    #[cfg(test)]
     fn collect_pinned_records(index: &HashMap<B256, DeltaEntry>) -> Vec<(u64, u32)> {
         let mut out =
             index.values().map(|entry| (entry.page_off, entry.record_off)).collect::<Vec<_>>();
@@ -899,6 +997,12 @@ mod tests {
             let reader = mgr.open_published_store(&meta).unwrap().unwrap();
             assert_eq!(reader.meta(), &meta);
             assert_eq!(mgr.active_generation_leases(), vec![1]);
+            assert!(mgr.active_record_pins().is_empty());
+            let key = Nibbles::unpack(B256::with_last_byte(1));
+            let loaded = reader
+                .materialize_touched_paths(&B256::with_last_byte(0x11), root, &[key])
+                .unwrap();
+            assert!(loaded.is_some());
             let pins = mgr.active_record_pins();
             assert_eq!(pins.len(), 1);
             assert_eq!(pins[0].0, 8);

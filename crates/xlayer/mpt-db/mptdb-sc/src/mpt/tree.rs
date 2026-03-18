@@ -105,6 +105,7 @@ impl MptTree {
     /// If `parallel_frontier_width()` is below the threshold, falls back to
     /// a serial read-only encoding path. The result is byte-for-byte identical
     /// to `root_hash()`.
+    #[cfg(test)]
     pub(crate) fn root_hash_parallel(&self, thresholds: &ParallelismThresholds) -> B256 {
         match self.root {
             None => alloy_trie::EMPTY_ROOT_HASH,
@@ -254,6 +255,7 @@ impl MptTree {
     }
 
     /// Encode a node by arena index without writing to rlp_cache. Read-only.
+    #[cfg(test)]
     fn encode_node_readonly(&self, idx: u32) -> Vec<u8> {
         // Check existing cache first (opportunistic, but never write)
         if let Some(cached) = self.arena.get_rlp(idx) {
@@ -280,6 +282,7 @@ impl MptTree {
     }
 
     /// Read-only child encoding for parent embedding.
+    #[cfg(test)]
     fn encode_child_for_parent_readonly(&self, child: &ChildRef) -> Vec<u8> {
         match child {
             ChildRef::Arena(idx) => {
@@ -296,6 +299,7 @@ impl MptTree {
     }
 
     /// Parallel root hash inner: find frontier, hash subtrees in parallel, assemble.
+    #[cfg(test)]
     fn root_hash_parallel_inner(&self, root_idx: u32) -> B256 {
         let node = self.arena.get(root_idx);
         match node {
@@ -345,6 +349,7 @@ impl MptTree {
 
     /// Parallel-encode each branch child subtree using rayon, producing
     /// the child-embedding bytes for each slot.
+    #[cfg(test)]
     fn parallel_encode_branch_children(
         &self,
         branch: &super::node::BranchNode,
@@ -390,6 +395,7 @@ impl MptTree {
     ///
     /// Ensures all RLP caches are populated first via `encode_node`.
     /// Phase 2 exports every node (no dirty-tracking optimization).
+    #[cfg(test)]
     pub(crate) fn collect_node_blobs(&mut self) -> Vec<(B256, Vec<u8>)> {
         let root_idx = match self.root {
             Some(idx) => idx,
@@ -404,6 +410,7 @@ impl MptTree {
         result
     }
 
+    #[cfg(test)]
     fn collect_blobs_recursive(&self, idx: u32, out: &mut Vec<(B256, Vec<u8>)>) {
         let rlp = self.arena.get_rlp(idx).expect("RLP cache must be populated").clone();
         let node_hash = self.arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
@@ -429,6 +436,7 @@ impl MptTree {
 
     /// Collect only dirty (modified) node blobs. Requires RLP cache to be populated first
     /// (e.g., via `encode_node`). Returns a subset of what `collect_node_blobs()` would return.
+    #[cfg(test)]
     pub(crate) fn collect_dirty_blobs(&mut self) -> Vec<(B256, Vec<u8>)> {
         let root_idx = match self.root {
             Some(idx) => idx,

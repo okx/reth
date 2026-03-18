@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, U256};
 use alloy_trie::KECCAK_EMPTY;
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
 use revm_database::{states::StorageSlot, AccountStatus, BundleAccount, BundleState};
