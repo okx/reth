@@ -321,6 +321,8 @@ fn print_profile(label: &str, profile: &CommitProfile) {
     println!("  l3_published_post:    {:>8}", profile.apply_l3_published_post_flush_hits);
     println!("  node_fallback_loads:  {:>8}", profile.apply_node_fallback_loads);
     println!("storage_roots:          {:>8} µs", profile.storage_roots.as_micros());
+    println!("  root_hashing:         {:>8} µs", profile.storage_root_hashing.as_micros());
+    println!("  segment_build:        {:>8} µs", profile.storage_segment_build.as_micros());
     println!("account_updates:        {:>8} µs", profile.account_updates.as_micros());
     println!("account_root_and_blobs: {:>8} µs", profile.account_root_and_blobs.as_micros());
     println!("persist_and_manifest:   {:>8} µs", profile.persist_and_manifest.as_micros());
@@ -351,7 +353,7 @@ fn profile_b4_4_large() {
     println!("Pre-pop commit: {}ms", t1.elapsed().as_millis());
 
     println!(
-        "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+        "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
         "Block",
         "Apply",
         "Collect",
@@ -364,6 +366,8 @@ fn profile_b4_4_large() {
         "L3Hit",
         "NDFall",
         "StorRoot",
+        "RtHash",
+        "SegBld",
         "AcctUpd",
         "AcctRoot",
         "Persist",
@@ -376,7 +380,7 @@ fn profile_b4_4_large() {
         let ((_version, _root), profile) = store.commit_with_profile().unwrap();
 
         println!(
-            "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+            "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
             i + 1,
             profile.apply_bundle_state.as_millis(),
             profile.apply_collect_dirty_accounts.as_millis(),
@@ -391,6 +395,8 @@ fn profile_b4_4_large() {
                 + profile.apply_l3_published_post_flush_hits,
             profile.apply_node_fallback_loads,
             profile.storage_roots.as_millis(),
+            profile.storage_root_hashing.as_millis(),
+            profile.storage_segment_build.as_millis(),
             profile.account_updates.as_millis(),
             profile.account_root_and_blobs.as_millis(),
             profile.persist_and_manifest.as_millis(),

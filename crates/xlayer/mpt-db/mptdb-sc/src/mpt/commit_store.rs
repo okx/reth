@@ -55,6 +55,8 @@ struct StorageTrieCommitArtifacts {
     storage_root: B256,
     node_blobs: Vec<(B256, Vec<u8>)>,
     segment: Option<StorageTrieSegment>,
+    hash_elapsed: Duration,
+    segment_elapsed: Duration,
     /// The trie after root computation, returned for LRU caching.
     trie: MptTree,
 }
@@ -137,6 +139,8 @@ pub struct CommitProfile {
     pub apply_l3_published_post_flush_hits: u64,
     pub apply_node_fallback_loads: u64,
     pub storage_roots: Duration,
+    pub storage_root_hashing: Duration,
+    pub storage_segment_build: Duration,
     pub account_updates: Duration,
     pub account_root_and_blobs: Duration,
     pub persist_and_manifest: Duration,
@@ -1415,6 +1419,8 @@ impl MptCommitStore {
         let storage_tries = std::mem::take(&mut self.storage_tries);
         let storage_tries_len = storage_tries.len();
         let should_parallel = self.parallelism.should_parallelize_storage_tries(storage_tries_len);
+        let mut storage_root_hash_elapsed = Duration::ZERO;
+        let mut storage_segment_build_elapsed = Duration::ZERO;
 
         let storage_artifacts: Vec<StorageTrieCommitArtifacts> = if should_parallel {
             storage_tries
@@ -1422,28 +1428,40 @@ impl MptCommitStore {
                 .map(|(addr, trie)| -> Result<StorageTrieCommitArtifacts> {
                     match trie {
                         WorkingStorageTrie::Overlay(overlay) => {
+                            let hash_start = std::time::Instant::now();
                             let (root, blobs, trie) = overlay.root_hash_and_dirty_blobs();
+                            let hash_elapsed = hash_start.elapsed();
+                            let segment_start = std::time::Instant::now();
                             let segment = (root != EMPTY_ROOT_HASH)
                                 .then(|| StorageTrieSegment::from_tree(&trie, root))
                                 .transpose()?;
+                            let segment_elapsed = segment_start.elapsed();
                             Ok(StorageTrieCommitArtifacts {
                                 hashed_address: addr,
                                 storage_root: root,
                                 node_blobs: blobs,
                                 segment,
+                                hash_elapsed,
+                                segment_elapsed,
                                 trie,
                             })
                         }
                         WorkingStorageTrie::Tree(mut trie) => {
+                            let hash_start = std::time::Instant::now();
                             let (root, blobs) = trie.root_hash_and_dirty_blobs();
+                            let hash_elapsed = hash_start.elapsed();
+                            let segment_start = std::time::Instant::now();
                             let segment = (root != EMPTY_ROOT_HASH)
                                 .then(|| StorageTrieSegment::from_tree(&trie, root))
                                 .transpose()?;
+                            let segment_elapsed = segment_start.elapsed();
                             Ok(StorageTrieCommitArtifacts {
                                 hashed_address: addr,
                                 storage_root: root,
                                 node_blobs: blobs,
                                 segment,
+                                hash_elapsed,
+                                segment_elapsed,
                                 trie,
                             })
                         }
@@ -1456,28 +1474,40 @@ impl MptCommitStore {
                 .map(|(addr, trie)| -> Result<StorageTrieCommitArtifacts> {
                     match trie {
                         WorkingStorageTrie::Overlay(overlay) => {
+                            let hash_start = std::time::Instant::now();
                             let (root, blobs, trie) = overlay.root_hash_and_dirty_blobs();
+                            let hash_elapsed = hash_start.elapsed();
+                            let segment_start = std::time::Instant::now();
                             let segment = (root != EMPTY_ROOT_HASH)
                                 .then(|| StorageTrieSegment::from_tree(&trie, root))
                                 .transpose()?;
+                            let segment_elapsed = segment_start.elapsed();
                             Ok(StorageTrieCommitArtifacts {
                                 hashed_address: addr,
                                 storage_root: root,
                                 node_blobs: blobs,
                                 segment,
+                                hash_elapsed,
+                                segment_elapsed,
                                 trie,
                             })
                         }
                         WorkingStorageTrie::Tree(mut trie) => {
+                            let hash_start = std::time::Instant::now();
                             let (root, blobs) = trie.root_hash_and_dirty_blobs();
+                            let hash_elapsed = hash_start.elapsed();
+                            let segment_start = std::time::Instant::now();
                             let segment = (root != EMPTY_ROOT_HASH)
                                 .then(|| StorageTrieSegment::from_tree(&trie, root))
                                 .transpose()?;
+                            let segment_elapsed = segment_start.elapsed();
                             Ok(StorageTrieCommitArtifacts {
                                 hashed_address: addr,
                                 storage_root: root,
                                 node_blobs: blobs,
                                 segment,
+                                hash_elapsed,
+                                segment_elapsed,
                                 trie,
                             })
                         }
@@ -1489,6 +1519,8 @@ impl MptCommitStore {
         // Merge RECOMPUTE roots into storage_roots map
         for artifact in &storage_artifacts {
             storage_roots.insert(artifact.hashed_address, artifact.storage_root);
+            storage_root_hash_elapsed += artifact.hash_elapsed;
+            storage_segment_build_elapsed += artifact.segment_elapsed;
         }
 
         let storage_roots_elapsed = storage_start.elapsed();
@@ -1496,39 +1528,41 @@ impl MptCommitStore {
         // Phase 2: precompute account writes in parallel, then apply to the
         // single shared account trie serially.
         let account_updates_start = std::time::Instant::now();
-        let account_writes: Vec<(Nibbles, Option<Vec<u8>>)> = self
-            .dirty_accounts
-            .par_iter()
-            .map(|dirty| {
-                let storage_root = storage_roots[&dirty.hashed_address];
-                let encoded = match &dirty.info {
-                    None => None,
-                    Some(info) => {
-                        let is_empty = info.is_empty() && storage_root == EMPTY_ROOT_HASH;
-                        if is_empty {
-                            None
-                        } else {
-                            let trie_account = alloy_trie::TrieAccount {
-                                nonce: info.nonce,
-                                balance: info.balance,
-                                storage_root,
-                                code_hash: info.code_hash,
-                            };
-                            let mut rlp_buf = Vec::new();
-                            trie_account.encode(&mut rlp_buf);
-                            Some(rlp_buf)
-                        }
+        let encode_account = |dirty: &DirtyAccount| {
+            let storage_root = storage_roots[&dirty.hashed_address];
+            match &dirty.info {
+                None => None,
+                Some(info) => {
+                    let is_empty = info.is_empty() && storage_root == EMPTY_ROOT_HASH;
+                    if is_empty {
+                        None
+                    } else {
+                        let trie_account = alloy_trie::TrieAccount {
+                            nonce: info.nonce,
+                            balance: info.balance,
+                            storage_root,
+                            code_hash: info.code_hash,
+                        };
+                        let mut rlp_buf = Vec::new();
+                        trie_account.encode(&mut rlp_buf);
+                        Some(rlp_buf)
                     }
-                };
-                (dirty.account_key.clone(), encoded)
-            })
-            .collect();
+                }
+            }
+        };
 
-        for (key, encoded) in account_writes {
+        let account_writes: Vec<Option<Vec<u8>>> = if self.dirty_accounts.len() >= 1_024 {
+            self.dirty_accounts.par_iter().map(encode_account).collect()
+        } else {
+            self.dirty_accounts.iter().map(encode_account).collect()
+        };
+
+        for (dirty, encoded) in self.dirty_accounts.iter().zip(account_writes.into_iter()) {
+            let key = &dirty.account_key;
             if let Some(rlp_buf) = encoded {
-                self.account_trie.insert(&key, rlp_buf);
+                self.account_trie.insert(key, rlp_buf);
             } else {
-                self.account_trie.delete(&key);
+                self.account_trie.delete(key);
             }
         }
         let account_updates_elapsed = account_updates_start.elapsed();
@@ -1689,6 +1723,8 @@ impl MptCommitStore {
             apply_l3_published_post_flush_hits: self.last_apply_l3_published_post_flush_hits,
             apply_node_fallback_loads: self.last_apply_node_fallback_loads,
             storage_roots: storage_roots_elapsed,
+            storage_root_hashing: storage_root_hash_elapsed,
+            storage_segment_build: storage_segment_build_elapsed,
             account_updates: account_updates_elapsed,
             account_root_and_blobs: account_root_elapsed,
             persist_and_manifest: persist_elapsed,

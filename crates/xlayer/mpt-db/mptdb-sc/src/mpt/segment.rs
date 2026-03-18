@@ -2,7 +2,6 @@ use alloy_primitives::B256;
 use alloy_trie::Nibbles;
 use mptdb_common::error::{MptDbError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use super::{
     arena::MutableTrieArena,
@@ -84,7 +83,7 @@ impl StorageTrieSegment {
         };
 
         let mut reachable = Vec::new();
-        let mut arena_to_segment = HashMap::<u32, u32>::new();
+        let mut arena_to_segment = vec![None; nodes.len()];
         collect_reachable_nodes(nodes, root_idx, &mut arena_to_segment, &mut reachable);
 
         let mut build_nodes = Vec::with_capacity(reachable.len());
@@ -210,16 +209,16 @@ impl<'a> StorageTrieSegmentReader<'a> {
         }
 
         let mut arena = MutableTrieArena::new();
-        let mut materialized = HashMap::<u32, u32>::new();
+        let mut materialized = vec![None; self.node_count as usize];
 
         for key in keys {
             self.materialize_for_key(self.root_idx, key, 0, &mut arena, &mut materialized)?;
         }
 
-        let root_idx = materialized
-            .get(&self.root_idx)
-            .copied()
-            .ok_or_else(|| MptDbError::Other("segment root was not materialized".to_string()))?;
+        let root_idx =
+            materialized.get(self.root_idx as usize).copied().flatten().ok_or_else(|| {
+                MptDbError::Other("segment root was not materialized".to_string())
+            })?;
         Ok(StoragePathTrace { arena, root: Some(root_idx), touched_keys: keys.len() })
     }
 
@@ -233,10 +232,10 @@ impl<'a> StorageTrieSegmentReader<'a> {
         key: &Nibbles,
         offset: usize,
         arena: &mut MutableTrieArena,
-        materialized: &mut HashMap<u32, u32>,
+        materialized: &mut [Option<u32>],
     ) -> Result<u32> {
         let mut inserted = false;
-        let arena_idx = if let Some(idx) = materialized.get(&seg_idx).copied() {
+        let arena_idx = if let Some(idx) = materialized.get(seg_idx as usize).copied().flatten() {
             idx
         } else {
             let node = self.decode_node(seg_idx)?;
@@ -244,7 +243,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
             if let Some(hash) = node.hash {
                 arena.set_hash(idx, hash);
             }
-            materialized.insert(seg_idx, idx);
+            materialized[seg_idx as usize] = Some(idx);
             inserted = true;
             idx
         };
@@ -491,14 +490,14 @@ impl SegmentChildMeta {
 fn collect_reachable_nodes(
     nodes: &[MptNode],
     arena_idx: u32,
-    arena_to_segment: &mut HashMap<u32, u32>,
+    arena_to_segment: &mut [Option<u32>],
     reachable: &mut Vec<u32>,
 ) {
-    if arena_to_segment.contains_key(&arena_idx) {
+    if arena_to_segment[arena_idx as usize].is_some() {
         return;
     }
     let seg_idx = reachable.len() as u32;
-    arena_to_segment.insert(arena_idx, seg_idx);
+    arena_to_segment[arena_idx as usize] = Some(seg_idx);
     reachable.push(arena_idx);
     match &nodes[arena_idx as usize] {
         MptNode::Leaf(_) => {}
@@ -521,7 +520,7 @@ fn build_node(
     nodes: &[MptNode],
     hash_cache: &[Option<B256>],
     arena_idx: u32,
-    arena_to_segment: &HashMap<u32, u32>,
+    arena_to_segment: &[Option<u32>],
 ) -> Result<BuildNode> {
     let hash = node_hash(nodes, hash_cache, arena_idx)?;
     match &nodes[arena_idx as usize] {
@@ -556,14 +555,14 @@ fn build_node(
 fn build_child(
     nodes: &[MptNode],
     hash_cache: &[Option<B256>],
-    arena_to_segment: &HashMap<u32, u32>,
+    arena_to_segment: &[Option<u32>],
     slot: u8,
     child: &ChildRef,
 ) -> Result<BuildChild> {
     Ok(match child {
         ChildRef::Arena(idx) => BuildChild {
             slot,
-            target_idx: arena_to_segment.get(idx).copied(),
+            target_idx: arena_to_segment.get(*idx as usize).copied().flatten(),
             embed: match child_embed(nodes, hash_cache, *idx)? {
                 ChildEmbedOwned::Hash(hash) => ChildEmbedOwned::Hash(hash),
                 ChildEmbedOwned::Inline(bytes) => ChildEmbedOwned::Inline(bytes),
