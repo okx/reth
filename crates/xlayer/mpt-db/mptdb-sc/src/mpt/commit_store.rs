@@ -57,13 +57,12 @@ struct StorageTrieCommitArtifacts {
     segment: Option<StorageTrieSegment>,
     hash_elapsed: Duration,
     segment_elapsed: Duration,
-    /// The trie after root computation, returned for LRU caching.
-    trie: MptTree,
+    /// The overlay after root computation, returned for LRU caching.
+    trie: StorageOverlay,
 }
 
 enum WorkingStorageTrie {
     Overlay(StorageOverlay),
-    Tree(MptTree),
 }
 
 /// A persist job sent to the background worker thread.
@@ -84,7 +83,7 @@ struct PersistJob {
 }
 
 struct StorageTrieCache {
-    inner: LruMap<B256, MptTree, ByLength>,
+    inner: LruMap<B256, StorageOverlay, ByLength>,
     capacity: usize,
 }
 
@@ -94,11 +93,11 @@ impl StorageTrieCache {
         Self { inner: LruMap::new(ByLength::new(limit)), capacity }
     }
 
-    fn remove(&mut self, key: &B256) -> Option<MptTree> {
+    fn remove(&mut self, key: &B256) -> Option<StorageOverlay> {
         self.inner.remove(key)
     }
 
-    fn insert(&mut self, key: B256, trie: MptTree) {
+    fn insert(&mut self, key: B256, trie: StorageOverlay) {
         if self.capacity == 0 {
             return;
         }
@@ -106,6 +105,7 @@ impl StorageTrieCache {
         let _ = self.inner.get_or_insert(key, || trie);
     }
 
+    #[cfg(test)]
     fn contains_key(&self, key: &B256) -> bool {
         self.inner.peek(key).is_some()
     }
@@ -114,10 +114,7 @@ impl StorageTrieCache {
         self.inner.clear();
     }
 
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -219,10 +216,6 @@ pub struct MptCommitStore {
 }
 
 impl MptCommitStore {
-    fn insert_working_tree(&mut self, hashed_address: B256, trie: MptTree) {
-        self.storage_tries.insert(hashed_address, WorkingStorageTrie::Tree(trie));
-    }
-
     fn insert_working_overlay(&mut self, hashed_address: B256, overlay: StorageOverlay) {
         self.storage_tries.insert(hashed_address, WorkingStorageTrie::Overlay(overlay));
     }
@@ -235,28 +228,16 @@ impl MptCommitStore {
         mut trie: WorkingStorageTrie,
         dirty: &DirtyAccount,
     ) -> WorkingStorageTrie {
-        match &mut trie {
-            WorkingStorageTrie::Overlay(overlay) => {
-                for change in &dirty.storage_changes {
-                    if change.value == U256::ZERO {
-                        overlay.apply_change(change.hashed_slot, change.slot_key.clone(), None);
-                    } else {
-                        overlay.apply_change(
-                            change.hashed_slot,
-                            change.slot_key.clone(),
-                            change.encoded_value.clone(),
-                        );
-                    }
-                }
-            }
-            WorkingStorageTrie::Tree(tree) => {
-                for change in &dirty.storage_changes {
-                    if change.value == U256::ZERO {
-                        tree.delete(&change.slot_key);
-                    } else if let Some(encoded) = &change.encoded_value {
-                        tree.insert(&change.slot_key, encoded.clone());
-                    }
-                }
+        let WorkingStorageTrie::Overlay(overlay) = &mut trie;
+        for change in &dirty.storage_changes {
+            if change.value == U256::ZERO {
+                overlay.apply_change(change.hashed_slot, change.slot_key.clone(), None);
+            } else {
+                overlay.apply_change(
+                    change.hashed_slot,
+                    change.slot_key.clone(),
+                    change.encoded_value.clone(),
+                );
             }
         }
         trie
@@ -372,19 +353,6 @@ impl MptCommitStore {
             }
         }
         Ok(())
-    }
-
-    fn maybe_refresh_published_view(&mut self) -> Result<()> {
-        if self.has_current_published_view() {
-            return Ok(());
-        }
-
-        let durable = self.durable_version.load(Ordering::Acquire);
-        if durable < self.version {
-            return Ok(());
-        }
-
-        self.reload_published_view()
     }
 
     fn has_current_published_view(&self) -> bool {
@@ -1140,7 +1108,7 @@ impl MptCommitStore {
                 continue;
             }
             if let Some(cached_trie) = self.storage_trie_cache.remove(&dirty.hashed_address) {
-                self.insert_working_tree(dirty.hashed_address, cached_trie);
+                self.insert_working_overlay(dirty.hashed_address, cached_trie);
                 l2_hits += 1;
                 continue;
             }
@@ -1317,7 +1285,12 @@ impl MptCommitStore {
                     })
                     .collect::<Result<_>>()?;
                 self.storage_tries.extend(loaded_tries.into_iter().map(
-                    |(hashed_address, trie)| (hashed_address, WorkingStorageTrie::Tree(trie)),
+                    |(hashed_address, trie)| {
+                        (
+                            hashed_address,
+                            WorkingStorageTrie::Overlay(StorageOverlay::from_tree(trie)),
+                        )
+                    },
                 ));
             }
         }
@@ -1425,92 +1398,62 @@ impl MptCommitStore {
             storage_tries
                 .into_par_iter()
                 .map(|(addr, trie)| -> Result<StorageTrieCommitArtifacts> {
-                    match trie {
-                        WorkingStorageTrie::Overlay(overlay) => {
-                            let hash_start = std::time::Instant::now();
-                            let (root, blobs, trie) = overlay.root_hash_and_dirty_blobs();
-                            let hash_elapsed = hash_start.elapsed();
-                            let segment_start = std::time::Instant::now();
-                            let segment = (root != EMPTY_ROOT_HASH)
-                                .then(|| StorageTrieSegment::from_tree(&trie, root))
-                                .transpose()?;
-                            let segment_elapsed = segment_start.elapsed();
-                            Ok(StorageTrieCommitArtifacts {
-                                hashed_address: addr,
-                                storage_root: root,
-                                node_blobs: blobs,
-                                segment,
-                                hash_elapsed,
-                                segment_elapsed,
-                                trie,
-                            })
-                        }
-                        WorkingStorageTrie::Tree(mut trie) => {
-                            let hash_start = std::time::Instant::now();
-                            let (root, blobs) = trie.root_hash_and_dirty_blobs();
-                            let hash_elapsed = hash_start.elapsed();
-                            let segment_start = std::time::Instant::now();
-                            let segment = (root != EMPTY_ROOT_HASH)
-                                .then(|| StorageTrieSegment::from_tree(&trie, root))
-                                .transpose()?;
-                            let segment_elapsed = segment_start.elapsed();
-                            Ok(StorageTrieCommitArtifacts {
-                                hashed_address: addr,
-                                storage_root: root,
-                                node_blobs: blobs,
-                                segment,
-                                hash_elapsed,
-                                segment_elapsed,
-                                trie,
-                            })
-                        }
-                    }
+                    let WorkingStorageTrie::Overlay(overlay) = trie;
+                    let hash_start = std::time::Instant::now();
+                    let (root, blobs, overlay) = overlay.root_hash_and_dirty_blobs();
+                    let hash_elapsed = hash_start.elapsed();
+                    let segment_start = std::time::Instant::now();
+                    let segment = (root != EMPTY_ROOT_HASH)
+                        .then(|| {
+                            StorageTrieSegment::from_parts(
+                                overlay.arena_nodes(),
+                                overlay.arena_hash_cache(),
+                                overlay.root_index(),
+                                root,
+                            )
+                        })
+                        .transpose()?;
+                    let segment_elapsed = segment_start.elapsed();
+                    Ok(StorageTrieCommitArtifacts {
+                        hashed_address: addr,
+                        storage_root: root,
+                        node_blobs: blobs,
+                        segment,
+                        hash_elapsed,
+                        segment_elapsed,
+                        trie: overlay,
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
             storage_tries
                 .into_iter()
                 .map(|(addr, trie)| -> Result<StorageTrieCommitArtifacts> {
-                    match trie {
-                        WorkingStorageTrie::Overlay(overlay) => {
-                            let hash_start = std::time::Instant::now();
-                            let (root, blobs, trie) = overlay.root_hash_and_dirty_blobs();
-                            let hash_elapsed = hash_start.elapsed();
-                            let segment_start = std::time::Instant::now();
-                            let segment = (root != EMPTY_ROOT_HASH)
-                                .then(|| StorageTrieSegment::from_tree(&trie, root))
-                                .transpose()?;
-                            let segment_elapsed = segment_start.elapsed();
-                            Ok(StorageTrieCommitArtifacts {
-                                hashed_address: addr,
-                                storage_root: root,
-                                node_blobs: blobs,
-                                segment,
-                                hash_elapsed,
-                                segment_elapsed,
-                                trie,
-                            })
-                        }
-                        WorkingStorageTrie::Tree(mut trie) => {
-                            let hash_start = std::time::Instant::now();
-                            let (root, blobs) = trie.root_hash_and_dirty_blobs();
-                            let hash_elapsed = hash_start.elapsed();
-                            let segment_start = std::time::Instant::now();
-                            let segment = (root != EMPTY_ROOT_HASH)
-                                .then(|| StorageTrieSegment::from_tree(&trie, root))
-                                .transpose()?;
-                            let segment_elapsed = segment_start.elapsed();
-                            Ok(StorageTrieCommitArtifacts {
-                                hashed_address: addr,
-                                storage_root: root,
-                                node_blobs: blobs,
-                                segment,
-                                hash_elapsed,
-                                segment_elapsed,
-                                trie,
-                            })
-                        }
-                    }
+                    let WorkingStorageTrie::Overlay(overlay) = trie;
+                    let hash_start = std::time::Instant::now();
+                    let (root, blobs, overlay) = overlay.root_hash_and_dirty_blobs();
+                    let hash_elapsed = hash_start.elapsed();
+                    let segment_start = std::time::Instant::now();
+                    let segment = (root != EMPTY_ROOT_HASH)
+                        .then(|| {
+                            StorageTrieSegment::from_parts(
+                                overlay.arena_nodes(),
+                                overlay.arena_hash_cache(),
+                                overlay.root_index(),
+                                root,
+                            )
+                        })
+                        .transpose()?;
+                    let segment_elapsed = segment_start.elapsed();
+                    Ok(StorageTrieCommitArtifacts {
+                        hashed_address: addr,
+                        storage_root: root,
+                        node_blobs: blobs,
+                        segment,
+                        hash_elapsed,
+                        segment_elapsed,
+                        trie: overlay,
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -1573,7 +1516,7 @@ impl MptCommitStore {
         let account_root_elapsed = account_root_start.elapsed();
 
         // Separate node blobs from tries so we can cache tries after persist
-        let mut storage_cache_candidates: Vec<(B256, MptTree)> =
+        let mut storage_cache_candidates: Vec<(B256, StorageOverlay)> =
             Vec::with_capacity(storage_artifacts.len());
         let mut prebuilt_segments: Vec<(B256, StorageTrieSegment)> =
             Vec::with_capacity(storage_artifacts.len());
@@ -1733,13 +1676,6 @@ impl MptCommitStore {
 
         Ok((new_version, state_root))
     }
-}
-
-/// Encode a U256 value using alloy_rlp (big-endian, trims leading zeros).
-fn alloy_rlp_encode_u256(value: &U256) -> Vec<u8> {
-    let mut buf = Vec::new();
-    value.encode(&mut buf);
-    buf
 }
 
 /// Wrapper that binds an importer's lifetime to the MptCommitStore.

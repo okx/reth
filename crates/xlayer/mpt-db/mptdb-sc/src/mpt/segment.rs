@@ -72,7 +72,7 @@ impl StorageTrieSegment {
         Self::from_parts(tree.arena_nodes(), tree.arena_hash_cache(), tree.root_index(), root)
     }
 
-    fn from_parts(
+    pub(crate) fn from_parts(
         nodes: &[MptNode],
         hash_cache: &[Option<B256>],
         root_idx: Option<u32>,
@@ -129,6 +129,11 @@ pub struct StoragePathTrace {
 }
 
 impl StoragePathTrace {
+    pub fn into_parts(self) -> (MutableTrieArena, Option<u32>) {
+        (self.arena, self.root)
+    }
+
+    #[cfg(test)]
     pub fn into_tree(self) -> MptTree {
         MptTree { arena: self.arena, root: self.root }
     }
@@ -222,6 +227,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
         Ok(StoragePathTrace { arena, root: Some(root_idx), touched_keys: keys.len() })
     }
 
+    #[cfg(test)]
     pub fn materialize_touched_paths(&self, keys: &[Nibbles]) -> Result<MptTree> {
         Ok(self.trace_touched_paths(keys)?.into_tree())
     }

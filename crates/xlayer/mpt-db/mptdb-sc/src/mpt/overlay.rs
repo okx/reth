@@ -1,18 +1,27 @@
 use alloy_trie::Nibbles;
 
-use super::{segment::StoragePathTrace, tree::MptTree};
+use super::{
+    arena::MutableTrieArena, segment::StoragePathTrace, storage_recompute, tree::MptTree, tree_algo,
+};
 
+#[derive(Clone)]
 pub struct StorageOverlay {
-    tree: MptTree,
+    arena: MutableTrieArena,
+    root: Option<u32>,
 }
 
 impl StorageOverlay {
     pub fn empty() -> Self {
-        Self { tree: MptTree::new() }
+        Self { arena: MutableTrieArena::new(), root: None }
     }
 
     pub fn from_trace(trace: StoragePathTrace) -> Self {
-        Self { tree: trace.into_tree() }
+        let (arena, root) = trace.into_parts();
+        Self { arena, root }
+    }
+
+    pub fn from_tree(tree: MptTree) -> Self {
+        Self { arena: tree.arena, root: tree.root }
     }
 
     pub fn apply_change(
@@ -22,26 +31,49 @@ impl StorageOverlay {
         value: Option<Vec<u8>>,
     ) {
         match value {
-            Some(value) => self.tree.insert(&key, value),
+            Some(value) => {
+                let new_root =
+                    tree_algo::insert_recursive(&mut self.arena, self.root, &key, 0, value);
+                self.root = Some(new_root);
+            }
             None => {
-                self.tree.delete(&key);
+                let (_deleted, new_root) =
+                    tree_algo::delete_recursive(&mut self.arena, self.root, &key, 0);
+                self.root = new_root;
             }
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tree.is_empty()
+        self.root.is_none()
     }
 
+    #[cfg(test)]
     pub fn into_tree(self) -> MptTree {
-        self.tree
+        MptTree { arena: self.arena, root: self.root }
     }
 
     pub fn root_hash_and_dirty_blobs(
         mut self,
-    ) -> (alloy_primitives::B256, Vec<(alloy_primitives::B256, Vec<u8>)>, MptTree) {
-        let (root, blobs) = self.tree.root_hash_and_dirty_blobs();
-        (root, blobs, self.tree)
+    ) -> (alloy_primitives::B256, Vec<(alloy_primitives::B256, Vec<u8>)>, StorageOverlay) {
+        let result = storage_recompute::recompute(&mut self.arena, self.root);
+        (result.root, result.dirty_blobs, self)
+    }
+
+    pub fn clear_dirty(&mut self) {
+        self.arena.clear_all_dirty();
+    }
+
+    pub fn arena_nodes(&self) -> &[super::node::MptNode] {
+        self.arena.nodes()
+    }
+
+    pub fn arena_hash_cache(&self) -> &[Option<alloy_primitives::B256>] {
+        self.arena.hash_cache_slice()
+    }
+
+    pub fn root_index(&self) -> Option<u32> {
+        self.root
     }
 }
 

@@ -23,19 +23,6 @@ struct ChildArtifacts {
 pub(crate) struct StorageRecomputeResult {
     pub root: B256,
     pub dirty_blobs: Vec<(B256, Vec<u8>)>,
-    pub finalized_nodes: Vec<FinalizedNode>,
-}
-
-impl StorageRecomputeResult {
-    pub fn finalized_index(&self, nodes_len: usize) -> Vec<Option<usize>> {
-        let mut index = vec![None; nodes_len];
-        for (pos, node) in self.finalized_nodes.iter().enumerate() {
-            if let Some(slot) = index.get_mut(node.idx as usize) {
-                *slot = Some(pos);
-            }
-        }
-        index
-    }
 }
 
 struct NodeArtifacts {
@@ -46,22 +33,14 @@ struct NodeArtifacts {
 
 pub(crate) fn recompute(arena: &mut MutableTrieArena, root: Option<u32>) -> StorageRecomputeResult {
     match root {
-        None => StorageRecomputeResult {
-            root: alloy_trie::EMPTY_ROOT_HASH,
-            dirty_blobs: vec![],
-            finalized_nodes: vec![],
-        },
+        None => StorageRecomputeResult { root: alloy_trie::EMPTY_ROOT_HASH, dirty_blobs: vec![] },
         Some(root_idx) => {
             let artifacts = compute_node_artifacts(arena, root_idx);
             for node in &artifacts.finalized_nodes {
                 arena.set_rlp(node.idx, node.rlp.clone());
                 arena.set_hash(node.idx, node.hash);
             }
-            StorageRecomputeResult {
-                root: artifacts.hash,
-                dirty_blobs: artifacts.dirty_blobs,
-                finalized_nodes: artifacts.finalized_nodes,
-            }
+            StorageRecomputeResult { root: artifacts.hash, dirty_blobs: artifacts.dirty_blobs }
         }
     }
 }
@@ -82,23 +61,15 @@ fn encode_child_for_parent_collect(arena: &MutableTrieArena, child: &ChildRef) -
                     let hash = hash::hash_rlp(rlp);
                     return ChildArtifacts {
                         embed: if rlp.len() < 32 { rlp.clone() } else { hash.to_vec() },
-                        finalized_nodes: vec![FinalizedNode {
-                            idx,
-                            rlp: rlp.clone(),
-                            hash,
-                        }],
+                        finalized_nodes: vec![FinalizedNode { idx, rlp: rlp.clone(), hash }],
                         dirty_blobs: Vec::new(),
                     };
                 }
             }
 
             let node = compute_node_artifacts(arena, idx);
-            let node_rlp = node
-                .finalized_nodes
-                .first()
-                .expect("root cache update must exist")
-                .rlp
-                .clone();
+            let node_rlp =
+                node.finalized_nodes.first().expect("root cache update must exist").rlp.clone();
             ChildArtifacts {
                 embed: if node_rlp.len() < 32 { node_rlp } else { node.hash.to_vec() },
                 finalized_nodes: node.finalized_nodes,
@@ -145,10 +116,7 @@ fn compute_node_artifacts(arena: &MutableTrieArena, idx: u32) -> NodeArtifacts {
     };
 
     let node_hash = arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
-    finalized_nodes.insert(
-        0,
-        FinalizedNode { idx, rlp: rlp.clone(), hash: node_hash },
-    );
+    finalized_nodes.insert(0, FinalizedNode { idx, rlp: rlp.clone(), hash: node_hash });
     if arena.is_dirty(idx) {
         dirty_blobs.insert(0, (node_hash, rlp));
     }

@@ -391,7 +391,7 @@ mod tests {
         store.replace_latest_index(&store.snapshot_index()).unwrap();
         store.clear_memory();
 
-        let mut loaded = store
+        let loaded = store
             .trace_touched_paths(&B256::with_last_byte(0x11), root, &[key.clone()])
             .unwrap()
             .expect("latest segment should materialize");

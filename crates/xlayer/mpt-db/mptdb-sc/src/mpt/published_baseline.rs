@@ -2,12 +2,14 @@ use alloy_primitives::B256;
 use alloy_trie::Nibbles;
 use memmap2::{Mmap, MmapOptions};
 use mptdb_common::error::{MptDbError, Result};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -63,8 +65,12 @@ pub struct PublishedGenerationResult {
 }
 
 pub struct PublishedBaselineReader {
+    meta: PublishedBaselineMeta,
     index: HashMap<B256, DeltaEntry>,
     data_mmap: Mmap,
+    leases: Arc<Mutex<HashMap<u64, usize>>>,
+    pinned_records: Vec<(u64, u32)>,
+    record_pins: Arc<Mutex<HashMap<(u64, u32), usize>>>,
 }
 
 pub struct PublishedTrieMaterialized {
@@ -74,6 +80,10 @@ pub struct PublishedTrieMaterialized {
 }
 
 impl PublishedBaselineReader {
+    pub fn meta(&self) -> &PublishedBaselineMeta {
+        &self.meta
+    }
+
     pub fn materialize_touched_paths(
         &self,
         hashed_address: &B256,
@@ -111,8 +121,37 @@ impl PublishedBaselineReader {
     }
 }
 
+impl Drop for PublishedBaselineReader {
+    fn drop(&mut self) {
+        {
+            let mut leases = self.leases.lock();
+            match leases.get_mut(&self.meta.generation) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    leases.remove(&self.meta.generation);
+                }
+                None => {}
+            }
+        }
+        {
+            let mut record_pins = self.record_pins.lock();
+            for record in &self.pinned_records {
+                match record_pins.get_mut(record) {
+                    Some(count) if *count > 1 => *count -= 1,
+                    Some(_) => {
+                        record_pins.remove(record);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+}
+
 pub struct PublishedBaselineManager {
     base_dir: PathBuf,
+    leases: Arc<Mutex<HashMap<u64, usize>>>,
+    record_pins: Arc<Mutex<HashMap<(u64, u32), usize>>>,
 }
 
 impl PublishedBaselineManager {
@@ -122,7 +161,11 @@ impl PublishedBaselineManager {
         fs::create_dir_all(Self::meta_dir(base_dir))
             .map_err(|e| MptDbError::Other(format!("create published baseline meta dir: {e}")))?;
         let _ = Self::open_data_file(base_dir)?;
-        Ok(Self { base_dir: base_dir.to_path_buf() })
+        Ok(Self {
+            base_dir: base_dir.to_path_buf(),
+            leases: Arc::new(Mutex::new(HashMap::new())),
+            record_pins: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     pub fn load_meta(&self) -> Result<Option<PublishedBaselineMeta>> {
@@ -154,7 +197,17 @@ impl PublishedBaselineManager {
                 .map(&data_file)
                 .map_err(|e| MptDbError::Other(format!("mmap published baseline data: {e}")))?
         };
-        Ok(Some(PublishedBaselineReader { index, data_mmap }))
+        self.acquire_generation_lease(meta.generation);
+        let pinned_records = Self::collect_pinned_records(&index);
+        self.acquire_record_pins(&pinned_records);
+        Ok(Some(PublishedBaselineReader {
+            meta: meta.clone(),
+            index,
+            data_mmap,
+            leases: Arc::clone(&self.leases),
+            pinned_records,
+            record_pins: Arc::clone(&self.record_pins),
+        }))
     }
 
     pub fn publish_generation(
@@ -298,7 +351,9 @@ impl PublishedBaselineManager {
         manifest: &VersionManifest,
         fast_store: Option<&FastStorageTrieStore>,
     ) -> Result<bool> {
-        let keep_generations: HashSet<u64> = manifest.versions.keys().map(|v| *v as u64).collect();
+        let mut keep_generations: HashSet<u64> =
+            manifest.versions.keys().map(|v| *v as u64).collect();
+        keep_generations.extend(self.generations_with_pinned_records()?);
         let latest_snapshot = fast_store.map(|store| store.snapshot_index()).unwrap_or_default();
 
         let current_meta = self.load_meta()?;
@@ -441,6 +496,41 @@ impl PublishedBaselineManager {
         }
 
         Ok(true)
+    }
+
+    pub fn active_generation_leases(&self) -> Vec<u64> {
+        let mut out = self.leases.lock().keys().copied().collect::<Vec<_>>();
+        out.sort_unstable();
+        out
+    }
+
+    pub fn active_record_pins(&self) -> Vec<(u64, u32)> {
+        let mut out = self.record_pins.lock().keys().copied().collect::<Vec<_>>();
+        out.sort_unstable();
+        out
+    }
+
+    fn generations_with_pinned_records(&self) -> Result<HashSet<u64>> {
+        let pinned_records = self.record_pins.lock().keys().copied().collect::<HashSet<_>>();
+        if pinned_records.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut out = HashSet::new();
+        for generation in self.list_generations()? {
+            let gen_meta = match self.load_generation_meta(generation)? {
+                Some(meta) => meta,
+                None => continue,
+            };
+            let merged = self.load_merged_index(&gen_meta)?;
+            if merged
+                .values()
+                .any(|entry| pinned_records.contains(&(entry.page_off, entry.record_off)))
+            {
+                out.insert(generation);
+            }
+        }
+        Ok(out)
     }
 
     fn load_merged_index(&self, meta: &GenerationMeta) -> Result<HashMap<B256, DeltaEntry>> {
@@ -686,12 +776,33 @@ impl PublishedBaselineManager {
         remap.insert(key, new_locator);
         Ok(new_locator)
     }
+
+    fn acquire_generation_lease(&self, generation: u64) {
+        let mut leases = self.leases.lock();
+        *leases.entry(generation).or_insert(0) += 1;
+    }
+
+    fn acquire_record_pins(&self, records: &[(u64, u32)]) {
+        let mut pins = self.record_pins.lock();
+        for record in records {
+            *pins.entry(*record).or_insert(0) += 1;
+        }
+    }
+
+    fn collect_pinned_records(index: &HashMap<B256, DeltaEntry>) -> Vec<(u64, u32)> {
+        let mut out =
+            index.values().map(|entry| (entry.page_off, entry.record_off)).collect::<Vec<_>>();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_trie::Nibbles;
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     use crate::mpt::tree::MptTree;
@@ -768,5 +879,111 @@ mod tests {
         let mgr = PublishedBaselineManager::open(dir.path()).unwrap();
         mgr.clear_meta().unwrap();
         assert!(mgr.load_meta().unwrap().is_none());
+    }
+
+    #[test]
+    fn published_reader_tracks_generation_leases_and_record_pins() {
+        let dir = TempDir::new().unwrap();
+        let mgr = PublishedBaselineManager::open(dir.path()).unwrap();
+        let (tree, root) = make_tree(1);
+        let image = StorageTrieSegment::from_tree(&tree, root).unwrap();
+        let meta = mgr
+            .publish_generation(None, 1, root, &[(B256::with_last_byte(0x11), image)], &[])
+            .unwrap()
+            .meta;
+
+        assert!(mgr.active_generation_leases().is_empty());
+        assert!(mgr.active_record_pins().is_empty());
+
+        {
+            let reader = mgr.open_published_store(&meta).unwrap().unwrap();
+            assert_eq!(reader.meta(), &meta);
+            assert_eq!(mgr.active_generation_leases(), vec![1]);
+            let pins = mgr.active_record_pins();
+            assert_eq!(pins.len(), 1);
+            assert_eq!(pins[0].0, 8);
+        }
+
+        assert!(mgr.active_generation_leases().is_empty());
+        assert!(mgr.active_record_pins().is_empty());
+    }
+
+    #[test]
+    fn compact_keeps_pinned_generation() {
+        let dir = TempDir::new().unwrap();
+        let mgr = PublishedBaselineManager::open(dir.path()).unwrap();
+
+        let (tree1, root1) = make_tree(1);
+        let image1 = StorageTrieSegment::from_tree(&tree1, root1).unwrap();
+        let meta1 = mgr
+            .publish_generation(None, 1, root1, &[(B256::with_last_byte(0x11), image1)], &[])
+            .unwrap()
+            .meta;
+
+        let (tree2, root2) = make_tree(2);
+        let image2 = StorageTrieSegment::from_tree(&tree2, root2).unwrap();
+        let _meta2 = mgr
+            .publish_generation(
+                Some(&meta1),
+                2,
+                root2,
+                &[(B256::with_last_byte(0x22), image2)],
+                &[],
+            )
+            .unwrap()
+            .meta;
+
+        let mut versions = BTreeMap::new();
+        versions.insert(0, alloy_trie::EMPTY_ROOT_HASH);
+        versions.insert(2, root2);
+        let manifest = VersionManifest { earliest_version: 2, latest_version: 2, versions };
+
+        let reader = mgr.open_published_store(&meta1).unwrap().unwrap();
+        assert_eq!(mgr.active_generation_leases(), vec![1]);
+        mgr.compact_for_manifest(&manifest, None).unwrap();
+        assert!(mgr.load_generation_meta(1).unwrap().is_some());
+        drop(reader);
+
+        mgr.compact_for_manifest(&manifest, None).unwrap();
+        assert!(mgr.load_generation_meta(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn compact_keeps_generation_from_record_pin_without_generation_lease() {
+        let dir = TempDir::new().unwrap();
+        let mgr = PublishedBaselineManager::open(dir.path()).unwrap();
+
+        let (tree1, root1) = make_tree(1);
+        let image1 = StorageTrieSegment::from_tree(&tree1, root1).unwrap();
+        let _meta1 = mgr
+            .publish_generation(None, 1, root1, &[(B256::with_last_byte(0x11), image1)], &[])
+            .unwrap()
+            .meta;
+
+        let (tree2, root2) = make_tree(2);
+        let image2 = StorageTrieSegment::from_tree(&tree2, root2).unwrap();
+        let _meta2 = mgr
+            .publish_generation(None, 2, root2, &[(B256::with_last_byte(0x22), image2)], &[])
+            .unwrap()
+            .meta;
+
+        let mut versions = BTreeMap::new();
+        versions.insert(0, alloy_trie::EMPTY_ROOT_HASH);
+        versions.insert(2, root2);
+        let manifest = VersionManifest { earliest_version: 2, latest_version: 2, versions };
+
+        let gen1 = mgr.load_generation_meta(1).unwrap().unwrap();
+        let merged1 = mgr.load_merged_index(&gen1).unwrap();
+        let pinned = PublishedBaselineManager::collect_pinned_records(&merged1);
+        assert_eq!(mgr.active_generation_leases(), Vec::<u64>::new());
+        assert!(mgr.active_record_pins().is_empty());
+
+        mgr.acquire_record_pins(&pinned);
+        mgr.compact_for_manifest(&manifest, None).unwrap();
+        assert!(mgr.load_generation_meta(1).unwrap().is_some());
+
+        mgr.record_pins.lock().clear();
+        mgr.compact_for_manifest(&manifest, None).unwrap();
+        assert!(mgr.load_generation_meta(1).unwrap().is_none());
     }
 }

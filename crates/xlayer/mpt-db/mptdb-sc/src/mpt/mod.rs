@@ -17,6 +17,7 @@ pub mod published_baseline;
 pub mod segment;
 pub mod snapshot;
 pub mod state;
+pub(crate) mod storage_recompute;
 pub mod r#trait;
 pub mod tree;
 pub mod tree_algo;
