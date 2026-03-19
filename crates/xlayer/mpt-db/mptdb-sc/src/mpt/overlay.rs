@@ -32,11 +32,13 @@ impl StorageOverlay {
     ) {
         match value {
             Some(value) => {
+                tree_algo::note_slot_insert();
                 let new_root =
                     tree_algo::insert_recursive(&mut self.arena, self.root, &key, 0, value);
                 self.root = Some(new_root);
             }
             None => {
+                tree_algo::note_slot_delete();
                 let (_deleted, new_root) =
                     tree_algo::delete_recursive(&mut self.arena, self.root, &key, 0);
                 self.root = new_root;

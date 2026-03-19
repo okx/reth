@@ -1,7 +1,9 @@
 use alloy_primitives::B256;
 use alloy_trie::Nibbles;
+use memmap2::Mmap;
 use mptdb_common::error::{MptDbError, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use super::{
     arena::MutableTrieArena,
@@ -116,6 +118,7 @@ pub struct StorageTrieSegmentReader<'a> {
     root_idx: u32,
     blob_offset: usize,
     root: B256,
+    lease: Option<Arc<SegmentPageLease>>,
 }
 
 pub struct StoragePathCursor<'a> {
@@ -126,6 +129,136 @@ pub struct StoragePathTrace {
     arena: MutableTrieArena,
     root: Option<u32>,
     touched_keys: usize,
+}
+
+#[derive(Clone)]
+pub struct MappedSegmentPage {
+    mmap: Arc<Mmap>,
+    page_off: usize,
+    total_len: usize,
+}
+
+impl MappedSegmentPage {
+    pub fn new(mmap: Arc<Mmap>, page_off: usize, total_len: usize) -> Self {
+        Self { mmap, page_off, total_len }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mmap[self.page_off..self.page_off + self.total_len]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.as_slice().as_ptr()
+    }
+}
+
+#[derive(Clone)]
+pub struct SegmentPageLease {
+    page: Arc<MappedSegmentPage>,
+    root: B256,
+    root_record_off: u32,
+}
+
+impl SegmentPageLease {
+    pub fn new(page: Arc<MappedSegmentPage>, root: B256, root_record_off: u32) -> Self {
+        Self { page, root, root_record_off }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.page.as_slice()
+    }
+
+    pub fn root(&self) -> B256 {
+        self.root
+    }
+
+    pub fn root_record_off(&self) -> u32 {
+        self.root_record_off
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.page.as_ptr()
+    }
+}
+
+#[derive(Clone)]
+pub struct SegmentNodeRef {
+    lease: Arc<SegmentPageLease>,
+    seg_idx: u32,
+    hash: Option<B256>,
+}
+
+impl SegmentNodeRef {
+    pub fn new(lease: Arc<SegmentPageLease>, seg_idx: u32, hash: Option<B256>) -> Self {
+        Self { lease, seg_idx, hash }
+    }
+
+    pub fn page_lease(&self) -> &Arc<SegmentPageLease> {
+        &self.lease
+    }
+
+    pub fn seg_idx(&self) -> u32 {
+        self.seg_idx
+    }
+
+    pub fn hash(&self) -> Option<B256> {
+        self.hash
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct SegmentChildrenView<'a> {
+    reader: &'a StorageTrieSegmentReader<'a>,
+    start_idx: usize,
+    len: usize,
+}
+
+impl<'a> SegmentChildrenView<'a> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(&self, idx: usize) -> Result<SegmentChildView<'a>> {
+        if idx >= self.len {
+            return Err(MptDbError::Other(format!("segment child view out of bounds: {idx}")));
+        }
+        self.reader.decode_child_view(self.start_idx + idx)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Result<SegmentChildView<'a>>> + '_ {
+        (0..self.len).map(move |idx| self.get(idx))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum SegmentChildEmbedRef<'a> {
+    None,
+    Hash(B256),
+    Inline(&'a [u8]),
+}
+
+#[derive(Clone, Copy)]
+pub struct SegmentChildView<'a> {
+    pub slot: u8,
+    pub target_idx: Option<u32>,
+    pub embed: SegmentChildEmbedRef<'a>,
+}
+
+pub enum SegmentNodeKind<'a> {
+    Branch { child_bitmap: u16, value: Option<&'a [u8]>, children: SegmentChildrenView<'a> },
+    Extension { nibbles: &'a [u8], child: SegmentChildView<'a> },
+    Leaf { nibbles: &'a [u8], value: &'a [u8] },
+}
+
+pub struct SegmentNodeView<'a> {
+    pub kind: SegmentNodeKind<'a>,
+    pub hash: Option<B256>,
 }
 
 impl StoragePathTrace {
@@ -144,6 +277,16 @@ impl StoragePathTrace {
 }
 
 impl<'a> StorageTrieSegmentReader<'a> {
+    pub fn open_shared_page(
+        lease: &'a Arc<SegmentPageLease>,
+        expected_root: B256,
+        expected_record_off: u32,
+    ) -> Result<Self> {
+        let mut reader = Self::open_page(lease.as_slice(), expected_root, expected_record_off)?;
+        reader.lease = Some(Arc::clone(lease));
+        Ok(reader)
+    }
+
     pub fn open_page(
         bytes: &'a [u8],
         expected_root: B256,
@@ -193,11 +336,97 @@ impl<'a> StorageTrieSegmentReader<'a> {
             return Err(MptDbError::Other("segment blob offset out of bounds".to_string()));
         }
 
-        Ok(Self { bytes, node_count, child_count, root_idx, blob_offset, root })
+        Ok(Self { bytes, node_count, child_count, root_idx, blob_offset, root, lease: None })
     }
 
     pub fn root(&self) -> B256 {
         self.root
+    }
+
+    pub fn root_ref(&self) -> Result<SegmentNodeRef> {
+        let lease = self.lease.as_ref().ok_or_else(|| {
+            MptDbError::Other("segment root ref requires shared page lease".to_string())
+        })?;
+        let hash = self.view_node(self.root_idx)?.hash;
+        Ok(SegmentNodeRef { lease: Arc::clone(lease), seg_idx: self.root_idx, hash })
+    }
+
+    pub fn view_node(&self, seg_idx: u32) -> Result<SegmentNodeView<'_>> {
+        if seg_idx >= self.node_count {
+            return Err(MptDbError::Other(format!("segment node idx out of bounds: {seg_idx}")));
+        }
+        let off = SEGMENT_HEADER_LEN + seg_idx as usize * NODE_RECORD_LEN;
+        let rec = self.bytes.get(off..off + NODE_RECORD_LEN).ok_or_else(|| {
+            MptDbError::Other(format!("segment node record out of bounds: {seg_idx}"))
+        })?;
+
+        let tag = rec[0];
+        let flags = rec[1];
+        let child_meta_count = u16::from_le_bytes([rec[2], rec[3]]) as usize;
+        let child_meta_offset = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+        let path_offset = u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]) as usize;
+        let path_len = u16::from_le_bytes([rec[12], rec[13]]) as usize;
+        let value_offset = u32::from_le_bytes([rec[16], rec[17], rec[18], rec[19]]) as usize;
+        let value_len = u32::from_le_bytes([rec[20], rec[21], rec[22], rec[23]]) as usize;
+        let hash = if (flags & 0b10) != 0 { Some(B256::from_slice(&rec[24..56])) } else { None };
+
+        let path = if path_len == 0 { &[][..] } else { self.blob_slice(path_offset, path_len)? };
+        let kind = match tag {
+            TAG_BRANCH => {
+                let child_bitmap = u16::from_le_bytes([rec[14], rec[15]]);
+                let value = if (flags & 0b01) != 0 {
+                    Some(self.blob_slice(value_offset, value_len)?)
+                } else {
+                    None
+                };
+                SegmentNodeKind::Branch {
+                    child_bitmap,
+                    value,
+                    children: SegmentChildrenView {
+                        reader: self,
+                        start_idx: child_meta_offset,
+                        len: child_meta_count,
+                    },
+                }
+            }
+            TAG_EXTENSION => {
+                let child = self.decode_child_view(child_meta_offset)?;
+                SegmentNodeKind::Extension { nibbles: path, child }
+            }
+            TAG_LEAF => SegmentNodeKind::Leaf {
+                nibbles: path,
+                value: self.blob_slice(value_offset, value_len)?,
+            },
+            _ => return Err(MptDbError::Other(format!("unknown segment node tag: {tag}"))),
+        };
+        Ok(SegmentNodeView { kind, hash })
+    }
+
+    pub fn segment_child_ref(&self, seg_idx: u32, slot: usize) -> Result<Option<SegmentNodeRef>> {
+        let lease = match self.lease.as_ref() {
+            Some(lease) => lease,
+            None => return Ok(None),
+        };
+        let target_idx = match self.view_node(seg_idx)?.kind {
+            SegmentNodeKind::Branch { children, .. } => {
+                let mut target = None;
+                for child in children.iter() {
+                    let child = child?;
+                    if child.slot as usize == slot {
+                        target = child.target_idx;
+                        break;
+                    }
+                }
+                target
+            }
+            SegmentNodeKind::Extension { child, .. } if slot == 0 => child.target_idx,
+            _ => None,
+        };
+        let Some(target_idx) = target_idx else {
+            return Ok(None);
+        };
+        let hash = self.view_node(target_idx)?.hash;
+        Ok(Some(SegmentNodeRef { lease: Arc::clone(lease), seg_idx: target_idx, hash }))
     }
 
     pub fn cursor(&'a self) -> StoragePathCursor<'a> {
@@ -430,6 +659,40 @@ impl<'a> StorageTrieSegmentReader<'a> {
                 EMBED_HASH => SegmentChildEmbed::Hash(hash),
                 EMBED_INLINE => {
                     SegmentChildEmbed::Inline(self.blob_slice(inline_offset, inline_len)?.to_vec())
+                }
+                _ => {
+                    return Err(MptDbError::Other(format!(
+                        "unknown segment child embed kind: {kind}"
+                    )));
+                }
+            },
+        })
+    }
+
+    fn decode_child_view(&self, idx: usize) -> Result<SegmentChildView<'_>> {
+        if idx >= self.child_count as usize {
+            return Err(MptDbError::Other(format!("segment child idx out of bounds: {idx}")));
+        }
+        let off = SEGMENT_HEADER_LEN +
+            self.node_count as usize * NODE_RECORD_LEN +
+            idx * CHILD_RECORD_LEN;
+        let rec = self.bytes.get(off..off + CHILD_RECORD_LEN).ok_or_else(|| {
+            MptDbError::Other(format!("segment child record out of bounds: {idx}"))
+        })?;
+        let slot = rec[0];
+        let kind = rec[1];
+        let target_idx = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+        let inline_offset = u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]) as usize;
+        let inline_len = u32::from_le_bytes([rec[12], rec[13], rec[14], rec[15]]) as usize;
+        let hash = B256::from_slice(&rec[16..48]);
+        Ok(SegmentChildView {
+            slot,
+            target_idx: (target_idx != u32::MAX).then_some(target_idx),
+            embed: match kind {
+                EMBED_NONE => SegmentChildEmbedRef::None,
+                EMBED_HASH => SegmentChildEmbedRef::Hash(hash),
+                EMBED_INLINE => {
+                    SegmentChildEmbedRef::Inline(self.blob_slice(inline_offset, inline_len)?)
                 }
                 _ => {
                     return Err(MptDbError::Other(format!(
@@ -785,6 +1048,8 @@ fn read_b256(bytes: &[u8], off: usize) -> Result<B256> {
 mod tests {
     use super::*;
     use alloy_primitives::keccak256;
+    use std::{fs::File, io::Write};
+    use tempfile::NamedTempFile;
 
     #[test]
     fn t4_8_segment_roundtrip_all_paths() {
@@ -826,5 +1091,50 @@ mod tests {
         full.insert(&touched_all[1], b"new".to_vec());
 
         assert_eq!(partial.root_hash(), full.root_hash());
+    }
+
+    #[test]
+    fn t4_10_segment_view_node_is_borrowed() {
+        let mut tree = MptTree::new();
+        let key = Nibbles::unpack(keccak256(b"view-node"));
+        tree.insert(&key, b"value".to_vec());
+        let root = tree.root_hash();
+        let segment = StorageTrieSegment::from_tree(&tree, root).unwrap();
+        let reader = StorageTrieSegmentReader::open(segment.as_bytes(), root).unwrap();
+        let view = reader.view_node(reader.root_idx).unwrap();
+        match view.kind {
+            SegmentNodeKind::Leaf { nibbles, value } => {
+                assert!(!nibbles.is_empty());
+                assert_eq!(value, b"value");
+            }
+            SegmentNodeKind::Extension { child, .. } => {
+                assert!(child.target_idx.is_some());
+            }
+            SegmentNodeKind::Branch { child_bitmap, .. } => {
+                assert_ne!(child_bitmap, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn t4_11_segment_open_shared_page_keeps_runtime_ref() {
+        let mut tree = MptTree::new();
+        let key = Nibbles::unpack(keccak256(b"shared-page"));
+        tree.insert(&key, b"value".to_vec());
+        let root = tree.root_hash();
+        let segment = StorageTrieSegment::from_tree(&tree, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { Mmap::map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+        let reader =
+            StorageTrieSegmentReader::open_shared_page(&lease, root, segment.root_record_off())
+                .unwrap();
+        let root_ref = reader.root_ref().unwrap();
+        assert_eq!(root_ref.page_lease().root(), root);
     }
 }

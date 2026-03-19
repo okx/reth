@@ -8,6 +8,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,9 +16,13 @@ use super::{
     flat_layout::{
         data_path as pages_data_path, index_path as pages_index_path, load_page_index,
         open_data_file as open_pages_data_file, open_index_file as open_pages_index_file,
-        read_page_header, FlatPageIndexEntry,
+        read_page_header, FlatPageIndexEntry, PAGE_INDEX_RECORD_LEN, SHARED_PAGES_INDEX_MAGIC,
     },
-    segment::{StoragePathTrace, StorageSegmentLocator, StorageTrieSegmentReader},
+    segment::{
+        MappedSegmentPage, SegmentPageLease, StoragePathTrace, StorageSegmentLocator,
+        StorageTrieSegmentReader,
+    },
+    storage_cow::StorageTrieCow,
 };
 
 const LATEST_INDEX_MAGIC: &[u8; 8] = b"lstidx03";
@@ -31,6 +36,16 @@ pub struct LatestPathTraceLoaded {
     pub materialize_elapsed: Duration,
 }
 
+pub struct LatestTriePageLoaded {
+    pub lease: Arc<SegmentPageLease>,
+    pub lookup_elapsed: Duration,
+}
+
+pub struct LatestTrieLoaded {
+    pub trie: StorageTrieCow,
+    pub lookup_elapsed: Duration,
+}
+
 struct FastStoreState {
     index_path: PathBuf,
     data_path: PathBuf,
@@ -40,7 +55,7 @@ struct FastStoreState {
     data_file: File,
     pages_index_file: File,
     pages: HashMap<u64, FlatPageIndexEntry>,
-    data_mmap: Option<Mmap>,
+    data_mmap: Option<Arc<Mmap>>,
 }
 
 /// Latest-only best-effort locator index over the shared storage segment data file.
@@ -84,38 +99,83 @@ impl FastStorageTrieStore {
         expected_root: B256,
         keys: &[Nibbles],
     ) -> Result<Option<LatestPathTraceLoaded>> {
-        let lookup_start = std::time::Instant::now();
-        let mut state = self.state.lock();
-        let locator = match state.index.get(hashed_address).copied() {
-            Some(locator) => locator,
+        let loaded = match self.open_trie_page(hashed_address, expected_root)? {
+            Some(loaded) => loaded,
             None => return Ok(None),
         };
-        if locator.root != expected_root {
-            return Ok(None);
-        }
-
-        let page = match state.pages.get(&locator.page_off).copied() {
-            Some(page) => page,
-            None => return Ok(None),
-        };
-        let mmap = Self::ensure_data_mmap(&mut state)?;
-        let start = locator.page_off as usize;
-        let end = start.saturating_add(page.total_len as usize);
-        if end > mmap.len() {
-            return Ok(None);
-        }
-        let page_bytes = &mmap[start..end];
-        let page_header = read_page_header(page_bytes)?;
-        if page_header.root != expected_root || page_header.root_record_off != locator.record_off {
-            return Ok(None);
-        }
-        let reader =
-            StorageTrieSegmentReader::open_page(page_bytes, expected_root, locator.record_off)?;
-        let lookup_elapsed = lookup_start.elapsed();
+        let reader = StorageTrieSegmentReader::open_shared_page(
+            &loaded.lease,
+            expected_root,
+            loaded.lease.root_record_off(),
+        )?;
         let materialize_start = std::time::Instant::now();
         let trace = reader.cursor().trace_paths(keys)?;
         let materialize_elapsed = materialize_start.elapsed();
-        Ok(Some(LatestPathTraceLoaded { trace, lookup_elapsed, materialize_elapsed }))
+        Ok(Some(LatestPathTraceLoaded {
+            trace,
+            lookup_elapsed: loaded.lookup_elapsed,
+            materialize_elapsed,
+        }))
+    }
+
+    pub fn open_trie_page(
+        &self,
+        hashed_address: &B256,
+        expected_root: B256,
+    ) -> Result<Option<LatestTriePageLoaded>> {
+        let lookup_start = std::time::Instant::now();
+        let lease = {
+            let mut state = self.state.lock();
+            let locator = match state.index.get(hashed_address).copied() {
+                Some(locator) => locator,
+                None => return Ok(None),
+            };
+            if locator.root != expected_root {
+                return Ok(None);
+            }
+
+            let page = match state.pages.get(&locator.page_off).copied() {
+                Some(page) => page,
+                None => {
+                    Self::refresh_shared_pages(&mut state)?;
+                    match state.pages.get(&locator.page_off).copied() {
+                        Some(page) => page,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            let mmap = Arc::clone(Self::ensure_data_mmap(&mut state)?);
+            let mapped = Arc::new(MappedSegmentPage::new(
+                mmap,
+                locator.page_off as usize,
+                page.total_len as usize,
+            ));
+            let lease = Arc::new(SegmentPageLease::new(mapped, expected_root, locator.record_off));
+            let page_header = read_page_header(lease.as_slice())?;
+            if page_header.root != expected_root ||
+                page_header.root_record_off != locator.record_off
+            {
+                return Ok(None);
+            }
+            lease
+        };
+
+        Ok(Some(LatestTriePageLoaded { lease, lookup_elapsed: lookup_start.elapsed() }))
+    }
+
+    pub fn open_trie(
+        &self,
+        hashed_address: &B256,
+        expected_root: B256,
+    ) -> Result<Option<LatestTrieLoaded>> {
+        let loaded = match self.open_trie_page(hashed_address, expected_root)? {
+            Some(loaded) => loaded,
+            None => return Ok(None),
+        };
+        Ok(Some(LatestTrieLoaded {
+            trie: StorageTrieCow::from_segment_page(loaded.lease),
+            lookup_elapsed: loaded.lookup_elapsed,
+        }))
     }
 
     pub fn apply_latest_updates(
@@ -141,6 +201,9 @@ impl FastStorageTrieStore {
                 *locator,
             )?;
             state.index.insert(*hashed_address, *locator);
+        }
+        if !puts.is_empty() {
+            Self::refresh_shared_pages(&mut state)?;
         }
         Ok(())
     }
@@ -341,16 +404,83 @@ impl FastStorageTrieStore {
         Ok(())
     }
 
-    fn ensure_data_mmap(state: &mut FastStoreState) -> Result<&Mmap> {
+    fn ensure_data_mmap(state: &mut FastStoreState) -> Result<&Arc<Mmap>> {
         if state.data_mmap.is_none() {
             let mmap = unsafe {
                 MmapOptions::new()
                     .map(&state.data_file)
                     .map_err(|e| MptDbError::Other(format!("mmap latest flat data: {e}")))?
             };
-            state.data_mmap = Some(mmap);
+            state.data_mmap = Some(Arc::new(mmap));
         }
         Ok(state.data_mmap.as_ref().unwrap())
+    }
+
+    fn refresh_shared_pages(state: &mut FastStoreState) -> Result<()> {
+        let start = state
+            .pages_index_file
+            .seek(SeekFrom::Current(0))
+            .map_err(|e| MptDbError::Other(format!("seek latest pages index cursor: {e}")))?
+            .max(SHARED_PAGES_INDEX_MAGIC.len() as u64);
+        let file_len = state
+            .pages_index_file
+            .metadata()
+            .map_err(|e| MptDbError::Other(format!("stat latest pages index: {e}")))?
+            .len();
+        if file_len <= start {
+            return Ok(());
+        }
+
+        state
+            .pages_index_file
+            .seek(SeekFrom::Start(start))
+            .map_err(|e| MptDbError::Other(format!("seek latest pages index tail: {e}")))?;
+        let mut bytes = Vec::with_capacity((file_len - start) as usize);
+        state
+            .pages_index_file
+            .read_to_end(&mut bytes)
+            .map_err(|e| MptDbError::Other(format!("read latest pages index tail: {e}")))?;
+
+        let mut pos = 0usize;
+        while pos + PAGE_INDEX_RECORD_LEN <= bytes.len() {
+            let page_off = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let total_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let root = B256::from_slice(&bytes[pos..pos + 32]);
+            pos += 32;
+            let root_record_off = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let layout_version = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+            let feature_flags = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+            let checksum = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+
+            state.pages.insert(
+                page_off,
+                FlatPageIndexEntry {
+                    page_off,
+                    total_len,
+                    root,
+                    root_record_off,
+                    layout_version,
+                    feature_flags,
+                    checksum,
+                },
+            );
+        }
+
+        state
+            .pages_index_file
+            .seek(SeekFrom::Start(start + pos as u64))
+            .map_err(|e| MptDbError::Other(format!("rewind latest pages index cursor: {e}")))?;
+
+        if pos > 0 {
+            state.data_mmap = None;
+        }
+        Ok(())
     }
 }
 
@@ -427,5 +557,43 @@ mod tests {
         store.replace_latest_index(&store.snapshot_index()).unwrap();
         store.delete_latest(&addr).unwrap();
         assert!(store.trace_touched_paths(&addr, root, &[key]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_open_trie_page_reuses_mmap_bytes() {
+        let dir = TempDir::new().unwrap();
+        let store = FastStorageTrieStore::open(dir.path()).unwrap();
+
+        let mut tree = MptTree::new();
+        let key = Nibbles::unpack(B256::with_last_byte(3));
+        tree.insert(&key, alloy_rlp::encode(U256::from(9u64)));
+        let (root, _) = tree.root_hash_and_dirty_blobs();
+        let segment = StorageTrieSegment::from_tree(&tree, root).unwrap();
+
+        let data_path = FastStorageTrieStore::data_path(dir.path());
+        let pages_index_path = FastStorageTrieStore::pages_index_path(dir.path());
+        let mut data_file = open_pages_data_file(&data_path).unwrap();
+        let mut pages_index_file = open_pages_index_file(&pages_index_path).unwrap();
+        let entry = flat_layout::append_page(
+            &mut data_file,
+            &mut pages_index_file,
+            segment.as_bytes(),
+            root,
+            segment.root_record_off(),
+        )
+        .unwrap();
+        let locator = StorageSegmentLocator::new(root, entry.page_off, entry.root_record_off);
+        let addr = B256::with_last_byte(0x33);
+        store.apply_latest_updates(&[(addr, locator)], &[]).unwrap();
+        store.replace_latest_index(&store.snapshot_index()).unwrap();
+        store.clear_memory();
+
+        let loaded = store.open_trie_page(&addr, root).unwrap().unwrap();
+        let expected_ptr = {
+            let state = store.state.lock();
+            let mmap = state.data_mmap.as_ref().unwrap();
+            unsafe { mmap.as_ptr().add(entry.page_off as usize) }
+        };
+        assert_eq!(loaded.lease.as_ptr(), expected_ptr);
     }
 }

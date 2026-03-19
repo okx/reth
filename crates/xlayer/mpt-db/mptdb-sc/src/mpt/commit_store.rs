@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256};
 use alloy_rlp::Encodable;
 use alloy_trie::{Nibbles, EMPTY_ROOT_HASH};
 use fs4::fs_std::FileExt;
@@ -26,7 +26,6 @@ use super::{
     fast_store::FastStorageTrieStore,
     gc,
     manifest::VersionManifest,
-    overlay::StorageOverlay,
     parallel::ParallelismThresholds,
     persisted::{self, PersistedTrieStore},
     proof,
@@ -37,8 +36,13 @@ use super::{
     segment::StorageTrieSegment,
     snapshot::{SnapshotExporter, SnapshotImporter},
     state::{self, DirtyAccount},
+    storage_cow::StorageTrieCow,
     tree::MptTree,
+    tree_algo,
 };
+
+#[cfg(test)]
+use alloy_primitives::U256;
 
 /// Test-only failure injection points for deterministic failure testing.
 #[cfg(test)]
@@ -54,15 +58,15 @@ struct StorageTrieCommitArtifacts {
     hashed_address: B256,
     storage_root: B256,
     node_blobs: Vec<(B256, Vec<u8>)>,
-    segment: Option<StorageTrieSegment>,
+    publish_view: StorageTriePublishView,
     hash_elapsed: Duration,
     segment_elapsed: Duration,
-    /// The overlay after root computation, returned for LRU caching.
-    trie: StorageOverlay,
+    /// The working trie after root computation, returned for cross-block caching.
+    trie: StorageTrieCow,
 }
 
-enum WorkingStorageTrie {
-    Overlay(StorageOverlay),
+enum StorageTriePublishView {
+    DeferredRoot(B256),
 }
 
 /// A persist job sent to the background worker thread.
@@ -70,6 +74,7 @@ struct PersistJob {
     barrier_only: bool,
     blobs: Vec<(B256, Vec<u8>)>,
     published_puts: Vec<(B256, StorageTrieSegment)>,
+    deferred_published_roots: Vec<(B256, B256)>,
     fast_store_deletes: Vec<B256>,
     publish_baseline: bool,
     state_root: B256,
@@ -83,7 +88,7 @@ struct PersistJob {
 }
 
 struct StorageTrieCache {
-    inner: LruMap<B256, StorageOverlay, ByLength>,
+    inner: LruMap<B256, StorageTrieCow, ByLength>,
     capacity: usize,
 }
 
@@ -93,11 +98,11 @@ impl StorageTrieCache {
         Self { inner: LruMap::new(ByLength::new(limit)), capacity }
     }
 
-    fn remove(&mut self, key: &B256) -> Option<StorageOverlay> {
+    fn remove(&mut self, key: &B256) -> Option<StorageTrieCow> {
         self.inner.remove(key)
     }
 
-    fn insert(&mut self, key: B256, trie: StorageOverlay) {
+    fn insert(&mut self, key: B256, trie: StorageTrieCow) {
         if self.capacity == 0 {
             return;
         }
@@ -135,6 +140,15 @@ pub struct CommitProfile {
     pub apply_l3_published_hits: u64,
     pub apply_l3_published_post_flush_hits: u64,
     pub apply_node_fallback_loads: u64,
+    pub apply_slot_inserts: u64,
+    pub apply_slot_deletes: u64,
+    pub apply_leaf_splits: u64,
+    pub apply_extension_splits: u64,
+    pub apply_branch_collapse_to_empty: u64,
+    pub apply_branch_collapse_to_leaf: u64,
+    pub apply_branch_collapse_to_extension: u64,
+    pub apply_extension_leaf_merges: u64,
+    pub apply_extension_extension_merges: u64,
     pub storage_roots: Duration,
     pub storage_root_hashing: Duration,
     pub storage_segment_build: Duration,
@@ -160,7 +174,7 @@ pub struct MptCommitStore {
 
     account_trie: MptTree,
     /// Per-account storage tries (hashed_address -> storage trie) for the current block.
-    storage_tries: HashMap<B256, WorkingStorageTrie>,
+    storage_tries: HashMap<B256, StorageTrieCow>,
     /// Cross-block LRU cache for storage tries. After commit, clean tries are moved here
     /// so the next block can reuse them without reloading from RocksDB.
     storage_trie_cache: StorageTrieCache,
@@ -205,6 +219,15 @@ pub struct MptCommitStore {
     last_apply_l3_published_hits: u64,
     last_apply_l3_published_post_flush_hits: u64,
     last_apply_node_fallback_loads: u64,
+    last_apply_slot_inserts: u64,
+    last_apply_slot_deletes: u64,
+    last_apply_leaf_splits: u64,
+    last_apply_extension_splits: u64,
+    last_apply_branch_collapse_to_empty: u64,
+    last_apply_branch_collapse_to_leaf: u64,
+    last_apply_branch_collapse_to_extension: u64,
+    last_apply_extension_leaf_merges: u64,
+    last_apply_extension_extension_merges: u64,
     last_commit_profile: CommitProfile,
     #[cfg(test)]
     loaded_from_checkpoint: bool,
@@ -216,8 +239,8 @@ pub struct MptCommitStore {
 }
 
 impl MptCommitStore {
-    fn insert_working_overlay(&mut self, hashed_address: B256, overlay: StorageOverlay) {
-        self.storage_tries.insert(hashed_address, WorkingStorageTrie::Overlay(overlay));
+    fn insert_working_cow(&mut self, hashed_address: B256, cow: StorageTrieCow) {
+        self.storage_tries.insert(hashed_address, cow);
     }
 
     fn contains_working_trie(&self, hashed_address: &B256) -> bool {
@@ -225,28 +248,43 @@ impl MptCommitStore {
     }
 
     fn apply_storage_changes_to_working(
-        mut trie: WorkingStorageTrie,
+        mut trie: StorageTrieCow,
+        persisted: &PersistedTrieStore,
         dirty: &DirtyAccount,
-    ) -> WorkingStorageTrie {
-        let WorkingStorageTrie::Overlay(overlay) = &mut trie;
-        for change in &dirty.storage_changes {
-            if change.value == U256::ZERO {
-                overlay.apply_change(change.hashed_slot, change.slot_key.clone(), None);
-            } else {
-                overlay.apply_change(
-                    change.hashed_slot,
-                    change.slot_key.clone(),
-                    change.encoded_value.clone(),
-                );
-            }
-        }
-        trie
+    ) -> Result<StorageTrieCow> {
+        trie.apply_changes_batched(persisted, &dirty.storage_changes)?;
+        Ok(trie)
     }
 
     fn current_async_error(detail: &Mutex<Option<String>>) -> MptDbError {
         MptDbError::Other(
             detail.lock().clone().unwrap_or_else(|| "mpt async persist failed".to_string()),
         )
+    }
+
+    fn build_publish_segments_from_roots(
+        persisted: &PersistedTrieStore,
+        deferred_roots: &[(B256, B256)],
+    ) -> Result<Vec<(B256, StorageTrieSegment)>> {
+        let built = deferred_roots
+            .par_iter()
+            .map(|(hashed_address, root)| -> Result<Option<(B256, StorageTrieSegment)>> {
+                if *root == EMPTY_ROOT_HASH {
+                    return Ok(None);
+                }
+                let tree = persisted::load_tree_from_root(persisted, *root)?;
+                let segment = StorageTrieSegment::from_tree(&tree, *root)?;
+                Ok(Some((*hashed_address, segment)))
+            })
+            .collect::<Vec<_>>();
+
+        let mut segments = Vec::with_capacity(deferred_roots.len());
+        for segment in built {
+            if let Some(segment) = segment? {
+                segments.push(segment);
+            }
+        }
+        Ok(segments)
     }
 
     fn report_async_error(
@@ -557,6 +595,33 @@ impl MptCommitStore {
                                 tracing::error!(?e, "background persist failed");
                             } else {
                                 if job.publish_baseline {
+                                    let mut publish_puts = job.published_puts.clone();
+                                    if !job.deferred_published_roots.is_empty() {
+                                        match Self::build_publish_segments_from_roots(
+                                            &persisted_clone,
+                                            &job.deferred_published_roots,
+                                        ) {
+                                            Ok(mut rebuilt) => publish_puts.append(&mut rebuilt),
+                                            Err(e) => {
+                                                Self::report_async_error(
+                                                    &async_error_clone,
+                                                    &async_error_detail_clone,
+                                                    &e,
+                                                );
+                                                tracing::error!(
+                                                    ?e,
+                                                    "background deferred segment rebuild failed"
+                                                );
+                                                if let Some(done) = job.done {
+                                                    let _ =
+                                                        done.send(Err(Self::current_async_error(
+                                                            &async_error_detail_clone,
+                                                        )));
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     #[cfg(test)]
                                     let publish_result =
                                         if async_fail_mode_clone.load(Ordering::Relaxed) == 3 {
@@ -569,7 +634,7 @@ impl MptCommitStore {
                                                 worker_published_meta.as_ref(),
                                                 job.version,
                                                 job.state_root,
-                                                &job.published_puts,
+                                                &publish_puts,
                                                 &job.fast_store_deletes,
                                             )
                                         };
@@ -579,7 +644,7 @@ impl MptCommitStore {
                                             worker_published_meta.as_ref(),
                                             job.version,
                                             job.state_root,
-                                            &job.published_puts,
+                                            &publish_puts,
                                             &job.fast_store_deletes,
                                         );
 
@@ -729,6 +794,15 @@ impl MptCommitStore {
             last_apply_l3_published_hits: 0,
             last_apply_l3_published_post_flush_hits: 0,
             last_apply_node_fallback_loads: 0,
+            last_apply_slot_inserts: 0,
+            last_apply_slot_deletes: 0,
+            last_apply_leaf_splits: 0,
+            last_apply_extension_splits: 0,
+            last_apply_branch_collapse_to_empty: 0,
+            last_apply_branch_collapse_to_leaf: 0,
+            last_apply_branch_collapse_to_extension: 0,
+            last_apply_extension_leaf_merges: 0,
+            last_apply_extension_extension_merges: 0,
             last_commit_profile: CommitProfile::default(),
             #[cfg(test)]
             loaded_from_checkpoint,
@@ -799,6 +873,7 @@ impl MptCommitStore {
                 barrier_only: true,
                 blobs: vec![],
                 published_puts: vec![],
+                deferred_published_roots: vec![],
                 fast_store_deletes: vec![],
                 publish_baseline: false,
                 state_root: EMPTY_ROOT_HASH,
@@ -1086,12 +1161,13 @@ impl MptCommitStore {
         let mut node_fallback_loads = 0u64;
         let mut l3_latest_load = Duration::ZERO;
         let mut l3_published_load = Duration::ZERO;
-        let mut l3_into_tree = Duration::ZERO;
+        let l3_into_tree = Duration::ZERO;
 
         let collect_start = std::time::Instant::now();
         let dirty_accounts = state::collect_dirty_accounts(bundle)?;
         let collect_elapsed = collect_start.elapsed();
         let load_start = std::time::Instant::now();
+        let mut latest_candidates = Vec::new();
         let mut storage_loads = Vec::new();
         let mut published_candidates = Vec::new();
         let published_current = self.has_current_published_view();
@@ -1104,77 +1180,55 @@ impl MptCommitStore {
                 continue;
             }
             if dirty.storage_known_empty {
-                self.insert_working_overlay(dirty.hashed_address, StorageOverlay::empty());
+                self.insert_working_cow(dirty.hashed_address, StorageTrieCow::empty());
                 continue;
             }
             if let Some(cached_trie) = self.storage_trie_cache.remove(&dirty.hashed_address) {
-                self.insert_working_overlay(dirty.hashed_address, cached_trie);
+                self.storage_tries.insert(dirty.hashed_address, cached_trie);
                 l2_hits += 1;
                 continue;
             }
 
             let existing_root = self.get_existing_storage_root(&dirty.hashed_address);
             if existing_root == EMPTY_ROOT_HASH {
-                self.insert_working_overlay(dirty.hashed_address, StorageOverlay::empty());
+                self.insert_working_cow(dirty.hashed_address, StorageTrieCow::empty());
             } else {
-                if published_current {
-                    published_candidates.push((
-                        dirty.hashed_address,
-                        existing_root,
-                        dirty
-                            .storage_changes
-                            .iter()
-                            .map(|change| Nibbles::unpack(&change.hashed_slot))
-                            .collect::<Vec<_>>(),
-                    ));
-                    continue;
-                }
-                // Check L3 latest locator: structured segment + touched-path materialize.
-                let mut l3_hit = false;
-                if let Some(ref fs) = self.fast_store {
-                    let touched_slots = dirty
-                        .storage_changes
-                        .iter()
-                        .map(|change| Nibbles::unpack(&change.hashed_slot))
-                        .collect::<Vec<_>>();
-                    let latest_load_start = std::time::Instant::now();
-                    if let Ok(Some(loaded)) =
-                        fs.trace_touched_paths(&dirty.hashed_address, existing_root, &touched_slots)
-                    {
-                        l3_latest_load += loaded.lookup_elapsed;
-                        l3_into_tree += loaded.materialize_elapsed;
-                        self.insert_working_overlay(
-                            dirty.hashed_address,
-                            StorageOverlay::from_trace(loaded.trace),
-                        );
-                        l3_hit = true;
+                latest_candidates.push((dirty.hashed_address, existing_root));
+            }
+        }
+
+        if !latest_candidates.is_empty() {
+            if let Some(ref fs) = self.fast_store {
+                let resolved = latest_candidates
+                    .into_par_iter()
+                    .map(|(hashed_address, existing_root)| {
+                        match fs.open_trie(&hashed_address, existing_root)? {
+                            Some(loaded) => Ok((
+                                Some((hashed_address, loaded.trie, loaded.lookup_elapsed)),
+                                None,
+                            )),
+                            None => Ok((None, Some((hashed_address, existing_root)))),
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                for (loaded, fallback) in resolved {
+                    if let Some((hashed_address, trie, load_elapsed)) = loaded {
+                        self.insert_working_cow(hashed_address, trie);
                         l3_latest_hits += 1;
-                    } else {
-                        l3_latest_load += latest_load_start.elapsed();
+                        l3_latest_load += load_elapsed;
+                    } else if let Some(load) = fallback {
+                        if published_current {
+                            published_candidates.push(load);
+                        } else {
+                            storage_loads.push(load);
+                        }
                     }
                 }
-                if !l3_hit {
-                    if published_current {
-                        published_candidates.push((
-                            dirty.hashed_address,
-                            existing_root,
-                            dirty
-                                .storage_changes
-                                .iter()
-                                .map(|change| Nibbles::unpack(&change.hashed_slot))
-                                .collect::<Vec<_>>(),
-                        ));
-                        l3_hit = true;
-                    }
-                }
-                if !l3_hit {
-                    let touched_slots = dirty
-                        .storage_changes
-                        .iter()
-                        .map(|change| Nibbles::unpack(&change.hashed_slot))
-                        .collect::<Vec<_>>();
-                    storage_loads.push((dirty.hashed_address, existing_root, touched_slots));
-                }
+            } else if published_current {
+                published_candidates = latest_candidates;
+            } else {
+                storage_loads = latest_candidates;
             }
         }
 
@@ -1182,37 +1236,22 @@ impl MptCommitStore {
             if let Some(ref store) = self.published_store {
                 let resolved = published_candidates
                     .into_par_iter()
-                    .map(|(hashed_address, existing_root, touched_slots)| {
-                        match store.materialize_touched_paths(
-                            &hashed_address,
-                            existing_root,
-                            &touched_slots,
-                        )? {
+                    .map(|(hashed_address, existing_root)| {
+                        match store.open_trie(&hashed_address, existing_root)? {
                             Some(loaded) => Ok((
-                                Some((
-                                    hashed_address,
-                                    loaded.trace,
-                                    loaded.lookup_elapsed,
-                                    loaded.materialize_elapsed,
-                                )),
+                                Some((hashed_address, loaded.trie, loaded.lookup_elapsed)),
                                 None,
                             )),
-                            None => {
-                                Ok((None, Some((hashed_address, existing_root, touched_slots))))
-                            }
+                            None => Ok((None, Some((hashed_address, existing_root)))),
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
 
                 for (loaded, fallback) in resolved {
-                    if let Some((hashed_address, trace, load_elapsed, into_tree_elapsed)) = loaded {
-                        self.insert_working_overlay(
-                            hashed_address,
-                            StorageOverlay::from_trace(trace),
-                        );
+                    if let Some((hashed_address, trie, load_elapsed)) = loaded {
+                        self.insert_working_cow(hashed_address, trie);
                         l3_published_hits += 1;
                         l3_published_load += load_elapsed;
-                        l3_into_tree += into_tree_elapsed;
                     } else if let Some(load) = fallback {
                         storage_loads.push(load);
                     }
@@ -1227,38 +1266,21 @@ impl MptCommitStore {
                 if let Some(ref store) = self.published_store {
                     let resolved = storage_loads
                         .into_par_iter()
-                        .map(|(hashed_address, existing_root, touched_slots)| {
-                            match store.materialize_touched_paths(
-                                &hashed_address,
-                                existing_root,
-                                &touched_slots,
-                            )? {
+                        .map(|(hashed_address, existing_root)| {
+                            match store.open_trie(&hashed_address, existing_root)? {
                                 Some(loaded) => Ok((
-                                    Some((
-                                        hashed_address,
-                                        loaded.trace,
-                                        loaded.lookup_elapsed,
-                                        loaded.materialize_elapsed,
-                                    )),
+                                    Some((hashed_address, loaded.trie, loaded.lookup_elapsed)),
                                     None,
                                 )),
-                                None => {
-                                    Ok((None, Some((hashed_address, existing_root, touched_slots))))
-                                }
+                                None => Ok((None, Some((hashed_address, existing_root)))),
                             }
                         })
                         .collect::<Result<Vec<_>>>()?;
                     for (loaded, fallback) in resolved {
-                        if let Some((hashed_address, trace, load_elapsed, into_tree_elapsed)) =
-                            loaded
-                        {
-                            self.insert_working_overlay(
-                                hashed_address,
-                                StorageOverlay::from_trace(trace),
-                            );
+                        if let Some((hashed_address, trie, load_elapsed)) = loaded {
+                            self.insert_working_cow(hashed_address, trie);
                             l3_published_post_flush_hits += 1;
                             l3_published_load += load_elapsed;
-                            l3_into_tree += into_tree_elapsed;
                         } else if let Some(load) = fallback {
                             remaining_loads.push(load);
                         }
@@ -1272,24 +1294,9 @@ impl MptCommitStore {
 
             if !remaining_loads.is_empty() {
                 node_fallback_loads += remaining_loads.len() as u64;
-                let persisted = Arc::clone(&self.persisted);
-                let loaded_tries: Vec<(B256, MptTree)> = remaining_loads
-                    .into_par_iter()
-                    .map(|(hashed_address, existing_root, touched_slots)| {
-                        persisted::load_tree_paths_from_root(
-                            &persisted,
-                            existing_root,
-                            &touched_slots,
-                        )
-                        .map(|trie| (hashed_address, trie))
-                    })
-                    .collect::<Result<_>>()?;
-                self.storage_tries.extend(loaded_tries.into_iter().map(
-                    |(hashed_address, trie)| {
-                        (
-                            hashed_address,
-                            WorkingStorageTrie::Overlay(StorageOverlay::from_tree(trie)),
-                        )
+                self.storage_tries.extend(remaining_loads.into_iter().map(
+                    |(hashed_address, existing_root)| {
+                        (hashed_address, StorageTrieCow::from_persisted_root(existing_root))
                     },
                 ));
             }
@@ -1299,6 +1306,7 @@ impl MptCommitStore {
         let mut slot_updates_elapsed = Duration::ZERO;
 
         let slot_updates_start = std::time::Instant::now();
+        tree_algo::reset_stats();
         let mut dirty_storage_accounts = HashMap::new();
         for dirty in &dirty_accounts {
             if dirty.storage_wiped {
@@ -1309,7 +1317,7 @@ impl MptCommitStore {
                     let _ = fs.delete_latest(&dirty.hashed_address);
                 }
                 // Wiped: start from empty storage trie, apply new changes on top.
-                self.insert_working_overlay(dirty.hashed_address, StorageOverlay::empty());
+                self.insert_working_cow(dirty.hashed_address, StorageTrieCow::empty());
             }
             if dirty.storage_wiped || !dirty.storage_changes.is_empty() {
                 dirty_storage_accounts.insert(dirty.hashed_address, dirty);
@@ -1317,16 +1325,18 @@ impl MptCommitStore {
         }
 
         let storage_tries = std::mem::take(&mut self.storage_tries);
-        let updated_storage_tries: Vec<(B256, WorkingStorageTrie)> = storage_tries
+        let updated_storage_tries: Vec<(B256, StorageTrieCow)> = storage_tries
             .into_par_iter()
-            .map(|(hashed_address, trie)| {
+            .map(|(hashed_address, trie)| -> Result<(B256, StorageTrieCow)> {
                 let trie = match dirty_storage_accounts.get(&hashed_address) {
-                    Some(dirty) => Self::apply_storage_changes_to_working(trie, dirty),
+                    Some(dirty) => {
+                        Self::apply_storage_changes_to_working(trie, &self.persisted, dirty)?
+                    }
                     None => trie,
                 };
-                (hashed_address, trie)
+                Ok((hashed_address, trie))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         self.storage_tries.extend(updated_storage_tries);
 
         for hashed_address in dirty_storage_accounts.keys() {
@@ -1338,6 +1348,7 @@ impl MptCommitStore {
             }
         }
         slot_updates_elapsed += slot_updates_start.elapsed();
+        let slot_stats = tree_algo::snapshot_stats();
 
         self.dirty_accounts = dirty_accounts;
         self.last_apply_collect_dirty_accounts = collect_elapsed;
@@ -1352,6 +1363,15 @@ impl MptCommitStore {
         self.last_apply_l3_published_hits = l3_published_hits;
         self.last_apply_l3_published_post_flush_hits = l3_published_post_flush_hits;
         self.last_apply_node_fallback_loads = node_fallback_loads;
+        self.last_apply_slot_inserts = slot_stats.slot_inserts;
+        self.last_apply_slot_deletes = slot_stats.slot_deletes;
+        self.last_apply_leaf_splits = slot_stats.leaf_splits;
+        self.last_apply_extension_splits = slot_stats.extension_splits;
+        self.last_apply_branch_collapse_to_empty = slot_stats.branch_collapse_to_empty;
+        self.last_apply_branch_collapse_to_leaf = slot_stats.branch_collapse_to_leaf;
+        self.last_apply_branch_collapse_to_extension = slot_stats.branch_collapse_to_extension;
+        self.last_apply_extension_leaf_merges = slot_stats.extension_leaf_merges;
+        self.last_apply_extension_extension_merges = slot_stats.extension_extension_merges;
         Ok(())
     }
 
@@ -1393,35 +1413,23 @@ impl MptCommitStore {
         let should_parallel = self.parallelism.should_parallelize_storage_tries(storage_tries_len);
         let mut storage_root_hash_elapsed = Duration::ZERO;
         let mut storage_segment_build_elapsed = Duration::ZERO;
+        let persisted_for_hash = Arc::clone(&self.persisted);
 
         let storage_artifacts: Vec<StorageTrieCommitArtifacts> = if should_parallel {
             storage_tries
                 .into_par_iter()
                 .map(|(addr, trie)| -> Result<StorageTrieCommitArtifacts> {
-                    let WorkingStorageTrie::Overlay(overlay) = trie;
                     let hash_start = std::time::Instant::now();
-                    let (root, blobs, overlay) = overlay.root_hash_and_dirty_blobs();
+                    let (root, blobs, cow) = trie.root_hash_and_dirty_blobs(&persisted_for_hash)?;
                     let hash_elapsed = hash_start.elapsed();
-                    let segment_start = std::time::Instant::now();
-                    let segment = (root != EMPTY_ROOT_HASH)
-                        .then(|| {
-                            StorageTrieSegment::from_parts(
-                                overlay.arena_nodes(),
-                                overlay.arena_hash_cache(),
-                                overlay.root_index(),
-                                root,
-                            )
-                        })
-                        .transpose()?;
-                    let segment_elapsed = segment_start.elapsed();
                     Ok(StorageTrieCommitArtifacts {
                         hashed_address: addr,
                         storage_root: root,
                         node_blobs: blobs,
-                        segment,
+                        publish_view: StorageTriePublishView::DeferredRoot(root),
                         hash_elapsed,
-                        segment_elapsed,
-                        trie: overlay,
+                        segment_elapsed: Duration::ZERO,
+                        trie: cow,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -1429,30 +1437,17 @@ impl MptCommitStore {
             storage_tries
                 .into_iter()
                 .map(|(addr, trie)| -> Result<StorageTrieCommitArtifacts> {
-                    let WorkingStorageTrie::Overlay(overlay) = trie;
                     let hash_start = std::time::Instant::now();
-                    let (root, blobs, overlay) = overlay.root_hash_and_dirty_blobs();
+                    let (root, blobs, cow) = trie.root_hash_and_dirty_blobs(&persisted_for_hash)?;
                     let hash_elapsed = hash_start.elapsed();
-                    let segment_start = std::time::Instant::now();
-                    let segment = (root != EMPTY_ROOT_HASH)
-                        .then(|| {
-                            StorageTrieSegment::from_parts(
-                                overlay.arena_nodes(),
-                                overlay.arena_hash_cache(),
-                                overlay.root_index(),
-                                root,
-                            )
-                        })
-                        .transpose()?;
-                    let segment_elapsed = segment_start.elapsed();
                     Ok(StorageTrieCommitArtifacts {
                         hashed_address: addr,
                         storage_root: root,
                         node_blobs: blobs,
-                        segment,
+                        publish_view: StorageTriePublishView::DeferredRoot(root),
                         hash_elapsed,
-                        segment_elapsed,
-                        trie: overlay,
+                        segment_elapsed: Duration::ZERO,
+                        trie: cow,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -1516,9 +1511,9 @@ impl MptCommitStore {
         let account_root_elapsed = account_root_start.elapsed();
 
         // Separate node blobs from tries so we can cache tries after persist
-        let mut storage_cache_candidates: Vec<(B256, StorageOverlay)> =
+        let mut storage_cache_candidates: Vec<(B256, StorageTrieCow)> =
             Vec::with_capacity(storage_artifacts.len());
-        let mut prebuilt_segments: Vec<(B256, StorageTrieSegment)> =
+        let mut deferred_published_roots: Vec<(B256, B256)> =
             Vec::with_capacity(storage_artifacts.len());
         let extra_blob_capacity: usize =
             storage_artifacts.iter().map(|artifact| artifact.node_blobs.len()).sum();
@@ -1526,9 +1521,8 @@ impl MptCommitStore {
         all_blobs.extend(account_blobs);
         for artifact in storage_artifacts {
             all_blobs.extend(artifact.node_blobs);
-            if let Some(segment) = artifact.segment {
-                prebuilt_segments.push((artifact.hashed_address, segment));
-            }
+            let StorageTriePublishView::DeferredRoot(root) = artifact.publish_view;
+            deferred_published_roots.push((artifact.hashed_address, root));
             storage_cache_candidates.push((artifact.hashed_address, artifact.trie));
         }
 
@@ -1559,7 +1553,7 @@ impl MptCommitStore {
             .map(|d| d.hashed_address)
             .collect();
         let cache_publish_start = std::time::Instant::now();
-        let mut published_puts = prebuilt_segments;
+        let mut published_puts = Vec::new();
         let mut fast_store_deletes = deleted_accounts.iter().copied().collect::<Vec<_>>();
         fast_store_deletes.extend(storage_cache_candidates.iter().filter_map(|(addr, _)| {
             match storage_roots.get(addr).copied() {
@@ -1588,11 +1582,13 @@ impl MptCommitStore {
         if use_async {
             let tx = self.persist_tx.as_ref().unwrap();
             let job_published_puts = std::mem::take(&mut published_puts);
+            let job_deferred_published_roots = std::mem::take(&mut deferred_published_roots);
             let job_fast_store_deletes = std::mem::take(&mut fast_store_deletes);
             let job = PersistJob {
                 barrier_only: false,
                 blobs: all_blobs,
                 published_puts: job_published_puts,
+                deferred_published_roots: job_deferred_published_roots,
                 fast_store_deletes: job_fast_store_deletes,
                 publish_baseline: true,
                 state_root,
@@ -1606,6 +1602,13 @@ impl MptCommitStore {
             // Synchronous persist for large batches or when no background worker
             self.persisted.persist_batch(&all_blobs, true)?;
             manifest_copy.save(&self.manifest_path)?;
+            if !deferred_published_roots.is_empty() {
+                let rebuilt = Self::build_publish_segments_from_roots(
+                    &self.persisted,
+                    &deferred_published_roots,
+                )?;
+                published_puts.extend(rebuilt);
+            }
             let published_meta = self.published_baseline.publish_generation(
                 self.published_meta.as_ref(),
                 new_version,
@@ -1664,6 +1667,15 @@ impl MptCommitStore {
             apply_l3_published_hits: self.last_apply_l3_published_hits,
             apply_l3_published_post_flush_hits: self.last_apply_l3_published_post_flush_hits,
             apply_node_fallback_loads: self.last_apply_node_fallback_loads,
+            apply_slot_inserts: self.last_apply_slot_inserts,
+            apply_slot_deletes: self.last_apply_slot_deletes,
+            apply_leaf_splits: self.last_apply_leaf_splits,
+            apply_extension_splits: self.last_apply_extension_splits,
+            apply_branch_collapse_to_empty: self.last_apply_branch_collapse_to_empty,
+            apply_branch_collapse_to_leaf: self.last_apply_branch_collapse_to_leaf,
+            apply_branch_collapse_to_extension: self.last_apply_branch_collapse_to_extension,
+            apply_extension_leaf_merges: self.last_apply_extension_leaf_merges,
+            apply_extension_extension_merges: self.last_apply_extension_extension_merges,
             storage_roots: storage_roots_elapsed,
             storage_root_hashing: storage_root_hash_elapsed,
             storage_segment_build: storage_segment_build_elapsed,
@@ -2881,6 +2893,11 @@ mod tests {
             store.storage_trie_cache.contains_key(&hashed_addr),
             "storage trie should be in cache after commit"
         );
+        let cached = match store.storage_trie_cache.remove(&hashed_addr) {
+            Some(entry) => entry,
+            None => panic!("missing cached trie"),
+        };
+        store.storage_trie_cache.insert(hashed_addr, cached);
 
         // Block 2: add slot2 to same account
         let bundle2 = make_bundle(vec![(
@@ -3042,7 +3059,44 @@ mod tests {
     }
 
     #[test]
-    fn t6_5d_publish_failure_fails_fast() {
+    fn t6_5d_prefers_fast_store_over_published_for_current_version() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        let addr = Address::repeat_byte(0x34);
+
+        let bundle1 = make_bundle(vec![(
+            addr,
+            Some(default_info(1, 100)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(1))],
+        )]);
+        store.apply_bundle_state(&bundle1).unwrap();
+        store.commit().unwrap();
+
+        // Rebind to the current published view and clear the cross-block L2 cache so the
+        // next block must choose between fast-store and published baseline.
+        store.load_version().unwrap();
+        assert_eq!(store.published_version(), Some(1));
+        assert!(store.has_published_store());
+
+        let bundle2 = make_bundle(vec![(
+            addr,
+            Some(default_info(2, 200)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(2))],
+        )]);
+        store.apply_bundle_state(&bundle2).unwrap();
+        let ((_version, _root), profile) = store.commit_with_profile().unwrap();
+
+        assert_eq!(profile.apply_l2_hits, 0, "profile: {profile:?}");
+        assert_eq!(profile.apply_l3_latest_hits, 1, "profile: {profile:?}");
+        assert_eq!(profile.apply_l3_published_hits, 0, "profile: {profile:?}");
+        assert_eq!(profile.apply_l3_published_post_flush_hits, 0, "profile: {profile:?}");
+        assert_eq!(profile.apply_node_fallback_loads, 0, "profile: {profile:?}");
+    }
+
+    #[test]
+    fn t6_5e_publish_failure_fails_fast() {
         let dir = TempDir::new().unwrap();
         let mut store = MptCommitStore::open(dir.path(), false).unwrap();
         store.set_async_fail_mode(3);
@@ -3059,6 +3113,97 @@ mod tests {
 
         assert!(store.flush_persist().is_err());
         assert!(store.load_version().is_err());
+    }
+
+    #[test]
+    fn t6_5f_deferred_root_rebuilds_latest_locator() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        let addr = Address::repeat_byte(0x35);
+
+        let bundle1 = make_bundle(vec![(
+            addr,
+            Some(default_info(1, 100)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(1))],
+        )]);
+        store.apply_bundle_state(&bundle1).unwrap();
+        store.commit().unwrap();
+        store.load_version().unwrap();
+
+        let bundle2 = make_bundle(vec![(
+            addr,
+            Some(default_info(2, 200)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(2), U256::ZERO, U256::from(2))],
+        )]);
+        store.apply_bundle_state(&bundle2).unwrap();
+        let ((_version2, _root2), profile2) = store.commit_with_profile().unwrap();
+        assert_eq!(profile2.apply_l2_hits, 0, "profile2: {profile2:?}");
+        assert_eq!(profile2.apply_l3_latest_hits, 1, "profile2: {profile2:?}");
+
+        // Clear the L2 cache and require the next block to reload from the latest/published
+        // indexes produced by the deferred-root rebuild path for version 2.
+        store.load_version().unwrap();
+
+        let bundle3 = make_bundle(vec![(
+            addr,
+            Some(default_info(3, 300)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(3), U256::ZERO, U256::from(3))],
+        )]);
+        store.apply_bundle_state(&bundle3).unwrap();
+        let ((_version3, _root3), profile3) = store.commit_with_profile().unwrap();
+
+        assert_eq!(profile3.apply_l2_hits, 0, "profile3: {profile3:?}");
+        assert_eq!(profile3.apply_node_fallback_loads, 0, "profile3: {profile3:?}");
+        assert_eq!(profile3.apply_l3_latest_hits, 1, "profile3: {profile3:?}");
+        assert_eq!(profile3.apply_l3_published_hits, 0, "profile3: {profile3:?}");
+        assert_eq!(profile3.apply_l3_published_post_flush_hits, 0, "profile3: {profile3:?}");
+    }
+
+    #[test]
+    fn t6_5g_overlay_commit_also_rebuilds_latest_locator() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        let addr = Address::repeat_byte(0x36);
+
+        let bundle1 = make_bundle(vec![(
+            addr,
+            Some(default_info(1, 100)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(1))],
+        )]);
+        store.apply_bundle_state(&bundle1).unwrap();
+        store.commit().unwrap();
+
+        // Block 2 should come from the L2 cache and commit through the overlay path.
+        let bundle2 = make_bundle(vec![(
+            addr,
+            Some(default_info(2, 200)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(2), U256::ZERO, U256::from(2))],
+        )]);
+        store.apply_bundle_state(&bundle2).unwrap();
+        let ((_version2, _root2), profile2) = store.commit_with_profile().unwrap();
+        assert_eq!(profile2.apply_l2_hits, 1, "profile2: {profile2:?}");
+
+        // After clearing L2 via load_version, the next block must be able to reload from
+        // the latest/published indexes rebuilt from the deferred root of block 2.
+        store.load_version().unwrap();
+
+        let bundle3 = make_bundle(vec![(
+            addr,
+            Some(default_info(3, 300)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(3), U256::ZERO, U256::from(3))],
+        )]);
+        store.apply_bundle_state(&bundle3).unwrap();
+        let ((_version3, _root3), profile3) = store.commit_with_profile().unwrap();
+
+        assert_eq!(profile3.apply_l2_hits, 0, "profile3: {profile3:?}");
+        assert_eq!(profile3.apply_node_fallback_loads, 0, "profile3: {profile3:?}");
+        assert_eq!(profile3.apply_l3_latest_hits, 1, "profile3: {profile3:?}");
     }
 
     /// load_version and rollback clear the storage trie cache.

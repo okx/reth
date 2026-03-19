@@ -1,0 +1,1411 @@
+use alloy_primitives::B256;
+use alloy_trie::Nibbles;
+use mptdb_common::error::{MptDbError, Result};
+use std::{collections::HashMap, sync::Arc};
+
+use super::{
+    arena::MutableTrieArena,
+    encoding::decode_node,
+    node::{BranchNode, ChildRef, ExtensionNode, LeafNode, MptNode},
+    overlay::StorageOverlay,
+    persisted::PersistedTrieStore,
+    segment::{
+        SegmentChildEmbedRef, SegmentNodeKind, SegmentNodeRef, SegmentPageLease,
+        StorageTrieSegmentReader,
+    },
+    state::StorageChange,
+    storage_recompute,
+    tree::MptTree,
+    tree_algo,
+};
+
+#[derive(Clone)]
+pub enum CowRootRef {
+    Empty,
+    Arena(u32),
+    Segment(SegmentNodeRef),
+    Persisted(B256),
+}
+
+#[derive(Clone)]
+pub enum CowChildRef {
+    Arena(u32),
+    Hash(B256),
+    Inline(Vec<u8>),
+    Segment(SegmentNodeRef),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum PendingCowEdge {
+    Extension,
+    Branch(u8),
+}
+
+#[derive(Clone)]
+pub struct StorageTrieCow {
+    root: CowRootRef,
+    arena: MutableTrieArena,
+    pending_segment_children: HashMap<(u32, PendingCowEdge), CowChildRef>,
+}
+
+impl StorageTrieCow {
+    pub fn empty() -> Self {
+        Self {
+            root: CowRootRef::Empty,
+            arena: MutableTrieArena::new(),
+            pending_segment_children: HashMap::new(),
+        }
+    }
+
+    pub fn from_segment_page(page: Arc<SegmentPageLease>) -> Self {
+        let reader =
+            StorageTrieSegmentReader::open_shared_page(&page, page.root(), page.root_record_off())
+                .expect("segment page lease should always reference a valid trie page");
+        let root = reader.root_ref().expect("segment page lease should expose a root node ref");
+        Self {
+            root: CowRootRef::Segment(root),
+            arena: MutableTrieArena::new(),
+            pending_segment_children: HashMap::new(),
+        }
+    }
+
+    pub fn from_segment_root(root: SegmentNodeRef) -> Self {
+        Self {
+            root: CowRootRef::Segment(root),
+            arena: MutableTrieArena::new(),
+            pending_segment_children: HashMap::new(),
+        }
+    }
+
+    pub fn from_persisted_root(root: B256) -> Self {
+        Self {
+            root: CowRootRef::Persisted(root),
+            arena: MutableTrieArena::new(),
+            pending_segment_children: HashMap::new(),
+        }
+    }
+
+    pub fn from_tree(tree: MptTree) -> Self {
+        let root = tree.root.map(CowRootRef::Arena).unwrap_or(CowRootRef::Empty);
+        Self { root, arena: tree.arena, pending_segment_children: HashMap::new() }
+    }
+
+    pub fn root_ref(&self) -> &CowRootRef {
+        &self.root
+    }
+
+    pub fn arena(&self) -> &MutableTrieArena {
+        &self.arena
+    }
+
+    pub fn clear_dirty(&mut self) {
+        self.arena.clear_all_dirty();
+    }
+
+    pub fn arena_nodes(&self) -> &[MptNode] {
+        self.arena.nodes()
+    }
+
+    pub fn arena_hash_cache(&self) -> &[Option<B256>] {
+        self.arena.hash_cache_slice()
+    }
+
+    pub fn root_index(&self) -> Option<u32> {
+        match self.root {
+            CowRootRef::Empty => None,
+            CowRootRef::Arena(idx) => Some(idx),
+            CowRootRef::Segment(_) | CowRootRef::Persisted(_) => None,
+        }
+    }
+
+    pub fn get(&self, store: &PersistedTrieStore, key: &Nibbles) -> Result<Option<Vec<u8>>> {
+        match self.root_ref() {
+            CowRootRef::Empty => Ok(None),
+            CowRootRef::Arena(idx) => Ok(self.get_arena_recursive(*idx, store, key, 0)),
+            CowRootRef::Segment(root) => self.get_segment_recursive(root.clone(), store, key, 0),
+            CowRootRef::Persisted(root) => self.get_persisted_recursive(*root, store, key, 0),
+        }
+    }
+
+    pub fn apply_change(
+        &mut self,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+        value: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let new_root = match value {
+            Some(value) => {
+                let root_idx = self.ensure_path_loaded(store, key)?;
+                let current_root = root_idx.or_else(|| match self.root {
+                    CowRootRef::Arena(idx) => Some(idx),
+                    CowRootRef::Empty => None,
+                    _ => None,
+                });
+                Some(tree_algo::insert_recursive(&mut self.arena, current_root, key, 0, value))
+            }
+            None => {
+                let root_idx = self.ensure_delete_ready(store, key)?;
+                tree_algo::delete_recursive(&mut self.arena, root_idx, key, 0).1
+            }
+        };
+        self.root = match new_root {
+            Some(idx) => CowRootRef::Arena(idx),
+            None => CowRootRef::Empty,
+        };
+        self.prune_pending_segment_children();
+        Ok(())
+    }
+
+    pub fn apply_changes_batched(
+        &mut self,
+        store: &PersistedTrieStore,
+        changes: &[StorageChange],
+    ) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        let mut ordered: Vec<&StorageChange> = changes.iter().collect();
+        ordered.sort_by(|a, b| a.slot_key.cmp(&b.slot_key));
+
+        let mut idx = 0usize;
+        while idx < ordered.len() {
+            let change = ordered[idx];
+            while idx + 1 < ordered.len() && ordered[idx + 1].slot_key == change.slot_key {
+                idx += 1;
+            }
+            let change = ordered[idx];
+            let value = if change.value == alloy_primitives::U256::ZERO {
+                None
+            } else {
+                change.encoded_value.clone()
+            };
+            self.apply_change(store, &change.slot_key, value)?;
+            idx += 1;
+        }
+
+        Ok(())
+    }
+
+    pub fn root_hash_and_dirty_blobs(
+        mut self,
+        store: &PersistedTrieStore,
+    ) -> Result<(B256, Vec<(B256, Vec<u8>)>, StorageTrieCow)> {
+        let root = match self.root.clone() {
+            CowRootRef::Empty => None,
+            CowRootRef::Arena(idx) => Some(idx),
+            CowRootRef::Segment(_) | CowRootRef::Persisted(_) => {
+                self.materialize_all(store, self.root.clone())?
+            }
+        };
+        self.root = match root {
+            Some(idx) => CowRootRef::Arena(idx),
+            None => CowRootRef::Empty,
+        };
+        self.prune_pending_segment_children();
+
+        let result = storage_recompute::recompute(&mut self.arena, root);
+        Ok((result.root, result.dirty_blobs, self))
+    }
+
+    pub fn into_overlay_materialized(
+        mut self,
+        store: &PersistedTrieStore,
+    ) -> Result<StorageOverlay> {
+        let root = self.materialize_all(store, self.root.clone())?;
+        self.root = match root {
+            Some(idx) => CowRootRef::Arena(idx),
+            None => CowRootRef::Empty,
+        };
+        self.prune_pending_segment_children();
+        Ok(StorageOverlay::from_tree(MptTree { arena: self.arena, root }))
+    }
+
+    fn get_arena_recursive(
+        &self,
+        idx: u32,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+        offset: usize,
+    ) -> Option<Vec<u8>> {
+        match self.arena.get(idx) {
+            MptNode::Leaf(leaf) => {
+                let remaining = key.slice(offset..);
+                if leaf.nibbles == remaining {
+                    Some(leaf.value.clone())
+                } else {
+                    None
+                }
+            }
+            MptNode::Extension(ext) => {
+                let remaining = key.slice(offset..);
+                if remaining.len() < ext.nibbles.len() ||
+                    remaining.slice(..ext.nibbles.len()) != ext.nibbles
+                {
+                    return None;
+                }
+                self.get_child_value(
+                    idx,
+                    PendingCowEdge::Extension,
+                    &ext.child,
+                    store,
+                    key,
+                    offset + ext.nibbles.len(),
+                )
+            }
+            MptNode::Branch(branch) => {
+                if offset >= key.len() {
+                    branch.value.clone()
+                } else {
+                    let nibble = key.get_unchecked(offset) as usize;
+                    let child = branch.children[nibble].as_ref()?;
+                    self.get_child_value(
+                        idx,
+                        PendingCowEdge::Branch(nibble as u8),
+                        child,
+                        store,
+                        key,
+                        offset + 1,
+                    )
+                }
+            }
+        }
+    }
+
+    fn get_child_value(
+        &self,
+        parent_idx: u32,
+        edge: PendingCowEdge,
+        child: &ChildRef,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+        offset: usize,
+    ) -> Option<Vec<u8>> {
+        match self.pending_segment_children.get(&(parent_idx, edge)) {
+            Some(CowChildRef::Arena(idx)) => self.get_arena_recursive(*idx, store, key, offset),
+            Some(CowChildRef::Hash(hash)) => {
+                self.get_persisted_recursive(*hash, store, key, offset).ok().flatten()
+            }
+            Some(CowChildRef::Inline(rlp)) => {
+                self.get_inline_recursive(rlp, store, key, offset).ok().flatten()
+            }
+            Some(CowChildRef::Segment(node_ref)) => {
+                self.get_segment_recursive(node_ref.clone(), store, key, offset).ok().flatten()
+            }
+            None => match child {
+                ChildRef::Arena(idx) => self.get_arena_recursive(*idx, store, key, offset),
+                ChildRef::Hash(hash) => {
+                    self.get_persisted_recursive(*hash, store, key, offset).ok().flatten()
+                }
+                ChildRef::Inline(rlp) => {
+                    self.get_inline_recursive(rlp, store, key, offset).ok().flatten()
+                }
+            },
+        }
+    }
+
+    fn get_segment_recursive(
+        &self,
+        node_ref: SegmentNodeRef,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+        offset: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let reader = StorageTrieSegmentReader::open_shared_page(
+            node_ref.page_lease(),
+            node_ref.page_lease().root(),
+            node_ref.page_lease().root_record_off(),
+        )?;
+        let view = reader.view_node(node_ref.seg_idx())?;
+        match view.kind {
+            SegmentNodeKind::Leaf { nibbles, value } => {
+                let remaining = key.slice(offset..);
+                if remaining == Nibbles::from_nibbles(nibbles) {
+                    Ok(Some(value.to_vec()))
+                } else {
+                    Ok(None)
+                }
+            }
+            SegmentNodeKind::Extension { nibbles, child } => {
+                let remaining = key.slice(offset..);
+                if remaining.len() < nibbles.len() ||
+                    remaining.slice(..nibbles.len()) != Nibbles::from_nibbles(nibbles)
+                {
+                    return Ok(None);
+                }
+                let next_offset = offset + nibbles.len();
+                match child.target_idx {
+                    Some(seg_idx) => {
+                        let hash = reader.view_node(seg_idx)?.hash;
+                        self.get_segment_recursive(
+                            SegmentNodeRef::new(Arc::clone(node_ref.page_lease()), seg_idx, hash),
+                            store,
+                            key,
+                            next_offset,
+                        )
+                    }
+                    None => self.get_segment_embed(child.embed, store, key, next_offset),
+                }
+            }
+            SegmentNodeKind::Branch { value, children, .. } => {
+                if offset >= key.len() {
+                    Ok(value.map(|value| value.to_vec()))
+                } else {
+                    let nibble = key.get_unchecked(offset);
+                    for child in children.iter() {
+                        let child = child?;
+                        if child.slot == nibble {
+                            return match child.target_idx {
+                                Some(seg_idx) => {
+                                    let hash = reader.view_node(seg_idx)?.hash;
+                                    self.get_segment_recursive(
+                                        SegmentNodeRef::new(
+                                            Arc::clone(node_ref.page_lease()),
+                                            seg_idx,
+                                            hash,
+                                        ),
+                                        store,
+                                        key,
+                                        offset + 1,
+                                    )
+                                }
+                                None => self.get_segment_embed(child.embed, store, key, offset + 1),
+                            };
+                        }
+                    }
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    fn get_segment_embed(
+        &self,
+        embed: SegmentChildEmbedRef<'_>,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+        offset: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        match embed {
+            SegmentChildEmbedRef::None => Ok(None),
+            SegmentChildEmbedRef::Hash(hash) => {
+                self.get_persisted_recursive(hash, store, key, offset)
+            }
+            SegmentChildEmbedRef::Inline(bytes) => {
+                self.get_inline_recursive(bytes, store, key, offset)
+            }
+        }
+    }
+
+    fn get_persisted_recursive(
+        &self,
+        root: B256,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+        offset: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let rlp = match store.get_node(root)? {
+            Some(rlp) => rlp,
+            None => return Ok(None),
+        };
+        self.get_inline_recursive(&rlp, store, key, offset)
+    }
+
+    fn get_inline_recursive(
+        &self,
+        rlp: &[u8],
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+        offset: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let node =
+            decode_node(rlp).map_err(|e| MptDbError::Other(format!("decode inline child: {e}")))?;
+        match node {
+            MptNode::Leaf(leaf) => {
+                let remaining = key.slice(offset..);
+                if leaf.nibbles == remaining {
+                    Ok(Some(leaf.value))
+                } else {
+                    Ok(None)
+                }
+            }
+            MptNode::Extension(ext) => {
+                let remaining = key.slice(offset..);
+                if remaining.len() < ext.nibbles.len() ||
+                    remaining.slice(..ext.nibbles.len()) != ext.nibbles
+                {
+                    return Ok(None);
+                }
+                match ext.child {
+                    ChildRef::Arena(_) => Ok(None),
+                    ChildRef::Hash(hash) => {
+                        self.get_persisted_recursive(hash, store, key, offset + ext.nibbles.len())
+                    }
+                    ChildRef::Inline(bytes) => {
+                        self.get_inline_recursive(&bytes, store, key, offset + ext.nibbles.len())
+                    }
+                }
+            }
+            MptNode::Branch(branch) => {
+                if offset >= key.len() {
+                    Ok(branch.value)
+                } else {
+                    let nibble = key.get_unchecked(offset) as usize;
+                    match branch.children[nibble].as_ref() {
+                        Some(ChildRef::Arena(_)) => Ok(None),
+                        Some(ChildRef::Hash(hash)) => {
+                            self.get_persisted_recursive(*hash, store, key, offset + 1)
+                        }
+                        Some(ChildRef::Inline(bytes)) => {
+                            self.get_inline_recursive(bytes, store, key, offset + 1)
+                        }
+                        None => Ok(None),
+                    }
+                }
+            }
+        }
+    }
+
+    fn ensure_path_loaded(
+        &mut self,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+    ) -> Result<Option<u32>> {
+        let root_idx = match self.root.clone() {
+            CowRootRef::Empty => return Ok(None),
+            CowRootRef::Arena(idx) => idx,
+            CowRootRef::Segment(root) => {
+                let idx = self.materialize_segment_node(root)?;
+                self.root = CowRootRef::Arena(idx);
+                idx
+            }
+            CowRootRef::Persisted(root) => {
+                let idx = self.materialize_persisted_root(store, root)?;
+                self.root = CowRootRef::Arena(idx);
+                idx
+            }
+        };
+        self.ensure_path_loaded_recursive(store, root_idx, key, 0)?;
+        Ok(Some(root_idx))
+    }
+
+    fn ensure_delete_ready(
+        &mut self,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+    ) -> Result<Option<u32>> {
+        let root_idx = match self.root.clone() {
+            CowRootRef::Empty => return Ok(None),
+            CowRootRef::Arena(idx) => idx,
+            CowRootRef::Segment(root) => {
+                let idx = self.materialize_segment_node(root)?;
+                self.root = CowRootRef::Arena(idx);
+                idx
+            }
+            CowRootRef::Persisted(root) => {
+                let idx = self.materialize_persisted_root(store, root)?;
+                self.root = CowRootRef::Arena(idx);
+                idx
+            }
+        };
+        self.ensure_delete_ready_recursive(store, root_idx, key, 0)?;
+        Ok(Some(root_idx))
+    }
+
+    fn ensure_path_loaded_recursive(
+        &mut self,
+        store: &PersistedTrieStore,
+        idx: u32,
+        key: &Nibbles,
+        offset: usize,
+    ) -> Result<()> {
+        match self.arena.get(idx).clone() {
+            MptNode::Leaf(_) => Ok(()),
+            MptNode::Extension(ext) => {
+                let remaining = key.slice(offset..);
+                if remaining.len() < ext.nibbles.len() ||
+                    remaining.slice(..ext.nibbles.len()) != ext.nibbles
+                {
+                    return Ok(());
+                }
+                let child_idx = self.materialize_child_on_path(store, idx, None, ext.child)?;
+                self.ensure_path_loaded_recursive(store, child_idx, key, offset + ext.nibbles.len())
+            }
+            MptNode::Branch(branch) => {
+                if offset >= key.len() {
+                    return Ok(());
+                }
+                let nibble = key.get_unchecked(offset) as usize;
+                let Some(child) = branch.children[nibble].clone() else {
+                    return Ok(());
+                };
+                let child_idx = self.materialize_child_on_path(store, idx, Some(nibble), child)?;
+                self.ensure_path_loaded_recursive(store, child_idx, key, offset + 1)
+            }
+        }
+    }
+
+    fn ensure_delete_ready_recursive(
+        &mut self,
+        store: &PersistedTrieStore,
+        idx: u32,
+        key: &Nibbles,
+        offset: usize,
+    ) -> Result<()> {
+        match self.arena.get(idx).clone() {
+            MptNode::Leaf(_) => Ok(()),
+            MptNode::Extension(ext) => {
+                let remaining = key.slice(offset..);
+                if remaining.len() < ext.nibbles.len() ||
+                    remaining.slice(..ext.nibbles.len()) != ext.nibbles
+                {
+                    return Ok(());
+                }
+                let child_idx = self.materialize_child_on_path(store, idx, None, ext.child)?;
+                self.ensure_delete_ready_recursive(
+                    store,
+                    child_idx,
+                    key,
+                    offset + ext.nibbles.len(),
+                )
+            }
+            MptNode::Branch(branch) => {
+                if offset >= key.len() {
+                    if branch.value.is_some() && branch.child_count() == 1 {
+                        self.materialize_single_branch_child_if_needed(store, idx)?;
+                    }
+                    return Ok(());
+                }
+
+                let nibble = key.get_unchecked(offset) as usize;
+                let Some(child) = branch.children[nibble].clone() else {
+                    return Ok(());
+                };
+
+                if branch.value.is_none() && branch.child_count() == 2 {
+                    self.materialize_other_branch_children(store, idx, nibble)?;
+                }
+
+                let child_idx = self.materialize_child_on_path(store, idx, Some(nibble), child)?;
+                self.ensure_delete_ready_recursive(store, child_idx, key, offset + 1)
+            }
+        }
+    }
+
+    fn materialize_other_branch_children(
+        &mut self,
+        store: &PersistedTrieStore,
+        branch_idx: u32,
+        keep_slot: usize,
+    ) -> Result<()> {
+        let children = match self.arena.get(branch_idx) {
+            MptNode::Branch(branch) => branch.children.clone(),
+            _ => return Ok(()),
+        };
+
+        for (slot, child) in children.into_iter().enumerate() {
+            if slot == keep_slot {
+                continue;
+            }
+            match child {
+                Some(ChildRef::Arena(_)) | None => {}
+                Some(other) => {
+                    let _ = self.materialize_child_on_path(store, branch_idx, Some(slot), other)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn materialize_single_branch_child_if_needed(
+        &mut self,
+        store: &PersistedTrieStore,
+        branch_idx: u32,
+    ) -> Result<()> {
+        let children = match self.arena.get(branch_idx) {
+            MptNode::Branch(branch) => branch.children.clone(),
+            _ => return Ok(()),
+        };
+
+        for (slot, child) in children.into_iter().enumerate() {
+            match child {
+                Some(ChildRef::Arena(_)) | None => {}
+                Some(other) => {
+                    let _ = self.materialize_child_on_path(store, branch_idx, Some(slot), other)?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn materialize_child_on_path(
+        &mut self,
+        store: &PersistedTrieStore,
+        parent_idx: u32,
+        branch_slot: Option<usize>,
+        child: ChildRef,
+    ) -> Result<u32> {
+        let edge = pending_edge(branch_slot)?;
+        let child_idx = match self.pending_segment_children.remove(&(parent_idx, edge)) {
+            Some(CowChildRef::Arena(idx)) => idx,
+            Some(CowChildRef::Hash(hash)) => self.materialize_persisted_root(store, hash)?,
+            Some(CowChildRef::Inline(rlp)) => self.materialize_inline_node(&rlp)?,
+            Some(CowChildRef::Segment(segment_ref)) => {
+                self.materialize_segment_node(segment_ref)?
+            }
+            None => match child {
+                ChildRef::Arena(idx) => idx,
+                ChildRef::Hash(hash) => self.materialize_persisted_root(store, hash)?,
+                ChildRef::Inline(rlp) => self.materialize_inline_node(&rlp)?,
+            },
+        };
+
+        match self.arena.get_mut(parent_idx) {
+            MptNode::Extension(ext) => ext.child = ChildRef::Arena(child_idx),
+            MptNode::Branch(branch) => {
+                let slot = branch_slot.expect("branch child materialization requires slot");
+                branch.children[slot] = Some(ChildRef::Arena(child_idx));
+            }
+            MptNode::Leaf(_) => unreachable!("leaf cannot own child ref"),
+        }
+        Ok(child_idx)
+    }
+
+    fn materialize_persisted_root(
+        &mut self,
+        store: &PersistedTrieStore,
+        root: B256,
+    ) -> Result<u32> {
+        let rlp = store
+            .get_node(root)?
+            .ok_or_else(|| MptDbError::Other(format!("child node not found: {root}")))?;
+        let node =
+            decode_node(&rlp).map_err(|e| MptDbError::Other(format!("decode child node: {e}")))?;
+        let idx = self.arena.alloc_clean(node);
+        self.arena.set_hash(idx, root);
+        Ok(idx)
+    }
+
+    fn materialize_inline_node(&mut self, rlp: &[u8]) -> Result<u32> {
+        let node =
+            decode_node(rlp).map_err(|e| MptDbError::Other(format!("decode inline child: {e}")))?;
+        Ok(self.arena.alloc_clean(node))
+    }
+
+    fn materialize_segment_node(&mut self, node_ref: SegmentNodeRef) -> Result<u32> {
+        let reader = StorageTrieSegmentReader::open_shared_page(
+            node_ref.page_lease(),
+            node_ref.page_lease().root(),
+            node_ref.page_lease().root_record_off(),
+        )?;
+        let view = reader.view_node(node_ref.seg_idx())?;
+        let mut deferred_children = Vec::new();
+        let node = match view.kind {
+            SegmentNodeKind::Leaf { nibbles, value } => MptNode::Leaf(LeafNode {
+                nibbles: Nibbles::from_nibbles(nibbles),
+                value: value.to_vec(),
+            }),
+            SegmentNodeKind::Extension { nibbles, child } => {
+                if let Some(seg_idx) = child.target_idx {
+                    let hash = reader.view_node(seg_idx)?.hash;
+                    deferred_children.push((
+                        PendingCowEdge::Extension,
+                        SegmentNodeRef::new(Arc::clone(node_ref.page_lease()), seg_idx, hash),
+                    ));
+                }
+                MptNode::Extension(ExtensionNode {
+                    nibbles: Nibbles::from_nibbles(nibbles),
+                    child: segment_child_to_ref(child.embed)?,
+                })
+            }
+            SegmentNodeKind::Branch { value, children, .. } => {
+                let mut branch = BranchNode::new();
+                branch.value = value.map(|value| value.to_vec());
+                for child in children.iter() {
+                    let child = child?;
+                    if let Some(seg_idx) = child.target_idx {
+                        let hash = reader.view_node(seg_idx)?.hash;
+                        deferred_children.push((
+                            PendingCowEdge::Branch(child.slot),
+                            SegmentNodeRef::new(Arc::clone(node_ref.page_lease()), seg_idx, hash),
+                        ));
+                    }
+                    branch.children[child.slot as usize] = Some(segment_child_to_ref(child.embed)?);
+                }
+                MptNode::Branch(branch)
+            }
+        };
+        let idx = self.arena.alloc_clean(node);
+        for (edge, child_ref) in deferred_children {
+            self.pending_segment_children.insert((idx, edge), CowChildRef::Segment(child_ref));
+        }
+        if let Some(hash) = node_ref.hash() {
+            self.arena.set_hash(idx, hash);
+        }
+        Ok(idx)
+    }
+
+    fn materialize_all(
+        &mut self,
+        store: &PersistedTrieStore,
+        root: CowRootRef,
+    ) -> Result<Option<u32>> {
+        let idx = match root {
+            CowRootRef::Empty => return Ok(None),
+            CowRootRef::Arena(idx) => idx,
+            CowRootRef::Segment(node_ref) => self.materialize_segment_subtree(node_ref)?,
+            CowRootRef::Persisted(root) => self.materialize_persisted_subtree(store, root)?,
+        };
+        Ok(Some(idx))
+    }
+
+    fn prune_pending_segment_children(&mut self) {
+        if self.pending_segment_children.is_empty() {
+            return;
+        }
+
+        let mut reachable = vec![false; self.arena.nodes().len()];
+        let mut stack = Vec::new();
+        if let CowRootRef::Arena(root_idx) = self.root {
+            stack.push(root_idx);
+        }
+
+        while let Some(idx) = stack.pop() {
+            let slot = idx as usize;
+            if slot >= reachable.len() || reachable[slot] {
+                continue;
+            }
+            reachable[slot] = true;
+
+            match self.arena.get(idx) {
+                MptNode::Leaf(_) => {}
+                MptNode::Extension(ext) => {
+                    if let ChildRef::Arena(child_idx) = ext.child {
+                        stack.push(child_idx);
+                    }
+                }
+                MptNode::Branch(branch) => {
+                    for child in branch.children.iter().flatten() {
+                        if let ChildRef::Arena(child_idx) = child {
+                            stack.push(*child_idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.pending_segment_children.retain(|(idx, edge), _| {
+            let slot = *idx as usize;
+            if slot >= reachable.len() || !reachable[slot] {
+                return false;
+            }
+
+            match (self.arena.get(*idx), edge) {
+                (MptNode::Extension(ext), PendingCowEdge::Extension) => {
+                    !matches!(ext.child, ChildRef::Arena(_))
+                }
+                (MptNode::Branch(branch), PendingCowEdge::Branch(slot)) => branch.children
+                    [*slot as usize]
+                    .as_ref()
+                    .is_some_and(|child| !matches!(child, ChildRef::Arena(_))),
+                _ => false,
+            }
+        });
+    }
+
+    fn materialize_segment_subtree(&mut self, node_ref: SegmentNodeRef) -> Result<u32> {
+        let reader = StorageTrieSegmentReader::open_shared_page(
+            node_ref.page_lease(),
+            node_ref.page_lease().root(),
+            node_ref.page_lease().root_record_off(),
+        )?;
+        let view = reader.view_node(node_ref.seg_idx())?;
+        let idx = match view.kind {
+            SegmentNodeKind::Leaf { nibbles, value } => {
+                self.arena.alloc_clean(MptNode::Leaf(LeafNode {
+                    nibbles: Nibbles::from_nibbles(nibbles),
+                    value: value.to_vec(),
+                }))
+            }
+            SegmentNodeKind::Extension { nibbles, child } => {
+                let child_ref = match child.target_idx {
+                    Some(seg_idx) => {
+                        let hash = reader.view_node(seg_idx)?.hash;
+                        let child_idx = self.materialize_segment_subtree(SegmentNodeRef::new(
+                            Arc::clone(node_ref.page_lease()),
+                            seg_idx,
+                            hash,
+                        ))?;
+                        ChildRef::Arena(child_idx)
+                    }
+                    None => segment_child_to_ref(child.embed)?,
+                };
+                self.arena.alloc_clean(MptNode::Extension(ExtensionNode {
+                    nibbles: Nibbles::from_nibbles(nibbles),
+                    child: child_ref,
+                }))
+            }
+            SegmentNodeKind::Branch { value, children, .. } => {
+                let mut branch = BranchNode::new();
+                branch.value = value.map(|value| value.to_vec());
+                for child in children.iter() {
+                    let child = child?;
+                    branch.children[child.slot as usize] = Some(match child.target_idx {
+                        Some(seg_idx) => {
+                            let hash = reader.view_node(seg_idx)?.hash;
+                            let child_idx =
+                                self.materialize_segment_subtree(SegmentNodeRef::new(
+                                    Arc::clone(node_ref.page_lease()),
+                                    seg_idx,
+                                    hash,
+                                ))?;
+                            ChildRef::Arena(child_idx)
+                        }
+                        None => segment_child_to_ref(child.embed)?,
+                    });
+                }
+                self.arena.alloc_clean(MptNode::Branch(branch))
+            }
+        };
+        if let Some(hash) = node_ref.hash() {
+            self.arena.set_hash(idx, hash);
+        }
+        Ok(idx)
+    }
+
+    fn materialize_persisted_subtree(
+        &mut self,
+        store: &PersistedTrieStore,
+        root: B256,
+    ) -> Result<u32> {
+        let rlp = store
+            .get_node(root)?
+            .ok_or_else(|| MptDbError::Other(format!("child node not found: {root}")))?;
+        let node =
+            decode_node(&rlp).map_err(|e| MptDbError::Other(format!("decode child node: {e}")))?;
+        let idx = match node {
+            MptNode::Leaf(leaf) => self.arena.alloc_clean(MptNode::Leaf(leaf)),
+            MptNode::Extension(ext) => {
+                let child_idx = materialize_persisted_child(store, &mut self.arena, ext.child)?;
+                self.arena.alloc_clean(MptNode::Extension(ExtensionNode {
+                    nibbles: ext.nibbles,
+                    child: ChildRef::Arena(child_idx),
+                }))
+            }
+            MptNode::Branch(branch) => {
+                let mut children: [Option<ChildRef>; 16] = std::array::from_fn(|_| None);
+                for (slot, child) in branch.children.into_iter().enumerate() {
+                    if let Some(child) = child {
+                        let child_idx = materialize_persisted_child(store, &mut self.arena, child)?;
+                        children[slot] = Some(ChildRef::Arena(child_idx));
+                    }
+                }
+                self.arena
+                    .alloc_clean(MptNode::Branch(BranchNode { children, value: branch.value }))
+            }
+        };
+        self.arena.set_hash(idx, root);
+        Ok(idx)
+    }
+}
+
+fn materialize_persisted_child(
+    store: &PersistedTrieStore,
+    arena: &mut MutableTrieArena,
+    child: ChildRef,
+) -> Result<u32> {
+    match child {
+        ChildRef::Arena(idx) => Ok(idx),
+        ChildRef::Hash(hash) => {
+            let rlp = store
+                .get_node(hash)?
+                .ok_or_else(|| MptDbError::Other(format!("child node not found: {hash}")))?;
+            let node = decode_node(&rlp)
+                .map_err(|e| MptDbError::Other(format!("decode child node: {e}")))?;
+            let idx = match node {
+                MptNode::Leaf(leaf) => arena.alloc_clean(MptNode::Leaf(leaf)),
+                MptNode::Extension(ext) => {
+                    let child_idx = materialize_persisted_child(store, arena, ext.child)?;
+                    arena.alloc_clean(MptNode::Extension(ExtensionNode {
+                        nibbles: ext.nibbles,
+                        child: ChildRef::Arena(child_idx),
+                    }))
+                }
+                MptNode::Branch(branch) => {
+                    let mut children: [Option<ChildRef>; 16] = std::array::from_fn(|_| None);
+                    for (slot, child) in branch.children.into_iter().enumerate() {
+                        if let Some(child) = child {
+                            let child_idx = materialize_persisted_child(store, arena, child)?;
+                            children[slot] = Some(ChildRef::Arena(child_idx));
+                        }
+                    }
+                    arena.alloc_clean(MptNode::Branch(BranchNode { children, value: branch.value }))
+                }
+            };
+            arena.set_hash(idx, hash);
+            Ok(idx)
+        }
+        ChildRef::Inline(rlp) => {
+            let node = decode_node(&rlp)
+                .map_err(|e| MptDbError::Other(format!("decode inline child: {e}")))?;
+            match node {
+                MptNode::Leaf(leaf) => Ok(arena.alloc_clean(MptNode::Leaf(leaf))),
+                MptNode::Extension(ext) => {
+                    let child_idx = materialize_persisted_child(store, arena, ext.child)?;
+                    Ok(arena.alloc_clean(MptNode::Extension(ExtensionNode {
+                        nibbles: ext.nibbles,
+                        child: ChildRef::Arena(child_idx),
+                    })))
+                }
+                MptNode::Branch(branch) => {
+                    let mut children: [Option<ChildRef>; 16] = std::array::from_fn(|_| None);
+                    for (slot, child) in branch.children.into_iter().enumerate() {
+                        if let Some(child) = child {
+                            let child_idx = materialize_persisted_child(store, arena, child)?;
+                            children[slot] = Some(ChildRef::Arena(child_idx));
+                        }
+                    }
+                    Ok(arena
+                        .alloc_clean(MptNode::Branch(BranchNode { children, value: branch.value })))
+                }
+            }
+        }
+    }
+}
+
+fn segment_child_to_ref(embed: SegmentChildEmbedRef<'_>) -> Result<ChildRef> {
+    Ok(match embed {
+        SegmentChildEmbedRef::None => {
+            return Err(MptDbError::Other("missing child embed".to_string()));
+        }
+        SegmentChildEmbedRef::Hash(hash) => ChildRef::Hash(hash),
+        SegmentChildEmbedRef::Inline(bytes) => ChildRef::Inline(bytes.to_vec()),
+    })
+}
+
+fn pending_edge(branch_slot: Option<usize>) -> Result<PendingCowEdge> {
+    match branch_slot {
+        Some(slot) => Ok(PendingCowEdge::Branch(
+            u8::try_from(slot)
+                .map_err(|_| MptDbError::Other(format!("branch slot out of range: {slot}")))?,
+        )),
+        None => Ok(PendingCowEdge::Extension),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memmap2::MmapOptions;
+    use std::{fs::File, io::Write};
+    use tempfile::{NamedTempFile, TempDir};
+
+    use crate::mpt::{
+        persisted::PersistedTrieStore,
+        segment::{MappedSegmentPage, StorageTrieSegment},
+    };
+
+    #[test]
+    fn cow_empty_starts_empty() {
+        let cow = StorageTrieCow::empty();
+        assert!(matches!(cow.root_ref(), CowRootRef::Empty));
+        assert!(cow.arena().nodes().is_empty());
+    }
+
+    #[test]
+    fn cow_from_persisted_root_keeps_root_hash() {
+        let root = B256::with_last_byte(0x11);
+        let cow = StorageTrieCow::from_persisted_root(root);
+        assert!(matches!(cow.root_ref(), CowRootRef::Persisted(value) if *value == root));
+    }
+
+    #[test]
+    fn cow_materialize_persisted_root_seeds_hash_cache() {
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+
+        let key = Nibbles::unpack(B256::with_last_byte(0x31));
+        let mut tree = MptTree::new();
+        tree.insert(&key, b"one".to_vec());
+        let (root, blobs) = tree.root_hash_and_dirty_blobs();
+        store.persist_batch(&blobs, true).unwrap();
+
+        let mut cow = StorageTrieCow::from_persisted_root(root);
+        let idx = cow.materialize_persisted_root(&store, root).unwrap();
+        assert_eq!(cow.arena_hash_cache()[idx as usize], Some(root));
+    }
+
+    #[test]
+    fn cow_from_segment_page_uses_runtime_root_ref() {
+        let mut tree = MptTree::new();
+        let key = Nibbles::unpack(B256::with_last_byte(0x21));
+        tree.insert(&key, b"one".to_vec());
+        let root = tree.root_hash();
+        let segment = StorageTrieSegment::from_tree(&tree, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+        let cow = StorageTrieCow::from_segment_page(Arc::clone(&lease));
+        match cow.root_ref() {
+            CowRootRef::Segment(root) => {
+                assert_eq!(root.page_lease().root(), lease.root());
+                assert_eq!(root.hash(), Some(lease.root()));
+            }
+            _ => panic!("expected segment root"),
+        }
+    }
+
+    #[test]
+    fn cow_get_reads_from_segment_page_without_mutation() {
+        let key = Nibbles::from_nibbles(&[1, 2]);
+        let mut tree = MptTree::new();
+        tree.insert(&key, b"one".to_vec());
+        let root = tree.root_hash();
+        let segment = StorageTrieSegment::from_tree(&tree, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+        let cow = StorageTrieCow::from_segment_page(lease);
+        assert_eq!(cow.get(&store, &key).unwrap(), Some(b"one".to_vec()));
+    }
+
+    #[test]
+    fn cow_get_reads_from_persisted_root_without_materialize() {
+        let key = Nibbles::from_nibbles(&[4, 5]);
+        let mut tree = MptTree::new();
+        tree.insert(&key, b"two".to_vec());
+        let (root, blobs) = tree.root_hash_and_dirty_blobs();
+
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+        store.persist_batch(&blobs, true).unwrap();
+
+        let cow = StorageTrieCow::from_persisted_root(root);
+        assert_eq!(cow.get(&store, &key).unwrap(), Some(b"two".to_vec()));
+    }
+
+    #[test]
+    fn cow_materialize_segment_node_tracks_pending_segment_children() {
+        let mut base = MptTree::new();
+        let key1 = Nibbles::from_nibbles(&[1]);
+        let key2 = Nibbles::from_nibbles(&[2]);
+        base.insert(&key1, vec![0xaa; 64]);
+        base.insert(&key2, vec![0xbb; 64]);
+        let root = base.root_hash();
+        let segment = StorageTrieSegment::from_tree(&base, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        let mut cow = StorageTrieCow::from_segment_page(lease);
+        let root_ref = match cow.root_ref() {
+            CowRootRef::Segment(root_ref) => root_ref.clone(),
+            _ => panic!("expected segment root"),
+        };
+        let idx = cow.materialize_segment_node(root_ref).unwrap();
+
+        assert!(cow.pending_segment_children.contains_key(&(idx, PendingCowEdge::Branch(1))));
+        assert!(cow.pending_segment_children.contains_key(&(idx, PendingCowEdge::Branch(2))));
+        assert!(matches!(
+            cow.pending_segment_children.get(&(idx, PendingCowEdge::Branch(1))),
+            Some(CowChildRef::Segment(_))
+        ));
+    }
+
+    #[test]
+    fn cow_segment_pending_child_allows_mutation_without_persisted_lookup() {
+        let mut base = MptTree::new();
+        let key1 = Nibbles::from_nibbles(&[1]);
+        let key2 = Nibbles::from_nibbles(&[2]);
+        base.insert(&key1, vec![0xaa; 64]);
+        base.insert(&key2, vec![0xbb; 64]);
+        let root = base.root_hash();
+        let segment = StorageTrieSegment::from_tree(&base, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+        let mut cow = StorageTrieCow::from_segment_page(lease);
+        cow.apply_change(&store, &key1, Some(vec![0xcc; 64])).unwrap();
+
+        let overlay = cow.into_overlay_materialized(&store).unwrap();
+        base.insert(&key1, vec![0xcc; 64]);
+        assert_eq!(overlay.root_hash_and_dirty_blobs().0, base.root_hash());
+    }
+
+    #[test]
+    fn cow_prunes_pending_segment_children_when_root_changes() {
+        let mut base = MptTree::new();
+        let key1 = Nibbles::from_nibbles(&[1]);
+        let key2 = Nibbles::from_nibbles(&[2]);
+        base.insert(&key1, vec![0xaa; 64]);
+        base.insert(&key2, vec![0xbb; 64]);
+        let root = base.root_hash();
+        let segment = StorageTrieSegment::from_tree(&base, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        let mut cow = StorageTrieCow::from_segment_page(lease);
+        let root_ref = match cow.root_ref() {
+            CowRootRef::Segment(root_ref) => root_ref.clone(),
+            _ => panic!("expected segment root"),
+        };
+        let idx = cow.materialize_segment_node(root_ref).unwrap();
+        cow.root = CowRootRef::Arena(idx);
+        assert!(!cow.pending_segment_children.is_empty());
+
+        cow.root = CowRootRef::Empty;
+        cow.prune_pending_segment_children();
+        assert!(cow.pending_segment_children.is_empty());
+    }
+
+    #[test]
+    fn cow_mixed_segment_hash_inline_recompute_matches_materialized_tree() {
+        let key_inline = Nibbles::from_nibbles(&[1]);
+        let key_hash = Nibbles::from_nibbles(&[2]);
+        let key_mutate = Nibbles::from_nibbles(&[3]);
+
+        let mut base = MptTree::new();
+        base.insert(&key_inline, vec![0x11]);
+        base.insert(&key_hash, vec![0x22; 64]);
+        base.insert(&key_mutate, vec![0x33; 64]);
+        let root = base.root_hash();
+        let segment = StorageTrieSegment::from_tree(&base, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+        let mut cow = StorageTrieCow::from_segment_page(lease);
+        cow.apply_change(&store, &key_mutate, Some(vec![0x44; 64])).unwrap();
+        let (cow_root, _, _) = cow.root_hash_and_dirty_blobs(&store).unwrap();
+
+        base.insert(&key_mutate, vec![0x44; 64]);
+        assert_eq!(cow_root, base.root_hash());
+    }
+
+    #[test]
+    fn cow_batched_changes_latest_wins_same_slot() {
+        let key = Nibbles::from_nibbles(&[4]);
+
+        let mut base = MptTree::new();
+        base.insert(&key, vec![0x01]);
+        let root = base.root_hash();
+        let segment = StorageTrieSegment::from_tree(&base, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+        let changes = vec![
+            StorageChange {
+                hashed_slot: B256::with_last_byte(0x04),
+                slot_key: key.clone(),
+                value: alloy_primitives::U256::from(2u64),
+                encoded_value: Some(vec![0x02]),
+            },
+            StorageChange {
+                hashed_slot: B256::with_last_byte(0x04),
+                slot_key: key.clone(),
+                value: alloy_primitives::U256::from(3u64),
+                encoded_value: Some(vec![0x03]),
+            },
+            StorageChange {
+                hashed_slot: B256::with_last_byte(0x04),
+                slot_key: key.clone(),
+                value: alloy_primitives::U256::ZERO,
+                encoded_value: None,
+            },
+        ];
+
+        let mut cow = StorageTrieCow::from_segment_page(lease);
+        cow.apply_changes_batched(&store, &changes).unwrap();
+        let (cow_root, _, _) = cow.root_hash_and_dirty_blobs(&store).unwrap();
+
+        base.delete(&key);
+        assert_eq!(cow_root, base.root_hash());
+    }
+
+    #[test]
+    fn cow_segment_insert_matches_full_tree() {
+        let mut base = MptTree::new();
+        let key1 = Nibbles::unpack(B256::with_last_byte(0x11));
+        let key2 = Nibbles::unpack(B256::with_last_byte(0x22));
+        base.insert(&key1, b"one".to_vec());
+        let root = base.root_hash();
+        let segment = StorageTrieSegment::from_tree(&base, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+        let mut cow = StorageTrieCow::from_segment_page(lease);
+        cow.apply_change(&store, &key2, Some(b"two".to_vec())).unwrap();
+        let overlay = cow.into_overlay_materialized(&store).unwrap();
+
+        base.insert(&key2, b"two".to_vec());
+        assert_eq!(overlay.root_hash_and_dirty_blobs().0, base.root_hash());
+    }
+
+    #[test]
+    fn cow_persisted_delete_matches_full_tree() {
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+
+        let key1 = Nibbles::unpack(B256::with_last_byte(0x31));
+        let key2 = Nibbles::unpack(B256::with_last_byte(0x32));
+        let mut base = MptTree::new();
+        base.insert(&key1, b"one".to_vec());
+        base.insert(&key2, b"two".to_vec());
+        let (root, blobs) = base.root_hash_and_dirty_blobs();
+        store.persist_batch(&blobs, true).unwrap();
+
+        let mut cow = StorageTrieCow::from_persisted_root(root);
+        cow.apply_change(&store, &key1, None).unwrap();
+        let overlay = cow.into_overlay_materialized(&store).unwrap();
+
+        base.delete(&key1);
+        assert_eq!(overlay.root_hash_and_dirty_blobs().0, base.root_hash());
+    }
+
+    #[test]
+    fn cow_segment_delete_branch_collapse_matches_full_tree() {
+        let mut base = MptTree::new();
+        let key1 = Nibbles::unpack(B256::with_last_byte(0x51));
+        let key2 = Nibbles::unpack(B256::with_last_byte(0x52));
+        base.insert(&key1, b"one".to_vec());
+        base.insert(&key2, b"two".to_vec());
+        let root = base.root_hash();
+        let segment = StorageTrieSegment::from_tree(&base, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+        let mut cow = StorageTrieCow::from_segment_page(lease);
+        cow.apply_change(&store, &key1, None).unwrap();
+        let overlay = cow.into_overlay_materialized(&store).unwrap();
+
+        base.delete(&key1);
+        assert_eq!(overlay.root_hash_and_dirty_blobs().0, base.root_hash());
+    }
+
+    #[test]
+    fn cow_batched_changes_match_sequential() {
+        let mut base = MptTree::new();
+        let key1 = Nibbles::unpack(B256::with_last_byte(0x41));
+        let key2 = Nibbles::unpack(B256::with_last_byte(0x42));
+        let key3 = Nibbles::unpack(B256::with_last_byte(0x43));
+        base.insert(&key1, b"one".to_vec());
+        let root = base.root_hash();
+        let segment = StorageTrieSegment::from_tree(&base, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+
+        let changes = vec![
+            StorageChange {
+                hashed_slot: B256::with_last_byte(0x43),
+                slot_key: key3.clone(),
+                value: alloy_primitives::U256::from(3u64),
+                encoded_value: Some(alloy_rlp::encode(3u64)),
+            },
+            StorageChange {
+                hashed_slot: B256::with_last_byte(0x41),
+                slot_key: key1.clone(),
+                value: alloy_primitives::U256::ZERO,
+                encoded_value: None,
+            },
+            StorageChange {
+                hashed_slot: B256::with_last_byte(0x42),
+                slot_key: key2.clone(),
+                value: alloy_primitives::U256::from(2u64),
+                encoded_value: Some(alloy_rlp::encode(2u64)),
+            },
+        ];
+
+        let mut batched = StorageTrieCow::from_segment_page(Arc::clone(&lease));
+        batched.apply_changes_batched(&store, &changes).unwrap();
+        let batched_overlay = batched.into_overlay_materialized(&store).unwrap();
+
+        let mut sequential = StorageTrieCow::from_segment_page(lease);
+        for change in &changes {
+            let value = if change.value == alloy_primitives::U256::ZERO {
+                None
+            } else {
+                change.encoded_value.clone()
+            };
+            sequential.apply_change(&store, &change.slot_key, value).unwrap();
+        }
+        let sequential_overlay = sequential.into_overlay_materialized(&store).unwrap();
+
+        assert_eq!(
+            batched_overlay.root_hash_and_dirty_blobs().0,
+            sequential_overlay.root_hash_and_dirty_blobs().0
+        );
+    }
+}

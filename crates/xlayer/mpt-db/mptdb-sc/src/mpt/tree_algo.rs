@@ -1,9 +1,67 @@
 use alloy_trie::Nibbles;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     arena::MutableTrieArena,
     node::{BranchNode, ChildRef, ExtensionNode, LeafNode, MptNode},
 };
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TreeAlgoStats {
+    pub slot_inserts: u64,
+    pub slot_deletes: u64,
+    pub leaf_splits: u64,
+    pub extension_splits: u64,
+    pub branch_collapse_to_empty: u64,
+    pub branch_collapse_to_leaf: u64,
+    pub branch_collapse_to_extension: u64,
+    pub extension_leaf_merges: u64,
+    pub extension_extension_merges: u64,
+}
+
+static SLOT_INSERTS: AtomicU64 = AtomicU64::new(0);
+static SLOT_DELETES: AtomicU64 = AtomicU64::new(0);
+static LEAF_SPLITS: AtomicU64 = AtomicU64::new(0);
+static EXTENSION_SPLITS: AtomicU64 = AtomicU64::new(0);
+static BRANCH_COLLAPSE_TO_EMPTY: AtomicU64 = AtomicU64::new(0);
+static BRANCH_COLLAPSE_TO_LEAF: AtomicU64 = AtomicU64::new(0);
+static BRANCH_COLLAPSE_TO_EXTENSION: AtomicU64 = AtomicU64::new(0);
+static EXTENSION_LEAF_MERGES: AtomicU64 = AtomicU64::new(0);
+static EXTENSION_EXTENSION_MERGES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn reset_stats() {
+    SLOT_INSERTS.store(0, Ordering::Relaxed);
+    SLOT_DELETES.store(0, Ordering::Relaxed);
+    LEAF_SPLITS.store(0, Ordering::Relaxed);
+    EXTENSION_SPLITS.store(0, Ordering::Relaxed);
+    BRANCH_COLLAPSE_TO_EMPTY.store(0, Ordering::Relaxed);
+    BRANCH_COLLAPSE_TO_LEAF.store(0, Ordering::Relaxed);
+    BRANCH_COLLAPSE_TO_EXTENSION.store(0, Ordering::Relaxed);
+    EXTENSION_LEAF_MERGES.store(0, Ordering::Relaxed);
+    EXTENSION_EXTENSION_MERGES.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn snapshot_stats() -> TreeAlgoStats {
+    TreeAlgoStats {
+        slot_inserts: SLOT_INSERTS.load(Ordering::Relaxed),
+        slot_deletes: SLOT_DELETES.load(Ordering::Relaxed),
+        leaf_splits: LEAF_SPLITS.load(Ordering::Relaxed),
+        extension_splits: EXTENSION_SPLITS.load(Ordering::Relaxed),
+        branch_collapse_to_empty: BRANCH_COLLAPSE_TO_EMPTY.load(Ordering::Relaxed),
+        branch_collapse_to_leaf: BRANCH_COLLAPSE_TO_LEAF.load(Ordering::Relaxed),
+        branch_collapse_to_extension: BRANCH_COLLAPSE_TO_EXTENSION.load(Ordering::Relaxed),
+        extension_leaf_merges: EXTENSION_LEAF_MERGES.load(Ordering::Relaxed),
+        extension_extension_merges: EXTENSION_EXTENSION_MERGES.load(Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn note_slot_insert() {
+    SLOT_INSERTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn note_slot_delete() {
+    SLOT_DELETES.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Insert a key-value pair into the trie rooted at `node_idx`.
 /// `offset` is the current position in `key`.
@@ -56,6 +114,7 @@ fn insert_at_leaf(
         }
         idx
     } else {
+        LEAF_SPLITS.fetch_add(1, Ordering::Relaxed);
         // Split: create Branch, put old leaf and new leaf at respective nibble slots
         let mut branch = BranchNode::new();
 
@@ -122,6 +181,7 @@ fn insert_at_extension(
         }
         idx
     } else {
+        EXTENSION_SPLITS.fetch_add(1, Ordering::Relaxed);
         // Partial match: split extension
         let mut branch = BranchNode::new();
 
@@ -257,6 +317,7 @@ fn delete_at_extension(
             let child_node = arena.get(new_child_idx).clone();
             match child_node {
                 MptNode::Leaf(child_leaf) => {
+                    EXTENSION_LEAF_MERGES.fetch_add(1, Ordering::Relaxed);
                     // Merge Extension + Leaf
                     let mut combined = ext.nibbles.clone();
                     combined.extend(&child_leaf.nibbles);
@@ -267,6 +328,7 @@ fn delete_at_extension(
                     (true, Some(merged))
                 }
                 MptNode::Extension(child_ext) => {
+                    EXTENSION_EXTENSION_MERGES.fetch_add(1, Ordering::Relaxed);
                     // Merge two Extensions
                     let mut combined = ext.nibbles.clone();
                     combined.extend(&child_ext.nibbles);
@@ -329,8 +391,10 @@ fn delete_at_branch(
     let child_count = updated_branch.child_count();
 
     if child_count == 0 && updated_branch.value.is_none() {
+        BRANCH_COLLAPSE_TO_EMPTY.fetch_add(1, Ordering::Relaxed);
         (true, None)
     } else if child_count == 0 && updated_branch.value.is_some() {
+        BRANCH_COLLAPSE_TO_LEAF.fetch_add(1, Ordering::Relaxed);
         // Only value remains: convert to Leaf with empty nibbles
         let leaf = arena.alloc(MptNode::Leaf(LeafNode {
             nibbles: Nibbles::default(),
@@ -338,6 +402,7 @@ fn delete_at_branch(
         }));
         (true, Some(leaf))
     } else if child_count == 1 && updated_branch.value.is_none() {
+        BRANCH_COLLAPSE_TO_EXTENSION.fetch_add(1, Ordering::Relaxed);
         // Single child, no value: merge
         let (nibble_idx, child_ref) = updated_branch.single_child().unwrap();
         let child_arena_idx = match child_ref {

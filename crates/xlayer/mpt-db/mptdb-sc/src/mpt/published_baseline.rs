@@ -23,8 +23,10 @@ use super::{
     },
     manifest::VersionManifest,
     segment::{
-        StoragePathTrace, StorageSegmentLocator, StorageTrieSegment, StorageTrieSegmentReader,
+        MappedSegmentPage, SegmentPageLease, StoragePathTrace, StorageSegmentLocator,
+        StorageTrieSegment, StorageTrieSegmentReader,
     },
+    storage_cow::StorageTrieCow,
 };
 
 const DELTA_MAGIC: &[u8; 8] = b"pbldlt01";
@@ -129,7 +131,7 @@ pub struct PublishedGenerationResult {
 pub struct PublishedBaselineReader {
     meta: PublishedBaselineMeta,
     deltas: Vec<PublishedDeltaMmap>,
-    data_mmap: Mmap,
+    data_mmap: Arc<Mmap>,
     leases: Arc<Mutex<HashMap<u64, usize>>>,
     pinned_records: Mutex<HashSet<(u64, u32)>>,
     record_pins: Arc<Mutex<HashMap<(u64, u32), usize>>>,
@@ -139,6 +141,16 @@ pub struct PublishedTrieMaterialized {
     pub trace: StoragePathTrace,
     pub lookup_elapsed: Duration,
     pub materialize_elapsed: Duration,
+}
+
+pub struct PublishedTriePageLoaded {
+    pub lease: Arc<SegmentPageLease>,
+    pub lookup_elapsed: Duration,
+}
+
+pub struct PublishedTrieLoaded {
+    pub trie: StorageTrieCow,
+    pub lookup_elapsed: Duration,
 }
 
 impl PublishedBaselineReader {
@@ -152,6 +164,30 @@ impl PublishedBaselineReader {
         expected_root: B256,
         keys: &[Nibbles],
     ) -> Result<Option<PublishedTrieMaterialized>> {
+        let loaded = match self.open_trie_page(hashed_address, expected_root)? {
+            Some(loaded) => loaded,
+            None => return Ok(None),
+        };
+        let reader = StorageTrieSegmentReader::open_shared_page(
+            &loaded.lease,
+            expected_root,
+            loaded.lease.root_record_off(),
+        )?;
+        let materialize_start = std::time::Instant::now();
+        let trace = reader.cursor().trace_paths(keys)?;
+        let materialize_elapsed = materialize_start.elapsed();
+        Ok(Some(PublishedTrieMaterialized {
+            trace,
+            lookup_elapsed: loaded.lookup_elapsed,
+            materialize_elapsed,
+        }))
+    }
+
+    pub fn open_trie_page(
+        &self,
+        hashed_address: &B256,
+        expected_root: B256,
+    ) -> Result<Option<PublishedTriePageLoaded>> {
         let lookup_start = std::time::Instant::now();
         let entry = match self.lookup_entry(hashed_address)? {
             Some(entry) => entry,
@@ -160,7 +196,7 @@ impl PublishedBaselineReader {
         if entry.root != expected_root {
             return Ok(None);
         }
-        let mmap = &self.data_mmap;
+        let mmap = Arc::clone(&self.data_mmap);
         let start = entry.page_off as usize;
         if start >= mmap.len() {
             return Ok(None);
@@ -170,17 +206,25 @@ impl PublishedBaselineReader {
         if end > mmap.len() || page_header.root_record_off != entry.record_off {
             return Ok(None);
         }
-        let reader = StorageTrieSegmentReader::open_page(
-            &mmap[start..end],
-            expected_root,
-            entry.record_off,
-        )?;
-        let lookup_elapsed = lookup_start.elapsed();
-        let materialize_start = std::time::Instant::now();
-        let trace = reader.cursor().trace_paths(keys)?;
-        let materialize_elapsed = materialize_start.elapsed();
+        let mapped = Arc::new(MappedSegmentPage::new(mmap, start, page_header.total_len as usize));
+        let lease = Arc::new(SegmentPageLease::new(mapped, expected_root, entry.record_off));
         self.pin_record((entry.page_off, entry.record_off));
-        Ok(Some(PublishedTrieMaterialized { trace, lookup_elapsed, materialize_elapsed }))
+        Ok(Some(PublishedTriePageLoaded { lease, lookup_elapsed: lookup_start.elapsed() }))
+    }
+
+    pub fn open_trie(
+        &self,
+        hashed_address: &B256,
+        expected_root: B256,
+    ) -> Result<Option<PublishedTrieLoaded>> {
+        let loaded = match self.open_trie_page(hashed_address, expected_root)? {
+            Some(loaded) => loaded,
+            None => return Ok(None),
+        };
+        Ok(Some(PublishedTrieLoaded {
+            trie: StorageTrieCow::from_segment_page(loaded.lease),
+            lookup_elapsed: loaded.lookup_elapsed,
+        }))
     }
 
     fn lookup_entry(&self, hashed_address: &B256) -> Result<Option<DeltaEntry>> {
@@ -285,7 +329,7 @@ impl PublishedBaselineManager {
         Ok(Some(PublishedBaselineReader {
             meta: meta.clone(),
             deltas,
-            data_mmap,
+            data_mmap: Arc::new(data_mmap),
             leases: Arc::clone(&self.leases),
             pinned_records: Mutex::new(HashSet::new()),
             record_pins: Arc::clone(&self.record_pins),

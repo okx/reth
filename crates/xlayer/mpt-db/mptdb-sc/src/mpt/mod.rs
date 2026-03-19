@@ -17,6 +17,7 @@ pub mod published_baseline;
 pub mod segment;
 pub mod snapshot;
 pub mod state;
+pub mod storage_cow;
 pub(crate) mod storage_recompute;
 pub mod r#trait;
 pub mod tree;
@@ -33,3 +34,4 @@ pub use r#trait::{
     MptSnapshotMeta, MptSnapshotNode,
 };
 pub use segment::StorageTrieSegment;
+pub use storage_cow::{CowChildRef, CowRootRef, StorageTrieCow};
