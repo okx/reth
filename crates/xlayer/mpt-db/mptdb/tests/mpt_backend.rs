@@ -69,9 +69,25 @@ fn i3_2_load_version_zero() {
     assert!(db.load_version(0).is_ok());
 }
 
-/// I3.3: load_version(1) returns Err
+/// I3.3: load_version(nonzero) can open a historical committed version
 #[test]
 fn i3_3_load_version_nonzero() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().to_string_lossy().to_string();
+    let mut db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();
+
+    for _ in 0..3 {
+        db.sc_mut().apply_bundle_state(&BundleState::default()).unwrap();
+        db.sc_mut().commit().unwrap();
+    }
+
+    db.load_version(1).unwrap();
+    assert_eq!(db.version(), 1);
+}
+
+/// I3.3b: load_version(out of range) returns Err
+#[test]
+fn i3_3b_load_version_out_of_range() {
     let dir = tempdir().unwrap();
     let home = dir.path().to_string_lossy().to_string();
     let mut db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();

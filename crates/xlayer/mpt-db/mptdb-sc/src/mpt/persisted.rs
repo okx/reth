@@ -18,6 +18,10 @@ use super::{
 
 /// Default maximum number of entries in the node cache before it is cleared.
 const DEFAULT_NODE_CACHE_CAPACITY: usize = 100_000;
+/// Large sync persist batches are usually cold bulk writes. Cloning every node
+/// back into the in-memory cache adds CPU and memory traffic without helping the
+/// hot read path, which prefers snapshot-backed tries and published pages.
+const MAX_SYNC_BATCH_CACHE_POPULATE: usize = 8_192;
 
 /// Minimal persisted trie node store backed by RocksDB.
 ///
@@ -102,13 +106,23 @@ impl PersistedTrieStore {
         }
         batch.commit(&WriteOptions { sync: durable })?;
 
-        // Populate cache with newly written nodes so subsequent reads are fast
+        // Large sync batches are bulk durability work; avoid cloning the whole
+        // batch back into the cache when the entries are unlikely to be reused
+        // before snapshot-backed readers take over.
         {
             let mut cache = self.cache.lock();
+            if self.cache_capacity == 0 {
+                cache.clear();
+                return Ok(());
+            }
+            if nodes.len() > MAX_SYNC_BATCH_CACHE_POPULATE {
+                cache.clear();
+                return Ok(());
+            }
+            if cache.len() + nodes.len() > self.cache_capacity {
+                cache.clear();
+            }
             for (hash, rlp) in nodes {
-                if cache.len() >= self.cache_capacity {
-                    cache.clear();
-                }
                 cache.insert(*hash, rlp.clone());
             }
         }
@@ -684,6 +698,25 @@ mod tests {
         // Cache was cleared then 1 entry inserted
         assert_eq!(store.cache_len(), 1);
         assert_eq!(store.get_node(overflow_hash).unwrap(), Some(vec![0x80]));
+    }
+
+    /// Large sync persist batches should not repopulate the entire cache.
+    #[test]
+    fn large_sync_batch_skips_cache_population() {
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open_with_capacity(dir.path(), 100_000).unwrap();
+
+        let nodes: Vec<(B256, Vec<u8>)> = (0..(MAX_SYNC_BATCH_CACHE_POPULATE as u64 + 1))
+            .map(|i| {
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes[..8].copy_from_slice(&i.to_le_bytes());
+                (B256::from(hash_bytes), vec![0xc1, 0x80])
+            })
+            .collect();
+
+        store.persist_batch(&nodes, false).unwrap();
+        assert_eq!(store.cache_len(), 0);
+        assert_eq!(store.get_node(nodes[0].0).unwrap(), Some(vec![0xc1, 0x80]));
     }
 
     /// clear_cache() empties the cache

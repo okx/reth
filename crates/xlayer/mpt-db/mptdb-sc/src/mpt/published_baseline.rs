@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -18,7 +18,7 @@ use super::{
         append_page as append_flat_page, data_path as pages_data_path,
         index_path as pages_index_path, open_data_file as open_pages_data_file,
         open_index_file as open_pages_index_file_handle, read_page_header, write_full_page_index,
-        FlatPageIndexEntry,
+        FlatPageIndexEntry, PAGE_INDEX_RECORD_LEN,
     },
     manifest::VersionManifest,
     segment::{
@@ -362,13 +362,24 @@ impl PublishedBaselineManager {
 
         let mut data_file = Self::open_data_file(&self.base_dir)?;
         let mut pages_index_file = Self::open_pages_index_file(&self.base_dir)?;
+        let mut next_page_off = data_file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| MptDbError::Other(format!("seek published data append: {e}")))?;
+        pages_index_file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| MptDbError::Other(format!("seek published pages index append: {e}")))?;
         let mut delta_records = Vec::new();
         if let Some(mut full_index) = rewritten_index {
             for hashed_address in deletes {
                 full_index.remove(hashed_address);
             }
             for (hashed_address, image) in puts {
-                let page = Self::append_page(&mut data_file, &mut pages_index_file, image)?;
+                let page = Self::append_page_streaming(
+                    &mut data_file,
+                    &mut pages_index_file,
+                    &mut next_page_off,
+                    image,
+                )?;
                 full_index.insert(
                     *hashed_address,
                     DeltaEntry {
@@ -396,7 +407,12 @@ impl PublishedBaselineManager {
                 delta_records.push((DELTA_OP_DELETE, *hashed_address, B256::ZERO, 0, 0, 0));
             }
             for (hashed_address, image) in puts {
-                let page = Self::append_page(&mut data_file, &mut pages_index_file, image)?;
+                let page = Self::append_page_streaming(
+                    &mut data_file,
+                    &mut pages_index_file,
+                    &mut next_page_off,
+                    image,
+                )?;
                 delta_records.push((
                     DELTA_OP_PUT,
                     *hashed_address,
@@ -699,26 +715,63 @@ impl PublishedBaselineManager {
         open_pages_index_file_handle(&Self::pages_index_path(base_dir))
     }
 
-    fn append_page(
+    fn append_page_streaming(
         data_file: &mut File,
         pages_index_file: &mut File,
+        next_page_off: &mut u64,
         segment: &StorageTrieSegment,
     ) -> Result<FlatPageIndexEntry> {
-        append_flat_page(
-            data_file,
-            pages_index_file,
-            segment.as_bytes(),
-            segment.root(),
-            segment.root_record_off(),
-        )
+        let page_bytes = segment.as_bytes();
+        let root = segment.root();
+        let root_record_off = segment.root_record_off();
+        let header = read_page_header(page_bytes)?;
+        if header.root != root || header.root_record_off != root_record_off {
+            return Err(MptDbError::Other("flat page header mismatch".to_string()));
+        }
+
+        let entry = FlatPageIndexEntry {
+            page_off: *next_page_off,
+            total_len: header.total_len,
+            root,
+            root_record_off,
+            layout_version: header.layout_version,
+            feature_flags: header.feature_flags,
+            checksum: header.checksum,
+        };
+
+        data_file
+            .write_all(page_bytes)
+            .map_err(|e| MptDbError::Other(format!("append flat page data: {e}")))?;
+        *next_page_off += u64::from(header.total_len);
+
+        let mut record = [0u8; PAGE_INDEX_RECORD_LEN];
+        let mut pos = 0usize;
+        record[pos..pos + 8].copy_from_slice(&entry.page_off.to_le_bytes());
+        pos += 8;
+        record[pos..pos + 4].copy_from_slice(&entry.total_len.to_le_bytes());
+        pos += 4;
+        record[pos..pos + 32].copy_from_slice(entry.root.as_slice());
+        pos += 32;
+        record[pos..pos + 4].copy_from_slice(&entry.root_record_off.to_le_bytes());
+        pos += 4;
+        record[pos..pos + 2].copy_from_slice(&entry.layout_version.to_le_bytes());
+        pos += 2;
+        record[pos..pos + 2].copy_from_slice(&entry.feature_flags.to_le_bytes());
+        pos += 2;
+        record[pos..pos + 4].copy_from_slice(&entry.checksum.to_le_bytes());
+        pages_index_file
+            .write_all(&record)
+            .map_err(|e| MptDbError::Other(format!("append flat page index record: {e}")))?;
+
+        Ok(entry)
     }
 
     fn write_delta_file(path: &Path, records: &[(u8, B256, B256, u64, u32, u16)]) -> Result<()> {
         let tmp = path.with_extension("delta.tmp");
         let mut file = File::create(&tmp)
             .map_err(|e| MptDbError::Other(format!("create published delta file: {e}")))?;
-        file.write_all(DELTA_MAGIC)
-            .map_err(|e| MptDbError::Other(format!("write published delta header: {e}")))?;
+        let mut bytes = Vec::with_capacity(DELTA_MAGIC.len() + records.len() * DELTA_RECORD_LEN);
+        bytes.extend_from_slice(DELTA_MAGIC);
         for (op, key, root, page_off, record_off, format_version) in records {
             let mut record = [0u8; DELTA_RECORD_LEN];
             let mut pos = 0usize;
@@ -733,9 +786,10 @@ impl PublishedBaselineManager {
             record[pos..pos + 4].copy_from_slice(&record_off.to_le_bytes());
             pos += 4;
             record[pos..pos + 2].copy_from_slice(&format_version.to_le_bytes());
-            file.write_all(&record)
-                .map_err(|e| MptDbError::Other(format!("write published delta record: {e}")))?;
+            bytes.extend_from_slice(&record);
         }
+        file.write_all(&bytes)
+            .map_err(|e| MptDbError::Other(format!("write published delta file: {e}")))?;
         file.flush().map_err(|e| MptDbError::Other(format!("flush published delta file: {e}")))?;
         fs::rename(&tmp, path)
             .map_err(|e| MptDbError::Other(format!("rename published delta file: {e}")))?;
@@ -781,7 +835,7 @@ impl PublishedBaselineManager {
     fn save_meta(&self, meta: &PublishedBaselineMeta) -> Result<()> {
         let path = self.meta_path();
         let tmp = path.with_extension("tmp");
-        let bytes = serde_json::to_vec_pretty(meta)
+        let bytes = serde_json::to_vec(meta)
             .map_err(|e| MptDbError::Other(format!("serialize baseline meta: {e}")))?;
         fs::write(&tmp, bytes)
             .map_err(|e| MptDbError::Other(format!("write baseline meta: {e}")))?;
@@ -793,7 +847,7 @@ impl PublishedBaselineManager {
     fn save_generation_meta(&self, meta: &GenerationMeta) -> Result<()> {
         let path = self.generation_meta_path(meta.generation);
         let tmp = path.with_extension("tmp");
-        let bytes = serde_json::to_vec_pretty(meta)
+        let bytes = serde_json::to_vec(meta)
             .map_err(|e| MptDbError::Other(format!("serialize generation meta: {e}")))?;
         fs::write(&tmp, bytes)
             .map_err(|e| MptDbError::Other(format!("write generation meta: {e}")))?;

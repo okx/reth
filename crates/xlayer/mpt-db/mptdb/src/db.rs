@@ -61,18 +61,11 @@ impl MptDb {
         self.ss.as_ref()
     }
 
-    /// Loads the latest committed version of the SC database.
+    /// Loads the requested committed version of the SC database.
     ///
-    /// Only `target_version == 0` is supported (meaning "load latest").
-    /// For rollback semantics, use `sc_mut().rollback(target)` then `load_version(0)`.
+    /// `target_version == 0` means "load latest committed version".
     pub fn load_version(&mut self, target_version: i64) -> Result<()> {
-        if target_version != 0 {
-            return Err(MptDbError::Other(format!(
-                "MPT SC only supports loading latest version (target_version=0); \
-                 got target_version={target_version}. Use rollback(target) then load_version(0) instead."
-            )));
-        }
-        self.sc.load_version()
+        self.sc.load_version_target(target_version)
     }
 
     /// Closes the SC layer.
@@ -161,9 +154,24 @@ mod tests {
         assert!(db.load_version(0).is_ok());
     }
 
-    /// T2.5: load_version(3) returns Err
+    /// T2.5: load_version(nonzero) can open a historical committed version
     #[test]
     fn t2_5_load_version_nonzero() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().to_string_lossy().to_string();
+        let mut db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();
+        for _ in 0..3 {
+            db.sc_mut().apply_bundle_state(&revm_database::BundleState::default()).unwrap();
+            db.sc_mut().commit().unwrap();
+        }
+
+        db.load_version(2).unwrap();
+        assert_eq!(db.version(), 2);
+    }
+
+    /// T2.5b: load_version(out of range) returns Err
+    #[test]
+    fn t2_5b_load_version_out_of_range() {
         let dir = tempdir().unwrap();
         let home = dir.path().to_string_lossy().to_string();
         let mut db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();

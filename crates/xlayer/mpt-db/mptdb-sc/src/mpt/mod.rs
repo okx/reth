@@ -22,8 +22,9 @@ pub(crate) mod storage_recompute;
 pub mod r#trait;
 pub mod tree;
 pub mod tree_algo;
+pub mod wal;
 
-pub use commit_store::{CommitProfile, MptCommitStore};
+pub use commit_store::{BulkLoadOptions, BulkLoadSummary, CommitProfile, MptCommitStore};
 pub use config::MptConfig;
 pub use fast_store::FastStorageTrieStore;
 pub use manifest::VersionManifest;
@@ -35,3 +36,4 @@ pub use r#trait::{
 };
 pub use segment::StorageTrieSegment;
 pub use storage_cow::{CowChildRef, CowRootRef, StorageTrieCow};
+pub use wal::{CommitWalEntry, CommitWalStore};

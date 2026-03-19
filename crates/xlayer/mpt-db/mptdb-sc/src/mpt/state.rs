@@ -1,6 +1,6 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_trie::Nibbles;
-use mptdb_common::error::Result;
+use mptdb_common::error::{MptDbError, Result};
 use rayon::prelude::*;
 use revm_database::BundleState;
 use revm_state::AccountInfo;
@@ -35,22 +35,54 @@ pub struct DirtyAccount {
     pub storage_changes: Vec<StorageChange>,
 }
 
+#[derive(Clone, Copy)]
+enum CollectMode {
+    Standard,
+    PrePop,
+}
+
 /// Convert a BundleState into sorted, deduplicated DirtyAccounts.
 ///
 /// Output is sorted by `hashed_address` for deterministic commit ordering.
 pub fn collect_dirty_accounts(bundle: &BundleState) -> Result<Vec<DirtyAccount>> {
+    collect_accounts(bundle, CollectMode::Standard)
+}
+
+/// Convert a fresh-DB pre-pop BundleState into sorted DirtyAccounts.
+///
+/// This path assumes every account starts from an empty storage baseline and rejects
+/// delete/selfdestruct semantics that only make sense for normal block execution.
+pub fn collect_prepop_accounts(bundle: &BundleState) -> Result<Vec<DirtyAccount>> {
+    collect_accounts(bundle, CollectMode::PrePop)
+}
+
+fn collect_accounts(bundle: &BundleState, mode: CollectMode) -> Result<Vec<DirtyAccount>> {
     let mut accounts: Vec<DirtyAccount> = bundle
         .state
         .iter()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .map(|(address, bundle_account)| {
+        .map(|(address, bundle_account)| -> Result<DirtyAccount> {
             let hashed_address = keccak256(address);
             let account_key = Nibbles::unpack(&hashed_address);
 
-            let info = bundle_account.info.clone();
-            let storage_wiped = bundle_account.was_destroyed();
-            let storage_known_empty = bundle_account.status.is_storage_known() && !storage_wiped;
+            let (info, storage_wiped, storage_known_empty) = match mode {
+                CollectMode::Standard => {
+                    let info = bundle_account.info.clone();
+                    let storage_wiped = bundle_account.was_destroyed();
+                    let storage_known_empty =
+                        bundle_account.status.is_storage_known() && !storage_wiped;
+                    (info, storage_wiped, storage_known_empty)
+                }
+                CollectMode::PrePop => {
+                    if bundle_account.was_destroyed() || bundle_account.info.is_none() {
+                        return Err(MptDbError::Other(
+                            "bulk pre-pop only supports live account inserts".to_string(),
+                        ));
+                    }
+                    (bundle_account.info.clone(), false, true)
+                }
+            };
 
             let storage_changes = bundle_account
                 .storage
@@ -67,7 +99,7 @@ pub fn collect_dirty_accounts(bundle: &BundleState) -> Result<Vec<DirtyAccount>>
                 })
                 .collect();
 
-            DirtyAccount {
+            Ok(DirtyAccount {
                 address: *address,
                 hashed_address,
                 account_key,
@@ -75,9 +107,9 @@ pub fn collect_dirty_accounts(bundle: &BundleState) -> Result<Vec<DirtyAccount>>
                 storage_wiped,
                 storage_known_empty,
                 storage_changes,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     // Sort by hashed_address for deterministic ordering
     accounts.sort_by(|a, b| a.hashed_address.cmp(&b.hashed_address));

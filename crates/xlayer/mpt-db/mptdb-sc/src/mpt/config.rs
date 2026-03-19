@@ -13,6 +13,12 @@ pub struct MptConfig {
     pub async_queue_depth: usize,
     /// Threshold: blobs below this count use async persist, above use sync.
     pub async_blob_threshold: usize,
+    /// Enable phase-1 shadow WAL append on commit.
+    pub wal_first_commit: bool,
+    /// When enabled alongside `wal_first_commit`, perform extra parity checks.
+    pub wal_shadow_validate: bool,
+    /// Skip account-trie checkpoint writes once the committed trie grows beyond this size.
+    pub checkpoint_max_account_trie_nodes: usize,
 }
 
 impl Default for MptConfig {
@@ -24,6 +30,9 @@ impl Default for MptConfig {
             parallel_account_frontier_min: 4,
             async_queue_depth: 64,
             async_blob_threshold: 50_000,
+            wal_first_commit: false,
+            wal_shadow_validate: false,
+            checkpoint_max_account_trie_nodes: 200_000,
         }
     }
 }

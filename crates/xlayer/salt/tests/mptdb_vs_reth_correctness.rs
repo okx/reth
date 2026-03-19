@@ -5,7 +5,7 @@
 
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{map::HashMap as PrimitivesHashMap, Address, B256, U256};
-use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
+use mptdb_sc::mpt::{MptCommitStore, MptCommitter, MptConfig};
 use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use reth_provider::{test_utils::create_test_provider_factory, StateWriter, TrieWriter};
 use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
@@ -13,6 +13,20 @@ use reth_trie_db::DatabaseStateRoot;
 use revm_database::{states::StorageSlot, AccountStatus, StorageWithOriginalValues};
 use revm_state::AccountInfo;
 use tempfile::TempDir;
+
+#[derive(Clone, Copy, Debug)]
+enum MptMode {
+    Legacy,
+    WalFirst,
+}
+
+fn wal_first_config() -> MptConfig {
+    let mut config = MptConfig::default();
+    config.wal_first_commit = true;
+    config.wal_shadow_validate = true;
+    config.checkpoint_max_account_trie_nodes = 0;
+    config
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -157,9 +171,15 @@ fn reth_roots(
 fn mptdb_roots(
     pre_pop: &revm_database::BundleState,
     block_bundles: &[revm_database::BundleState],
+    mode: MptMode,
 ) -> Vec<B256> {
     let dir = TempDir::new().unwrap();
-    let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+    let mut store = match mode {
+        MptMode::Legacy => MptCommitStore::open(dir.path(), false).unwrap(),
+        MptMode::WalFirst => {
+            MptCommitStore::open_with_config(dir.path(), false, wal_first_config()).unwrap()
+        }
+    };
 
     // Apply pre-pop
     store.apply_bundle_state(pre_pop).unwrap();
@@ -176,6 +196,27 @@ fn mptdb_roots(
     roots
 }
 
+fn assert_matches_reth_all_modes(
+    pre_pop: &revm_database::BundleState,
+    block_bundles: &[revm_database::BundleState],
+) {
+    let reth = reth_roots(pre_pop, block_bundles);
+    for mode in [MptMode::Legacy, MptMode::WalFirst] {
+        let mptdb = mptdb_roots(pre_pop, block_bundles, mode);
+        assert_eq!(reth.len(), mptdb.len());
+        for (i, (r, m)) in reth.iter().zip(mptdb.iter()).enumerate() {
+            assert_eq!(
+                r,
+                m,
+                "mode {mode:?} block {} root mismatch: reth={:?} mptdb={:?}",
+                i + 1,
+                r,
+                m
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -186,16 +227,7 @@ fn correctness_fresh_100_accounts_5_slots() {
     let mut rng = StdRng::seed_from_u64(100);
     let (bundle, _) = generate_accounts(100, 5, &mut rng);
 
-    let reth = reth_roots(&revm_database::BundleState::default(), &[bundle.clone()]);
-    let mptdb = mptdb_roots(&revm_database::BundleState::default(), &[bundle]);
-
-    assert_eq!(reth.len(), 1);
-    assert_eq!(mptdb.len(), 1);
-    assert_eq!(
-        reth[0], mptdb[0],
-        "fresh 100 accounts: reth root {:?} != mptdb root {:?}",
-        reth[0], mptdb[0]
-    );
+    assert_matches_reth_all_modes(&revm_database::BundleState::default(), &[bundle]);
 }
 
 /// Pre-populated 500 accounts → 3 blocks of 100 updates each → every block root must match.
@@ -208,14 +240,7 @@ fn correctness_prepop_500_3_blocks() {
     let blocks: Vec<_> =
         (0..3).map(|i| generate_updates(&addresses, 3, i, 100, &mut rng_blocks)).collect();
 
-    let reth = reth_roots(&pre_pop, &blocks);
-    let mptdb = mptdb_roots(&pre_pop, &blocks);
-
-    assert_eq!(reth.len(), 3);
-    assert_eq!(mptdb.len(), 3);
-    for (i, (r, m)) in reth.iter().zip(mptdb.iter()).enumerate() {
-        assert_eq!(r, m, "block {} root mismatch: reth={:?} mptdb={:?}", i + 1, r, m);
-    }
+    assert_matches_reth_all_modes(&pre_pop, &blocks);
 }
 
 /// Account-only (no storage) → root must match.
@@ -224,10 +249,7 @@ fn correctness_account_only_no_storage() {
     let mut rng = StdRng::seed_from_u64(300);
     let (bundle, _) = generate_accounts(200, 0, &mut rng);
 
-    let reth = reth_roots(&revm_database::BundleState::default(), &[bundle.clone()]);
-    let mptdb = mptdb_roots(&revm_database::BundleState::default(), &[bundle]);
-
-    assert_eq!(reth[0], mptdb[0], "account-only: roots must match");
+    assert_matches_reth_all_modes(&revm_database::BundleState::default(), &[bundle]);
 }
 
 /// Storage-heavy: 50 accounts with 50 slots each → root must match.
@@ -236,10 +258,7 @@ fn correctness_storage_heavy() {
     let mut rng = StdRng::seed_from_u64(400);
     let (bundle, _) = generate_accounts(50, 50, &mut rng);
 
-    let reth = reth_roots(&revm_database::BundleState::default(), &[bundle.clone()]);
-    let mptdb = mptdb_roots(&revm_database::BundleState::default(), &[bundle]);
-
-    assert_eq!(reth[0], mptdb[0], "storage-heavy: roots must match");
+    assert_matches_reth_all_modes(&revm_database::BundleState::default(), &[bundle]);
 }
 
 /// 10-block incremental: 1K pre-pop, 200 updates/block → all roots must match.
@@ -252,14 +271,7 @@ fn correctness_10_blocks_incremental() {
     let blocks: Vec<_> =
         (0..10).map(|i| generate_updates(&addresses, 5, i, 200, &mut rng_blocks)).collect();
 
-    let reth = reth_roots(&pre_pop, &blocks);
-    let mptdb = mptdb_roots(&pre_pop, &blocks);
-
-    assert_eq!(reth.len(), 10);
-    assert_eq!(mptdb.len(), 10);
-    for (i, (r, m)) in reth.iter().zip(mptdb.iter()).enumerate() {
-        assert_eq!(r, m, "block {} root mismatch: reth={:?} mptdb={:?}", i + 1, r, m);
-    }
+    assert_matches_reth_all_modes(&pre_pop, &blocks);
 }
 
 /// Mixed workload: account creates + updates + deletes (slot=0) → root must match.
@@ -315,10 +327,7 @@ fn correctness_mixed_with_deletes() {
         reverts_size: 0,
     };
 
-    let reth = reth_roots(&pre_pop, &[block1.clone()]);
-    let mptdb = mptdb_roots(&pre_pop, &[block1]);
-
-    assert_eq!(reth[0], mptdb[0], "mixed with deletes: roots must match");
+    assert_matches_reth_all_modes(&pre_pop, &[block1]);
 }
 
 /// Self-destruct + recreate in same block → root must match.
@@ -368,10 +377,7 @@ fn correctness_selfdestruct_recreate() {
         reverts_size: 0,
     };
 
-    let reth = reth_roots(&pre_pop, &[block1.clone()]);
-    let mptdb = mptdb_roots(&pre_pop, &[block1]);
-
-    assert_eq!(reth[0], mptdb[0], "selfdestruct+recreate: roots must match");
+    assert_matches_reth_all_modes(&pre_pop, &[block1]);
 }
 
 /// Close + reopen between every block → forces full RocksDB read-back.
@@ -389,26 +395,47 @@ fn correctness_reopen_between_blocks() {
     let reth = reth_roots(&pre_pop, &blocks);
 
     // mptdb with close+reopen between each block
-    let dir = TempDir::new().unwrap();
     let mut mptdb_roots_vec = Vec::new();
 
-    {
-        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
-        store.apply_bundle_state(&pre_pop).unwrap();
-        store.commit().unwrap();
-        store.close().unwrap();
-    }
+    for mode in [MptMode::Legacy, MptMode::WalFirst] {
+        let dir = TempDir::new().unwrap();
+        mptdb_roots_vec.clear();
 
-    for bundle in &blocks {
-        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
-        store.apply_bundle_state(bundle).unwrap();
-        let (_, root) = store.commit().unwrap();
-        mptdb_roots_vec.push(root);
-        store.close().unwrap();
-    }
+        {
+            let mut store = match mode {
+                MptMode::Legacy => MptCommitStore::open(dir.path(), false).unwrap(),
+                MptMode::WalFirst => {
+                    MptCommitStore::open_with_config(dir.path(), false, wal_first_config()).unwrap()
+                }
+            };
+            store.apply_bundle_state(&pre_pop).unwrap();
+            store.commit().unwrap();
+            store.close().unwrap();
+        }
 
-    assert_eq!(reth.len(), mptdb_roots_vec.len());
-    for (i, (r, m)) in reth.iter().zip(mptdb_roots_vec.iter()).enumerate() {
-        assert_eq!(r, m, "block {} root mismatch after reopen: reth={:?} mptdb={:?}", i + 1, r, m);
+        for bundle in &blocks {
+            let mut store = match mode {
+                MptMode::Legacy => MptCommitStore::open(dir.path(), false).unwrap(),
+                MptMode::WalFirst => {
+                    MptCommitStore::open_with_config(dir.path(), false, wal_first_config()).unwrap()
+                }
+            };
+            store.apply_bundle_state(bundle).unwrap();
+            let (_, root) = store.commit().unwrap();
+            mptdb_roots_vec.push(root);
+            store.close().unwrap();
+        }
+
+        assert_eq!(reth.len(), mptdb_roots_vec.len());
+        for (i, (r, m)) in reth.iter().zip(mptdb_roots_vec.iter()).enumerate() {
+            assert_eq!(
+                r,
+                m,
+                "mode {mode:?} block {} root mismatch after reopen: reth={:?} mptdb={:?}",
+                i + 1,
+                r,
+                m
+            );
+        }
     }
 }

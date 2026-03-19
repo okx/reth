@@ -4,28 +4,45 @@
 
 use alloy_primitives::{keccak256, map::HashMap as PrimitivesHashMap, Address, B256, U256};
 use alloy_trie::KECCAK_EMPTY;
-use mptdb_sc::mpt::{CommitProfile, MptCommitStore, MptCommitter};
+use mptdb_sc::mpt::{BulkLoadOptions, CommitProfile, MptCommitStore, MptCommitter};
 use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use revm_database::{states::StorageSlot, AccountStatus, StorageWithOriginalValues};
 use revm_state::AccountInfo;
 use std::time::Instant;
 use tempfile::TempDir;
 
-fn generate_accounts(
-    num: usize,
-    slots_per: usize,
-    rng: &mut StdRng,
-) -> (revm_database::BundleState, Vec<Address>) {
-    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
-        PrimitivesHashMap::default();
+const PREPOP_CHUNK_SIZE: usize = 10_000;
+
+fn wal_first_config() -> mptdb_sc::mpt::MptConfig {
+    let mut config = mptdb_sc::mpt::MptConfig::default();
+    config.wal_first_commit = true;
+    config.checkpoint_max_account_trie_nodes = 0;
+    config
+}
+
+fn generate_addresses(num: usize, rng: &mut StdRng) -> Vec<Address> {
     let mut addresses = Vec::with_capacity(num);
     let mut addr_buf = [0u8; 20];
 
-    for i in 0..num {
+    for _ in 0..num {
         rng.fill_bytes(&mut addr_buf);
         let addr = Address::from(addr_buf);
         addresses.push(addr);
+    }
 
+    addresses
+}
+
+fn generate_account_chunk(
+    addresses: &[Address],
+    start_index: usize,
+    slots_per: usize,
+) -> revm_database::BundleState {
+    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+        PrimitivesHashMap::default();
+
+    for (offset, &addr) in addresses.iter().enumerate() {
+        let i = start_index + offset;
         let info = AccountInfo {
             nonce: i as u64,
             balance: U256::from(1_000_000 * (i + 1)),
@@ -55,13 +72,22 @@ fn generate_accounts(
         );
     }
 
-    let bundle = revm_database::BundleState {
+    revm_database::BundleState {
         state,
         contracts: Default::default(),
         reverts: Default::default(),
         state_size: 0,
         reverts_size: 0,
-    };
+    }
+}
+
+fn generate_accounts(
+    num: usize,
+    slots_per: usize,
+    rng: &mut StdRng,
+) -> (revm_database::BundleState, Vec<Address>) {
+    let addresses = generate_addresses(num, rng);
+    let bundle = generate_account_chunk(&addresses, 0, slots_per);
     (bundle, addresses)
 }
 
@@ -112,6 +138,21 @@ fn generate_updates(
         state_size: 0,
         reverts_size: 0,
     }
+}
+
+fn prepopulate_store_in_chunks(
+    store: &mut MptCommitStore,
+    addresses: &[Address],
+    slots_per: usize,
+    chunk_size: usize,
+) {
+    store.begin_bulk_load(BulkLoadOptions { retain_only_latest: true }).unwrap();
+    for (chunk_idx, chunk) in addresses.chunks(chunk_size).enumerate() {
+        let start_index = chunk_idx * chunk_size;
+        let bundle = generate_account_chunk(chunk, start_index, slots_per);
+        store.bulk_ingest_bundle_chunk(&bundle).unwrap();
+    }
+    store.finish_bulk_load().unwrap();
 }
 
 /// Profile apply_bundle_state breakdown: how much time is spent in
@@ -334,7 +375,17 @@ fn print_profile(label: &str, profile: &CommitProfile) {
     println!("  segment_build:        {:>8} µs", profile.storage_segment_build.as_micros());
     println!("account_updates:        {:>8} µs", profile.account_updates.as_micros());
     println!("account_root_and_blobs: {:>8} µs", profile.account_root_and_blobs.as_micros());
+    println!("wal_append:             {:>8} µs", profile.wal_append.as_micros());
+    println!("wal_replay:             {:>8} µs", profile.wal_replay.as_micros());
+    println!("durable_materialize:    {:>8} µs", profile.durable_materialize.as_micros());
+    println!("published_materialize:  {:>8} µs", profile.published_materialize.as_micros());
+    println!("durable_version_lag:    {:>8}", profile.durable_version_lag);
+    println!("published_version_lag:  {:>8}", profile.published_version_lag);
     println!("persist_and_manifest:   {:>8} µs", profile.persist_and_manifest.as_micros());
+    println!("  persist_batch:        {:>8} µs", profile.persist_batch.as_micros());
+    println!("  manifest_save:        {:>8} µs", profile.manifest_save.as_micros());
+    println!("  publish_generation:   {:>8} µs", profile.publish_generation.as_micros());
+    println!("  open_published_store: {:>8} µs", profile.open_published_store.as_micros());
     println!("cache_publish:          {:>8} µs", profile.cache_publish.as_micros());
     println!("total_commit:           {:>8} µs", profile.total_commit.as_micros());
 }
@@ -351,7 +402,8 @@ fn profile_b4_4_large() {
         (0..10).map(|i| generate_updates(&addrs, 2_000, 10, i, &mut rng_blocks)).collect();
 
     let dir = TempDir::new().unwrap();
-    let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+    let mut store =
+        MptCommitStore::open_with_config(dir.path(), false, wal_first_config()).unwrap();
 
     let t0 = Instant::now();
     store.apply_bundle_state(&pre_pop).unwrap();
@@ -433,22 +485,26 @@ fn profile_b4_4_large() {
 fn print_large_profile_table(
     label: &str,
     store: &mut MptCommitStore,
-    pre_pop: &revm_database::BundleState,
+    addresses: &[Address],
+    slots_per: usize,
     blocks: &[revm_database::BundleState],
 ) {
     let t0 = Instant::now();
-    store.apply_bundle_state(pre_pop).unwrap();
+    prepopulate_store_in_chunks(store, addresses, slots_per, PREPOP_CHUNK_SIZE);
     println!("\n=== {label} ===");
-    println!("Pre-pop apply: {}ms", t0.elapsed().as_millis());
-    let t1 = Instant::now();
-    store.commit().unwrap();
-    println!("Pre-pop commit: {}ms", t1.elapsed().as_millis());
+    println!("Pre-pop total: {}ms", t0.elapsed().as_millis());
+    println!(
+        "Pre-pop chunks: {} x {}",
+        addresses.len().div_ceil(PREPOP_CHUNK_SIZE),
+        PREPOP_CHUNK_SIZE
+    );
 
     println!(
-        "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+        "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8} {:<8} {:<8} {:<8} {:<7} {:<7} {:<10} {:<10} {:<10}",
         "Block", "Apply", "Collect", "TrieLd", "SlotUpd", "LtLd", "PbLd", "ToTree",
         "L2Hit", "L3Hit", "NDFall", "StorRoot", "RtHash", "SegBld", "AcctUpd",
-        "AcctRoot", "Persist", "Commit", "Total", "Ins/Del", "Split/Mrg"
+        "AcctRoot", "WalApp", "WalRpl", "DurMat", "PubMat", "DLag", "PLag", "Persist",
+        "Commit", "Total"
     );
 
     for (i, block) in blocks.iter().enumerate() {
@@ -456,7 +512,7 @@ fn print_large_profile_table(
         let ((_version, _root), profile) = store.commit_with_profile().unwrap();
 
         println!(
-            "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+            "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8} {:<8} {:<8} {:<8} {:<7} {:<7} {:<10} {:<10} {:<10}",
             i + 1,
             profile.apply_bundle_state.as_millis(),
             profile.apply_collect_dirty_accounts.as_millis(),
@@ -475,19 +531,15 @@ fn print_large_profile_table(
             profile.storage_segment_build.as_millis(),
             profile.account_updates.as_millis(),
             profile.account_root_and_blobs.as_millis(),
+            profile.wal_append.as_millis(),
+            profile.wal_replay.as_millis(),
+            profile.durable_materialize.as_millis(),
+            profile.published_materialize.as_millis(),
+            profile.durable_version_lag,
+            profile.published_version_lag,
             profile.persist_and_manifest.as_millis(),
             profile.total_commit.as_millis(),
             (profile.apply_bundle_state + profile.total_commit).as_millis(),
-            format!("{}/{}", profile.apply_slot_inserts, profile.apply_slot_deletes),
-            format!(
-                "{}/{}/{}/{}",
-                profile.apply_leaf_splits + profile.apply_extension_splits,
-                profile.apply_branch_collapse_to_empty
-                    + profile.apply_branch_collapse_to_leaf
-                    + profile.apply_branch_collapse_to_extension,
-                profile.apply_extension_leaf_merges,
-                profile.apply_extension_extension_merges
-            )
         );
     }
 }
@@ -497,22 +549,28 @@ fn print_large_profile_table(
 #[ignore]
 fn profile_b4_5_near_production() {
     let mut rng = StdRng::seed_from_u64(4500);
-    let (pre_pop, addrs) = generate_accounts(1_000_000, 10, &mut rng);
+    let addrs = generate_addresses(1_000_000, &mut rng);
 
     let mut rng_blocks = StdRng::seed_from_u64(4501);
     let blocks: Vec<_> =
         (0..10).map(|i| generate_updates(&addrs, 5_000, 10, i, &mut rng_blocks)).collect();
 
     let dir = TempDir::new().unwrap();
-    let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+    let mut store =
+        MptCommitStore::open_with_config(dir.path(), false, wal_first_config()).unwrap();
 
     print_large_profile_table(
         "B4.5 Profile (1M pre-pop × 10 slots, 10 x 5K updates)",
         &mut store,
-        &pre_pop,
+        &addrs,
+        10,
         &blocks,
     );
 
+    if std::env::var_os("MPT_DEBUG_SKIP_CLOSE").is_some() {
+        std::mem::forget(store);
+        return;
+    }
     store.close().unwrap();
 }
 
@@ -521,7 +579,7 @@ fn profile_b4_5_near_production() {
 #[ignore]
 fn profile_b4_6_storage_heavy_large() {
     let mut rng = StdRng::seed_from_u64(4600);
-    let (pre_pop, addrs) = generate_accounts(1_000_000, 30, &mut rng);
+    let addrs = generate_addresses(1_000_000, &mut rng);
 
     let mut rng_blocks = StdRng::seed_from_u64(4601);
     let blocks: Vec<_> =
@@ -533,9 +591,14 @@ fn profile_b4_6_storage_heavy_large() {
     print_large_profile_table(
         "B4.6 Profile (1M pre-pop × 30 slots, 10 x 10K updates)",
         &mut store,
-        &pre_pop,
+        &addrs,
+        30,
         &blocks,
     );
 
+    if std::env::var_os("MPT_DEBUG_SKIP_CLOSE").is_some() {
+        std::mem::forget(store);
+        return;
+    }
     store.close().unwrap();
 }
