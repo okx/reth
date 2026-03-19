@@ -109,6 +109,14 @@ impl StorageTrieSegment {
     pub fn root_record_off(&self) -> u32 {
         self.root_record_off
     }
+
+    pub fn into_page_lease(self) -> Arc<SegmentPageLease> {
+        let root = self.root;
+        let root_record_off = self.root_record_off;
+        let bytes: Arc<[u8]> = self.bytes.into();
+        let mapped = Arc::new(MappedSegmentPage::from_owned_bytes(bytes));
+        Arc::new(SegmentPageLease::new(mapped, root, root_record_off))
+    }
 }
 
 pub struct StorageTrieSegmentReader<'a> {
@@ -133,18 +141,34 @@ pub struct StoragePathTrace {
 
 #[derive(Clone)]
 pub struct MappedSegmentPage {
-    mmap: Arc<Mmap>,
+    backing: SegmentPageBacking,
     page_off: usize,
     total_len: usize,
 }
 
+#[derive(Clone)]
+enum SegmentPageBacking {
+    Mmap(Arc<Mmap>),
+    Owned(Arc<[u8]>),
+}
+
 impl MappedSegmentPage {
     pub fn new(mmap: Arc<Mmap>, page_off: usize, total_len: usize) -> Self {
-        Self { mmap, page_off, total_len }
+        Self { backing: SegmentPageBacking::Mmap(mmap), page_off, total_len }
+    }
+
+    pub fn from_owned_bytes(bytes: Arc<[u8]>) -> Self {
+        let total_len = bytes.len();
+        Self { backing: SegmentPageBacking::Owned(bytes), page_off: 0, total_len }
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.mmap[self.page_off..self.page_off + self.total_len]
+        match &self.backing {
+            SegmentPageBacking::Mmap(mmap) => &mmap[self.page_off..self.page_off + self.total_len],
+            SegmentPageBacking::Owned(bytes) => {
+                &bytes[self.page_off..self.page_off + self.total_len]
+            }
+        }
     }
 
     #[cfg(test)]

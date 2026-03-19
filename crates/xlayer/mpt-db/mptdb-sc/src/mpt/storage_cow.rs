@@ -168,6 +168,19 @@ impl StorageTrieCow {
         let mut ordered: Vec<&StorageChange> = changes.iter().collect();
         ordered.sort_by(|a, b| a.slot_key.cmp(&b.slot_key));
 
+        let mut touched_keys = Vec::with_capacity(ordered.len());
+        let mut idx = 0usize;
+        while idx < ordered.len() {
+            let change = ordered[idx];
+            while idx + 1 < ordered.len() && ordered[idx + 1].slot_key == change.slot_key {
+                idx += 1;
+            }
+            touched_keys.push(change.slot_key.clone());
+            idx += 1;
+        }
+
+        self.preload_batched_paths(store, &touched_keys)?;
+
         let mut idx = 0usize;
         while idx < ordered.len() {
             let change = ordered[idx];
@@ -182,6 +195,41 @@ impl StorageTrieCow {
             };
             self.apply_change(store, &change.slot_key, value)?;
             idx += 1;
+        }
+
+        Ok(())
+    }
+
+    fn preload_batched_paths(
+        &mut self,
+        store: &PersistedTrieStore,
+        touched_keys: &[Nibbles],
+    ) -> Result<()> {
+        if touched_keys.is_empty() {
+            return Ok(());
+        }
+
+        match self.root.clone() {
+            CowRootRef::Segment(root_ref)
+                if self.arena.nodes().is_empty() && self.pending_segment_children.is_empty() =>
+            {
+                let reader = StorageTrieSegmentReader::open_shared_page(
+                    root_ref.page_lease(),
+                    root_ref.page_lease().root(),
+                    root_ref.page_lease().root_record_off(),
+                )?;
+                let trace = reader.cursor().trace_paths(touched_keys)?;
+                let (arena, root) = trace.into_parts();
+                self.arena = arena;
+                self.root = root.map(CowRootRef::Arena).unwrap_or(CowRootRef::Empty);
+            }
+            CowRootRef::Persisted(root)
+                if self.arena.nodes().is_empty() && self.pending_segment_children.is_empty() =>
+            {
+                let idx = self.materialize_persisted_root(store, root)?;
+                self.root = CowRootRef::Arena(idx);
+            }
+            _ => {}
         }
 
         Ok(())

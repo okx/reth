@@ -33,7 +33,7 @@ use super::{
         PublishedBaselineManager, PublishedBaselineMeta, PublishedBaselineReader,
     },
     r#trait::{CommitFrontier, MptCommitter, MptGcStats, MptSnapshotExporter, MptSnapshotImporter},
-    segment::StorageTrieSegment,
+    segment::{SegmentPageLease, StorageSegmentLocator, StorageTrieSegment},
     snapshot::{SnapshotExporter, SnapshotImporter},
     state::{self, DirtyAccount},
     storage_cow::StorageTrieCow,
@@ -88,40 +88,121 @@ struct PersistJob {
 }
 
 struct StorageTrieCache {
-    inner: LruMap<B256, StorageTrieCow, ByLength>,
-    capacity: usize,
+    hot: LruMap<B256, StorageTrieCow, ByLength>,
+    cold: LruMap<B256, StorageTrieCacheEntry, ByLength>,
+    hot_capacity: usize,
+    cold_capacity: usize,
+}
+
+enum StorageTrieCacheEntry {
+    Empty,
+    SegmentPage(Arc<SegmentPageLease>),
+    Trie(StorageTrieCow),
+}
+
+impl StorageTrieCacheEntry {
+    fn into_working_cow(self) -> StorageTrieCow {
+        match self {
+            Self::Empty => StorageTrieCow::empty(),
+            Self::SegmentPage(lease) => StorageTrieCow::from_segment_page(lease),
+            Self::Trie(trie) => trie,
+        }
+    }
+
+    #[cfg(test)]
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::SegmentPage(_) => "segment_page",
+            Self::Trie(_) => "trie",
+        }
+    }
 }
 
 impl StorageTrieCache {
+    fn new(capacity: usize) -> Self {
+        let hot_capacity =
+            if capacity < 64 { 0 } else { (capacity / 16).clamp(1, 4_096).min(capacity / 2) };
+        let cold_capacity = capacity.saturating_sub(hot_capacity);
+        Self {
+            hot: LruMap::new(ByLength::new(hot_capacity.max(1) as u32)),
+            cold: LruMap::new(ByLength::new(cold_capacity.max(1) as u32)),
+            hot_capacity,
+            cold_capacity,
+        }
+    }
+
+    fn remove(&mut self, key: &B256) -> Option<StorageTrieCacheEntry> {
+        if let Some(trie) = self.hot.remove(key) {
+            return Some(StorageTrieCacheEntry::Trie(trie));
+        }
+        self.cold.remove(key)
+    }
+
+    fn insert_hot_trie(&mut self, key: B256, trie: StorageTrieCow) {
+        if self.hot_capacity == 0 {
+            self.insert_cold(key, StorageTrieCacheEntry::Trie(trie));
+            return;
+        }
+        self.hot.remove(&key);
+        let _ = self.hot.get_or_insert(key, || trie);
+    }
+
+    fn insert_cold(&mut self, key: B256, entry: StorageTrieCacheEntry) {
+        if self.cold_capacity == 0 {
+            return;
+        }
+        self.cold.remove(&key);
+        let _ = self.cold.get_or_insert(key, || entry);
+    }
+
+    #[cfg(test)]
+    fn insert(&mut self, key: B256, entry: StorageTrieCacheEntry) {
+        match entry {
+            StorageTrieCacheEntry::Trie(trie) => self.insert_hot_trie(key, trie),
+            entry => self.insert_cold(key, entry),
+        }
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &B256) -> bool {
+        self.hot.peek(key).is_some() || self.cold.peek(key).is_some()
+    }
+
+    fn clear(&mut self) {
+        self.hot.clear();
+        self.cold.clear();
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.hot.is_empty() && self.cold.is_empty()
+    }
+}
+
+struct StorageTrieRecentTouches {
+    inner: LruMap<B256, (), ByLength>,
+    capacity: usize,
+}
+
+impl StorageTrieRecentTouches {
     fn new(capacity: usize) -> Self {
         let limit = capacity.max(1) as u32;
         Self { inner: LruMap::new(ByLength::new(limit)), capacity }
     }
 
-    fn remove(&mut self, key: &B256) -> Option<StorageTrieCow> {
-        self.inner.remove(key)
-    }
-
-    fn insert(&mut self, key: B256, trie: StorageTrieCow) {
+    fn note_touch(&mut self, key: B256) -> bool {
         if self.capacity == 0 {
-            return;
+            return false;
         }
+        let seen = self.inner.peek(&key).is_some();
         self.inner.remove(&key);
-        let _ = self.inner.get_or_insert(key, || trie);
-    }
-
-    #[cfg(test)]
-    fn contains_key(&self, key: &B256) -> bool {
-        self.inner.peek(key).is_some()
+        let _ = self.inner.get_or_insert(key, || ());
+        seen
     }
 
     fn clear(&mut self) {
         self.inner.clear();
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
     }
 }
 
@@ -178,6 +259,12 @@ pub struct MptCommitStore {
     /// Cross-block LRU cache for storage tries. After commit, clean tries are moved here
     /// so the next block can reuse them without reloading from RocksDB.
     storage_trie_cache: StorageTrieCache,
+    /// Recent-touch filter used to admit only cross-block-hot storage tries into L2.
+    storage_trie_recent_touches: StorageTrieRecentTouches,
+    /// Storage tries eligible to be reinserted into L2 after the current commit.
+    cache_admit_candidates: HashSet<B256>,
+    /// Hot storage tries should stay in ready-to-mutate form for the next block.
+    hot_cache_candidates: HashSet<B256>,
     dirty_accounts: Vec<DirtyAccount>,
 
     persisted: Arc<PersistedTrieStore>,
@@ -239,6 +326,58 @@ pub struct MptCommitStore {
 }
 
 impl MptCommitStore {
+    fn storage_trie_cache_bulk_threshold(&self) -> usize {
+        self.config.storage_trie_cache_capacity.max(1) / 2
+    }
+
+    fn build_storage_trie_cache_entry(
+        &self,
+        hashed_address: B256,
+        storage_root: B256,
+        mut trie: StorageTrieCow,
+        latest_locators: &HashMap<B256, StorageSegmentLocator>,
+        use_async: bool,
+    ) -> Result<StorageTrieCacheEntry> {
+        if storage_root == EMPTY_ROOT_HASH {
+            return Ok(StorageTrieCacheEntry::Empty);
+        }
+
+        if !use_async {
+            if let (Some(fs), Some(locator)) =
+                (self.fast_store.as_ref(), latest_locators.get(&hashed_address))
+            {
+                if let Ok(Some(lease)) = fs.open_locator_page(*locator) {
+                    return Ok(StorageTrieCacheEntry::SegmentPage(lease));
+                }
+            }
+        }
+
+        if let Some(root_idx) = trie.root_index() {
+            let segment = StorageTrieSegment::from_parts(
+                trie.arena_nodes(),
+                trie.arena_hash_cache(),
+                Some(root_idx),
+                storage_root,
+            )?;
+            return Ok(StorageTrieCacheEntry::SegmentPage(segment.into_page_lease()));
+        }
+
+        trie.clear_dirty();
+        Ok(StorageTrieCacheEntry::Trie(trie))
+    }
+
+    fn build_hot_storage_trie_cache_entry(
+        &self,
+        storage_root: B256,
+        mut trie: StorageTrieCow,
+    ) -> StorageTrieCacheEntry {
+        if storage_root == EMPTY_ROOT_HASH {
+            return StorageTrieCacheEntry::Empty;
+        }
+        trie.clear_dirty();
+        StorageTrieCacheEntry::Trie(trie)
+    }
+
     fn insert_working_cow(&mut self, hashed_address: B256, cow: StorageTrieCow) {
         self.storage_tries.insert(hashed_address, cow);
     }
@@ -797,6 +936,11 @@ impl MptCommitStore {
             account_trie,
             storage_tries: HashMap::new(),
             storage_trie_cache: StorageTrieCache::new(config.storage_trie_cache_capacity),
+            storage_trie_recent_touches: StorageTrieRecentTouches::new(
+                config.storage_trie_cache_capacity.saturating_mul(4),
+            ),
+            cache_admit_candidates: HashSet::new(),
+            hot_cache_candidates: HashSet::new(),
             dirty_accounts: Vec::new(),
             persisted,
             fast_store,
@@ -1027,6 +1171,9 @@ impl MptCommitter for MptCommitStore {
         self.dirty_accounts.clear();
         self.storage_tries.clear();
         self.storage_trie_cache.clear();
+        self.storage_trie_recent_touches.clear();
+        self.cache_admit_candidates.clear();
+        self.hot_cache_candidates.clear();
         if let Some(ref fs) = self.fast_store {
             fs.clear_memory();
         }
@@ -1196,15 +1343,18 @@ impl MptCommitStore {
         let mut node_fallback_loads = 0u64;
         let mut l3_latest_load = Duration::ZERO;
         let mut l3_published_load = Duration::ZERO;
-        let l3_into_tree = Duration::ZERO;
+        let mut l3_into_tree = Duration::ZERO;
 
         let collect_start = std::time::Instant::now();
         let dirty_accounts = state::collect_dirty_accounts(bundle)?;
         let collect_elapsed = collect_start.elapsed();
+        self.cache_admit_candidates.clear();
+        self.hot_cache_candidates.clear();
+        let cache_bulk_block = dirty_accounts.len() > self.storage_trie_cache_bulk_threshold();
         let load_start = std::time::Instant::now();
-        let mut latest_candidates = Vec::new();
-        let mut storage_loads = Vec::new();
-        let mut published_candidates = Vec::new();
+        let mut latest_candidates: Vec<(B256, B256, Vec<Nibbles>)> = Vec::new();
+        let mut storage_loads: Vec<(B256, B256, Vec<Nibbles>)> = Vec::new();
+        let mut published_candidates: Vec<(B256, B256, Vec<Nibbles>)> = Vec::new();
         let published_current = self.has_current_published_view();
 
         for dirty in &dirty_accounts {
@@ -1214,21 +1364,38 @@ impl MptCommitStore {
             if self.contains_working_trie(&dirty.hashed_address) {
                 continue;
             }
+            let seen_recently = self.storage_trie_recent_touches.note_touch(dirty.hashed_address);
             if dirty.storage_known_empty {
                 self.insert_working_cow(dirty.hashed_address, StorageTrieCow::empty());
+                if !cache_bulk_block || seen_recently {
+                    self.cache_admit_candidates.insert(dirty.hashed_address);
+                }
+                if seen_recently {
+                    self.hot_cache_candidates.insert(dirty.hashed_address);
+                }
                 continue;
             }
             if let Some(cached_trie) = self.storage_trie_cache.remove(&dirty.hashed_address) {
-                self.storage_tries.insert(dirty.hashed_address, cached_trie);
+                self.storage_tries.insert(dirty.hashed_address, cached_trie.into_working_cow());
+                self.cache_admit_candidates.insert(dirty.hashed_address);
+                self.hot_cache_candidates.insert(dirty.hashed_address);
                 l2_hits += 1;
                 continue;
+            }
+            if !cache_bulk_block || seen_recently {
+                self.cache_admit_candidates.insert(dirty.hashed_address);
+            }
+            if seen_recently {
+                self.hot_cache_candidates.insert(dirty.hashed_address);
             }
 
             let existing_root = self.get_existing_storage_root(&dirty.hashed_address);
             if existing_root == EMPTY_ROOT_HASH {
                 self.insert_working_cow(dirty.hashed_address, StorageTrieCow::empty());
             } else {
-                latest_candidates.push((dirty.hashed_address, existing_root));
+                let touched_keys: Vec<Nibbles> =
+                    dirty.storage_changes.iter().map(|change| change.slot_key.clone()).collect();
+                latest_candidates.push((dirty.hashed_address, existing_root, touched_keys));
             }
         }
 
@@ -1236,22 +1403,36 @@ impl MptCommitStore {
             if let Some(ref fs) = self.fast_store {
                 let resolved = latest_candidates
                     .into_par_iter()
-                    .map(|(hashed_address, existing_root)| {
-                        match fs.open_trie(&hashed_address, existing_root)? {
-                            Some(loaded) => Ok((
-                                Some((hashed_address, loaded.trie, loaded.lookup_elapsed)),
-                                None,
-                            )),
-                            None => Ok((None, Some((hashed_address, existing_root)))),
+                    .map(|(hashed_address, existing_root, touched_keys)| {
+                        match fs.trace_touched_paths(
+                            &hashed_address,
+                            existing_root,
+                            &touched_keys,
+                        )? {
+                            Some(loaded) => {
+                                let (arena, root) = loaded.trace.into_parts();
+                                Ok((
+                                    Some((
+                                        hashed_address,
+                                        StorageTrieCow::from_tree(MptTree { arena, root }),
+                                        loaded.lookup_elapsed,
+                                        loaded.materialize_elapsed,
+                                    )),
+                                    None,
+                                ))
+                            }
+                            None => Ok((None, Some((hashed_address, existing_root, touched_keys)))),
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
 
                 for (loaded, fallback) in resolved {
-                    if let Some((hashed_address, trie, load_elapsed)) = loaded {
+                    if let Some((hashed_address, trie, load_elapsed, materialize_elapsed)) = loaded
+                    {
                         self.insert_working_cow(hashed_address, trie);
                         l3_latest_hits += 1;
                         l3_latest_load += load_elapsed;
+                        l3_into_tree += materialize_elapsed;
                     } else if let Some(load) = fallback {
                         if published_current {
                             published_candidates.push(load);
@@ -1271,22 +1452,36 @@ impl MptCommitStore {
             if let Some(ref store) = self.published_store {
                 let resolved = published_candidates
                     .into_par_iter()
-                    .map(|(hashed_address, existing_root)| {
-                        match store.open_trie(&hashed_address, existing_root)? {
-                            Some(loaded) => Ok((
-                                Some((hashed_address, loaded.trie, loaded.lookup_elapsed)),
-                                None,
-                            )),
-                            None => Ok((None, Some((hashed_address, existing_root)))),
+                    .map(|(hashed_address, existing_root, touched_keys)| {
+                        match store.materialize_touched_paths(
+                            &hashed_address,
+                            existing_root,
+                            &touched_keys,
+                        )? {
+                            Some(loaded) => {
+                                let (arena, root) = loaded.trace.into_parts();
+                                Ok((
+                                    Some((
+                                        hashed_address,
+                                        StorageTrieCow::from_tree(MptTree { arena, root }),
+                                        loaded.lookup_elapsed,
+                                        loaded.materialize_elapsed,
+                                    )),
+                                    None,
+                                ))
+                            }
+                            None => Ok((None, Some((hashed_address, existing_root, touched_keys)))),
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
 
                 for (loaded, fallback) in resolved {
-                    if let Some((hashed_address, trie, load_elapsed)) = loaded {
+                    if let Some((hashed_address, trie, load_elapsed, materialize_elapsed)) = loaded
+                    {
                         self.insert_working_cow(hashed_address, trie);
                         l3_published_hits += 1;
                         l3_published_load += load_elapsed;
+                        l3_into_tree += materialize_elapsed;
                     } else if let Some(load) = fallback {
                         storage_loads.push(load);
                     }
@@ -1296,18 +1491,20 @@ impl MptCommitStore {
 
         if !storage_loads.is_empty() {
             self.flush_persist()?;
-            let mut remaining_loads = Vec::new();
+            let mut remaining_loads: Vec<(B256, B256, Vec<Nibbles>)> = Vec::new();
             if published_current {
                 if let Some(ref store) = self.published_store {
                     let resolved = storage_loads
                         .into_par_iter()
-                        .map(|(hashed_address, existing_root)| {
+                        .map(|(hashed_address, existing_root, touched_keys)| {
                             match store.open_trie(&hashed_address, existing_root)? {
                                 Some(loaded) => Ok((
                                     Some((hashed_address, loaded.trie, loaded.lookup_elapsed)),
                                     None,
                                 )),
-                                None => Ok((None, Some((hashed_address, existing_root)))),
+                                None => {
+                                    Ok((None, Some((hashed_address, existing_root, touched_keys))))
+                                }
                             }
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -1330,7 +1527,7 @@ impl MptCommitStore {
             if !remaining_loads.is_empty() {
                 node_fallback_loads += remaining_loads.len() as u64;
                 self.storage_tries.extend(remaining_loads.into_iter().map(
-                    |(hashed_address, existing_root)| {
+                    |(hashed_address, existing_root, _touched_keys)| {
                         (hashed_address, StorageTrieCow::from_persisted_root(existing_root))
                     },
                 ));
@@ -1589,6 +1786,7 @@ impl MptCommitStore {
             .collect();
         let cache_publish_start = std::time::Instant::now();
         let mut published_puts = Vec::new();
+        let mut latest_cache_locators = HashMap::new();
         let mut fast_store_deletes = deleted_accounts.iter().copied().collect::<Vec<_>>();
         fast_store_deletes.extend(storage_cache_candidates.iter().filter_map(|(addr, _)| {
             match storage_roots.get(addr).copied() {
@@ -1648,6 +1846,7 @@ impl MptCommitStore {
                 &published_puts,
                 &fast_store_deletes,
             )?;
+            latest_cache_locators.extend(published_meta.latest_updates.iter().copied());
             if let Some(ref fs) = self.fast_store {
                 if let Err(e) = fs.apply_latest_updates(
                     &published_meta.latest_updates,
@@ -1679,13 +1878,36 @@ impl MptCommitStore {
         // Move committed storage tries into the cross-block cache so the next
         // block can reuse them without reloading from RocksDB.
         // Also write L3 fast store images (best-effort, non-fatal).
-        for (addr, mut trie) in storage_cache_candidates {
+        for (addr, trie) in storage_cache_candidates {
             if deleted_accounts.contains(&addr) {
                 continue;
             }
-            trie.clear_dirty();
-            self.storage_trie_cache.insert(addr, trie);
+            if !self.cache_admit_candidates.contains(&addr) {
+                continue;
+            }
+            let storage_root = storage_roots.get(&addr).copied().unwrap_or(EMPTY_ROOT_HASH);
+            if self.hot_cache_candidates.contains(&addr) {
+                match self.build_hot_storage_trie_cache_entry(storage_root, trie.clone()) {
+                    StorageTrieCacheEntry::Empty => {}
+                    StorageTrieCacheEntry::Trie(trie) => {
+                        self.storage_trie_cache.insert_hot_trie(addr, trie)
+                    }
+                    StorageTrieCacheEntry::SegmentPage(_) => {
+                        unreachable!("hot cache uses trie form")
+                    }
+                }
+            }
+            let entry = self.build_storage_trie_cache_entry(
+                addr,
+                storage_root,
+                trie,
+                &latest_cache_locators,
+                use_async,
+            )?;
+            self.storage_trie_cache.insert_cold(addr, entry);
         }
+        self.cache_admit_candidates.clear();
+        self.hot_cache_candidates.clear();
 
         self.last_commit_profile = CommitProfile {
             apply_bundle_state: self.last_apply_duration,
@@ -1772,6 +1994,11 @@ impl<'a> super::r#trait::MptSnapshotImporter for BoundImporter<'a> {
         self.store.storage_tries.clear();
         self.store.storage_trie_cache =
             StorageTrieCache::new(self.store.config.storage_trie_cache_capacity);
+        self.store.storage_trie_recent_touches = StorageTrieRecentTouches::new(
+            self.store.config.storage_trie_cache_capacity.saturating_mul(4),
+        );
+        self.store.cache_admit_candidates.clear();
+        self.store.hot_cache_candidates.clear();
         if let Some(ref fs) = self.store.fast_store {
             fs.clear_memory();
         }
@@ -2954,6 +3181,154 @@ mod tests {
 
         // After block 2 commit, trie should be back in cache
         assert!(store.storage_trie_cache.contains_key(&hashed_addr));
+    }
+
+    #[test]
+    fn storage_trie_cache_prefers_segment_pages_after_sync_commit() {
+        let dir = TempDir::new().unwrap();
+        let mut config = MptConfig::default();
+        config.async_blob_threshold = 0;
+        let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+
+        let addr = Address::repeat_byte(0xAB);
+        let info = default_info(1, 1000);
+        let bundle = make_bundle(vec![(
+            addr,
+            Some(info),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(10))],
+        )]);
+        store.apply_bundle_state(&bundle).unwrap();
+        store.commit().unwrap();
+
+        let hashed_addr = keccak256(addr);
+        let cached = store
+            .storage_trie_cache
+            .remove(&hashed_addr)
+            .expect("expected cached entry after sync commit");
+        assert_eq!(cached.kind_name(), "segment_page");
+        store.storage_trie_cache.insert(hashed_addr, cached);
+    }
+
+    #[test]
+    fn storage_trie_cache_prefers_segment_pages_after_async_commit() {
+        let dir = TempDir::new().unwrap();
+        let mut config = MptConfig::default();
+        config.async_blob_threshold = usize::MAX;
+        let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+
+        let addr = Address::repeat_byte(0xAC);
+        let info = default_info(1, 1000);
+        let bundle = make_bundle(vec![(
+            addr,
+            Some(info),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(10))],
+        )]);
+        store.apply_bundle_state(&bundle).unwrap();
+        store.commit().unwrap();
+
+        let hashed_addr = keccak256(addr);
+        let cached = store
+            .storage_trie_cache
+            .remove(&hashed_addr)
+            .expect("expected cached entry after async commit");
+        assert_eq!(cached.kind_name(), "segment_page");
+        store.storage_trie_cache.insert(hashed_addr, cached);
+        store.flush_persist().unwrap();
+    }
+
+    #[test]
+    fn storage_trie_cache_promotes_l2_hits_to_hot_trie() {
+        let dir = TempDir::new().unwrap();
+        let mut config = MptConfig::default();
+        config.async_blob_threshold = 0;
+        let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+
+        let addr = Address::repeat_byte(0xAD);
+        let info = default_info(1, 1000);
+
+        let bundle1 = make_bundle(vec![(
+            addr,
+            Some(info.clone()),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(10))],
+        )]);
+        store.apply_bundle_state(&bundle1).unwrap();
+        store.commit().unwrap();
+
+        let bundle2 = make_bundle(vec![(
+            addr,
+            Some(info),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(2), U256::ZERO, U256::from(20))],
+        )]);
+        store.apply_bundle_state(&bundle2).unwrap();
+        store.commit().unwrap();
+
+        let hashed_addr = keccak256(addr);
+        let cached = store
+            .storage_trie_cache
+            .remove(&hashed_addr)
+            .expect("expected cached entry after hot reuse");
+        assert_eq!(cached.kind_name(), "trie");
+        store.storage_trie_cache.insert(hashed_addr, cached);
+    }
+
+    #[test]
+    fn storage_trie_cache_bulk_block_skips_cold_admission() {
+        let dir = TempDir::new().unwrap();
+        let mut config = MptConfig::default();
+        config.storage_trie_cache_capacity = 2;
+        let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+
+        let hot_a = Address::repeat_byte(0xA1);
+        let hot_b = Address::repeat_byte(0xB2);
+        let hot_info = default_info(1, 1000);
+
+        for (addr, slot, value) in [(hot_a, 1_u64, 11_u64), (hot_b, 2_u64, 22_u64)] {
+            let bundle = make_bundle(vec![(
+                addr,
+                Some(hot_info.clone()),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(slot), U256::ZERO, U256::from(value))],
+            )]);
+            store.apply_bundle_state(&bundle).unwrap();
+            store.commit().unwrap();
+        }
+
+        let hashed_hot_a = keccak256(hot_a);
+        let hashed_hot_b = keccak256(hot_b);
+        assert!(store.storage_trie_cache.contains_key(&hashed_hot_a));
+        assert!(store.storage_trie_cache.contains_key(&hashed_hot_b));
+
+        let cold_accounts = [0xC1_u8, 0xC2_u8, 0xC3_u8];
+        let mut accounts = vec![(
+            hot_a,
+            Some(hot_info.clone()),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(3), U256::ZERO, U256::from(33))],
+        )];
+        accounts.extend(cold_accounts.into_iter().enumerate().map(|(idx, byte)| {
+            (
+                Address::repeat_byte(byte),
+                Some(default_info(1, 2000 + idx as u64)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(idx as u64 + 10), U256::ZERO, U256::from(idx as u64 + 100))],
+            )
+        }));
+
+        store.apply_bundle_state(&make_bundle(accounts)).unwrap();
+        store.commit().unwrap();
+
+        assert!(store.storage_trie_cache.contains_key(&hashed_hot_a));
+        assert!(store.storage_trie_cache.contains_key(&hashed_hot_b));
+        for byte in [0xC1_u8, 0xC2_u8, 0xC3_u8] {
+            assert!(
+                !store.storage_trie_cache.contains_key(&keccak256(Address::repeat_byte(byte))),
+                "cold bulk account should not be admitted into L2",
+            );
+        }
     }
 
     /// Selfdestruct (storage_wiped) should evict cached trie and not reuse it.

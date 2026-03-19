@@ -124,49 +124,24 @@ impl FastStorageTrieStore {
         expected_root: B256,
     ) -> Result<Option<LatestTriePageLoaded>> {
         let lookup_start = std::time::Instant::now();
-        let (locator, page, mmap) = {
-            let state = self.state.upgradable_read();
-            let locator = match state.index.get(hashed_address).copied() {
-                Some(locator) => locator,
+        let locator = {
+            let state = self.state.read();
+            match state.index.get(hashed_address).copied() {
+                Some(locator) if locator.root == expected_root => locator,
+                Some(_) => return Ok(None),
                 None => return Ok(None),
-            };
-            if locator.root != expected_root {
-                return Ok(None);
-            }
-
-            let mut page = state.pages.get(&locator.page_off).copied();
-            let mmap = state.data_mmap.clone();
-
-            if page.is_none() || mmap.is_none() {
-                let mut state = RwLockUpgradableReadGuard::upgrade(state);
-                if page.is_none() {
-                    Self::refresh_shared_pages(&mut state)?;
-                    page = state.pages.get(&locator.page_off).copied();
-                }
-                let Some(page) = page else {
-                    return Ok(None);
-                };
-                let mmap = match mmap {
-                    Some(mmap) => mmap,
-                    None => Arc::clone(Self::ensure_data_mmap(&mut state)?),
-                };
-                (locator, page, mmap)
-            } else {
-                (locator, page.expect("checked above"), mmap.expect("checked above"))
             }
         };
-        let mapped = Arc::new(MappedSegmentPage::new(
-            mmap,
-            locator.page_off as usize,
-            page.total_len as usize,
-        ));
-        let lease = Arc::new(SegmentPageLease::new(mapped, expected_root, locator.record_off));
-        let page_header = read_page_header(lease.as_slice())?;
-        if page_header.root != expected_root || page_header.root_record_off != locator.record_off {
-            return Ok(None);
-        }
+        self.open_trie_page_for_locator(locator, lookup_start)
+    }
 
-        Ok(Some(LatestTriePageLoaded { lease, lookup_elapsed: lookup_start.elapsed() }))
+    pub fn open_locator_page(
+        &self,
+        locator: StorageSegmentLocator,
+    ) -> Result<Option<Arc<SegmentPageLease>>> {
+        Ok(self
+            .open_trie_page_for_locator(locator, std::time::Instant::now())?
+            .map(|loaded| loaded.lease))
     }
 
     pub fn open_trie(
@@ -426,6 +401,49 @@ impl FastStorageTrieStore {
             state.data_mmap = Some(Arc::new(mmap));
         }
         Ok(state.data_mmap.as_ref().unwrap())
+    }
+
+    fn open_trie_page_for_locator(
+        &self,
+        locator: StorageSegmentLocator,
+        lookup_start: std::time::Instant,
+    ) -> Result<Option<LatestTriePageLoaded>> {
+        let (page, mmap) = {
+            let state = self.state.upgradable_read();
+            let mut page = state.pages.get(&locator.page_off).copied();
+            let mmap = state.data_mmap.clone();
+
+            if page.is_none() || mmap.is_none() {
+                let mut state = RwLockUpgradableReadGuard::upgrade(state);
+                if page.is_none() {
+                    Self::refresh_shared_pages(&mut state)?;
+                    page = state.pages.get(&locator.page_off).copied();
+                }
+                let Some(page) = page else {
+                    return Ok(None);
+                };
+                let mmap = match mmap {
+                    Some(mmap) => mmap,
+                    None => Arc::clone(Self::ensure_data_mmap(&mut state)?),
+                };
+                (page, mmap)
+            } else {
+                (page.expect("checked above"), mmap.expect("checked above"))
+            }
+        };
+
+        let mapped = Arc::new(MappedSegmentPage::new(
+            mmap,
+            locator.page_off as usize,
+            page.total_len as usize,
+        ));
+        let lease = Arc::new(SegmentPageLease::new(mapped, locator.root, locator.record_off));
+        let page_header = read_page_header(lease.as_slice())?;
+        if page_header.root != locator.root || page_header.root_record_off != locator.record_off {
+            return Ok(None);
+        }
+
+        Ok(Some(LatestTriePageLoaded { lease, lookup_elapsed: lookup_start.elapsed() }))
     }
 
     fn refresh_shared_pages(state: &mut FastStoreState) -> Result<()> {
