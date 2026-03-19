@@ -792,9 +792,9 @@ crc32fast = "1"
 fs4 = "0.12"
 
 # salt (megaETH state tree)
-salt = { path = "../salt/salt" }
-banderwagon = { path = "../salt/banderwagon" }
-ipa-multipoint = { path = "../salt/ipa-multipoint" }
+salt = { path = "../megaEth/salt/salt" }
+banderwagon = { path = "../megaEth/salt/banderwagon" }
+ipa-multipoint = { path = "../megaEth/salt/ipa-multipoint" }
 
 # qmdb (LayerZero Quick Merkle Database)
 qmdb = { path = "../megaEth/qmdb/qmdb", default-features = false }

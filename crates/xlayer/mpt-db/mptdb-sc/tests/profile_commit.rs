@@ -320,6 +320,15 @@ fn print_profile(label: &str, profile: &CommitProfile) {
     println!("  l3_published_hits:    {:>8}", profile.apply_l3_published_hits);
     println!("  l3_published_post:    {:>8}", profile.apply_l3_published_post_flush_hits);
     println!("  node_fallback_loads:  {:>8}", profile.apply_node_fallback_loads);
+    println!("  slot_inserts:         {:>8}", profile.apply_slot_inserts);
+    println!("  slot_deletes:         {:>8}", profile.apply_slot_deletes);
+    println!("  leaf_splits:          {:>8}", profile.apply_leaf_splits);
+    println!("  ext_splits:           {:>8}", profile.apply_extension_splits);
+    println!("  br_collapse_empty:    {:>8}", profile.apply_branch_collapse_to_empty);
+    println!("  br_collapse_leaf:     {:>8}", profile.apply_branch_collapse_to_leaf);
+    println!("  br_collapse_ext:      {:>8}", profile.apply_branch_collapse_to_extension);
+    println!("  ext_leaf_merges:      {:>8}", profile.apply_extension_leaf_merges);
+    println!("  ext_ext_merges:       {:>8}", profile.apply_extension_extension_merges);
     println!("storage_roots:          {:>8} µs", profile.storage_roots.as_micros());
     println!("  root_hashing:         {:>8} µs", profile.storage_root_hashing.as_micros());
     println!("  segment_build:        {:>8} µs", profile.storage_segment_build.as_micros());
@@ -353,7 +362,7 @@ fn profile_b4_4_large() {
     println!("Pre-pop commit: {}ms", t1.elapsed().as_millis());
 
     println!(
-        "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+        "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
         "Block",
         "Apply",
         "Collect",
@@ -372,7 +381,9 @@ fn profile_b4_4_large() {
         "AcctRoot",
         "Persist",
         "Commit",
-        "Total"
+        "Total",
+        "Ins/Del",
+        "Split/Mrg"
     );
 
     for (i, block) in blocks.iter().enumerate() {
@@ -380,7 +391,7 @@ fn profile_b4_4_large() {
         let ((_version, _root), profile) = store.commit_with_profile().unwrap();
 
         println!(
-            "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+            "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
             i + 1,
             profile.apply_bundle_state.as_millis(),
             profile.apply_collect_dirty_accounts.as_millis(),
@@ -401,9 +412,130 @@ fn profile_b4_4_large() {
             profile.account_root_and_blobs.as_millis(),
             profile.persist_and_manifest.as_millis(),
             profile.total_commit.as_millis(),
-            (profile.apply_bundle_state + profile.total_commit).as_millis()
+            (profile.apply_bundle_state + profile.total_commit).as_millis(),
+            format!("{}/{}", profile.apply_slot_inserts, profile.apply_slot_deletes),
+            format!(
+                "{}/{}/{}/{}",
+                profile.apply_leaf_splits + profile.apply_extension_splits,
+                profile.apply_branch_collapse_to_empty
+                    + profile.apply_branch_collapse_to_leaf
+                    + profile.apply_branch_collapse_to_extension,
+                profile.apply_extension_leaf_merges,
+                profile.apply_extension_extension_merges
+            )
         );
     }
+
+    store.close().unwrap();
+}
+
+/// Helper: print the per-block profile table header + rows for large-scale profiles.
+fn print_large_profile_table(
+    label: &str,
+    store: &mut MptCommitStore,
+    pre_pop: &revm_database::BundleState,
+    blocks: &[revm_database::BundleState],
+) {
+    let t0 = Instant::now();
+    store.apply_bundle_state(pre_pop).unwrap();
+    println!("\n=== {label} ===");
+    println!("Pre-pop apply: {}ms", t0.elapsed().as_millis());
+    let t1 = Instant::now();
+    store.commit().unwrap();
+    println!("Pre-pop commit: {}ms", t1.elapsed().as_millis());
+
+    println!(
+        "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+        "Block", "Apply", "Collect", "TrieLd", "SlotUpd", "LtLd", "PbLd", "ToTree",
+        "L2Hit", "L3Hit", "NDFall", "StorRoot", "RtHash", "SegBld", "AcctUpd",
+        "AcctRoot", "Persist", "Commit", "Total", "Ins/Del", "Split/Mrg"
+    );
+
+    for (i, block) in blocks.iter().enumerate() {
+        store.apply_bundle_state(block).unwrap();
+        let ((_version, _root), profile) = store.commit_with_profile().unwrap();
+
+        println!(
+            "{:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+            i + 1,
+            profile.apply_bundle_state.as_millis(),
+            profile.apply_collect_dirty_accounts.as_millis(),
+            profile.apply_get_or_load_storage_tries.as_millis(),
+            profile.apply_storage_slot_updates.as_millis(),
+            profile.apply_l3_latest_load.as_millis(),
+            profile.apply_l3_published_load.as_millis(),
+            profile.apply_l3_into_tree.as_millis(),
+            profile.apply_l2_hits,
+            profile.apply_l3_latest_hits
+                + profile.apply_l3_published_hits
+                + profile.apply_l3_published_post_flush_hits,
+            profile.apply_node_fallback_loads,
+            profile.storage_roots.as_millis(),
+            profile.storage_root_hashing.as_millis(),
+            profile.storage_segment_build.as_millis(),
+            profile.account_updates.as_millis(),
+            profile.account_root_and_blobs.as_millis(),
+            profile.persist_and_manifest.as_millis(),
+            profile.total_commit.as_millis(),
+            (profile.apply_bundle_state + profile.total_commit).as_millis(),
+            format!("{}/{}", profile.apply_slot_inserts, profile.apply_slot_deletes),
+            format!(
+                "{}/{}/{}/{}",
+                profile.apply_leaf_splits + profile.apply_extension_splits,
+                profile.apply_branch_collapse_to_empty
+                    + profile.apply_branch_collapse_to_leaf
+                    + profile.apply_branch_collapse_to_extension,
+                profile.apply_extension_leaf_merges,
+                profile.apply_extension_extension_merges
+            )
+        );
+    }
+}
+
+/// Profile B4.5 near-production: 1M accounts × 10 slots, 10 blocks × 5K updates.
+#[test]
+#[ignore]
+fn profile_b4_5_near_production() {
+    let mut rng = StdRng::seed_from_u64(4500);
+    let (pre_pop, addrs) = generate_accounts(1_000_000, 10, &mut rng);
+
+    let mut rng_blocks = StdRng::seed_from_u64(4501);
+    let blocks: Vec<_> =
+        (0..10).map(|i| generate_updates(&addrs, 5_000, 10, i, &mut rng_blocks)).collect();
+
+    let dir = TempDir::new().unwrap();
+    let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+    print_large_profile_table(
+        "B4.5 Profile (1M pre-pop × 10 slots, 10 x 5K updates)",
+        &mut store,
+        &pre_pop,
+        &blocks,
+    );
+
+    store.close().unwrap();
+}
+
+/// Profile B4.6 storage-heavy large: 1M accounts × 30 slots, 10 blocks × 10K updates.
+#[test]
+#[ignore]
+fn profile_b4_6_storage_heavy_large() {
+    let mut rng = StdRng::seed_from_u64(4600);
+    let (pre_pop, addrs) = generate_accounts(1_000_000, 30, &mut rng);
+
+    let mut rng_blocks = StdRng::seed_from_u64(4601);
+    let blocks: Vec<_> =
+        (0..10).map(|i| generate_updates(&addrs, 10_000, 30, i, &mut rng_blocks)).collect();
+
+    let dir = TempDir::new().unwrap();
+    let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+    print_large_profile_table(
+        "B4.6 Profile (1M pre-pop × 30 slots, 10 x 10K updates)",
+        &mut store,
+        &pre_pop,
+        &blocks,
+    );
 
     store.close().unwrap();
 }

@@ -356,11 +356,99 @@ fn bench_b4_4_large_scale(c: &mut Criterion) {
     group.finish();
 }
 
+/// B4.5: Near-production — 1M pre-pop (10 slots each) + 5K updates/block, 10 blocks.
+/// Stresses account trie breadth with realistic update density.
+/// Gated by BENCH_LARGE=1 environment variable.
+fn bench_b4_5_near_production(c: &mut Criterion) {
+    if std::env::var("BENCH_LARGE").is_err() {
+        eprintln!("Skipping B4.5 (set BENCH_LARGE=1 to run)");
+        return;
+    }
+
+    let mut group = c.benchmark_group("B4.5 near-production");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(120));
+
+    let mut rng = StdRng::seed_from_u64(4500);
+    let (pre_pop, addrs) = generate_accounts(1_000_000, 10, &mut rng);
+
+    let mut rng_blocks = StdRng::seed_from_u64(4501);
+    let blocks: Vec<_> =
+        (0..10).map(|i| generate_updates(&addrs, 5_000, 10, i, &mut rng_blocks)).collect();
+
+    group.bench_function(BenchmarkId::new("reth_mpt", "1M_pre_10x5K_upd"), |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += run_reth_lane(&pre_pop, &blocks);
+            }
+            total
+        })
+    });
+
+    group.bench_function(BenchmarkId::new("mptdb_mpt", "1M_pre_10x5K_upd"), |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += run_mptdb_lane(&pre_pop, &blocks);
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
+/// B4.6: Storage-heavy large-scale — 1M pre-pop (30 slots each) + 10K updates/block, 10 blocks.
+/// Stresses storage trie depth and update density (~4GB working set).
+/// Gated by BENCH_LARGE=1 environment variable.
+fn bench_b4_6_storage_heavy_large(c: &mut Criterion) {
+    if std::env::var("BENCH_LARGE").is_err() {
+        eprintln!("Skipping B4.6 (set BENCH_LARGE=1 to run)");
+        return;
+    }
+
+    let mut group = c.benchmark_group("B4.6 storage-heavy large");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(180));
+
+    let mut rng = StdRng::seed_from_u64(4600);
+    let (pre_pop, addrs) = generate_accounts(1_000_000, 30, &mut rng);
+
+    let mut rng_blocks = StdRng::seed_from_u64(4601);
+    let blocks: Vec<_> =
+        (0..10).map(|i| generate_updates(&addrs, 10_000, 30, i, &mut rng_blocks)).collect();
+
+    group.bench_function(BenchmarkId::new("reth_mpt", "1M_30s_10x10K_upd"), |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += run_reth_lane(&pre_pop, &blocks);
+            }
+            total
+        })
+    });
+
+    group.bench_function(BenchmarkId::new("mptdb_mpt", "1M_30s_10x10K_upd"), |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += run_mptdb_lane(&pre_pop, &blocks);
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_b4_1_fresh_state,
     bench_b4_2_prepop_single_block,
     bench_b4_3_incremental_blocks,
-    bench_b4_4_large_scale
+    bench_b4_4_large_scale,
+    bench_b4_5_near_production,
+    bench_b4_6_storage_heavy_large
 );
 criterion_main!(benches);
