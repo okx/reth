@@ -123,9 +123,10 @@ impl PublishedDeltaMmap {
 }
 
 #[derive(Clone)]
-pub struct PublishedGenerationResult {
+pub(crate) struct PublishedGenerationResult {
     pub meta: PublishedBaselineMeta,
     pub latest_updates: Vec<(B256, super::segment::StorageSegmentLocator)>,
+    pub latest_pages: Vec<FlatPageIndexEntry>,
 }
 
 pub struct PublishedBaselineReader {
@@ -336,7 +337,7 @@ impl PublishedBaselineManager {
         }))
     }
 
-    pub fn publish_generation(
+    pub(crate) fn publish_generation(
         &self,
         prev: Option<&PublishedBaselineMeta>,
         version: i64,
@@ -366,6 +367,7 @@ impl PublishedBaselineManager {
         let mut pages_index_file = Self::open_pages_index_file(&self.base_dir)?;
         let mut delta_records = Vec::new();
         let mut latest_updates = Vec::with_capacity(puts.len());
+        let mut latest_pages = Vec::with_capacity(puts.len());
 
         if let Some(mut full_index) = rewritten_index {
             for hashed_address in deletes {
@@ -391,6 +393,7 @@ impl PublishedBaselineManager {
                         format_version: page.layout_version,
                     },
                 ));
+                latest_pages.push(page);
             }
             delta_records.reserve(full_index.len());
             for (hashed_address, entry) in full_index {
@@ -427,6 +430,7 @@ impl PublishedBaselineManager {
                         format_version: page.layout_version,
                     },
                 ));
+                latest_pages.push(page);
             }
         }
 
@@ -444,7 +448,7 @@ impl PublishedBaselineManager {
 
         let meta = PublishedBaselineMeta { generation, version, root };
         self.save_meta(&meta)?;
-        Ok(PublishedGenerationResult { meta, latest_updates })
+        Ok(PublishedGenerationResult { meta, latest_updates, latest_pages })
     }
 
     pub fn activate_published_version(&self, version: i64, root: B256) -> Result<()> {

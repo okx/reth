@@ -287,6 +287,38 @@ impl MptCommitStore {
         Ok(segments)
     }
 
+    fn build_publish_segments_from_tries(
+        storage_roots: &HashMap<B256, B256>,
+        tries: &[(B256, StorageTrieCow)],
+    ) -> Result<Vec<(B256, StorageTrieSegment)>> {
+        let built = tries
+            .par_iter()
+            .map(|(hashed_address, trie)| -> Result<Option<(B256, StorageTrieSegment)>> {
+                let Some(root) = storage_roots.get(hashed_address).copied() else {
+                    return Ok(None);
+                };
+                if root == EMPTY_ROOT_HASH {
+                    return Ok(None);
+                }
+                let segment = StorageTrieSegment::from_parts(
+                    trie.arena_nodes(),
+                    trie.arena_hash_cache(),
+                    trie.root_index(),
+                    root,
+                )?;
+                Ok(Some((*hashed_address, segment)))
+            })
+            .collect::<Vec<_>>();
+
+        let mut segments = Vec::with_capacity(tries.len());
+        for segment in built {
+            if let Some(segment) = segment? {
+                segments.push(segment);
+            }
+        }
+        Ok(segments)
+    }
+
     fn report_async_error(
         async_error: &AtomicBool,
         detail: &Mutex<Option<String>>,
@@ -648,10 +680,10 @@ impl MptCommitStore {
                                             &job.fast_store_deletes,
                                         );
 
-                                    let latest_updates = match publish_result {
+                                    let publish_result = match publish_result {
                                         Ok(result) => {
-                                            worker_published_meta = Some(result.meta);
-                                            result.latest_updates
+                                            worker_published_meta = Some(result.meta.clone());
+                                            Some(result)
                                         }
                                         Err(e) => {
                                             Self::report_async_error(
@@ -663,15 +695,16 @@ impl MptCommitStore {
                                                 ?e,
                                                 "background published baseline failed"
                                             );
-                                            Vec::new()
+                                            None
                                         }
                                     };
 
-                                    if !latest_updates.is_empty() {
+                                    if let Some(published_result) = publish_result {
                                         if let Some(ref fast_store) = fast_store_clone {
                                             if let Err(e) = fast_store.apply_latest_updates(
-                                                &latest_updates,
+                                                &published_result.latest_updates,
                                                 &job.fast_store_deletes,
+                                                &published_result.latest_pages,
                                             ) {
                                                 tracing::warn!(
                                                     ?e,
@@ -681,9 +714,11 @@ impl MptCommitStore {
                                         }
                                     } else if !job.fast_store_deletes.is_empty() {
                                         if let Some(ref fast_store) = fast_store_clone {
-                                            if let Err(e) = fast_store
-                                                .apply_latest_updates(&[], &job.fast_store_deletes)
-                                            {
+                                            if let Err(e) = fast_store.apply_latest_updates(
+                                                &[],
+                                                &job.fast_store_deletes,
+                                                &[],
+                                            ) {
                                                 tracing::warn!(
                                                     ?e,
                                                     "best-effort latest segment delete failed"
@@ -1600,15 +1635,12 @@ impl MptCommitStore {
             tx.send(job).map_err(|e| MptDbError::Other(format!("send persist job: {e}")))?;
         } else {
             // Synchronous persist for large batches or when no background worker
+            let segment_build_start = std::time::Instant::now();
+            published_puts =
+                Self::build_publish_segments_from_tries(&storage_roots, &storage_cache_candidates)?;
+            storage_segment_build_elapsed += segment_build_start.elapsed();
             self.persisted.persist_batch(&all_blobs, true)?;
             manifest_copy.save(&self.manifest_path)?;
-            if !deferred_published_roots.is_empty() {
-                let rebuilt = Self::build_publish_segments_from_roots(
-                    &self.persisted,
-                    &deferred_published_roots,
-                )?;
-                published_puts.extend(rebuilt);
-            }
             let published_meta = self.published_baseline.publish_generation(
                 self.published_meta.as_ref(),
                 new_version,
@@ -1617,9 +1649,11 @@ impl MptCommitStore {
                 &fast_store_deletes,
             )?;
             if let Some(ref fs) = self.fast_store {
-                if let Err(e) =
-                    fs.apply_latest_updates(&published_meta.latest_updates, &fast_store_deletes)
-                {
+                if let Err(e) = fs.apply_latest_updates(
+                    &published_meta.latest_updates,
+                    &fast_store_deletes,
+                    &published_meta.latest_pages,
+                ) {
                     tracing::warn!(?e, "best-effort latest segment index update failed");
                 }
             }
