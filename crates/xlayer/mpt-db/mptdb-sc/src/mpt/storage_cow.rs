@@ -8,7 +8,7 @@ use super::{
     encoding::decode_node,
     node::{BranchNode, ChildRef, ExtensionNode, LeafNode, MptNode},
     overlay::StorageOverlay,
-    persisted::PersistedTrieStore,
+    persisted::{self, PersistedTrieStore},
     segment::{
         SegmentChildEmbedRef, SegmentNodeKind, SegmentNodeRef, SegmentPageLease,
         StorageTrieSegment, StorageTrieSegmentReader,
@@ -231,6 +231,14 @@ impl StorageTrieCow {
         Ok(())
     }
 
+    pub fn preload_paths(
+        &mut self,
+        store: &PersistedTrieStore,
+        touched_keys: &[Nibbles],
+    ) -> Result<()> {
+        self.preload_batched_paths(store, touched_keys)
+    }
+
     fn preload_batched_paths(
         &mut self,
         store: &PersistedTrieStore,
@@ -257,8 +265,8 @@ impl StorageTrieCow {
             CowRootRef::Lazy(CowLazyNodeRef::Persisted(root))
                 if self.arena.nodes().is_empty() && self.pending_lazy_children.is_empty() =>
             {
-                let idx = self.mutate_persisted_root(store, root)?;
-                self.root = CowRootRef::Arena(idx);
+                let tree = persisted::load_tree_paths_from_root(store, root, touched_keys)?;
+                *self = Self::from_tree(tree);
             }
             _ => {}
         }
@@ -296,6 +304,23 @@ impl StorageTrieCow {
         };
         self.prune_pending_lazy_children();
         Ok(StorageOverlay::from_tree(MptTree { arena: self.arena, root }))
+    }
+
+    pub fn into_materialized_tree(mut self, store: &PersistedTrieStore) -> Result<MptTree> {
+        let root = self.materialize_root_subtree(store, self.root.clone())?;
+        self.root = match root {
+            Some(idx) => CowRootRef::Arena(idx),
+            None => CowRootRef::Empty,
+        };
+        self.prune_pending_lazy_children();
+        Ok(MptTree {
+            arena: self.arena,
+            root: match self.root {
+                CowRootRef::Arena(idx) => Some(idx),
+                CowRootRef::Empty => None,
+                CowRootRef::Lazy(_) => unreachable!("materialized tree cannot keep lazy root"),
+            },
+        })
     }
 
     fn get_arena_recursive(

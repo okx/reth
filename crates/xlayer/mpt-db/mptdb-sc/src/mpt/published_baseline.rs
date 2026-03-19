@@ -14,7 +14,6 @@ use std::{
 };
 
 use super::{
-    fast_store::FastStorageTrieStore,
     flat_layout::{
         append_page as append_flat_page, data_path as pages_data_path,
         index_path as pages_index_path, open_data_file as open_pages_data_file,
@@ -125,8 +124,6 @@ impl PublishedDeltaMmap {
 #[derive(Clone)]
 pub(crate) struct PublishedGenerationResult {
     pub meta: PublishedBaselineMeta,
-    pub latest_updates: Vec<(B256, super::segment::StorageSegmentLocator)>,
-    pub latest_pages: Vec<FlatPageIndexEntry>,
 }
 
 pub struct PublishedBaselineReader {
@@ -366,9 +363,6 @@ impl PublishedBaselineManager {
         let mut data_file = Self::open_data_file(&self.base_dir)?;
         let mut pages_index_file = Self::open_pages_index_file(&self.base_dir)?;
         let mut delta_records = Vec::new();
-        let mut latest_updates = Vec::with_capacity(puts.len());
-        let mut latest_pages = Vec::with_capacity(puts.len());
-
         if let Some(mut full_index) = rewritten_index {
             for hashed_address in deletes {
                 full_index.remove(hashed_address);
@@ -384,16 +378,6 @@ impl PublishedBaselineManager {
                         format_version: page.layout_version,
                     },
                 );
-                latest_updates.push((
-                    *hashed_address,
-                    super::segment::StorageSegmentLocator {
-                        root: image.root(),
-                        page_off: page.page_off,
-                        record_off: page.root_record_off,
-                        format_version: page.layout_version,
-                    },
-                ));
-                latest_pages.push(page);
             }
             delta_records.reserve(full_index.len());
             for (hashed_address, entry) in full_index {
@@ -421,16 +405,6 @@ impl PublishedBaselineManager {
                     page.root_record_off,
                     page.layout_version,
                 ));
-                latest_updates.push((
-                    *hashed_address,
-                    super::segment::StorageSegmentLocator {
-                        root: image.root(),
-                        page_off: page.page_off,
-                        record_off: page.root_record_off,
-                        format_version: page.layout_version,
-                    },
-                ));
-                latest_pages.push(page);
             }
         }
 
@@ -448,7 +422,7 @@ impl PublishedBaselineManager {
 
         let meta = PublishedBaselineMeta { generation, version, root };
         self.save_meta(&meta)?;
-        Ok(PublishedGenerationResult { meta, latest_updates, latest_pages })
+        Ok(PublishedGenerationResult { meta })
     }
 
     pub fn activate_published_version(&self, version: i64, root: B256) -> Result<()> {
@@ -476,16 +450,11 @@ impl PublishedBaselineManager {
         }
     }
 
-    pub fn compact_for_manifest(
-        &self,
-        manifest: &VersionManifest,
-        fast_store: Option<&FastStorageTrieStore>,
-    ) -> Result<bool> {
+    pub fn compact_for_manifest(&self, manifest: &VersionManifest) -> Result<bool> {
         let mut keep_generations: HashSet<u64> =
             manifest.versions.keys().map(|v| *v as u64).collect();
         keep_generations.extend(self.active_generation_leases());
         keep_generations.extend(self.generations_with_pinned_records()?);
-        let latest_snapshot = fast_store.map(|store| store.snapshot_index()).unwrap_or_default();
 
         let current_meta = self.load_meta()?;
         if let Some(meta) = current_meta.as_ref() {
@@ -565,19 +534,6 @@ impl PublishedBaselineManager {
             });
         }
 
-        let mut rewritten_latest = HashMap::with_capacity(latest_snapshot.len());
-        for (key, locator) in &latest_snapshot {
-            let new_locator = Self::remap_segment(
-                &mut new_data,
-                &mut new_pages_index,
-                &data_mmap,
-                &mut remap,
-                &mut rewritten_pages,
-                *locator,
-            )?;
-            rewritten_latest.insert(*key, new_locator);
-        }
-
         new_data
             .flush()
             .map_err(|e| MptDbError::Other(format!("flush compacted data tmp: {e}")))?;
@@ -620,10 +576,6 @@ impl PublishedBaselineManager {
                 let _ = fs::remove_file(self.delta_path(generation));
                 let _ = fs::remove_file(self.generation_meta_path(generation));
             }
-        }
-
-        if let Some(store) = fast_store {
-            store.replace_latest_index(&rewritten_latest)?;
         }
 
         Ok(true)
@@ -1092,11 +1044,11 @@ mod tests {
 
         let reader = mgr.open_published_store(&meta1).unwrap().unwrap();
         assert_eq!(mgr.active_generation_leases(), vec![1]);
-        mgr.compact_for_manifest(&manifest, None).unwrap();
+        mgr.compact_for_manifest(&manifest).unwrap();
         assert!(mgr.load_generation_meta(1).unwrap().is_some());
         drop(reader);
 
-        mgr.compact_for_manifest(&manifest, None).unwrap();
+        mgr.compact_for_manifest(&manifest).unwrap();
         assert!(mgr.load_generation_meta(1).unwrap().is_none());
     }
 
@@ -1131,11 +1083,11 @@ mod tests {
         assert!(mgr.active_record_pins().is_empty());
 
         mgr.acquire_record_pins(&pinned);
-        mgr.compact_for_manifest(&manifest, None).unwrap();
+        mgr.compact_for_manifest(&manifest).unwrap();
         assert!(mgr.load_generation_meta(1).unwrap().is_some());
 
         mgr.record_pins.lock().clear();
-        mgr.compact_for_manifest(&manifest, None).unwrap();
+        mgr.compact_for_manifest(&manifest).unwrap();
         assert!(mgr.load_generation_meta(1).unwrap().is_none());
     }
 }

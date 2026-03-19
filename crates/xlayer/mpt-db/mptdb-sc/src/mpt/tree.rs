@@ -336,7 +336,10 @@ impl MptTree {
                             }
                         }
                     }
-                    _ => panic!("Phase 1: only Arena child refs in live tree"),
+                    _ => {
+                        let rlp = self.encode_node_readonly(root_idx);
+                        hash::hash_rlp(&rlp)
+                    }
                 }
             }
             _ => {
@@ -354,29 +357,26 @@ impl MptTree {
         &self,
         branch: &super::node::BranchNode,
     ) -> [Option<Vec<u8>>; 16] {
-        // Collect (slot_index, arena_idx) for non-empty Arena children
-        let tasks: Vec<(usize, u32)> = branch
+        // Collect (slot_index, child_embed) for non-empty children.
+        let tasks: Vec<(usize, Vec<u8>)> = branch
             .children
             .iter()
             .enumerate()
             .filter_map(|(i, c)| match c {
-                Some(ChildRef::Arena(idx)) => Some((i, *idx)),
-                Some(ChildRef::Inline(_)) | Some(ChildRef::Hash(_)) => {
-                    panic!("Phase 1: only Arena child refs in live tree")
+                Some(ChildRef::Arena(idx)) => {
+                    let rlp = self.encode_node_readonly(*idx);
+                    let embed = if rlp.len() < 32 { rlp } else { hash::hash_rlp(&rlp).to_vec() };
+                    Some((i, embed))
                 }
+                Some(ChildRef::Inline(rlp)) => Some((i, rlp.clone())),
+                Some(ChildRef::Hash(hash)) => Some((i, hash.to_vec())),
                 None => None,
             })
             .collect();
 
-        // Parallel encode each subtree
-        let results: Vec<(usize, Vec<u8>)> = tasks
-            .into_par_iter()
-            .map(|(slot, idx)| {
-                let rlp = self.encode_node_readonly(idx);
-                let embed = if rlp.len() < 32 { rlp } else { hash::hash_rlp(&rlp).to_vec() };
-                (slot, embed)
-            })
-            .collect();
+        // The embeds are already prepared above. Keep the same shape for deterministic assembly.
+        let results: Vec<(usize, Vec<u8>)> =
+            tasks.into_par_iter().map(|(slot, embed)| (slot, embed)).collect();
 
         let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
         for (slot, bytes) in results {
@@ -696,66 +696,21 @@ impl MptTree {
                 Some((root_hash, all_blobs, all_cache_updates))
             }
             MptNode::Extension(ext) => {
-                let ChildRef::Arena(branch_idx) = &ext.child else {
-                    panic!("Phase 1: only Arena child refs in live tree");
-                };
-                let MptNode::Branch(branch) = self.arena.get(*branch_idx) else {
-                    return None;
-                };
-
-                let tasks: Vec<(usize, ChildRef)> = branch
-                    .children
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, child)| child.clone().map(|child| (slot, child)))
-                    .collect();
-
-                let mut results: Vec<(usize, ChildArtifacts)> = tasks
-                    .into_par_iter()
-                    .map(|(slot, child)| {
-                        (slot, self.encode_child_for_parent_collect_readonly(&child))
-                    })
-                    .collect();
-                results.sort_by_key(|(slot, _)| *slot);
-
-                let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
-                let mut cache_updates = Vec::new();
-                let mut child_dirty_blobs = Vec::new();
-                for (slot, artifacts) in results {
-                    children_bytes[slot] = Some(artifacts.embed);
-                    cache_updates.extend(artifacts.cache_updates);
-                    child_dirty_blobs.extend(artifacts.dirty_blobs);
-                }
-
-                let branch_rlp = encode_branch(&children_bytes, branch.value.as_deref());
-                let branch_hash = hash::hash_rlp(&branch_rlp);
-                let branch_embed =
-                    if branch_rlp.len() < 32 { branch_rlp.clone() } else { branch_hash.to_vec() };
-
-                let root_rlp = encode_extension(&ext.nibbles, &branch_embed);
+                let child = self.encode_child_for_parent_collect_readonly(&ext.child);
+                let root_rlp = encode_extension(&ext.nibbles, &child.embed);
                 let root_hash = hash::hash_rlp(&root_rlp);
 
-                let mut all_blobs = Vec::with_capacity(
-                    child_dirty_blobs.len() + usize::from(self.arena.is_dirty(*branch_idx)) + 1,
-                );
+                let mut all_blobs = Vec::with_capacity(child.dirty_blobs.len() + 1);
                 all_blobs.push((root_hash, root_rlp.clone()));
-                if self.arena.is_dirty(*branch_idx) {
-                    all_blobs.push((branch_hash, branch_rlp.clone()));
-                }
-                all_blobs.extend(child_dirty_blobs);
+                all_blobs.extend(child.dirty_blobs);
 
-                let mut all_cache_updates = Vec::with_capacity(cache_updates.len() + 2);
+                let mut all_cache_updates = Vec::with_capacity(child.cache_updates.len() + 1);
                 all_cache_updates.push(CacheUpdate {
                     idx: root_idx,
                     hash: (root_rlp.len() >= 32).then_some(root_hash),
                     rlp: root_rlp,
                 });
-                all_cache_updates.push(CacheUpdate {
-                    idx: *branch_idx,
-                    hash: (branch_rlp.len() >= 32).then_some(branch_hash),
-                    rlp: branch_rlp,
-                });
-                all_cache_updates.extend(cache_updates);
+                all_cache_updates.extend(child.cache_updates);
 
                 Some((root_hash, all_blobs, all_cache_updates))
             }
@@ -801,7 +756,11 @@ impl MptTree {
                 cache_updates: Vec::new(),
                 dirty_blobs: Vec::new(),
             },
-            ChildRef::Hash(_) => panic!("Phase 1: Hash child refs not supported in encode"),
+            ChildRef::Hash(hash) => ChildArtifacts {
+                embed: hash.to_vec(),
+                cache_updates: Vec::new(),
+                dirty_blobs: Vec::new(),
+            },
         }
     }
 

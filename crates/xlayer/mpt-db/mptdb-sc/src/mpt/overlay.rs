@@ -50,7 +50,6 @@ impl StorageOverlay {
         self.root.is_none()
     }
 
-    #[cfg(test)]
     pub fn into_tree(self) -> MptTree {
         MptTree { arena: self.arena, root: self.root }
     }
