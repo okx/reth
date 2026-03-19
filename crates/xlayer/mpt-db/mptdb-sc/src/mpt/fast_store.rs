@@ -118,6 +118,34 @@ impl FastStorageTrieStore {
         }))
     }
 
+    pub fn trace_locator_touched_paths(
+        &self,
+        locator: StorageSegmentLocator,
+        expected_root: B256,
+        keys: &[Nibbles],
+    ) -> Result<Option<LatestPathTraceLoaded>> {
+        if locator.root != expected_root {
+            return Ok(None);
+        }
+        let loaded = match self.open_trie_page_for_locator(locator, std::time::Instant::now())? {
+            Some(loaded) => loaded,
+            None => return Ok(None),
+        };
+        let reader = StorageTrieSegmentReader::open_shared_page(
+            &loaded.lease,
+            expected_root,
+            loaded.lease.root_record_off(),
+        )?;
+        let materialize_start = std::time::Instant::now();
+        let trace = reader.cursor().trace_paths(keys)?;
+        let materialize_elapsed = materialize_start.elapsed();
+        Ok(Some(LatestPathTraceLoaded {
+            trace,
+            lookup_elapsed: loaded.lookup_elapsed,
+            materialize_elapsed,
+        }))
+    }
+
     pub fn open_trie_page(
         &self,
         hashed_address: &B256,

@@ -11,7 +11,7 @@ use super::{
     persisted::PersistedTrieStore,
     segment::{
         SegmentChildEmbedRef, SegmentNodeKind, SegmentNodeRef, SegmentPageLease,
-        StorageTrieSegmentReader,
+        StorageTrieSegment, StorageTrieSegmentReader,
     },
     state::StorageChange,
     storage_recompute,
@@ -20,19 +20,23 @@ use super::{
 };
 
 #[derive(Clone)]
+pub enum CowLazyNodeRef {
+    Persisted(B256),
+    Inline(Vec<u8>),
+    Segment(SegmentNodeRef),
+}
+
+#[derive(Clone)]
 pub enum CowRootRef {
     Empty,
     Arena(u32),
-    Segment(SegmentNodeRef),
-    Persisted(B256),
+    Lazy(CowLazyNodeRef),
 }
 
 #[derive(Clone)]
 pub enum CowChildRef {
     Arena(u32),
-    Hash(B256),
-    Inline(Vec<u8>),
-    Segment(SegmentNodeRef),
+    Lazy(CowLazyNodeRef),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,7 +49,7 @@ enum PendingCowEdge {
 pub struct StorageTrieCow {
     root: CowRootRef,
     arena: MutableTrieArena,
-    pending_segment_children: HashMap<(u32, PendingCowEdge), CowChildRef>,
+    pending_lazy_children: HashMap<(u32, PendingCowEdge), CowChildRef>,
 }
 
 impl StorageTrieCow {
@@ -53,7 +57,7 @@ impl StorageTrieCow {
         Self {
             root: CowRootRef::Empty,
             arena: MutableTrieArena::new(),
-            pending_segment_children: HashMap::new(),
+            pending_lazy_children: HashMap::new(),
         }
     }
 
@@ -63,31 +67,59 @@ impl StorageTrieCow {
                 .expect("segment page lease should always reference a valid trie page");
         let root = reader.root_ref().expect("segment page lease should expose a root node ref");
         Self {
-            root: CowRootRef::Segment(root),
+            root: CowRootRef::Lazy(CowLazyNodeRef::Segment(root)),
             arena: MutableTrieArena::new(),
-            pending_segment_children: HashMap::new(),
+            pending_lazy_children: HashMap::new(),
         }
     }
 
     pub fn from_segment_root(root: SegmentNodeRef) -> Self {
         Self {
-            root: CowRootRef::Segment(root),
+            root: CowRootRef::Lazy(CowLazyNodeRef::Segment(root)),
             arena: MutableTrieArena::new(),
-            pending_segment_children: HashMap::new(),
+            pending_lazy_children: HashMap::new(),
         }
     }
 
     pub fn from_persisted_root(root: B256) -> Self {
         Self {
-            root: CowRootRef::Persisted(root),
+            root: CowRootRef::Lazy(CowLazyNodeRef::Persisted(root)),
             arena: MutableTrieArena::new(),
-            pending_segment_children: HashMap::new(),
+            pending_lazy_children: HashMap::new(),
         }
     }
 
     pub fn from_tree(tree: MptTree) -> Self {
         let root = tree.root.map(CowRootRef::Arena).unwrap_or(CowRootRef::Empty);
-        Self { root, arena: tree.arena, pending_segment_children: HashMap::new() }
+        Self { root, arena: tree.arena, pending_lazy_children: HashMap::new() }
+    }
+
+    pub fn into_snapshot_cached(
+        mut self,
+        storage_root: B256,
+        published_segment: Option<&StorageTrieSegment>,
+        use_async: bool,
+    ) -> Result<Self> {
+        if storage_root == alloy_trie::EMPTY_ROOT_HASH {
+            return Ok(Self::empty());
+        }
+
+        if !use_async && let Some(segment) = published_segment {
+            return Ok(Self::from_segment_page(segment.clone().into_page_lease()));
+        }
+
+        if let Some(root_idx) = self.root_index() {
+            let segment = StorageTrieSegment::from_parts(
+                self.arena_nodes(),
+                self.arena_hash_cache(),
+                Some(root_idx),
+                storage_root,
+            )?;
+            return Ok(Self::from_segment_page(segment.into_page_lease()));
+        }
+
+        self.clear_dirty();
+        Ok(self)
     }
 
     pub fn root_ref(&self) -> &CowRootRef {
@@ -114,7 +146,7 @@ impl StorageTrieCow {
         match self.root {
             CowRootRef::Empty => None,
             CowRootRef::Arena(idx) => Some(idx),
-            CowRootRef::Segment(_) | CowRootRef::Persisted(_) => None,
+            CowRootRef::Lazy(_) => None,
         }
     }
 
@@ -122,8 +154,7 @@ impl StorageTrieCow {
         match self.root_ref() {
             CowRootRef::Empty => Ok(None),
             CowRootRef::Arena(idx) => Ok(self.get_arena_recursive(*idx, store, key, 0)),
-            CowRootRef::Segment(root) => self.get_segment_recursive(root.clone(), store, key, 0),
-            CowRootRef::Persisted(root) => self.get_persisted_recursive(*root, store, key, 0),
+            CowRootRef::Lazy(lazy) => self.get_lazy_recursive(lazy.clone(), store, key, 0),
         }
     }
 
@@ -152,7 +183,7 @@ impl StorageTrieCow {
             Some(idx) => CowRootRef::Arena(idx),
             None => CowRootRef::Empty,
         };
-        self.prune_pending_segment_children();
+        self.prune_pending_lazy_children();
         Ok(())
     }
 
@@ -210,8 +241,8 @@ impl StorageTrieCow {
         }
 
         match self.root.clone() {
-            CowRootRef::Segment(root_ref)
-                if self.arena.nodes().is_empty() && self.pending_segment_children.is_empty() =>
+            CowRootRef::Lazy(CowLazyNodeRef::Segment(root_ref))
+                if self.arena.nodes().is_empty() && self.pending_lazy_children.is_empty() =>
             {
                 let reader = StorageTrieSegmentReader::open_shared_page(
                     root_ref.page_lease(),
@@ -223,10 +254,10 @@ impl StorageTrieCow {
                 self.arena = arena;
                 self.root = root.map(CowRootRef::Arena).unwrap_or(CowRootRef::Empty);
             }
-            CowRootRef::Persisted(root)
-                if self.arena.nodes().is_empty() && self.pending_segment_children.is_empty() =>
+            CowRootRef::Lazy(CowLazyNodeRef::Persisted(root))
+                if self.arena.nodes().is_empty() && self.pending_lazy_children.is_empty() =>
             {
-                let idx = self.materialize_persisted_root(store, root)?;
+                let idx = self.mutate_persisted_root(store, root)?;
                 self.root = CowRootRef::Arena(idx);
             }
             _ => {}
@@ -242,15 +273,13 @@ impl StorageTrieCow {
         let root = match self.root.clone() {
             CowRootRef::Empty => None,
             CowRootRef::Arena(idx) => Some(idx),
-            CowRootRef::Segment(_) | CowRootRef::Persisted(_) => {
-                self.materialize_all(store, self.root.clone())?
-            }
+            CowRootRef::Lazy(_) => self.materialize_root_subtree(store, self.root.clone())?,
         };
         self.root = match root {
             Some(idx) => CowRootRef::Arena(idx),
             None => CowRootRef::Empty,
         };
-        self.prune_pending_segment_children();
+        self.prune_pending_lazy_children();
 
         let result = storage_recompute::recompute(&mut self.arena, root);
         Ok((result.root, result.dirty_blobs, self))
@@ -260,12 +289,12 @@ impl StorageTrieCow {
         mut self,
         store: &PersistedTrieStore,
     ) -> Result<StorageOverlay> {
-        let root = self.materialize_all(store, self.root.clone())?;
+        let root = self.materialize_root_subtree(store, self.root.clone())?;
         self.root = match root {
             Some(idx) => CowRootRef::Arena(idx),
             None => CowRootRef::Empty,
         };
-        self.prune_pending_segment_children();
+        self.prune_pending_lazy_children();
         Ok(StorageOverlay::from_tree(MptTree { arena: self.arena, root }))
     }
 
@@ -329,26 +358,34 @@ impl StorageTrieCow {
         key: &Nibbles,
         offset: usize,
     ) -> Option<Vec<u8>> {
-        match self.pending_segment_children.get(&(parent_idx, edge)) {
+        match self.pending_lazy_children.get(&(parent_idx, edge)) {
             Some(CowChildRef::Arena(idx)) => self.get_arena_recursive(*idx, store, key, offset),
-            Some(CowChildRef::Hash(hash)) => {
-                self.get_persisted_recursive(*hash, store, key, offset).ok().flatten()
-            }
-            Some(CowChildRef::Inline(rlp)) => {
-                self.get_inline_recursive(rlp, store, key, offset).ok().flatten()
-            }
-            Some(CowChildRef::Segment(node_ref)) => {
-                self.get_segment_recursive(node_ref.clone(), store, key, offset).ok().flatten()
+            Some(CowChildRef::Lazy(lazy)) => {
+                self.get_lazy_recursive(lazy.clone(), store, key, offset).ok().flatten()
             }
             None => match child {
                 ChildRef::Arena(idx) => self.get_arena_recursive(*idx, store, key, offset),
-                ChildRef::Hash(hash) => {
-                    self.get_persisted_recursive(*hash, store, key, offset).ok().flatten()
-                }
-                ChildRef::Inline(rlp) => {
-                    self.get_inline_recursive(rlp, store, key, offset).ok().flatten()
-                }
+                other => self
+                    .get_lazy_recursive(child_ref_to_lazy(other.clone()), store, key, offset)
+                    .ok()
+                    .flatten(),
             },
+        }
+    }
+
+    fn get_lazy_recursive(
+        &self,
+        lazy: CowLazyNodeRef,
+        store: &PersistedTrieStore,
+        key: &Nibbles,
+        offset: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        match lazy {
+            CowLazyNodeRef::Persisted(root) => {
+                self.get_persisted_recursive(root, store, key, offset)
+            }
+            CowLazyNodeRef::Inline(rlp) => self.get_inline_recursive(&rlp, store, key, offset),
+            CowLazyNodeRef::Segment(root) => self.get_segment_recursive(root, store, key, offset),
         }
     }
 
@@ -519,19 +556,8 @@ impl StorageTrieCow {
         store: &PersistedTrieStore,
         key: &Nibbles,
     ) -> Result<Option<u32>> {
-        let root_idx = match self.root.clone() {
-            CowRootRef::Empty => return Ok(None),
-            CowRootRef::Arena(idx) => idx,
-            CowRootRef::Segment(root) => {
-                let idx = self.materialize_segment_node(root)?;
-                self.root = CowRootRef::Arena(idx);
-                idx
-            }
-            CowRootRef::Persisted(root) => {
-                let idx = self.materialize_persisted_root(store, root)?;
-                self.root = CowRootRef::Arena(idx);
-                idx
-            }
+        let Some(root_idx) = self.mutate_root_for_write(store)? else {
+            return Ok(None);
         };
         self.ensure_path_loaded_recursive(store, root_idx, key, 0)?;
         Ok(Some(root_idx))
@@ -542,22 +568,21 @@ impl StorageTrieCow {
         store: &PersistedTrieStore,
         key: &Nibbles,
     ) -> Result<Option<u32>> {
-        let root_idx = match self.root.clone() {
-            CowRootRef::Empty => return Ok(None),
-            CowRootRef::Arena(idx) => idx,
-            CowRootRef::Segment(root) => {
-                let idx = self.materialize_segment_node(root)?;
-                self.root = CowRootRef::Arena(idx);
-                idx
-            }
-            CowRootRef::Persisted(root) => {
-                let idx = self.materialize_persisted_root(store, root)?;
-                self.root = CowRootRef::Arena(idx);
-                idx
-            }
+        let Some(root_idx) = self.mutate_root_for_write(store)? else {
+            return Ok(None);
         };
         self.ensure_delete_ready_recursive(store, root_idx, key, 0)?;
         Ok(Some(root_idx))
+    }
+
+    fn mutate_root_for_write(&mut self, store: &PersistedTrieStore) -> Result<Option<u32>> {
+        let idx = match self.root.clone() {
+            CowRootRef::Empty => return Ok(None),
+            CowRootRef::Arena(idx) => idx,
+            CowRootRef::Lazy(lazy) => self.mutate_lazy_node_for_write(store, lazy)?,
+        };
+        self.root = CowRootRef::Arena(idx);
+        Ok(Some(idx))
     }
 
     fn ensure_path_loaded_recursive(
@@ -576,7 +601,7 @@ impl StorageTrieCow {
                 {
                     return Ok(());
                 }
-                let child_idx = self.materialize_child_on_path(store, idx, None, ext.child)?;
+                let child_idx = self.mutate_child_for_write(store, idx, None, ext.child)?;
                 self.ensure_path_loaded_recursive(store, child_idx, key, offset + ext.nibbles.len())
             }
             MptNode::Branch(branch) => {
@@ -587,7 +612,7 @@ impl StorageTrieCow {
                 let Some(child) = branch.children[nibble].clone() else {
                     return Ok(());
                 };
-                let child_idx = self.materialize_child_on_path(store, idx, Some(nibble), child)?;
+                let child_idx = self.mutate_child_for_write(store, idx, Some(nibble), child)?;
                 self.ensure_path_loaded_recursive(store, child_idx, key, offset + 1)
             }
         }
@@ -609,7 +634,7 @@ impl StorageTrieCow {
                 {
                     return Ok(());
                 }
-                let child_idx = self.materialize_child_on_path(store, idx, None, ext.child)?;
+                let child_idx = self.mutate_child_for_write(store, idx, None, ext.child)?;
                 self.ensure_delete_ready_recursive(
                     store,
                     child_idx,
@@ -634,7 +659,7 @@ impl StorageTrieCow {
                     self.materialize_other_branch_children(store, idx, nibble)?;
                 }
 
-                let child_idx = self.materialize_child_on_path(store, idx, Some(nibble), child)?;
+                let child_idx = self.mutate_child_for_write(store, idx, Some(nibble), child)?;
                 self.ensure_delete_ready_recursive(store, child_idx, key, offset + 1)
             }
         }
@@ -658,7 +683,7 @@ impl StorageTrieCow {
             match child {
                 Some(ChildRef::Arena(_)) | None => {}
                 Some(other) => {
-                    let _ = self.materialize_child_on_path(store, branch_idx, Some(slot), other)?;
+                    let _ = self.mutate_child_for_write(store, branch_idx, Some(slot), other)?;
                 }
             }
         }
@@ -679,7 +704,7 @@ impl StorageTrieCow {
             match child {
                 Some(ChildRef::Arena(_)) | None => {}
                 Some(other) => {
-                    let _ = self.materialize_child_on_path(store, branch_idx, Some(slot), other)?;
+                    let _ = self.mutate_child_for_write(store, branch_idx, Some(slot), other)?;
                     break;
                 }
             }
@@ -687,7 +712,7 @@ impl StorageTrieCow {
         Ok(())
     }
 
-    fn materialize_child_on_path(
+    fn mutate_child_for_write(
         &mut self,
         store: &PersistedTrieStore,
         parent_idx: u32,
@@ -695,17 +720,12 @@ impl StorageTrieCow {
         child: ChildRef,
     ) -> Result<u32> {
         let edge = pending_edge(branch_slot)?;
-        let child_idx = match self.pending_segment_children.remove(&(parent_idx, edge)) {
+        let child_idx = match self.pending_lazy_children.remove(&(parent_idx, edge)) {
             Some(CowChildRef::Arena(idx)) => idx,
-            Some(CowChildRef::Hash(hash)) => self.materialize_persisted_root(store, hash)?,
-            Some(CowChildRef::Inline(rlp)) => self.materialize_inline_node(&rlp)?,
-            Some(CowChildRef::Segment(segment_ref)) => {
-                self.materialize_segment_node(segment_ref)?
-            }
+            Some(CowChildRef::Lazy(lazy)) => self.mutate_lazy_node_for_write(store, lazy)?,
             None => match child {
                 ChildRef::Arena(idx) => idx,
-                ChildRef::Hash(hash) => self.materialize_persisted_root(store, hash)?,
-                ChildRef::Inline(rlp) => self.materialize_inline_node(&rlp)?,
+                other => self.mutate_lazy_node_for_write(store, child_ref_to_lazy(other))?,
             },
         };
 
@@ -720,11 +740,7 @@ impl StorageTrieCow {
         Ok(child_idx)
     }
 
-    fn materialize_persisted_root(
-        &mut self,
-        store: &PersistedTrieStore,
-        root: B256,
-    ) -> Result<u32> {
+    fn mutate_persisted_root(&mut self, store: &PersistedTrieStore, root: B256) -> Result<u32> {
         let rlp = store
             .get_node(root)?
             .ok_or_else(|| MptDbError::Other(format!("child node not found: {root}")))?;
@@ -735,13 +751,25 @@ impl StorageTrieCow {
         Ok(idx)
     }
 
+    fn mutate_lazy_node_for_write(
+        &mut self,
+        store: &PersistedTrieStore,
+        lazy: CowLazyNodeRef,
+    ) -> Result<u32> {
+        match lazy {
+            CowLazyNodeRef::Persisted(root) => self.mutate_persisted_root(store, root),
+            CowLazyNodeRef::Inline(rlp) => self.materialize_inline_node(&rlp),
+            CowLazyNodeRef::Segment(node_ref) => self.mutate_segment_node(node_ref),
+        }
+    }
+
     fn materialize_inline_node(&mut self, rlp: &[u8]) -> Result<u32> {
         let node =
             decode_node(rlp).map_err(|e| MptDbError::Other(format!("decode inline child: {e}")))?;
         Ok(self.arena.alloc_clean(node))
     }
 
-    fn materialize_segment_node(&mut self, node_ref: SegmentNodeRef) -> Result<u32> {
+    fn mutate_segment_node(&mut self, node_ref: SegmentNodeRef) -> Result<u32> {
         let reader = StorageTrieSegmentReader::open_shared_page(
             node_ref.page_lease(),
             node_ref.page_lease().root(),
@@ -786,7 +814,8 @@ impl StorageTrieCow {
         };
         let idx = self.arena.alloc_clean(node);
         for (edge, child_ref) in deferred_children {
-            self.pending_segment_children.insert((idx, edge), CowChildRef::Segment(child_ref));
+            self.pending_lazy_children
+                .insert((idx, edge), CowChildRef::Lazy(CowLazyNodeRef::Segment(child_ref)));
         }
         if let Some(hash) = node_ref.hash() {
             self.arena.set_hash(idx, hash);
@@ -794,7 +823,12 @@ impl StorageTrieCow {
         Ok(idx)
     }
 
-    fn materialize_all(
+    #[cfg(test)]
+    fn materialize_segment_node(&mut self, node_ref: SegmentNodeRef) -> Result<u32> {
+        self.mutate_segment_node(node_ref)
+    }
+
+    fn materialize_root_subtree(
         &mut self,
         store: &PersistedTrieStore,
         root: CowRootRef,
@@ -802,14 +836,27 @@ impl StorageTrieCow {
         let idx = match root {
             CowRootRef::Empty => return Ok(None),
             CowRootRef::Arena(idx) => idx,
-            CowRootRef::Segment(node_ref) => self.materialize_segment_subtree(node_ref)?,
-            CowRootRef::Persisted(root) => self.materialize_persisted_subtree(store, root)?,
+            CowRootRef::Lazy(lazy) => self.materialize_lazy_subtree(store, lazy)?,
         };
         Ok(Some(idx))
     }
 
-    fn prune_pending_segment_children(&mut self) {
-        if self.pending_segment_children.is_empty() {
+    fn materialize_lazy_subtree(
+        &mut self,
+        store: &PersistedTrieStore,
+        lazy: CowLazyNodeRef,
+    ) -> Result<u32> {
+        match lazy {
+            CowLazyNodeRef::Segment(node_ref) => self.materialize_segment_lazy_subtree(node_ref),
+            CowLazyNodeRef::Persisted(root) => self.materialize_persisted_lazy_subtree(store, root),
+            CowLazyNodeRef::Inline(_) => {
+                return Err(MptDbError::Other("root cannot be inline lazy node".to_string()))
+            }
+        }
+    }
+
+    fn prune_pending_lazy_children(&mut self) {
+        if self.pending_lazy_children.is_empty() {
             return;
         }
 
@@ -843,7 +890,7 @@ impl StorageTrieCow {
             }
         }
 
-        self.pending_segment_children.retain(|(idx, edge), _| {
+        self.pending_lazy_children.retain(|(idx, edge), _| {
             let slot = *idx as usize;
             if slot >= reachable.len() || !reachable[slot] {
                 return false;
@@ -862,7 +909,7 @@ impl StorageTrieCow {
         });
     }
 
-    fn materialize_segment_subtree(&mut self, node_ref: SegmentNodeRef) -> Result<u32> {
+    fn materialize_segment_lazy_subtree(&mut self, node_ref: SegmentNodeRef) -> Result<u32> {
         let reader = StorageTrieSegmentReader::open_shared_page(
             node_ref.page_lease(),
             node_ref.page_lease().root(),
@@ -880,11 +927,9 @@ impl StorageTrieCow {
                 let child_ref = match child.target_idx {
                     Some(seg_idx) => {
                         let hash = reader.view_node(seg_idx)?.hash;
-                        let child_idx = self.materialize_segment_subtree(SegmentNodeRef::new(
-                            Arc::clone(node_ref.page_lease()),
-                            seg_idx,
-                            hash,
-                        ))?;
+                        let child_idx = self.materialize_segment_lazy_subtree(
+                            SegmentNodeRef::new(Arc::clone(node_ref.page_lease()), seg_idx, hash),
+                        )?;
                         ChildRef::Arena(child_idx)
                     }
                     None => segment_child_to_ref(child.embed)?,
@@ -903,7 +948,7 @@ impl StorageTrieCow {
                         Some(seg_idx) => {
                             let hash = reader.view_node(seg_idx)?.hash;
                             let child_idx =
-                                self.materialize_segment_subtree(SegmentNodeRef::new(
+                                self.materialize_segment_lazy_subtree(SegmentNodeRef::new(
                                     Arc::clone(node_ref.page_lease()),
                                     seg_idx,
                                     hash,
@@ -922,7 +967,7 @@ impl StorageTrieCow {
         Ok(idx)
     }
 
-    fn materialize_persisted_subtree(
+    fn materialize_persisted_lazy_subtree(
         &mut self,
         store: &PersistedTrieStore,
         root: B256,
@@ -935,7 +980,8 @@ impl StorageTrieCow {
         let idx = match node {
             MptNode::Leaf(leaf) => self.arena.alloc_clean(MptNode::Leaf(leaf)),
             MptNode::Extension(ext) => {
-                let child_idx = materialize_persisted_child(store, &mut self.arena, ext.child)?;
+                let child_idx =
+                    materialize_lazy_child(store, &mut self.arena, child_ref_to_lazy(ext.child))?;
                 self.arena.alloc_clean(MptNode::Extension(ExtensionNode {
                     nibbles: ext.nibbles,
                     child: ChildRef::Arena(child_idx),
@@ -945,7 +991,11 @@ impl StorageTrieCow {
                 let mut children: [Option<ChildRef>; 16] = std::array::from_fn(|_| None);
                 for (slot, child) in branch.children.into_iter().enumerate() {
                     if let Some(child) = child {
-                        let child_idx = materialize_persisted_child(store, &mut self.arena, child)?;
+                        let child_idx = materialize_lazy_child(
+                            store,
+                            &mut self.arena,
+                            child_ref_to_lazy(child),
+                        )?;
                         children[slot] = Some(ChildRef::Arena(child_idx));
                     }
                 }
@@ -958,14 +1008,13 @@ impl StorageTrieCow {
     }
 }
 
-fn materialize_persisted_child(
+fn materialize_lazy_child(
     store: &PersistedTrieStore,
     arena: &mut MutableTrieArena,
-    child: ChildRef,
+    lazy: CowLazyNodeRef,
 ) -> Result<u32> {
-    match child {
-        ChildRef::Arena(idx) => Ok(idx),
-        ChildRef::Hash(hash) => {
+    match lazy {
+        CowLazyNodeRef::Persisted(hash) => {
             let rlp = store
                 .get_node(hash)?
                 .ok_or_else(|| MptDbError::Other(format!("child node not found: {hash}")))?;
@@ -974,7 +1023,8 @@ fn materialize_persisted_child(
             let idx = match node {
                 MptNode::Leaf(leaf) => arena.alloc_clean(MptNode::Leaf(leaf)),
                 MptNode::Extension(ext) => {
-                    let child_idx = materialize_persisted_child(store, arena, ext.child)?;
+                    let child_idx =
+                        materialize_lazy_child(store, arena, child_ref_to_lazy(ext.child))?;
                     arena.alloc_clean(MptNode::Extension(ExtensionNode {
                         nibbles: ext.nibbles,
                         child: ChildRef::Arena(child_idx),
@@ -984,7 +1034,8 @@ fn materialize_persisted_child(
                     let mut children: [Option<ChildRef>; 16] = std::array::from_fn(|_| None);
                     for (slot, child) in branch.children.into_iter().enumerate() {
                         if let Some(child) = child {
-                            let child_idx = materialize_persisted_child(store, arena, child)?;
+                            let child_idx =
+                                materialize_lazy_child(store, arena, child_ref_to_lazy(child))?;
                             children[slot] = Some(ChildRef::Arena(child_idx));
                         }
                     }
@@ -994,13 +1045,14 @@ fn materialize_persisted_child(
             arena.set_hash(idx, hash);
             Ok(idx)
         }
-        ChildRef::Inline(rlp) => {
+        CowLazyNodeRef::Inline(rlp) => {
             let node = decode_node(&rlp)
                 .map_err(|e| MptDbError::Other(format!("decode inline child: {e}")))?;
             match node {
                 MptNode::Leaf(leaf) => Ok(arena.alloc_clean(MptNode::Leaf(leaf))),
                 MptNode::Extension(ext) => {
-                    let child_idx = materialize_persisted_child(store, arena, ext.child)?;
+                    let child_idx =
+                        materialize_lazy_child(store, arena, child_ref_to_lazy(ext.child))?;
                     Ok(arena.alloc_clean(MptNode::Extension(ExtensionNode {
                         nibbles: ext.nibbles,
                         child: ChildRef::Arena(child_idx),
@@ -1010,7 +1062,8 @@ fn materialize_persisted_child(
                     let mut children: [Option<ChildRef>; 16] = std::array::from_fn(|_| None);
                     for (slot, child) in branch.children.into_iter().enumerate() {
                         if let Some(child) = child {
-                            let child_idx = materialize_persisted_child(store, arena, child)?;
+                            let child_idx =
+                                materialize_lazy_child(store, arena, child_ref_to_lazy(child))?;
                             children[slot] = Some(ChildRef::Arena(child_idx));
                         }
                     }
@@ -1018,6 +1071,16 @@ fn materialize_persisted_child(
                         .alloc_clean(MptNode::Branch(BranchNode { children, value: branch.value })))
                 }
             }
+        }
+        CowLazyNodeRef::Segment(node_ref) => {
+            let mut cow = StorageTrieCow {
+                root: CowRootRef::Empty,
+                arena: std::mem::take(arena),
+                pending_lazy_children: HashMap::new(),
+            };
+            let idx = cow.materialize_segment_lazy_subtree(node_ref)?;
+            *arena = cow.arena;
+            Ok(idx)
         }
     }
 }
@@ -1030,6 +1093,14 @@ fn segment_child_to_ref(embed: SegmentChildEmbedRef<'_>) -> Result<ChildRef> {
         SegmentChildEmbedRef::Hash(hash) => ChildRef::Hash(hash),
         SegmentChildEmbedRef::Inline(bytes) => ChildRef::Inline(bytes.to_vec()),
     })
+}
+
+fn child_ref_to_lazy(child: ChildRef) -> CowLazyNodeRef {
+    match child {
+        ChildRef::Arena(_) => unreachable!("arena child is not lazy"),
+        ChildRef::Hash(hash) => CowLazyNodeRef::Persisted(hash),
+        ChildRef::Inline(rlp) => CowLazyNodeRef::Inline(rlp),
+    }
 }
 
 fn pending_edge(branch_slot: Option<usize>) -> Result<PendingCowEdge> {
@@ -1065,7 +1136,10 @@ mod tests {
     fn cow_from_persisted_root_keeps_root_hash() {
         let root = B256::with_last_byte(0x11);
         let cow = StorageTrieCow::from_persisted_root(root);
-        assert!(matches!(cow.root_ref(), CowRootRef::Persisted(value) if *value == root));
+        assert!(matches!(
+            cow.root_ref(),
+            CowRootRef::Lazy(CowLazyNodeRef::Persisted(value)) if *value == root
+        ));
     }
 
     #[test]
@@ -1080,7 +1154,7 @@ mod tests {
         store.persist_batch(&blobs, true).unwrap();
 
         let mut cow = StorageTrieCow::from_persisted_root(root);
-        let idx = cow.materialize_persisted_root(&store, root).unwrap();
+        let idx = cow.materialize_lazy_subtree(&store, CowLazyNodeRef::Persisted(root)).unwrap();
         assert_eq!(cow.arena_hash_cache()[idx as usize], Some(root));
     }
 
@@ -1101,7 +1175,7 @@ mod tests {
         let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
         let cow = StorageTrieCow::from_segment_page(Arc::clone(&lease));
         match cow.root_ref() {
-            CowRootRef::Segment(root) => {
+            CowRootRef::Lazy(CowLazyNodeRef::Segment(root)) => {
                 assert_eq!(root.page_lease().root(), lease.root());
                 assert_eq!(root.hash(), Some(lease.root()));
             }
@@ -1147,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn cow_materialize_segment_node_tracks_pending_segment_children() {
+    fn cow_materialize_segment_node_tracks_pending_lazy_children() {
         let mut base = MptTree::new();
         let key1 = Nibbles::from_nibbles(&[1]);
         let key2 = Nibbles::from_nibbles(&[2]);
@@ -1166,16 +1240,16 @@ mod tests {
 
         let mut cow = StorageTrieCow::from_segment_page(lease);
         let root_ref = match cow.root_ref() {
-            CowRootRef::Segment(root_ref) => root_ref.clone(),
+            CowRootRef::Lazy(CowLazyNodeRef::Segment(root_ref)) => root_ref.clone(),
             _ => panic!("expected segment root"),
         };
         let idx = cow.materialize_segment_node(root_ref).unwrap();
 
-        assert!(cow.pending_segment_children.contains_key(&(idx, PendingCowEdge::Branch(1))));
-        assert!(cow.pending_segment_children.contains_key(&(idx, PendingCowEdge::Branch(2))));
+        assert!(cow.pending_lazy_children.contains_key(&(idx, PendingCowEdge::Branch(1))));
+        assert!(cow.pending_lazy_children.contains_key(&(idx, PendingCowEdge::Branch(2))));
         assert!(matches!(
-            cow.pending_segment_children.get(&(idx, PendingCowEdge::Branch(1))),
-            Some(CowChildRef::Segment(_))
+            cow.pending_lazy_children.get(&(idx, PendingCowEdge::Branch(1))),
+            Some(CowChildRef::Lazy(CowLazyNodeRef::Segment(_)))
         ));
     }
 
@@ -1208,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn cow_prunes_pending_segment_children_when_root_changes() {
+    fn cow_prunes_pending_lazy_children_when_root_changes() {
         let mut base = MptTree::new();
         let key1 = Nibbles::from_nibbles(&[1]);
         let key2 = Nibbles::from_nibbles(&[2]);
@@ -1227,16 +1301,16 @@ mod tests {
 
         let mut cow = StorageTrieCow::from_segment_page(lease);
         let root_ref = match cow.root_ref() {
-            CowRootRef::Segment(root_ref) => root_ref.clone(),
+            CowRootRef::Lazy(CowLazyNodeRef::Segment(root_ref)) => root_ref.clone(),
             _ => panic!("expected segment root"),
         };
         let idx = cow.materialize_segment_node(root_ref).unwrap();
         cow.root = CowRootRef::Arena(idx);
-        assert!(!cow.pending_segment_children.is_empty());
+        assert!(!cow.pending_lazy_children.is_empty());
 
         cow.root = CowRootRef::Empty;
-        cow.prune_pending_segment_children();
-        assert!(cow.pending_segment_children.is_empty());
+        cow.prune_pending_lazy_children();
+        assert!(cow.pending_lazy_children.is_empty());
     }
 
     #[test]

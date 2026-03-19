@@ -33,13 +33,16 @@ use super::{
         PublishedBaselineManager, PublishedBaselineMeta, PublishedBaselineReader,
     },
     r#trait::{CommitFrontier, MptCommitter, MptGcStats, MptSnapshotExporter, MptSnapshotImporter},
-    segment::{SegmentPageLease, StorageSegmentLocator, StorageTrieSegment},
+    segment::StorageTrieSegment,
     snapshot::{SnapshotExporter, SnapshotImporter},
     state::{self, DirtyAccount},
     storage_cow::StorageTrieCow,
     tree::MptTree,
     tree_algo,
 };
+
+#[cfg(test)]
+use super::storage_cow::{CowLazyNodeRef, CowRootRef};
 
 #[cfg(test)]
 use alloy_primitives::U256;
@@ -69,6 +72,58 @@ enum StorageTriePublishView {
     DeferredRoot(B256),
 }
 
+#[derive(Clone)]
+struct StorageTrieHandle {
+    base: StorageTrieCow,
+    base_version: i64,
+    working: Option<StorageTrieCow>,
+    working_version: Option<i64>,
+}
+
+impl StorageTrieHandle {
+    fn active(base_version: i64, working_version: i64, trie: StorageTrieCow) -> Self {
+        Self {
+            base: trie.clone(),
+            base_version,
+            working: Some(trie),
+            working_version: Some(working_version),
+        }
+    }
+
+    fn has_working(&self) -> bool {
+        self.working.is_some()
+    }
+
+    fn has_working_for_version(&self, version: i64) -> bool {
+        self.working_version == Some(version)
+    }
+
+    fn checkout_for_write(&mut self, working_version: i64) {
+        if self.working_version == Some(working_version) {
+            return;
+        }
+        if self.working.is_none() {
+            self.working = Some(self.base.clone());
+        }
+        self.working_version = Some(working_version);
+    }
+
+    fn set_committed_base(&mut self, committed_version: i64, trie: StorageTrieCow) {
+        self.base = trie;
+        self.base_version = committed_version;
+        self.working = None;
+        self.working_version = None;
+    }
+
+    fn take_working_for_version(&mut self, version: i64) -> Option<StorageTrieCow> {
+        if self.working_version != Some(version) {
+            return None;
+        }
+        self.working_version = None;
+        self.working.take()
+    }
+}
+
 /// A persist job sent to the background worker thread.
 struct PersistJob {
     barrier_only: bool,
@@ -87,124 +142,7 @@ struct PersistJob {
     done: Option<crossbeam_channel::Sender<Result<()>>>,
 }
 
-struct StorageTrieCache {
-    hot: LruMap<B256, StorageTrieCow, ByLength>,
-    cold: LruMap<B256, StorageTrieCacheEntry, ByLength>,
-    hot_capacity: usize,
-    cold_capacity: usize,
-}
-
-enum StorageTrieCacheEntry {
-    Empty,
-    SegmentPage(Arc<SegmentPageLease>),
-    Trie(StorageTrieCow),
-}
-
-impl StorageTrieCacheEntry {
-    fn into_working_cow(self) -> StorageTrieCow {
-        match self {
-            Self::Empty => StorageTrieCow::empty(),
-            Self::SegmentPage(lease) => StorageTrieCow::from_segment_page(lease),
-            Self::Trie(trie) => trie,
-        }
-    }
-
-    #[cfg(test)]
-    fn kind_name(&self) -> &'static str {
-        match self {
-            Self::Empty => "empty",
-            Self::SegmentPage(_) => "segment_page",
-            Self::Trie(_) => "trie",
-        }
-    }
-}
-
-impl StorageTrieCache {
-    fn new(capacity: usize) -> Self {
-        let hot_capacity =
-            if capacity < 64 { 0 } else { (capacity / 16).clamp(1, 4_096).min(capacity / 2) };
-        let cold_capacity = capacity.saturating_sub(hot_capacity);
-        Self {
-            hot: LruMap::new(ByLength::new(hot_capacity.max(1) as u32)),
-            cold: LruMap::new(ByLength::new(cold_capacity.max(1) as u32)),
-            hot_capacity,
-            cold_capacity,
-        }
-    }
-
-    fn remove(&mut self, key: &B256) -> Option<StorageTrieCacheEntry> {
-        if let Some(trie) = self.hot.remove(key) {
-            return Some(StorageTrieCacheEntry::Trie(trie));
-        }
-        self.cold.remove(key)
-    }
-
-    fn insert_hot_trie(&mut self, key: B256, trie: StorageTrieCow) {
-        if self.hot_capacity == 0 {
-            self.insert_cold(key, StorageTrieCacheEntry::Trie(trie));
-            return;
-        }
-        self.hot.remove(&key);
-        let _ = self.hot.get_or_insert(key, || trie);
-    }
-
-    fn insert_cold(&mut self, key: B256, entry: StorageTrieCacheEntry) {
-        if self.cold_capacity == 0 {
-            return;
-        }
-        self.cold.remove(&key);
-        let _ = self.cold.get_or_insert(key, || entry);
-    }
-
-    #[cfg(test)]
-    fn insert(&mut self, key: B256, entry: StorageTrieCacheEntry) {
-        match entry {
-            StorageTrieCacheEntry::Trie(trie) => self.insert_hot_trie(key, trie),
-            entry => self.insert_cold(key, entry),
-        }
-    }
-
-    #[cfg(test)]
-    fn contains_key(&self, key: &B256) -> bool {
-        self.hot.peek(key).is_some() || self.cold.peek(key).is_some()
-    }
-
-    fn clear(&mut self) {
-        self.hot.clear();
-        self.cold.clear();
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.hot.is_empty() && self.cold.is_empty()
-    }
-}
-
-struct StorageTrieRecentTouches {
-    inner: LruMap<B256, (), ByLength>,
-    capacity: usize,
-}
-
-impl StorageTrieRecentTouches {
-    fn new(capacity: usize) -> Self {
-        let limit = capacity.max(1) as u32;
-        Self { inner: LruMap::new(ByLength::new(limit)), capacity }
-    }
-
-    fn note_touch(&mut self, key: B256) -> bool {
-        if self.capacity == 0 {
-            return false;
-        }
-        let seen = self.inner.peek(&key).is_some();
-        self.inner.remove(&key);
-        let _ = self.inner.get_or_insert(key, || ());
-        seen
-    }
-
-    fn clear(&mut self) {
-        self.inner.clear();
-    }
-}
+const LIGHT_STORAGE_TRIE_CACHE_MULTIPLIER: usize = 4;
 
 #[derive(Debug, Clone, Default)]
 pub struct CommitProfile {
@@ -240,6 +178,17 @@ pub struct CommitProfile {
     pub total_commit: Duration,
 }
 
+#[derive(Default)]
+struct StorageTrieLoadStats {
+    l2_hits: u64,
+    l3_latest_hits: u64,
+    l3_published_hits: u64,
+    l3_published_post_flush_hits: u64,
+    node_fallback_loads: u64,
+    l3_latest_load: Duration,
+    l3_published_load: Duration,
+}
+
 #[derive(Serialize, Deserialize)]
 struct AccountTrieCheckpoint {
     version: i64,
@@ -254,17 +203,11 @@ pub struct MptCommitStore {
     manifest_path: PathBuf,
 
     account_trie: MptTree,
-    /// Per-account storage tries (hashed_address -> storage trie) for the current block.
-    storage_tries: HashMap<B256, StorageTrieCow>,
-    /// Cross-block LRU cache for storage tries. After commit, clean tries are moved here
-    /// so the next block can reuse them without reloading from RocksDB.
-    storage_trie_cache: StorageTrieCache,
-    /// Recent-touch filter used to admit only cross-block-hot storage tries into L2.
-    storage_trie_recent_touches: StorageTrieRecentTouches,
-    /// Storage tries eligible to be reinserted into L2 after the current commit.
-    cache_admit_candidates: HashSet<B256>,
-    /// Hot storage tries should stay in ready-to-mutate form for the next block.
-    hot_cache_candidates: HashSet<B256>,
+    /// Long-lived per-account storage trie handles. Working block-local state is carried in the
+    /// handle's optional `working` trie rather than a separate map.
+    storage_trie_handles: HashMap<B256, StorageTrieHandle>,
+    /// Cross-block LRU index for resident storage trie bases.
+    storage_trie_cache: LruMap<B256, (), ByLength>,
     dirty_accounts: Vec<DirtyAccount>,
 
     persisted: Arc<PersistedTrieStore>,
@@ -326,64 +269,348 @@ pub struct MptCommitStore {
 }
 
 impl MptCommitStore {
-    fn storage_trie_cache_bulk_threshold(&self) -> usize {
-        self.config.storage_trie_cache_capacity.max(1) / 2
+    fn current_working_version(&self) -> i64 {
+        self.version + 1
     }
 
-    fn build_storage_trie_cache_entry(
-        &self,
-        hashed_address: B256,
-        storage_root: B256,
-        mut trie: StorageTrieCow,
-        latest_locators: &HashMap<B256, StorageSegmentLocator>,
-        use_async: bool,
-    ) -> Result<StorageTrieCacheEntry> {
-        if storage_root == EMPTY_ROOT_HASH {
-            return Ok(StorageTrieCacheEntry::Empty);
+    fn storage_trie_cache_limit(capacity: usize) -> usize {
+        if capacity == 0 {
+            0
+        } else {
+            capacity.saturating_mul(LIGHT_STORAGE_TRIE_CACHE_MULTIPLIER)
+        }
+    }
+
+    fn new_storage_trie_cache(capacity: usize) -> LruMap<B256, (), ByLength> {
+        let limit = Self::storage_trie_cache_limit(capacity);
+        LruMap::new(ByLength::new(limit.max(1) as u32))
+    }
+
+    fn checkout_cached_storage_trie(&mut self, hashed_address: &B256) -> bool {
+        let working_version = self.current_working_version();
+        let Some(handle) = self.storage_trie_handles.get_mut(hashed_address) else {
+            return false;
+        };
+        handle.checkout_for_write(working_version);
+        if self.storage_trie_cache.peek(hashed_address).is_some() {
+            let _ = self.storage_trie_cache.get(hashed_address);
+        }
+        true
+    }
+
+    fn evict_cached_storage_trie(&mut self, hashed_address: &B256) -> Option<StorageTrieCow> {
+        self.storage_trie_cache.remove(hashed_address);
+        self.storage_trie_handles
+            .remove(hashed_address)
+            .map(|handle| handle.working.unwrap_or(handle.base))
+    }
+
+    fn touch_cached_storage_trie(&mut self, hashed_address: B256) {
+        let limit = Self::storage_trie_cache_limit(self.config.storage_trie_cache_capacity);
+        if limit == 0 {
+            return;
         }
 
-        if !use_async {
-            if let (Some(fs), Some(locator)) =
-                (self.fast_store.as_ref(), latest_locators.get(&hashed_address))
+        let evicted = if self.storage_trie_cache.peek(&hashed_address).is_none() &&
+            self.storage_trie_cache.len() >= limit
+        {
+            self.storage_trie_cache.peek_oldest().map(|(oldest, _)| *oldest)
+        } else {
+            None
+        };
+
+        self.storage_trie_cache.remove(&hashed_address);
+        let _ = self.storage_trie_cache.get_or_insert(hashed_address, || ());
+
+        if let Some(evicted) = evicted {
+            if evicted != hashed_address &&
+                self.storage_trie_cache.peek(&evicted).is_none() &&
+                self.storage_trie_handles
+                    .get(&evicted)
+                    .is_some_and(|handle| !handle.has_working())
             {
-                if let Ok(Some(lease)) = fs.open_locator_page(*locator) {
-                    return Ok(StorageTrieCacheEntry::SegmentPage(lease));
-                }
+                self.storage_trie_handles.remove(&evicted);
             }
         }
-
-        if let Some(root_idx) = trie.root_index() {
-            let segment = StorageTrieSegment::from_parts(
-                trie.arena_nodes(),
-                trie.arena_hash_cache(),
-                Some(root_idx),
-                storage_root,
-            )?;
-            return Ok(StorageTrieCacheEntry::SegmentPage(segment.into_page_lease()));
-        }
-
-        trie.clear_dirty();
-        Ok(StorageTrieCacheEntry::Trie(trie))
     }
 
-    fn build_hot_storage_trie_cache_entry(
-        &self,
-        storage_root: B256,
-        mut trie: StorageTrieCow,
-    ) -> StorageTrieCacheEntry {
-        if storage_root == EMPTY_ROOT_HASH {
-            return StorageTrieCacheEntry::Empty;
+    fn cache_storage_trie(&mut self, hashed_address: B256, trie: StorageTrieCow) {
+        let committed_version = self.version;
+        if let Some(handle) = self.storage_trie_handles.get_mut(&hashed_address) {
+            handle.set_committed_base(committed_version, trie);
+        } else {
+            self.storage_trie_handles.insert(
+                hashed_address,
+                StorageTrieHandle {
+                    base: trie,
+                    base_version: committed_version,
+                    working: None,
+                    working_version: None,
+                },
+            );
         }
-        trie.clear_dirty();
-        StorageTrieCacheEntry::Trie(trie)
+        self.touch_cached_storage_trie(hashed_address);
     }
 
-    fn insert_working_cow(&mut self, hashed_address: B256, cow: StorageTrieCow) {
-        self.storage_tries.insert(hashed_address, cow);
+    fn clear_storage_trie_cache(&mut self) {
+        self.storage_trie_cache.clear();
+        self.storage_trie_handles.retain(|_, handle| handle.has_working());
+    }
+
+    #[cfg(test)]
+    fn storage_trie_cache_contains(&self, hashed_address: &B256) -> bool {
+        self.storage_trie_cache.peek(hashed_address).is_some()
+    }
+
+    #[cfg(test)]
+    fn clone_cached_storage_trie(&mut self, hashed_address: &B256) -> Option<StorageTrieCow> {
+        if self.storage_trie_cache.peek(hashed_address).is_none() {
+            return None;
+        }
+        let handle = self.storage_trie_handles.get(hashed_address)?;
+        Some(handle.base.clone())
+    }
+
+    #[cfg(test)]
+    fn storage_trie_cache_is_empty(&self) -> bool {
+        self.storage_trie_cache.is_empty() && self.storage_trie_handles.is_empty()
+    }
+
+    #[cfg(test)]
+    fn working_storage_tries_empty(&self) -> bool {
+        self.storage_trie_handles.values().all(|handle| !handle.has_working())
+    }
+
+    fn activate_snapshot_trie(&mut self, hashed_address: B256, trie: StorageTrieCow) {
+        self.storage_trie_handles.insert(
+            hashed_address,
+            StorageTrieHandle::active(self.version, self.current_working_version(), trie),
+        );
+        self.touch_cached_storage_trie(hashed_address);
+    }
+
+    fn activate_empty_trie(&mut self, hashed_address: B256) {
+        self.storage_trie_handles.insert(
+            hashed_address,
+            StorageTrieHandle::active(
+                self.version,
+                self.current_working_version(),
+                StorageTrieCow::empty(),
+            ),
+        );
     }
 
     fn contains_working_trie(&self, hashed_address: &B256) -> bool {
-        self.storage_tries.contains_key(hashed_address)
+        self.storage_trie_handles
+            .get(hashed_address)
+            .is_some_and(|handle| handle.has_working_for_version(self.current_working_version()))
+    }
+
+    fn take_working_handles(
+        &mut self,
+        hashed_addresses: impl IntoIterator<Item = B256>,
+    ) -> Vec<(B256, StorageTrieHandle)> {
+        let mut handles = Vec::new();
+        for hashed_address in hashed_addresses {
+            if let Some(handle) = self.storage_trie_handles.remove(&hashed_address) {
+                handles.push((hashed_address, handle));
+            }
+        }
+        handles
+    }
+
+    fn reinsert_handles(&mut self, handles: impl IntoIterator<Item = (B256, StorageTrieHandle)>) {
+        self.storage_trie_handles.extend(handles);
+    }
+
+    fn ensure_working_storage_tries(
+        &mut self,
+        dirty_accounts: &[DirtyAccount],
+    ) -> Result<StorageTrieLoadStats> {
+        let mut stats = StorageTrieLoadStats::default();
+        let mut latest_candidates: Vec<(B256, B256)> = Vec::new();
+        let published_current = self.has_current_published_view();
+
+        for dirty in dirty_accounts {
+            if dirty.storage_wiped || dirty.storage_changes.is_empty() {
+                continue;
+            }
+            if self.contains_working_trie(&dirty.hashed_address) {
+                continue;
+            }
+            if dirty.storage_known_empty {
+                self.activate_empty_trie(dirty.hashed_address);
+                continue;
+            }
+
+            let existing_root = self.get_existing_storage_root(&dirty.hashed_address);
+            if self.checkout_cached_storage_trie(&dirty.hashed_address) {
+                stats.l2_hits += 1;
+                continue;
+            }
+
+            if existing_root == EMPTY_ROOT_HASH {
+                self.activate_empty_trie(dirty.hashed_address);
+            } else {
+                latest_candidates.push((dirty.hashed_address, existing_root));
+            }
+        }
+
+        let mut storage_loads =
+            self.load_latest_storage_tries(latest_candidates, published_current, &mut stats)?;
+        storage_loads =
+            self.load_published_storage_tries(storage_loads, published_current, &mut stats)?;
+        self.load_persisted_storage_tries(storage_loads, published_current, &mut stats)?;
+
+        Ok(stats)
+    }
+
+    fn load_latest_storage_tries(
+        &mut self,
+        latest_candidates: Vec<(B256, B256)>,
+        published_current: bool,
+        stats: &mut StorageTrieLoadStats,
+    ) -> Result<Vec<(B256, B256)>> {
+        if latest_candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if let Some(ref fs) = self.fast_store {
+            let resolved = latest_candidates
+                .into_par_iter()
+                .map(|(hashed_address, existing_root)| {
+                    match fs.open_trie(&hashed_address, existing_root)? {
+                        Some(loaded) => {
+                            Ok((Some((hashed_address, loaded.trie, loaded.lookup_elapsed)), None))
+                        }
+                        None => Ok((None, Some((hashed_address, existing_root)))),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let mut deferred = Vec::new();
+            for (loaded, fallback) in resolved {
+                if let Some((hashed_address, trie, load_elapsed)) = loaded {
+                    self.activate_snapshot_trie(hashed_address, trie);
+                    stats.l3_latest_hits += 1;
+                    stats.l3_latest_load += load_elapsed;
+                } else if let Some(load) = fallback {
+                    deferred.push(load);
+                }
+            }
+            if published_current {
+                Ok(deferred)
+            } else {
+                Ok(deferred)
+            }
+        } else if published_current {
+            Ok(latest_candidates)
+        } else {
+            Ok(latest_candidates)
+        }
+    }
+
+    fn load_published_storage_tries(
+        &mut self,
+        candidates: Vec<(B256, B256)>,
+        _published_current: bool,
+        stats: &mut StorageTrieLoadStats,
+    ) -> Result<Vec<(B256, B256)>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(ref store) = self.published_store else {
+            return Ok(candidates);
+        };
+
+        let resolved = candidates
+            .into_par_iter()
+            .map(|(hashed_address, existing_root)| {
+                match store.open_trie(&hashed_address, existing_root)? {
+                    Some(loaded) => {
+                        Ok((Some((hashed_address, loaded.trie, loaded.lookup_elapsed)), None))
+                    }
+                    None => Ok((None, Some((hashed_address, existing_root)))),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut remaining = Vec::new();
+        for (loaded, fallback) in resolved {
+            if let Some((hashed_address, trie, load_elapsed)) = loaded {
+                self.activate_snapshot_trie(hashed_address, trie);
+                stats.l3_published_hits += 1;
+                stats.l3_published_load += load_elapsed;
+            } else if let Some(load) = fallback {
+                remaining.push(load);
+            }
+        }
+        Ok(remaining)
+    }
+
+    fn load_persisted_storage_tries(
+        &mut self,
+        mut candidates: Vec<(B256, B256)>,
+        published_current: bool,
+        stats: &mut StorageTrieLoadStats,
+    ) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        self.flush_persist()?;
+
+        if published_current {
+            candidates = self.load_published_storage_tries_after_flush(candidates, stats)?;
+        }
+
+        if !candidates.is_empty() {
+            stats.node_fallback_loads += candidates.len() as u64;
+            for (hashed_address, existing_root) in candidates {
+                self.activate_snapshot_trie(
+                    hashed_address,
+                    StorageTrieCow::from_persisted_root(existing_root),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn load_published_storage_tries_after_flush(
+        &mut self,
+        candidates: Vec<(B256, B256)>,
+        stats: &mut StorageTrieLoadStats,
+    ) -> Result<Vec<(B256, B256)>> {
+        let Some(ref store) = self.published_store else {
+            return Ok(candidates);
+        };
+
+        let resolved = candidates
+            .into_par_iter()
+            .map(|(hashed_address, existing_root)| {
+                match store.open_trie(&hashed_address, existing_root)? {
+                    Some(loaded) => {
+                        Ok((Some((hashed_address, loaded.trie, loaded.lookup_elapsed)), None))
+                    }
+                    None => Ok((None, Some((hashed_address, existing_root)))),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut remaining = Vec::new();
+        for (loaded, fallback) in resolved {
+            if let Some((hashed_address, trie, load_elapsed)) = loaded {
+                self.activate_snapshot_trie(hashed_address, trie);
+                stats.l3_published_post_flush_hits += 1;
+                stats.l3_published_load += load_elapsed;
+            } else if let Some(load) = fallback {
+                remaining.push(load);
+            }
+        }
+
+        Ok(remaining)
     }
 
     fn apply_storage_changes_to_working(
@@ -934,13 +1161,8 @@ impl MptCommitStore {
             dir: dir.to_path_buf(),
             manifest_path,
             account_trie,
-            storage_tries: HashMap::new(),
-            storage_trie_cache: StorageTrieCache::new(config.storage_trie_cache_capacity),
-            storage_trie_recent_touches: StorageTrieRecentTouches::new(
-                config.storage_trie_cache_capacity.saturating_mul(4),
-            ),
-            cache_admit_candidates: HashSet::new(),
-            hot_cache_candidates: HashSet::new(),
+            storage_trie_handles: HashMap::new(),
+            storage_trie_cache: Self::new_storage_trie_cache(config.storage_trie_cache_capacity),
             dirty_accounts: Vec::new(),
             persisted,
             fast_store,
@@ -1169,11 +1391,7 @@ impl MptCommitter for MptCommitStore {
         self.reload_account_trie()?;
         self.version = self.manifest.latest_version;
         self.dirty_accounts.clear();
-        self.storage_tries.clear();
-        self.storage_trie_cache.clear();
-        self.storage_trie_recent_touches.clear();
-        self.cache_admit_candidates.clear();
-        self.hot_cache_candidates.clear();
+        self.clear_storage_trie_cache();
         if let Some(ref fs) = self.fast_store {
             fs.clear_memory();
         }
@@ -1336,203 +1554,13 @@ impl MptCommitStore {
 
     fn apply_bundle_state_inner(&mut self, bundle: &BundleState) -> Result<()> {
         let published_refreshes = 0u64;
-        let mut l2_hits = 0u64;
-        let mut l3_latest_hits = 0u64;
-        let mut l3_published_hits = 0u64;
-        let mut l3_published_post_flush_hits = 0u64;
-        let mut node_fallback_loads = 0u64;
-        let mut l3_latest_load = Duration::ZERO;
-        let mut l3_published_load = Duration::ZERO;
-        let mut l3_into_tree = Duration::ZERO;
+        let l3_into_tree = Duration::ZERO;
 
         let collect_start = std::time::Instant::now();
         let dirty_accounts = state::collect_dirty_accounts(bundle)?;
         let collect_elapsed = collect_start.elapsed();
-        self.cache_admit_candidates.clear();
-        self.hot_cache_candidates.clear();
-        let cache_bulk_block = dirty_accounts.len() > self.storage_trie_cache_bulk_threshold();
         let load_start = std::time::Instant::now();
-        let mut latest_candidates: Vec<(B256, B256, Vec<Nibbles>)> = Vec::new();
-        let mut storage_loads: Vec<(B256, B256, Vec<Nibbles>)> = Vec::new();
-        let mut published_candidates: Vec<(B256, B256, Vec<Nibbles>)> = Vec::new();
-        let published_current = self.has_current_published_view();
-
-        for dirty in &dirty_accounts {
-            if dirty.storage_wiped || dirty.storage_changes.is_empty() {
-                continue;
-            }
-            if self.contains_working_trie(&dirty.hashed_address) {
-                continue;
-            }
-            let seen_recently = self.storage_trie_recent_touches.note_touch(dirty.hashed_address);
-            if dirty.storage_known_empty {
-                self.insert_working_cow(dirty.hashed_address, StorageTrieCow::empty());
-                if !cache_bulk_block || seen_recently {
-                    self.cache_admit_candidates.insert(dirty.hashed_address);
-                }
-                if seen_recently {
-                    self.hot_cache_candidates.insert(dirty.hashed_address);
-                }
-                continue;
-            }
-            if let Some(cached_trie) = self.storage_trie_cache.remove(&dirty.hashed_address) {
-                self.storage_tries.insert(dirty.hashed_address, cached_trie.into_working_cow());
-                self.cache_admit_candidates.insert(dirty.hashed_address);
-                self.hot_cache_candidates.insert(dirty.hashed_address);
-                l2_hits += 1;
-                continue;
-            }
-            if !cache_bulk_block || seen_recently {
-                self.cache_admit_candidates.insert(dirty.hashed_address);
-            }
-            if seen_recently {
-                self.hot_cache_candidates.insert(dirty.hashed_address);
-            }
-
-            let existing_root = self.get_existing_storage_root(&dirty.hashed_address);
-            if existing_root == EMPTY_ROOT_HASH {
-                self.insert_working_cow(dirty.hashed_address, StorageTrieCow::empty());
-            } else {
-                let touched_keys: Vec<Nibbles> =
-                    dirty.storage_changes.iter().map(|change| change.slot_key.clone()).collect();
-                latest_candidates.push((dirty.hashed_address, existing_root, touched_keys));
-            }
-        }
-
-        if !latest_candidates.is_empty() {
-            if let Some(ref fs) = self.fast_store {
-                let resolved = latest_candidates
-                    .into_par_iter()
-                    .map(|(hashed_address, existing_root, touched_keys)| {
-                        match fs.trace_touched_paths(
-                            &hashed_address,
-                            existing_root,
-                            &touched_keys,
-                        )? {
-                            Some(loaded) => {
-                                let (arena, root) = loaded.trace.into_parts();
-                                Ok((
-                                    Some((
-                                        hashed_address,
-                                        StorageTrieCow::from_tree(MptTree { arena, root }),
-                                        loaded.lookup_elapsed,
-                                        loaded.materialize_elapsed,
-                                    )),
-                                    None,
-                                ))
-                            }
-                            None => Ok((None, Some((hashed_address, existing_root, touched_keys)))),
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                for (loaded, fallback) in resolved {
-                    if let Some((hashed_address, trie, load_elapsed, materialize_elapsed)) = loaded
-                    {
-                        self.insert_working_cow(hashed_address, trie);
-                        l3_latest_hits += 1;
-                        l3_latest_load += load_elapsed;
-                        l3_into_tree += materialize_elapsed;
-                    } else if let Some(load) = fallback {
-                        if published_current {
-                            published_candidates.push(load);
-                        } else {
-                            storage_loads.push(load);
-                        }
-                    }
-                }
-            } else if published_current {
-                published_candidates = latest_candidates;
-            } else {
-                storage_loads = latest_candidates;
-            }
-        }
-
-        if !published_candidates.is_empty() {
-            if let Some(ref store) = self.published_store {
-                let resolved = published_candidates
-                    .into_par_iter()
-                    .map(|(hashed_address, existing_root, touched_keys)| {
-                        match store.materialize_touched_paths(
-                            &hashed_address,
-                            existing_root,
-                            &touched_keys,
-                        )? {
-                            Some(loaded) => {
-                                let (arena, root) = loaded.trace.into_parts();
-                                Ok((
-                                    Some((
-                                        hashed_address,
-                                        StorageTrieCow::from_tree(MptTree { arena, root }),
-                                        loaded.lookup_elapsed,
-                                        loaded.materialize_elapsed,
-                                    )),
-                                    None,
-                                ))
-                            }
-                            None => Ok((None, Some((hashed_address, existing_root, touched_keys)))),
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                for (loaded, fallback) in resolved {
-                    if let Some((hashed_address, trie, load_elapsed, materialize_elapsed)) = loaded
-                    {
-                        self.insert_working_cow(hashed_address, trie);
-                        l3_published_hits += 1;
-                        l3_published_load += load_elapsed;
-                        l3_into_tree += materialize_elapsed;
-                    } else if let Some(load) = fallback {
-                        storage_loads.push(load);
-                    }
-                }
-            }
-        }
-
-        if !storage_loads.is_empty() {
-            self.flush_persist()?;
-            let mut remaining_loads: Vec<(B256, B256, Vec<Nibbles>)> = Vec::new();
-            if published_current {
-                if let Some(ref store) = self.published_store {
-                    let resolved = storage_loads
-                        .into_par_iter()
-                        .map(|(hashed_address, existing_root, touched_keys)| {
-                            match store.open_trie(&hashed_address, existing_root)? {
-                                Some(loaded) => Ok((
-                                    Some((hashed_address, loaded.trie, loaded.lookup_elapsed)),
-                                    None,
-                                )),
-                                None => {
-                                    Ok((None, Some((hashed_address, existing_root, touched_keys))))
-                                }
-                            }
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    for (loaded, fallback) in resolved {
-                        if let Some((hashed_address, trie, load_elapsed)) = loaded {
-                            self.insert_working_cow(hashed_address, trie);
-                            l3_published_post_flush_hits += 1;
-                            l3_published_load += load_elapsed;
-                        } else if let Some(load) = fallback {
-                            remaining_loads.push(load);
-                        }
-                    }
-                } else {
-                    remaining_loads = storage_loads;
-                }
-            } else {
-                remaining_loads = storage_loads;
-            }
-
-            if !remaining_loads.is_empty() {
-                node_fallback_loads += remaining_loads.len() as u64;
-                self.storage_tries.extend(remaining_loads.into_iter().map(
-                    |(hashed_address, existing_root, _touched_keys)| {
-                        (hashed_address, StorageTrieCow::from_persisted_root(existing_root))
-                    },
-                ));
-            }
-        }
+        let load_stats = self.ensure_working_storage_tries(&dirty_accounts)?;
 
         let get_or_load_elapsed = load_start.elapsed();
         let mut slot_updates_elapsed = Duration::ZERO;
@@ -1543,35 +1571,42 @@ impl MptCommitStore {
         for dirty in &dirty_accounts {
             if dirty.storage_wiped {
                 // Evict from cache: selfdestruct invalidates any cached trie
-                self.storage_trie_cache.remove(&dirty.hashed_address);
+                self.evict_cached_storage_trie(&dirty.hashed_address);
                 // Evict from L3 fast store
                 if let Some(ref fs) = self.fast_store {
                     let _ = fs.delete_latest(&dirty.hashed_address);
                 }
                 // Wiped: start from empty storage trie, apply new changes on top.
-                self.insert_working_cow(dirty.hashed_address, StorageTrieCow::empty());
+                self.activate_empty_trie(dirty.hashed_address);
             }
             if dirty.storage_wiped || !dirty.storage_changes.is_empty() {
                 dirty_storage_accounts.insert(dirty.hashed_address, dirty);
             }
         }
 
-        let storage_tries = std::mem::take(&mut self.storage_tries);
-        let updated_storage_tries: Vec<(B256, StorageTrieCow)> = storage_tries
+        let working_version = self.current_working_version();
+        let dirty_addresses: Vec<B256> = dirty_storage_accounts.keys().copied().collect();
+        let dirty_handles = self.take_working_handles(dirty_addresses.clone());
+        let updated_handles: Vec<(B256, StorageTrieHandle)> = dirty_handles
             .into_par_iter()
-            .map(|(hashed_address, trie)| -> Result<(B256, StorageTrieCow)> {
+            .map(|(hashed_address, mut handle)| -> Result<(B256, StorageTrieHandle)> {
+                let trie = handle
+                    .take_working_for_version(working_version)
+                    .unwrap_or_else(|| handle.base.clone());
                 let trie = match dirty_storage_accounts.get(&hashed_address) {
                     Some(dirty) => {
                         Self::apply_storage_changes_to_working(trie, &self.persisted, dirty)?
                     }
                     None => trie,
                 };
-                Ok((hashed_address, trie))
+                handle.working = Some(trie);
+                handle.working_version = Some(working_version);
+                Ok((hashed_address, handle))
             })
             .collect::<Result<_>>()?;
-        self.storage_tries.extend(updated_storage_tries);
+        self.reinsert_handles(updated_handles);
 
-        for hashed_address in dirty_storage_accounts.keys() {
+        for hashed_address in &dirty_addresses {
             if !self.contains_working_trie(hashed_address) {
                 return Err(MptDbError::Other(format!(
                     "missing working storage trie for {}",
@@ -1586,15 +1621,15 @@ impl MptCommitStore {
         self.last_apply_collect_dirty_accounts = collect_elapsed;
         self.last_apply_get_or_load_storage_tries = get_or_load_elapsed;
         self.last_apply_storage_slot_updates = slot_updates_elapsed;
-        self.last_apply_l3_latest_load = l3_latest_load;
-        self.last_apply_l3_published_load = l3_published_load;
+        self.last_apply_l3_latest_load = load_stats.l3_latest_load;
+        self.last_apply_l3_published_load = load_stats.l3_published_load;
         self.last_apply_l3_into_tree = l3_into_tree;
         self.last_apply_published_refreshes = published_refreshes;
-        self.last_apply_l2_hits = l2_hits;
-        self.last_apply_l3_latest_hits = l3_latest_hits;
-        self.last_apply_l3_published_hits = l3_published_hits;
-        self.last_apply_l3_published_post_flush_hits = l3_published_post_flush_hits;
-        self.last_apply_node_fallback_loads = node_fallback_loads;
+        self.last_apply_l2_hits = load_stats.l2_hits;
+        self.last_apply_l3_latest_hits = load_stats.l3_latest_hits;
+        self.last_apply_l3_published_hits = load_stats.l3_published_hits;
+        self.last_apply_l3_published_post_flush_hits = load_stats.l3_published_post_flush_hits;
+        self.last_apply_node_fallback_loads = load_stats.node_fallback_loads;
         self.last_apply_slot_inserts = slot_stats.slot_inserts;
         self.last_apply_slot_deletes = slot_stats.slot_deletes;
         self.last_apply_leaf_splits = slot_stats.leaf_splits;
@@ -1619,8 +1654,7 @@ impl MptCommitStore {
         // Phase 1: compute storage roots for all dirty accounts.
         //
         // Collect DELETE/REUSE roots serially (cheap lookups), then compute
-        // RECOMPUTE roots potentially in parallel using mem::take on
-        // storage_tries for ownership transfer.
+        // RECOMPUTE roots from dirty handle working copies.
         let profile_start = std::time::Instant::now();
         let mut storage_roots: HashMap<B256, B256> =
             HashMap::with_capacity(self.dirty_accounts.len());
@@ -1639,18 +1673,27 @@ impl MptCommitStore {
             // RECOMPUTE case handled below via parallel/serial path
         }
 
-        // Take ownership of storage tries for root computation.
-        let storage_tries = std::mem::take(&mut self.storage_tries);
-        let storage_tries_len = storage_tries.len();
-        let should_parallel = self.parallelism.should_parallelize_storage_tries(storage_tries_len);
+        let working_version = self.current_working_version();
+        let dirty_working_addresses: Vec<B256> = self
+            .dirty_accounts
+            .iter()
+            .filter(|dirty| self.contains_working_trie(&dirty.hashed_address))
+            .map(|dirty| dirty.hashed_address)
+            .collect();
+        let dirty_handles = self.take_working_handles(dirty_working_addresses.clone());
+        let should_parallel =
+            self.parallelism.should_parallelize_storage_tries(dirty_handles.len());
         let mut storage_root_hash_elapsed = Duration::ZERO;
         let mut storage_segment_build_elapsed = Duration::ZERO;
         let persisted_for_hash = Arc::clone(&self.persisted);
 
         let storage_artifacts: Vec<StorageTrieCommitArtifacts> = if should_parallel {
-            storage_tries
+            dirty_handles
                 .into_par_iter()
-                .map(|(addr, trie)| -> Result<StorageTrieCommitArtifacts> {
+                .map(|(addr, mut handle)| -> Result<StorageTrieCommitArtifacts> {
+                    let trie = handle
+                        .take_working_for_version(working_version)
+                        .unwrap_or_else(|| handle.base.clone());
                     let hash_start = std::time::Instant::now();
                     let (root, blobs, cow) = trie.root_hash_and_dirty_blobs(&persisted_for_hash)?;
                     let hash_elapsed = hash_start.elapsed();
@@ -1666,9 +1709,12 @@ impl MptCommitStore {
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
-            storage_tries
+            dirty_handles
                 .into_iter()
-                .map(|(addr, trie)| -> Result<StorageTrieCommitArtifacts> {
+                .map(|(addr, mut handle)| -> Result<StorageTrieCommitArtifacts> {
+                    let trie = handle
+                        .take_working_for_version(working_version)
+                        .unwrap_or_else(|| handle.base.clone());
                     let hash_start = std::time::Instant::now();
                     let (root, blobs, cow) = trie.root_hash_and_dirty_blobs(&persisted_for_hash)?;
                     let hash_elapsed = hash_start.elapsed();
@@ -1786,7 +1832,6 @@ impl MptCommitStore {
             .collect();
         let cache_publish_start = std::time::Instant::now();
         let mut published_puts = Vec::new();
-        let mut latest_cache_locators = HashMap::new();
         let mut fast_store_deletes = deleted_accounts.iter().copied().collect::<Vec<_>>();
         fast_store_deletes.extend(storage_cache_candidates.iter().filter_map(|(addr, _)| {
             match storage_roots.get(addr).copied() {
@@ -1846,7 +1891,6 @@ impl MptCommitStore {
                 &published_puts,
                 &fast_store_deletes,
             )?;
-            latest_cache_locators.extend(published_meta.latest_updates.iter().copied());
             if let Some(ref fs) = self.fast_store {
                 if let Err(e) = fs.apply_latest_updates(
                     &published_meta.latest_updates,
@@ -1868,46 +1912,28 @@ impl MptCommitStore {
         self.manifest = manifest_copy;
         self.version = new_version;
         self.dirty_accounts.clear();
-        self.storage_tries.clear();
         self.applied_this_block = false;
 
         if !use_async {
             self.maybe_compact_segment_store()?;
         }
 
-        // Move committed storage tries into the cross-block cache so the next
-        // block can reuse them without reloading from RocksDB.
+        // Fold committed working tries back into their long-lived handle bases.
         // Also write L3 fast store images (best-effort, non-fatal).
+        let published_segment_map: HashMap<B256, &StorageTrieSegment> =
+            published_puts.iter().map(|(addr, segment)| (*addr, segment)).collect();
         for (addr, trie) in storage_cache_candidates {
             if deleted_accounts.contains(&addr) {
                 continue;
             }
-            if !self.cache_admit_candidates.contains(&addr) {
-                continue;
-            }
             let storage_root = storage_roots.get(&addr).copied().unwrap_or(EMPTY_ROOT_HASH);
-            if self.hot_cache_candidates.contains(&addr) {
-                match self.build_hot_storage_trie_cache_entry(storage_root, trie.clone()) {
-                    StorageTrieCacheEntry::Empty => {}
-                    StorageTrieCacheEntry::Trie(trie) => {
-                        self.storage_trie_cache.insert_hot_trie(addr, trie)
-                    }
-                    StorageTrieCacheEntry::SegmentPage(_) => {
-                        unreachable!("hot cache uses trie form")
-                    }
-                }
-            }
-            let entry = self.build_storage_trie_cache_entry(
-                addr,
+            let cached_trie = trie.into_snapshot_cached(
                 storage_root,
-                trie,
-                &latest_cache_locators,
+                published_segment_map.get(&addr).copied(),
                 use_async,
             )?;
-            self.storage_trie_cache.insert_cold(addr, entry);
+            self.cache_storage_trie(addr, cached_trie);
         }
-        self.cache_admit_candidates.clear();
-        self.hot_cache_candidates.clear();
 
         self.last_commit_profile = CommitProfile {
             apply_bundle_state: self.last_apply_duration,
@@ -1991,14 +2017,9 @@ impl<'a> super::r#trait::MptSnapshotImporter for BoundImporter<'a> {
 
         // Reset working state
         self.store.dirty_accounts.clear();
-        self.store.storage_tries.clear();
+        self.store.storage_trie_handles.clear();
         self.store.storage_trie_cache =
-            StorageTrieCache::new(self.store.config.storage_trie_cache_capacity);
-        self.store.storage_trie_recent_touches = StorageTrieRecentTouches::new(
-            self.store.config.storage_trie_cache_capacity.saturating_mul(4),
-        );
-        self.store.cache_admit_candidates.clear();
-        self.store.hot_cache_candidates.clear();
+            MptCommitStore::new_storage_trie_cache(self.store.config.storage_trie_cache_capacity);
         if let Some(ref fs) = self.store.fast_store {
             fs.clear_memory();
         }
@@ -2437,7 +2458,7 @@ mod tests {
 
         assert!(!store.applied_this_block);
         assert!(store.dirty_accounts.is_empty());
-        assert!(store.storage_tries.is_empty());
+        assert!(store.working_storage_tries_empty());
     }
 
     /// T5.15: commit failure -> poisoned
@@ -2800,7 +2821,7 @@ mod tests {
 
         assert!(!store.applied_this_block);
         assert!(store.dirty_accounts.is_empty());
-        assert!(store.storage_tries.is_empty());
+        assert!(store.working_storage_tries_empty());
     }
 
     // ── Phase 5 tests ──
@@ -3151,14 +3172,14 @@ mod tests {
         // After commit, storage trie should be in cache
         let hashed_addr = keccak256(addr);
         assert!(
-            store.storage_trie_cache.contains_key(&hashed_addr),
+            store.storage_trie_cache_contains(&hashed_addr),
             "storage trie should be in cache after commit"
         );
-        let cached = match store.storage_trie_cache.remove(&hashed_addr) {
+        let cached = match store.clone_cached_storage_trie(&hashed_addr) {
             Some(entry) => entry,
             None => panic!("missing cached trie"),
         };
-        store.storage_trie_cache.insert(hashed_addr, cached);
+        store.cache_storage_trie(hashed_addr, cached);
 
         // Block 2: add slot2 to same account
         let bundle2 = make_bundle(vec![(
@@ -3169,22 +3190,22 @@ mod tests {
         )]);
         store.apply_bundle_state(&bundle2).unwrap();
 
-        // The trie should have been moved from cache to working set
+        // The cached snapshot should remain, and the handle should expose a working copy.
         assert!(
-            !store.storage_trie_cache.contains_key(&hashed_addr),
-            "trie should be removed from cache after loading into working set"
+            store.storage_trie_cache_contains(&hashed_addr),
+            "cached snapshot should remain after loading a working copy"
         );
-        assert!(store.storage_tries.contains_key(&hashed_addr), "trie should be in working set");
+        assert!(store.contains_working_trie(&hashed_addr), "trie should be in working state");
 
         let (_, root2) = store.commit().unwrap();
         assert_ne!(root1, root2, "root should change after adding slot2");
 
         // After block 2 commit, trie should be back in cache
-        assert!(store.storage_trie_cache.contains_key(&hashed_addr));
+        assert!(store.storage_trie_cache_contains(&hashed_addr));
     }
 
     #[test]
-    fn storage_trie_cache_prefers_segment_pages_after_sync_commit() {
+    fn storage_trie_cache_prefers_snapshot_cows_after_sync_commit() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
         config.async_blob_threshold = 0;
@@ -3203,15 +3224,16 @@ mod tests {
 
         let hashed_addr = keccak256(addr);
         let cached = store
-            .storage_trie_cache
-            .remove(&hashed_addr)
+            .clone_cached_storage_trie(&hashed_addr)
             .expect("expected cached entry after sync commit");
-        assert_eq!(cached.kind_name(), "segment_page");
-        store.storage_trie_cache.insert(hashed_addr, cached);
+        let trie = cached;
+        assert!(matches!(trie.root_ref(), CowRootRef::Lazy(CowLazyNodeRef::Segment(_))));
+        assert!(trie.arena_nodes().is_empty());
+        store.cache_storage_trie(hashed_addr, trie);
     }
 
     #[test]
-    fn storage_trie_cache_prefers_segment_pages_after_async_commit() {
+    fn storage_trie_cache_prefers_snapshot_cows_after_async_commit() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
         config.async_blob_threshold = usize::MAX;
@@ -3230,16 +3252,17 @@ mod tests {
 
         let hashed_addr = keccak256(addr);
         let cached = store
-            .storage_trie_cache
-            .remove(&hashed_addr)
+            .clone_cached_storage_trie(&hashed_addr)
             .expect("expected cached entry after async commit");
-        assert_eq!(cached.kind_name(), "segment_page");
-        store.storage_trie_cache.insert(hashed_addr, cached);
+        let trie = cached;
+        assert!(matches!(trie.root_ref(), CowRootRef::Lazy(CowLazyNodeRef::Segment(_))));
+        assert!(trie.arena_nodes().is_empty());
+        store.cache_storage_trie(hashed_addr, trie);
         store.flush_persist().unwrap();
     }
 
     #[test]
-    fn storage_trie_cache_promotes_l2_hits_to_hot_trie() {
+    fn storage_trie_cache_reloads_l2_hits_as_snapshot_cows() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
         config.async_blob_threshold = 0;
@@ -3268,65 +3291,44 @@ mod tests {
 
         let hashed_addr = keccak256(addr);
         let cached = store
-            .storage_trie_cache
-            .remove(&hashed_addr)
+            .clone_cached_storage_trie(&hashed_addr)
             .expect("expected cached entry after hot reuse");
-        assert_eq!(cached.kind_name(), "trie");
-        store.storage_trie_cache.insert(hashed_addr, cached);
+        let trie = cached;
+        assert!(matches!(trie.root_ref(), CowRootRef::Lazy(CowLazyNodeRef::Segment(_))));
+        store.cache_storage_trie(hashed_addr, trie);
     }
 
     #[test]
-    fn storage_trie_cache_bulk_block_skips_cold_admission() {
+    fn storage_trie_cache_bulk_block_caches_all_accounts_within_capacity() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
         config.storage_trie_cache_capacity = 2;
+        config.async_blob_threshold = 0;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
-        let hot_a = Address::repeat_byte(0xA1);
-        let hot_b = Address::repeat_byte(0xB2);
-        let hot_info = default_info(1, 1000);
+        let accounts = [0xD1_u8, 0xD2_u8, 0xD3_u8, 0xD4_u8];
+        let bundle = make_bundle(
+            accounts
+                .into_iter()
+                .enumerate()
+                .map(|(idx, byte)| {
+                    (
+                        Address::repeat_byte(byte),
+                        Some(default_info(1, 3000 + idx as u64)),
+                        revm_database::AccountStatus::Changed,
+                        vec![(U256::from(idx as u64 + 1), U256::ZERO, U256::from(idx as u64 + 10))],
+                    )
+                })
+                .collect(),
+        );
 
-        for (addr, slot, value) in [(hot_a, 1_u64, 11_u64), (hot_b, 2_u64, 22_u64)] {
-            let bundle = make_bundle(vec![(
-                addr,
-                Some(hot_info.clone()),
-                revm_database::AccountStatus::Changed,
-                vec![(U256::from(slot), U256::ZERO, U256::from(value))],
-            )]);
-            store.apply_bundle_state(&bundle).unwrap();
-            store.commit().unwrap();
-        }
-
-        let hashed_hot_a = keccak256(hot_a);
-        let hashed_hot_b = keccak256(hot_b);
-        assert!(store.storage_trie_cache.contains_key(&hashed_hot_a));
-        assert!(store.storage_trie_cache.contains_key(&hashed_hot_b));
-
-        let cold_accounts = [0xC1_u8, 0xC2_u8, 0xC3_u8];
-        let mut accounts = vec![(
-            hot_a,
-            Some(hot_info.clone()),
-            revm_database::AccountStatus::Changed,
-            vec![(U256::from(3), U256::ZERO, U256::from(33))],
-        )];
-        accounts.extend(cold_accounts.into_iter().enumerate().map(|(idx, byte)| {
-            (
-                Address::repeat_byte(byte),
-                Some(default_info(1, 2000 + idx as u64)),
-                revm_database::AccountStatus::Changed,
-                vec![(U256::from(idx as u64 + 10), U256::ZERO, U256::from(idx as u64 + 100))],
-            )
-        }));
-
-        store.apply_bundle_state(&make_bundle(accounts)).unwrap();
+        store.apply_bundle_state(&bundle).unwrap();
         store.commit().unwrap();
 
-        assert!(store.storage_trie_cache.contains_key(&hashed_hot_a));
-        assert!(store.storage_trie_cache.contains_key(&hashed_hot_b));
-        for byte in [0xC1_u8, 0xC2_u8, 0xC3_u8] {
+        for byte in accounts {
             assert!(
-                !store.storage_trie_cache.contains_key(&keccak256(Address::repeat_byte(byte))),
-                "cold bulk account should not be admitted into L2",
+                store.storage_trie_cache_contains(&keccak256(Address::repeat_byte(byte))),
+                "bulk account should remain cached when it fits in the LRU capacity",
             );
         }
     }
@@ -3353,7 +3355,7 @@ mod tests {
         store.commit().unwrap();
 
         let hashed_addr = keccak256(addr);
-        assert!(store.storage_trie_cache.contains_key(&hashed_addr));
+        assert!(store.storage_trie_cache_contains(&hashed_addr));
 
         // Block 2: selfdestruct + recreate with slot2 only
         let bundle2 = make_bundle(vec![(
@@ -3365,7 +3367,7 @@ mod tests {
         store.apply_bundle_state(&bundle2).unwrap();
 
         // Cache should be evicted after apply with storage_wiped
-        assert!(!store.storage_trie_cache.contains_key(&hashed_addr));
+        assert!(!store.storage_trie_cache_contains(&hashed_addr));
 
         let (_, root2) = store.commit().unwrap();
 
@@ -3633,20 +3635,20 @@ mod tests {
         store.commit().unwrap();
 
         let hashed_addr = keccak256(addr);
-        assert!(store.storage_trie_cache.contains_key(&hashed_addr));
+        assert!(store.storage_trie_cache_contains(&hashed_addr));
 
         // load_version clears cache
         store.load_version().unwrap();
-        assert!(store.storage_trie_cache.is_empty());
+        assert!(store.storage_trie_cache_is_empty());
 
         // Re-populate cache
         store.apply_bundle_state(&bundle).unwrap();
         store.commit().unwrap();
-        assert!(store.storage_trie_cache.contains_key(&hashed_addr));
+        assert!(store.storage_trie_cache_contains(&hashed_addr));
 
         // rollback clears cache
         store.rollback(1).unwrap();
-        assert!(store.storage_trie_cache.is_empty());
+        assert!(store.storage_trie_cache_is_empty());
     }
 
     /// Cache correctness across 3 blocks: account touched in block 1 and 3 (not 2)
@@ -3693,10 +3695,10 @@ mod tests {
         let mut store_n = MptCommitStore::open(dir_nocache.path(), false).unwrap();
         store_n.apply_bundle_state(&bundle1).unwrap();
         let (_, r1n) = store_n.commit().unwrap();
-        store_n.storage_trie_cache.clear();
+        store_n.clear_storage_trie_cache();
         store_n.apply_bundle_state(&bundle2).unwrap();
         let (_, r2n) = store_n.commit().unwrap();
-        store_n.storage_trie_cache.clear();
+        store_n.clear_storage_trie_cache();
         store_n.apply_bundle_state(&bundle3).unwrap();
         let (_, r3n) = store_n.commit().unwrap();
 
