@@ -184,6 +184,9 @@ struct MptdbTotals {
     manifest_save: Duration,
     publish_generation: Duration,
     open_published_store: Duration,
+    cache_publish: Duration,
+    storage_segment_build: Duration,
+    storage_root_hashing: Duration,
     durable_version_lag: i64,
     published_version_lag: i64,
     l2_hits: u64,
@@ -297,6 +300,9 @@ fn profile_b4_5_single_run_compare() {
         mptdb_totals.manifest_save += profile.manifest_save;
         mptdb_totals.publish_generation += profile.publish_generation;
         mptdb_totals.open_published_store += profile.open_published_store;
+        mptdb_totals.cache_publish += profile.cache_publish;
+        mptdb_totals.storage_segment_build += profile.storage_segment_build;
+        mptdb_totals.storage_root_hashing += profile.storage_root_hashing;
         mptdb_totals.durable_version_lag += profile.durable_version_lag;
         mptdb_totals.published_version_lag += profile.published_version_lag;
         mptdb_totals.l2_hits += profile.apply_l2_hits;
@@ -347,6 +353,15 @@ fn profile_b4_5_single_run_compare() {
     println!(
         "    open_published:    {} ms",
         fmt_ms(mptdb_totals.open_published_store / blocks_len)
+    );
+    println!("  cache_publish:       {} ms", fmt_ms(mptdb_totals.cache_publish / blocks_len));
+    println!(
+        "  segment_build:       {} ms",
+        fmt_ms(mptdb_totals.storage_segment_build / blocks_len)
+    );
+    println!(
+        "  root_hashing:        {} ms",
+        fmt_ms(mptdb_totals.storage_root_hashing / blocks_len)
     );
     println!(
         "  avg hits/block:      L2={}, L3={}",

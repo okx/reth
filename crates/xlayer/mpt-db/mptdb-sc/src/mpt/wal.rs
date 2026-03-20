@@ -325,7 +325,11 @@ impl CommitWalStore {
             .map_err(|e| MptDbError::Other(format!("write wal record crc: {e}")))?;
         file.write_all(&payload)
             .map_err(|e| MptDbError::Other(format!("write wal record payload: {e}")))?;
-        file.sync_data().map_err(|e| MptDbError::Other(format!("fdatasync wal segment: {e}")))?;
+        // No fsync here — matching sei-db's async WAL model.
+        // Data is in the OS page cache after write_all.  On crash,
+        // unfsynced entries are lost; recovery uses durable_version
+        // (synced via save_meta in the persist worker).  scan_segments
+        // handles incomplete tails on restart.
 
         let record_end = offset + WAL_RECORD_HEADER_LEN as u64 + payload_len as u64;
         self.index.insert(entry.version, WalLocation { segment_id, offset, len: payload_len });

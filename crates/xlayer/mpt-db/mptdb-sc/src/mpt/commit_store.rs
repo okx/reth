@@ -863,15 +863,14 @@ impl MptCommitStore {
             // This mirrors sei-db's model: frontend computes state, background
             // only serializes.  The WAL replay materializer is reserved for
             // crash recovery (open_with_config catch-up), not normal operation.
-            // WAL-first: save manifest eagerly so crash recovery can
-            // find the version even if the persist worker hasn't flushed.
-            if mode.wal_first && mode.save_manifest {
-                let manifest_save_start = std::time::Instant::now();
-                prepared.manifest.save(&self.manifest_path)?;
-                manifest_save_elapsed = manifest_save_start.elapsed();
-            }
+            // Matching sei-db's commit: frontend does pure memory work
+            // (hash computation), WAL append is the only IO.
+            // Manifest save and blob persist are deferred to the background
+            // worker.  WAL provides crash recovery — on restart, manifest
+            // is rebuilt from WAL + last snapshot.
             self.wait_for_backpressure()?;
-            self.persisted.populate_cache(&all_blobs);
+            // No populate_cache: account trie + storage tries stay resident
+            // in memory (arena + LRU handles), matching sei-db's model.
             let tx = self.persist_tx.as_ref().unwrap();
             let job = PersistJob {
                 barrier_only: false,
@@ -884,8 +883,7 @@ impl MptCommitStore {
                 state_root: prepared.state_root,
                 manifest: prepared.manifest.clone(),
                 manifest_path: self.manifest_path.clone(),
-                // WAL-first: frontend already saved manifest; skip worker save.
-                save_manifest: !mode.wal_first,
+                save_manifest: true,
                 version: prepared.new_version,
                 done: None,
             };
