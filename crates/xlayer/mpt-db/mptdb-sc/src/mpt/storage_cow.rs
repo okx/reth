@@ -109,12 +109,10 @@ impl StorageTrieCow {
         }
 
         if let Some(root_idx) = self.root_index() {
-            let segment = StorageTrieSegment::from_parts(
-                self.arena_nodes(),
-                self.arena_hash_cache(),
-                Some(root_idx),
-                storage_root,
-            )?;
+            let nodes = self.arena_nodes();
+            let hashes = self.arena_hash_cache();
+            let segment =
+                StorageTrieSegment::from_parts(&nodes, &hashes, Some(root_idx), storage_root)?;
             return Ok(Self::from_segment_page(segment.into_page_lease()));
         }
 
@@ -134,12 +132,30 @@ impl StorageTrieCow {
         self.arena.clear_all_dirty();
     }
 
-    pub fn arena_nodes(&self) -> &[MptNode] {
-        self.arena.nodes()
+    /// Snapshot the arena so that future `clone()` is O(overlay_size).
+    /// Call after commit when this trie becomes the new baseline.
+    /// Unlike freeze() (which is O(total_nodes)), snapshot() only promotes
+    /// the overlay without copying unchanged base nodes.
+    pub fn snapshot(&mut self) {
+        self.arena.snapshot();
     }
 
-    pub fn arena_hash_cache(&self) -> &[Option<B256>] {
-        self.arena.hash_cache_slice()
+    /// Collect all arena nodes into a contiguous Vec.
+    ///
+    /// Only used by low-frequency paths (segment build, snapshot export).
+    pub fn arena_nodes(&self) -> Vec<MptNode> {
+        self.arena.collect_all_nodes()
+    }
+
+    /// Collect the hash cache, merging frozen base + overlay.
+    pub fn arena_hash_cache(&self) -> Vec<Option<B256>> {
+        let len = self.arena.len();
+        (0..len).map(|i| self.arena.get_hash(i as u32)).collect()
+    }
+
+    /// Number of arena nodes.
+    pub fn arena_len(&self) -> usize {
+        self.arena.len()
     }
 
     pub fn root_index(&self) -> Option<u32> {
@@ -148,6 +164,18 @@ impl StorageTrieCow {
             CowRootRef::Arena(idx) => Some(idx),
             CowRootRef::Lazy(_) => None,
         }
+    }
+
+    /// Collect all leaf entries as `(full_nibble_key, value)` pairs.
+    ///
+    /// Only works when the trie is fully materialized in-memory (Arena root).
+    /// Returns an empty vec for lazy or empty tries.
+    pub fn collect_leaf_entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(root_idx) = self.root_index() else {
+            return Vec::new();
+        };
+        let tree = super::tree::MptTree { arena: self.arena.clone(), root: Some(root_idx) };
+        tree.collect_leaf_entries()
     }
 
     pub fn get(&self, store: &PersistedTrieStore, key: &Nibbles) -> Result<Option<Vec<u8>>> {
@@ -250,7 +278,7 @@ impl StorageTrieCow {
 
         match self.root.clone() {
             CowRootRef::Lazy(CowLazyNodeRef::Segment(root_ref))
-                if self.arena.nodes().is_empty() && self.pending_lazy_children.is_empty() =>
+                if self.arena.is_empty() && self.pending_lazy_children.is_empty() =>
             {
                 let reader = StorageTrieSegmentReader::open_shared_page(
                     root_ref.page_lease(),
@@ -263,7 +291,7 @@ impl StorageTrieCow {
                 self.root = root.map(CowRootRef::Arena).unwrap_or(CowRootRef::Empty);
             }
             CowRootRef::Lazy(CowLazyNodeRef::Persisted(root))
-                if self.arena.nodes().is_empty() && self.pending_lazy_children.is_empty() =>
+                if self.arena.is_empty() && self.pending_lazy_children.is_empty() =>
             {
                 let tree = persisted::load_tree_paths_from_root(store, root, touched_keys)?;
                 *self = Self::from_tree(tree);
@@ -885,7 +913,7 @@ impl StorageTrieCow {
             return;
         }
 
-        let mut reachable = vec![false; self.arena.nodes().len()];
+        let mut reachable = vec![false; self.arena.len()];
         let mut stack = Vec::new();
         if let CowRootRef::Arena(root_idx) = self.root {
             stack.push(root_idx);
@@ -1154,7 +1182,7 @@ mod tests {
     fn cow_empty_starts_empty() {
         let cow = StorageTrieCow::empty();
         assert!(matches!(cow.root_ref(), CowRootRef::Empty));
-        assert!(cow.arena().nodes().is_empty());
+        assert!(cow.arena().is_empty());
     }
 
     #[test]

@@ -17,6 +17,23 @@ pub struct MptConfig {
     pub wal_first_commit: bool,
     /// When enabled alongside `wal_first_commit`, perform extra parity checks.
     pub wal_shadow_validate: bool,
+    /// How many committed versions to advance before rewriting a fresh published snapshot.
+    pub published_snapshot_interval: usize,
+    /// Maximum seconds the published-rewrite worker waits for durable_version
+    /// to reach the target before giving up on the current rewrite job.
+    pub published_rewrite_timeout_secs: u64,
+    /// Maximum number of versions that committed_version may lead durable_version.
+    /// When the lag reaches this limit, the frontend commit blocks until the
+    /// persist worker catches up.  0 = no limit (rely on channel capacity only).
+    pub max_durable_lag: i64,
+    /// Maximum number of versions that committed_version may lead published_version.
+    /// When the lag reaches this limit, the frontend commit blocks until the
+    /// publish worker catches up.  0 = no limit.
+    pub max_published_lag: i64,
+    /// Maximum MB/s for background snapshot rewrite IO.  Limits how fast the
+    /// published-rewrite worker writes segment pages, preventing it from
+    /// starving the frontend of disk bandwidth.  0 = unlimited.
+    pub snapshot_write_rate_mb_per_sec: u64,
     /// Skip account-trie checkpoint writes once the committed trie grows beyond this size.
     pub checkpoint_max_account_trie_nodes: usize,
 }
@@ -32,6 +49,11 @@ impl Default for MptConfig {
             async_blob_threshold: 50_000,
             wal_first_commit: false,
             wal_shadow_validate: false,
+            published_snapshot_interval: 64,
+            published_rewrite_timeout_secs: 60,
+            max_durable_lag: 128,
+            max_published_lag: 0,
+            snapshot_write_rate_mb_per_sec: 0,
             checkpoint_max_account_trie_nodes: 200_000,
         }
     }

@@ -71,7 +71,9 @@ pub struct StorageTrieSegment {
 
 impl StorageTrieSegment {
     pub fn from_tree(tree: &MptTree, root: B256) -> Result<Self> {
-        Self::from_parts(tree.arena_nodes(), tree.arena_hash_cache(), tree.root_index(), root)
+        let nodes = tree.arena_nodes();
+        let hash_cache = tree.arena_hash_cache();
+        Self::from_parts(&nodes, &hash_cache, tree.root_index(), root)
     }
 
     pub(crate) fn from_parts(

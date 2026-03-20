@@ -274,6 +274,43 @@ impl Drop for PublishedBaselineReader {
     }
 }
 
+/// Simple token-bucket IO rate limiter for background snapshot writes.
+///
+/// Mirrors sei-db's `GlobalRateLimiter` shared across all tree writes during
+/// background snapshot rewrite, preventing the background worker from
+/// saturating disk bandwidth and impacting frontend commit latency.
+pub(crate) struct IoRateLimiter {
+    bytes_per_sec: u64,
+    written: u64,
+    start: std::time::Instant,
+}
+
+impl IoRateLimiter {
+    pub(crate) fn new(mb_per_sec: u64) -> Option<Self> {
+        if mb_per_sec == 0 {
+            None
+        } else {
+            Some(Self {
+                bytes_per_sec: mb_per_sec * 1024 * 1024,
+                written: 0,
+                start: std::time::Instant::now(),
+            })
+        }
+    }
+
+    /// Account for `n` bytes written and sleep if we're ahead of the rate.
+    pub(crate) fn account(&mut self, n: usize) {
+        self.written += n as u64;
+        let elapsed = self.start.elapsed();
+        let allowed = (elapsed.as_secs_f64() * self.bytes_per_sec as f64) as u64;
+        if self.written > allowed {
+            let excess = self.written - allowed;
+            let sleep_secs = excess as f64 / self.bytes_per_sec as f64;
+            std::thread::sleep(std::time::Duration::from_secs_f64(sleep_secs));
+        }
+    }
+}
+
 pub struct PublishedBaselineManager {
     base_dir: PathBuf,
     leases: Arc<Mutex<HashMap<u64, usize>>>,
@@ -373,6 +410,68 @@ impl PublishedBaselineManager {
         puts: &[(B256, StorageTrieSegment)],
         deletes: &[B256],
     ) -> Result<PublishedGenerationResult> {
+        self.publish_generation_inner(prev, version, root, puts, deletes, true)
+    }
+
+    pub(crate) fn stage_generation(
+        &self,
+        prev: Option<&PublishedBaselineMeta>,
+        version: i64,
+        root: B256,
+        puts: &[(B256, StorageTrieSegment)],
+        deletes: &[B256],
+    ) -> Result<PublishedGenerationResult> {
+        self.publish_generation_inner(prev, version, root, puts, deletes, false)
+    }
+
+    fn publish_generation_inner(
+        &self,
+        prev: Option<&PublishedBaselineMeta>,
+        version: i64,
+        root: B256,
+        puts: &[(B256, StorageTrieSegment)],
+        deletes: &[B256],
+        activate_meta: bool,
+    ) -> Result<PublishedGenerationResult> {
+        self.publish_generation_inner_with_limiter(
+            prev,
+            version,
+            root,
+            puts,
+            deletes,
+            activate_meta,
+            None,
+        )
+    }
+
+    /// Write a generation with rate limiting but do NOT activate the meta yet.
+    /// The caller must explicitly call `activate_published_meta` after all
+    /// post-processing (compact, WAL prune) succeeds.  This ensures the meta
+    /// file is only updated atomically at the end.
+    pub(crate) fn publish_generation_rate_limited(
+        &self,
+        prev: Option<&PublishedBaselineMeta>,
+        version: i64,
+        root: B256,
+        puts: &[(B256, StorageTrieSegment)],
+        deletes: &[B256],
+        limiter: Option<&mut IoRateLimiter>,
+    ) -> Result<PublishedGenerationResult> {
+        self.publish_generation_inner_with_limiter(
+            prev, version, root, puts, deletes, false, limiter,
+        )
+    }
+
+    fn publish_generation_inner_with_limiter(
+        &self,
+        prev: Option<&PublishedBaselineMeta>,
+        version: i64,
+        root: B256,
+        puts: &[(B256, StorageTrieSegment)],
+        deletes: &[B256],
+        activate_meta: bool,
+        mut limiter: Option<&mut IoRateLimiter>,
+    ) -> Result<PublishedGenerationResult> {
         let generation = version as u64;
         let prev_meta = match prev {
             Some(meta) => self.load_generation_meta(meta.generation)?,
@@ -405,6 +504,9 @@ impl PublishedBaselineManager {
                 full_index.remove(hashed_address);
             }
             for (hashed_address, image) in puts {
+                if let Some(ref mut lim) = limiter {
+                    lim.account(image.as_bytes().len());
+                }
                 let page = Self::append_page_streaming(
                     &mut data_file,
                     &mut pages_index_file,
@@ -438,6 +540,9 @@ impl PublishedBaselineManager {
                 delta_records.push((DELTA_OP_DELETE, *hashed_address, B256::ZERO, 0, 0, 0));
             }
             for (hashed_address, image) in puts {
+                if let Some(ref mut lim) = limiter {
+                    lim.account(image.as_bytes().len());
+                }
                 let page = Self::append_page_streaming(
                     &mut data_file,
                     &mut pages_index_file,
@@ -468,7 +573,9 @@ impl PublishedBaselineManager {
         self.save_generation_meta(&generation_meta)?;
 
         let meta = PublishedBaselineMeta { generation, version, root };
-        self.save_meta(&meta)?;
+        if activate_meta {
+            self.save_meta(&meta)?;
+        }
         Ok(PublishedGenerationResult { meta })
     }
 
@@ -485,6 +592,21 @@ impl PublishedBaselineManager {
             generation: meta.generation,
             version: meta.version,
             root: meta.root,
+        })
+    }
+
+    pub(crate) fn activate_published_meta(&self, meta: &PublishedBaselineMeta) -> Result<()> {
+        let stored = match self.load_generation_meta(meta.generation)? {
+            Some(stored) if stored.version == meta.version && stored.root == meta.root => stored,
+            _ => {
+                self.clear_meta()?;
+                return Ok(());
+            }
+        };
+        self.save_meta(&PublishedBaselineMeta {
+            generation: stored.generation,
+            version: stored.version,
+            root: stored.root,
         })
     }
 

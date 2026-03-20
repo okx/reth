@@ -6414,6 +6414,7 @@ dependencies = [
  "alloy-trie",
  "bincode 1.3.3",
  "codspeed-criterion-compat",
+ "crc32fast",
  "crossbeam-channel",
  "fs4",
  "memmap2",

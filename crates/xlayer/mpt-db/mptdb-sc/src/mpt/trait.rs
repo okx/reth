@@ -102,6 +102,16 @@ pub trait MptCommitter: Send {
         version: i64,
         expected_root: B256,
     ) -> Result<Box<dyn MptSnapshotImporter + '_>>;
+
+    /// Set the initial version for a fresh DB.
+    ///
+    /// When `initial_version > 1` and the current version is 0, the first
+    /// `commit()` jumps directly to `initial_version` instead of version 1.
+    /// This mirrors sei-db's `SetInitialVersion` / `nextVersionU32` semantics
+    /// for Cosmos chains whose genesis block starts at a non-zero height.
+    ///
+    /// Returns an error if the DB is not fresh (version != 0 or non-empty state).
+    fn set_initial_version(&mut self, initial_version: i64) -> Result<()>;
 }
 
 #[cfg(test)]

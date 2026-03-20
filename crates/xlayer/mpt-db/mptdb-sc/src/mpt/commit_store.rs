@@ -29,7 +29,7 @@ use super::{
     persisted::{self, PersistedTrieStore},
     proof,
     published_baseline::{
-        PublishedBaselineManager, PublishedBaselineMeta, PublishedBaselineReader,
+        IoRateLimiter, PublishedBaselineManager, PublishedBaselineMeta, PublishedBaselineReader,
     },
     r#trait::{CommitFrontier, MptCommitter, MptGcStats, MptSnapshotExporter, MptSnapshotImporter},
     segment::StorageTrieSegment,
@@ -113,9 +113,14 @@ impl StorageTrieHandle {
     }
 
     fn set_committed_base(&mut self, committed_version: i64, trie: StorageTrieCow) {
-        self.base = trie;
-        self.base_version = committed_version;
+        // Drop old base FIRST so its Arc reference is released.
+        // This ensures the frozen Arc strong_count == 1 when snapshot()
+        // calls Arc::make_mut, allowing in-place patch (O(overlay))
+        // instead of full copy (O(base_size)).
         self.working = None;
+        self.base = trie;
+        self.base.snapshot();
+        self.base_version = committed_version;
         self.working_version = None;
     }
 
@@ -182,9 +187,10 @@ impl AccountTrieHandle {
     }
 
     fn set_committed_base(&mut self, committed_version: i64, trie: StorageTrieCow) {
-        self.base = trie;
-        self.base_version = committed_version;
         self.working = None;
+        self.base = trie;
+        self.base.snapshot();
+        self.base_version = committed_version;
         self.working_version = None;
     }
 }
@@ -205,6 +211,17 @@ struct PersistJob {
     version: i64,
     /// If set, the background worker signals completion on this channel after
     /// finishing the persist. Used by `flush_persist()` to wait for drain.
+    done: Option<crossbeam_channel::Sender<Result<()>>>,
+}
+
+struct PublishedRewriteJob {
+    barrier_only: bool,
+    target_version: i64,
+    state_root: B256,
+    /// Pre-built segments from the persist worker's in-memory materializer.
+    /// When present, the rewrite worker uses these directly instead of
+    /// loading the full trie from disk.
+    segments: Option<Vec<(B256, StorageTrieSegment)>>,
     done: Option<crossbeam_channel::Sender<Result<()>>>,
 }
 
@@ -343,6 +360,9 @@ pub struct MptCommitStore {
     wal_store: Option<Arc<Mutex<CommitWalStore>>>,
 
     version: i64,
+    /// When > 1 and current version == 0, the first commit jumps to this
+    /// version instead of 1.  Mirrors sei-db's `initialVersion`.
+    initial_version: i64,
     applied_this_block: bool,
     poisoned: bool,
     read_only: bool,
@@ -365,6 +385,10 @@ pub struct MptCommitStore {
     persist_tx: Option<crossbeam_channel::Sender<PersistJob>>,
     /// Handle to the background persist worker thread.
     persist_handle: Option<JoinHandle<()>>,
+    /// Channel to send low-frequency published snapshot rewrite jobs.
+    published_rewrite_tx: Option<crossbeam_channel::Sender<PublishedRewriteJob>>,
+    /// Handle to the background published snapshot rewrite worker.
+    published_rewrite_handle: Option<JoinHandle<()>>,
     async_error: Arc<AtomicBool>,
     async_error_detail: Arc<Mutex<Option<String>>>,
     last_apply_duration: Duration,
@@ -406,8 +430,16 @@ impl MptCommitStore {
         std::env::var_os("MPT_DEBUG_DIAGNOSTICS").is_some()
     }
 
+    /// Next version that will be assigned on commit.
+    ///
+    /// Mirrors sei-db's `nextVersionU32`: if `version == 0` and
+    /// `initial_version > 1`, jump directly to `initial_version`.
     fn current_working_version(&self) -> i64 {
-        self.version + 1
+        if self.version == 0 && self.initial_version > 1 {
+            self.initial_version
+        } else {
+            self.version + 1
+        }
     }
 
     fn storage_trie_cache_limit(capacity: usize) -> usize {
@@ -574,6 +606,10 @@ impl MptCommitStore {
     ) -> Result<StorageTrieLoadStats> {
         let mut stats = StorageTrieLoadStats::default();
         let mut latest_candidates: Vec<(B256, B256)> = Vec::new();
+
+        // Lazy refresh: if the background rewrite worker has produced a newer
+        // published snapshot, reload it so that L3 lookups see the new data.
+        self.maybe_refresh_published_view()?;
         let published_current = self.has_current_published_view();
 
         for dirty in dirty_accounts {
@@ -813,6 +849,10 @@ impl MptCommitStore {
                 manifest_save_elapsed = manifest_save_start.elapsed();
             }
 
+            // Backpressure: block if committed_version is too far ahead of
+            // durable/published.  Must be checked BEFORE sending the job.
+            self.wait_for_backpressure()?;
+
             if let Some(tx) = self.persist_tx.as_ref() {
                 let job = PersistJob {
                     barrier_only: false,
@@ -840,6 +880,7 @@ impl MptCommitStore {
                 ));
             }
         } else if prepared.use_async {
+            self.wait_for_backpressure()?;
             self.persisted.populate_cache(&all_blobs);
             let tx = self.persist_tx.as_ref().unwrap();
             let job = PersistJob {
@@ -953,12 +994,10 @@ impl MptCommitStore {
                 if root == EMPTY_ROOT_HASH {
                     return Ok(None);
                 }
-                let segment = StorageTrieSegment::from_parts(
-                    trie.arena_nodes(),
-                    trie.arena_hash_cache(),
-                    trie.root_index(),
-                    root,
-                )?;
+                let nodes = trie.arena_nodes();
+                let hashes = trie.arena_hash_cache();
+                let segment =
+                    StorageTrieSegment::from_parts(&nodes, &hashes, trie.root_index(), root)?;
                 Ok(Some((*hashed_address, segment)))
             })
             .collect::<Vec<_>>();
@@ -972,16 +1011,342 @@ impl MptCommitStore {
         Ok(segments)
     }
 
+    fn nibbles_path_to_b256(path: &[u8]) -> Result<B256> {
+        if path.len() != 64 {
+            return Err(MptDbError::Other(format!(
+                "expected 64-nibble account key, got {}",
+                path.len()
+            )));
+        }
+        let mut out = [0u8; 32];
+        for (idx, chunk) in path.chunks_exact(2).enumerate() {
+            if chunk[0] > 0x0f || chunk[1] > 0x0f {
+                return Err(MptDbError::Other("account key nibble out of range".to_string()));
+            }
+            out[idx] = (chunk[0] << 4) | chunk[1];
+        }
+        Ok(B256::from(out))
+    }
+
+    fn build_full_published_segments(
+        persisted: &PersistedTrieStore,
+        state_root: B256,
+    ) -> Result<Vec<(B256, StorageTrieSegment)>> {
+        let deferred_roots = Self::collect_deferred_roots_from_persisted(persisted, state_root)?;
+        Self::build_publish_segments_from_roots(persisted, &deferred_roots)
+    }
+
+    fn collect_deferred_roots_from_persisted(
+        persisted: &PersistedTrieStore,
+        state_root: B256,
+    ) -> Result<Vec<(B256, B256)>> {
+        if state_root == EMPTY_ROOT_HASH {
+            return Ok(Vec::new());
+        }
+
+        let account_tree = persisted::load_tree_from_root(persisted, state_root)?;
+        let account_leaves = account_tree.collect_leaf_entries();
+        let mut deferred_roots = Vec::new();
+        for (path, value) in account_leaves {
+            let hashed_address = Self::nibbles_path_to_b256(&path)?;
+            let trie_account: alloy_trie::TrieAccount =
+                alloy_rlp::Decodable::decode(&mut &value[..]).map_err(|e| {
+                    MptDbError::Other(format!("decode account leaf during published rewrite: {e}"))
+                })?;
+            if trie_account.storage_root != EMPTY_ROOT_HASH {
+                deferred_roots.push((hashed_address, trie_account.storage_root));
+            }
+        }
+        Ok(deferred_roots)
+    }
+
+    /// Build full published segments using the materializer's in-memory account
+    /// trie to enumerate accounts, and the persisted store (which is cache-hot
+    /// right after persist_batch) to load storage tries.
+    fn build_full_published_segments_from_memory(
+        &self,
+        state_root: B256,
+    ) -> Result<Vec<(B256, StorageTrieSegment)>> {
+        if state_root == EMPTY_ROOT_HASH {
+            return Ok(Vec::new());
+        }
+
+        // Use the materializer's in-memory account trie to enumerate leaves.
+        // This avoids reloading the entire account trie from disk.
+        let account_trie = self.account_trie.committed();
+        let account_leaves = account_trie.collect_leaf_entries();
+        let mut deferred_roots = Vec::new();
+        for (path, value) in account_leaves {
+            let hashed_address = Self::nibbles_path_to_b256(&path)?;
+            let trie_account: alloy_trie::TrieAccount =
+                alloy_rlp::Decodable::decode(&mut &value[..]).map_err(|e| {
+                    MptDbError::Other(format!("decode account leaf during segment build: {e}"))
+                })?;
+            if trie_account.storage_root != EMPTY_ROOT_HASH {
+                deferred_roots.push((hashed_address, trie_account.storage_root));
+            }
+        }
+
+        // Build segments from persisted store — nodes are cache-hot after persist_batch.
+        Self::build_publish_segments_from_roots(&self.persisted, &deferred_roots)
+    }
+
+    fn should_rewrite_published_snapshot(
+        config: &MptConfig,
+        published_version: i64,
+        durable_version: i64,
+    ) -> bool {
+        if durable_version <= 0 {
+            return false;
+        }
+        if published_version <= 0 {
+            true
+        } else {
+            durable_version.saturating_sub(published_version) >=
+                config.published_snapshot_interval as i64
+        }
+    }
+
+    fn rewrite_published_snapshot_at_version(
+        persisted: &Arc<PersistedTrieStore>,
+        published_baseline: &Arc<PublishedBaselineManager>,
+        manifest: &VersionManifest,
+        target_version: i64,
+    ) -> Result<Option<PublishedBaselineMeta>> {
+        if target_version < manifest.earliest_version || target_version > manifest.latest_version {
+            return Ok(None);
+        }
+        let base_root = manifest.get_root(target_version).unwrap_or(EMPTY_ROOT_HASH);
+        let full_puts = Self::build_full_published_segments(persisted, base_root)?;
+        let staged_meta = published_baseline
+            .stage_generation(None, target_version, base_root, &full_puts, &[])?
+            .meta;
+        Ok(Some(staged_meta))
+    }
+
+    fn wal_prune_floor_for_manifest(
+        manifest: &VersionManifest,
+        published_baseline: &PublishedBaselineManager,
+    ) -> Result<i64> {
+        let mut floor = manifest.earliest_version;
+        if let Some(snapshot_floor) = published_baseline.earliest_snapshot_version()? {
+            floor = floor.min(snapshot_floor);
+        }
+        Ok(floor)
+    }
+
+    /// Schedule a published rewrite job.  Returns `true` if the job was
+    /// enqueued, `false` if the queue was full (a rewrite is in progress).
+    /// The caller should track the `false` case and retry on the next commit.
+    fn schedule_published_rewrite(
+        rewrite_tx: &crossbeam_channel::Sender<PublishedRewriteJob>,
+        target_version: i64,
+        state_root: B256,
+        segments: Option<Vec<(B256, StorageTrieSegment)>>,
+    ) -> Result<bool> {
+        match rewrite_tx.try_send(PublishedRewriteJob {
+            barrier_only: false,
+            target_version,
+            state_root,
+            segments,
+            done: None,
+        }) {
+            Ok(()) => Ok(true),
+            Err(crossbeam_channel::TrySendError::Full(_)) => Ok(false),
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                Err(MptDbError::Other("published rewrite worker disconnected".to_string()))
+            }
+        }
+    }
+
+    fn spawn_published_rewrite_worker(
+        persisted: Arc<PersistedTrieStore>,
+        published_baseline: Arc<PublishedBaselineManager>,
+        wal_store: Option<Arc<Mutex<CommitWalStore>>>,
+        manifest_path: PathBuf,
+        durable_version: Arc<AtomicI64>,
+        published_version: Arc<AtomicI64>,
+        last_published_materialize_micros: Arc<AtomicU64>,
+        async_error: Arc<AtomicBool>,
+        async_error_detail: Arc<Mutex<Option<String>>>,
+        rewrite_timeout: Duration,
+        snapshot_write_rate_mb_per_sec: u64,
+        #[cfg(test)] async_fail_mode: Arc<std::sync::atomic::AtomicU8>,
+    ) -> Result<(crossbeam_channel::Sender<PublishedRewriteJob>, JoinHandle<()>)> {
+        let (tx, rx) = crossbeam_channel::bounded::<PublishedRewriteJob>(1);
+        let handle = std::thread::Builder::new()
+            .name("mpt-published-rewrite".to_string())
+            .spawn(move || {
+                while let Ok(mut job) = rx.recv() {
+                    // Coalesce queued jobs — keep the one with highest target_version.
+                    while let Ok(next) = rx.try_recv() {
+                        if next.barrier_only {
+                            if let Some(done) = next.done {
+                                let result = if async_error.load(Ordering::Relaxed) {
+                                    Err(Self::current_async_error(&async_error_detail))
+                                } else {
+                                    Ok(())
+                                };
+                                let _ = done.send(result);
+                            }
+                            continue;
+                        }
+                        if next.target_version > job.target_version {
+                            job = next;
+                        }
+                    }
+
+                    if async_error.load(Ordering::Relaxed) {
+                        if let Some(done) = job.done {
+                            let _ = done.send(Err(Self::current_async_error(&async_error_detail)));
+                        }
+                        continue;
+                    }
+
+                    let result = if job.barrier_only {
+                        Ok(())
+                    } else {
+                        (|| -> Result<()> {
+                            // Wait for durable_version to reach the target, with timeout.
+                            let wait_start = std::time::Instant::now();
+                            while durable_version.load(Ordering::Acquire) < job.target_version {
+                                if async_error.load(Ordering::Relaxed) {
+                                    return Err(Self::current_async_error(&async_error_detail));
+                                }
+                                if wait_start.elapsed() >= rewrite_timeout {
+                                    tracing::warn!(
+                                        target_version = job.target_version,
+                                        "published rewrite: timed out waiting for durable_version, skipping"
+                                    );
+                                    return Ok(());
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+
+                            #[cfg(test)]
+                            if async_fail_mode.load(Ordering::Relaxed) == 3 {
+                                return Err(MptDbError::Other(
+                                    "forced async published baseline failure".to_string(),
+                                ));
+                            }
+
+                            let published_materialize_start = std::time::Instant::now();
+
+                            // The rewrite snapshot is a full baseline — it doesn't
+                            // need the old incremental chain to be caught up.
+                            // After activation, the persist worker's next
+                            // publish_generation will build deltas on top of the
+                            // new baseline.  This mirrors sei-db where the new
+                            // snapshot is self-contained after catch-up.
+
+                            // Use pre-built segments from the persist worker if available.
+                            // Otherwise fall back to loading from persisted store.
+                            // Apply IO rate limiting to prevent starving the frontend.
+                            let mut rate_limiter =
+                                IoRateLimiter::new(snapshot_write_rate_mb_per_sec);
+                            let staged_meta = if let Some(segments) = job.segments {
+                                let result = published_baseline
+                                    .publish_generation_rate_limited(
+                                        None,
+                                        job.target_version,
+                                        job.state_root,
+                                        &segments,
+                                        &[],
+                                        rate_limiter.as_mut(),
+                                    )?;
+                                result.meta
+                            } else {
+                                let manifest = VersionManifest::load(&manifest_path)?;
+                                match Self::rewrite_published_snapshot_at_version(
+                                    &persisted,
+                                    &published_baseline,
+                                    &manifest,
+                                    job.target_version,
+                                )? {
+                                    Some(meta) => meta,
+                                    None => return Ok(()),
+                                }
+                            };
+
+                            // Do compact/prune BEFORE activating meta so that
+                            // if they fail, the old meta stays consistent.
+                            let latest_manifest = VersionManifest::load(&manifest_path)?;
+                            let _ = published_baseline.compact_for_manifest(&latest_manifest);
+                            if let Some(wal_store) = wal_store.as_ref() {
+                                let floor = Self::wal_prune_floor_for_manifest(
+                                    &latest_manifest,
+                                    &published_baseline,
+                                )
+                                .unwrap_or(0);
+                                if floor > 0 {
+                                    let _ = wal_store.lock().prune_before(floor);
+                                }
+                            }
+                            // Activate meta last — atomic boundary.
+                            published_baseline.activate_published_meta(&staged_meta)?;
+                            last_published_materialize_micros.store(
+                                published_materialize_start.elapsed().as_micros() as u64,
+                                Ordering::Release,
+                            );
+                            let _ = published_version.fetch_update(
+                                Ordering::Release,
+                                Ordering::Relaxed,
+                                |cur| {
+                                    if staged_meta.version > cur {
+                                        Some(staged_meta.version)
+                                    } else {
+                                        None
+                                    }
+                                },
+                            );
+                            Ok(())
+                        })()
+                    };
+
+                    if let Err(err) = result {
+                        Self::warn_nonfatal_async_error(&err);
+                    }
+
+                    if let Some(done) = job.done {
+                        let result = if async_error.load(Ordering::Relaxed) {
+                            Err(Self::current_async_error(&async_error_detail))
+                        } else {
+                            Ok(())
+                        };
+                        let _ = done.send(result);
+                    }
+                }
+            })
+            .map_err(|e| MptDbError::Other(format!("spawn published rewrite thread: {e}")))?;
+        Ok((tx, handle))
+    }
+
+    /// Report a fatal async error that poisons the store.
+    ///
+    /// Use only for errors that compromise data durability (persist_batch
+    /// failure, WAL replay divergence).  Published baseline failures are
+    /// non-fatal and should use `warn_nonfatal_async_error` instead.
     fn report_async_error(
         async_error: &AtomicBool,
         detail: &Mutex<Option<String>>,
         err: &MptDbError,
     ) {
         if Self::diagnostics_enabled() {
-            eprintln!("[mptdiag] async error: {err}");
+            eprintln!("[mptdiag] async error (fatal): {err}");
         }
         *detail.lock() = Some(format!("mpt async persist failed: {err}"));
         async_error.store(true, Ordering::Relaxed);
+    }
+
+    /// Log a non-fatal async error.
+    ///
+    /// Published baseline / segment errors do not compromise committed state
+    /// (WAL + persisted nodes are intact).  The system continues operating;
+    /// L3 cache may degrade but correctness is maintained.  This mirrors
+    /// sei-db where snapshot rewrite errors are logged but do not stop the
+    /// database.
+    fn warn_nonfatal_async_error(err: &MptDbError) {
+        tracing::warn!(?err, "non-fatal background published baseline error (continuing)");
     }
 
     fn check_async_error(&self) -> Result<()> {
@@ -990,6 +1355,58 @@ impl MptCommitStore {
         } else {
             Ok(())
         }
+    }
+
+    /// Block until the background workers have caught up enough to satisfy
+    /// the configured lag limits.  This prevents committed_version from
+    /// running unboundedly ahead of durable/published, keeping WAL size
+    /// bounded and recovery time predictable.
+    fn wait_for_backpressure(&self) -> Result<()> {
+        let next_version = self.version + 1;
+
+        if self.config.max_durable_lag > 0 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                self.check_async_error()?;
+                let durable = self.durable_version.load(Ordering::Acquire);
+                if next_version - durable <= self.config.max_durable_lag {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        next_version,
+                        durable,
+                        max_lag = self.config.max_durable_lag,
+                        "backpressure: timed out waiting for durable_version"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        if self.config.max_published_lag > 0 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                self.check_async_error()?;
+                let published = self.published_version.load(Ordering::Acquire);
+                if next_version - published <= self.config.max_published_lag {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        next_version,
+                        published,
+                        max_lag = self.config.max_published_lag,
+                        "backpressure: timed out waiting for published_version"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        Ok(())
     }
 
     fn maybe_compact_segment_store(&mut self) -> Result<()> {
@@ -1133,36 +1550,65 @@ impl MptCommitStore {
         Ok(())
     }
 
+    /// Reload the published view from disk.
+    ///
+    /// In WAL-first mode the published version may lag behind the committed
+    /// version.  This is safe because every individual `open_trie` call in the
+    /// published store verifies the storage root — stale entries that no longer
+    /// match simply miss and fall through to the persisted store.
     fn reload_published_view(&mut self) -> Result<()> {
-        let root = self.manifest.get_root(self.version).unwrap_or(EMPTY_ROOT_HASH);
         let loaded_meta = self.published_baseline.load_meta()?;
         match loaded_meta {
-            Some(meta) if meta.version == self.version && meta.root == root => {
+            Some(meta) if meta.version > 0 => {
                 self.published_store = self.published_baseline.open_published_store(&meta)?;
                 self.published_meta = Some(meta);
-                self.published_version.store(self.version, Ordering::Release);
             }
             _ => {
                 self.published_meta = None;
                 self.published_store = None;
-                self.published_version.store(0, Ordering::Release);
             }
         }
         Ok(())
     }
 
+    /// Check if the background persist/rewrite worker has produced a newer
+    /// published snapshot than what the frontend currently holds. If so, reload.
+    fn maybe_refresh_published_view(&mut self) -> Result<()> {
+        let bg_version = self.published_version.load(Ordering::Acquire);
+        let current_version = self.published_meta.as_ref().map(|m| m.version).unwrap_or(0);
+        if bg_version > current_version {
+            self.reload_published_view()?;
+        }
+        Ok(())
+    }
+
     fn has_current_published_view(&self) -> bool {
-        let expected_root = self.manifest.get_root(self.version).unwrap_or(EMPTY_ROOT_HASH);
-        self.published_meta
-            .as_ref()
-            .zip(self.published_store.as_ref())
-            .map(|(meta, _store)| meta.version == self.version && meta.root == expected_root)
-            .unwrap_or(false)
+        self.published_meta.is_some() && self.published_store.is_some()
     }
 
     fn start_persist_worker(&mut self) -> Result<()> {
         if self.read_only || self.persist_tx.is_some() {
             return Ok(());
+        }
+
+        if self.published_rewrite_tx.is_none() {
+            let (rewrite_tx, rewrite_handle) = Self::spawn_published_rewrite_worker(
+                Arc::clone(&self.persisted),
+                Arc::clone(&self.published_baseline),
+                self.wal_store.as_ref().map(Arc::clone),
+                self.manifest_path.clone(),
+                Arc::clone(&self.durable_version),
+                Arc::clone(&self.published_version),
+                Arc::clone(&self.last_published_materialize_micros),
+                Arc::clone(&self.async_error),
+                Arc::clone(&self.async_error_detail),
+                Duration::from_secs(self.config.published_rewrite_timeout_secs),
+                self.config.snapshot_write_rate_mb_per_sec,
+                #[cfg(test)]
+                Arc::clone(&self.async_fail_mode),
+            )?;
+            self.published_rewrite_tx = Some(rewrite_tx);
+            self.published_rewrite_handle = Some(rewrite_handle);
         }
 
         let (tx, rx) = crossbeam_channel::bounded::<PersistJob>(self.config.async_queue_depth);
@@ -1179,6 +1625,7 @@ impl MptCommitStore {
         let last_published_materialize_micros_clone =
             Arc::clone(&self.last_published_materialize_micros);
         let wal_store_clone = self.wal_store.as_ref().map(Arc::clone);
+        let published_rewrite_tx_clone = self.published_rewrite_tx.as_ref().cloned();
         let dir_path = self.dir.clone();
         let manifest_path_clone = self.manifest_path.clone();
         let worker_config = self.config.clone();
@@ -1189,6 +1636,9 @@ impl MptCommitStore {
             .name("mpt-persist".to_string())
             .spawn(move || {
                 let mut replay_materializer: Option<MptCommitStore> = None;
+                // Track a pending rewrite that was dropped due to full queue,
+                // so it can be retried on the next durable version advance.
+                let mut pending_rewrite: Option<(i64, B256)> = None;
                 for job in rx {
                     if async_error_clone.load(Ordering::Relaxed) {
                         if let Some(done) = job.done {
@@ -1269,8 +1719,12 @@ impl MptCommitStore {
                                         replayed_root != entry.state_root
                                     {
                                         return Err(MptDbError::Other(format!(
-                                            "wal materializer replay divergence at version {}",
-                                            job.version
+                                            "wal materializer replay divergence at version {}: got ({}, {}), expected ({}, {})",
+                                            job.version,
+                                            replayed_version,
+                                            replayed_root,
+                                            entry.version,
+                                            entry.state_root,
                                         )));
                                     }
                                     last_wal_replay_micros_clone.store(
@@ -1292,14 +1746,34 @@ impl MptCommitStore {
                                             }
                                         },
                                     );
-                                    wal_store.lock().set_durable_version(job.version)?;
+                                    {
+                                        let mut wal = wal_store.lock();
+                                        wal.set_durable_version(job.version)?;
+                                        // Auto-truncate old WAL entries that are fully
+                                        // covered by a published snapshot, mirroring
+                                        // sei-db's tryTruncateWAL() on every commit.
+                                        let floor = Self::wal_prune_floor_for_manifest(
+                                            &job.manifest,
+                                            &published_baseline_clone,
+                                        )
+                                        .unwrap_or(0);
+                                        if floor > 0 {
+                                            let _ = wal.prune_before(floor);
+                                        }
+                                    }
 
+                                    // Per-block incremental publish: keep L3 hot so that
+                                    // the frontend's trie_load can use the published store.
+                                    // This mirrors sei-db's model where the in-memory tree
+                                    // always reflects the latest committed state.
                                     if job.publish_baseline {
-                                        let published_materialize_start = std::time::Instant::now();
+                                        let published_materialize_start =
+                                            std::time::Instant::now();
                                         let (publish_puts, published_deletes) = materializer
                                             .build_published_update_from_wal_entry(&entry)?;
+
                                         #[cfg(test)]
-                                        let published_meta =
+                                        let publish_result =
                                             if async_fail_mode_clone.load(Ordering::Relaxed) == 3 {
                                                 Err(MptDbError::Other(
                                                     "forced async published baseline failure"
@@ -1313,28 +1787,82 @@ impl MptCommitStore {
                                                     &publish_puts,
                                                     &published_deletes,
                                                 )
-                                            }?;
+                                            };
                                         #[cfg(not(test))]
-                                        let published_meta = published_baseline_clone
-                                            .publish_generation(
+                                        let publish_result =
+                                            published_baseline_clone.publish_generation(
                                                 worker_published_meta.as_ref(),
                                                 job.version,
                                                 entry.state_root,
                                                 &publish_puts,
                                                 &published_deletes,
-                                            )?;
-                                        worker_published_meta = Some(published_meta.meta.clone());
-                                        materializer.published_meta =
-                                            Some(published_meta.meta.clone());
-                                        materializer.published_store = published_baseline_clone
-                                            .open_published_store(&published_meta.meta)?;
-                                        last_published_materialize_micros_clone.store(
-                                            published_materialize_start.elapsed().as_micros()
-                                                as u64,
-                                            Ordering::Release,
-                                        );
-                                        published_version_clone
-                                            .store(job.version, Ordering::Release);
+                                            );
+
+                                        match publish_result {
+                                            Ok(result) => {
+                                                worker_published_meta =
+                                                    Some(result.meta.clone());
+                                                materializer.published_meta =
+                                                    Some(result.meta.clone());
+                                                materializer.published_store =
+                                                    published_baseline_clone
+                                                        .open_published_store(
+                                                            &result.meta,
+                                                        )?;
+                                                last_published_materialize_micros_clone
+                                                    .store(
+                                                        published_materialize_start
+                                                            .elapsed()
+                                                            .as_micros()
+                                                            as u64,
+                                                        Ordering::Release,
+                                                    );
+                                                published_version_clone
+                                                    .store(job.version, Ordering::Release);
+                                            }
+                                            Err(e) => {
+                                                Self::warn_nonfatal_async_error(&e);
+                                            }
+                                        }
+
+                                        // Periodic delta chain collapse via the rewrite
+                                        // worker (equivalent to sei-db's background
+                                        // snapshot rewrite).
+                                        if let Some(rewrite_tx) =
+                                            published_rewrite_tx_clone.as_ref()
+                                        {
+                                            // Check if a previously dropped rewrite should be retried.
+                                            let should_schedule = if pending_rewrite.is_some() {
+                                                true
+                                            } else {
+                                                let published_cur =
+                                                    published_version_clone.load(Ordering::Acquire);
+                                                Self::should_rewrite_published_snapshot(
+                                                    &worker_config,
+                                                    published_cur,
+                                                    job.version,
+                                                )
+                                            };
+                                            if should_schedule {
+                                                let segments = materializer
+                                                    .build_full_published_segments_from_memory(
+                                                        entry.state_root,
+                                                    )
+                                                    .ok();
+                                                let sent = Self::schedule_published_rewrite(
+                                                    rewrite_tx,
+                                                    job.version,
+                                                    entry.state_root,
+                                                    segments,
+                                                )?;
+                                                if sent {
+                                                    pending_rewrite = None;
+                                                } else {
+                                                    // Queue full — remember for retry.
+                                                    pending_rewrite = Some((job.version, entry.state_root));
+                                                }
+                                            }
+                                        }
                                     }
                                     Ok(())
                                 })()
@@ -1357,6 +1885,7 @@ impl MptCommitStore {
                         } else {
                             if job.publish_baseline && !job.replay_from_wal {
                                 let mut publish_puts = job.published_puts.clone();
+                                let mut skip_publish = false;
                                 if !job.deferred_published_roots.is_empty() {
                                     match Self::build_publish_segments_from_roots(
                                         &persisted_clone,
@@ -1364,24 +1893,16 @@ impl MptCommitStore {
                                     ) {
                                         Ok(mut rebuilt) => publish_puts.append(&mut rebuilt),
                                         Err(e) => {
-                                            Self::report_async_error(
-                                                &async_error_clone,
-                                                &async_error_detail_clone,
-                                                &e,
-                                            );
-                                            tracing::error!(
-                                                ?e,
-                                                "background deferred segment rebuild failed"
-                                            );
-                                            if let Some(done) = job.done {
-                                                let _ = done.send(Err(Self::current_async_error(
-                                                    &async_error_detail_clone,
-                                                )));
-                                            }
-                                            continue;
+                                            Self::warn_nonfatal_async_error(&e);
+                                            skip_publish = true;
                                         }
                                     }
                                 }
+                                if skip_publish {
+                                    // Persist succeeded but we can't build segments.
+                                    // Skip publish for this version; L3 will be stale
+                                    // but correctness is unaffected.
+                                } else {
                                 #[cfg(test)]
                                 let publish_result =
                                     if async_fail_mode_clone.load(Ordering::Relaxed) == 3 {
@@ -1412,12 +1933,7 @@ impl MptCommitStore {
                                         Some(result)
                                     }
                                     Err(e) => {
-                                        Self::report_async_error(
-                                            &async_error_clone,
-                                            &async_error_detail_clone,
-                                            &e,
-                                        );
-                                        tracing::error!(?e, "background published baseline failed");
+                                        Self::warn_nonfatal_async_error(&e);
                                         None
                                     }
                                 };
@@ -1432,14 +1948,10 @@ impl MptCommitStore {
                                     if let Err(e) =
                                         published_baseline_clone.compact_for_manifest(&job.manifest)
                                     {
-                                        Self::report_async_error(
-                                            &async_error_clone,
-                                            &async_error_detail_clone,
-                                            &e,
-                                        );
-                                        tracing::error!(?e, "background segment compaction failed");
+                                        Self::warn_nonfatal_async_error(&e);
                                     }
                                 }
+                                } // close skip_publish else
                             }
 
                             if async_error_clone.load(Ordering::Relaxed) {
@@ -1458,9 +1970,8 @@ impl MptCommitStore {
                                     |cur| if job.version > cur { Some(job.version) } else { None },
                                 );
                                 if let Some(wal_store) = wal_store_clone.as_ref() {
-                                    if let Err(e) =
-                                        wal_store.lock().set_durable_version(job.version)
-                                    {
+                                    let mut wal = wal_store.lock();
+                                    if let Err(e) = wal.set_durable_version(job.version) {
                                         Self::report_async_error(
                                             &async_error_clone,
                                             &async_error_detail_clone,
@@ -1470,6 +1981,15 @@ impl MptCommitStore {
                                             ?e,
                                             "background wal durable watermark update failed"
                                         );
+                                    } else {
+                                        let floor = Self::wal_prune_floor_for_manifest(
+                                            &job.manifest,
+                                            &published_baseline_clone,
+                                        )
+                                        .unwrap_or(0);
+                                        if floor > 0 {
+                                            let _ = wal.prune_before(floor);
+                                        }
                                     }
                                 }
                                 if job.publish_baseline {
@@ -1527,6 +2047,7 @@ impl MptCommitStore {
         }
 
         self.persist_tx.take();
+        self.published_rewrite_tx.take();
         if let Some(handle) = self.persist_handle.take() {
             let join_start = diagnostics.then(std::time::Instant::now);
             if best_effort {
@@ -1538,6 +2059,15 @@ impl MptCommitStore {
             }
             if let Some(start) = join_start {
                 eprintln!("[mptdiag] shutdown join_worker {:?}", start.elapsed());
+            }
+        }
+        if let Some(handle) = self.published_rewrite_handle.take() {
+            if best_effort {
+                let _ = handle.join();
+            } else {
+                handle.join().map_err(|_| {
+                    MptDbError::Other("published rewrite worker panicked".to_string())
+                })?;
             }
         }
 
@@ -1596,22 +2126,60 @@ impl MptCommitStore {
         Ok((None, None))
     }
 
+    /// Find the best available snapshot version `<= target` that can serve as a
+    /// replay base.  Returns `(snapshot_version, needs_wal_replay)`.
+    ///
+    /// This mirrors sei-db's `seekSnapshot(dir, targetVersion)`:
+    /// - If the target version is directly loadable from persisted, use it.
+    /// - Otherwise find the highest durable version `<= target` and replay WAL from there.
+    fn seek_best_snapshot_version(
+        &self,
+        manifest: &VersionManifest,
+        target_version: i64,
+    ) -> (i64, bool) {
+        let durable_version = if self.config.wal_first_commit {
+            self.wal_recovery_base_version(manifest.latest_version)
+        } else {
+            manifest.latest_version
+        };
+
+        if durable_version >= target_version {
+            // Target is already fully durable — load directly from persisted.
+            (target_version, false)
+        } else {
+            // Target is ahead of durable — need WAL replay from durable.
+            (durable_version, true)
+        }
+    }
+
     fn recover_target_state(
         &self,
         manifest: &VersionManifest,
         target_version: i64,
     ) -> Result<(StorageTrieCow, bool, i64)> {
-        let committed_version = manifest.latest_version;
-        let durable_version = if self.config.wal_first_commit {
-            self.wal_recovery_base_version(committed_version)
-        } else {
-            committed_version
-        };
+        let (snapshot_version, needs_replay) =
+            self.seek_best_snapshot_version(manifest, target_version);
 
-        if self.config.wal_first_commit && durable_version < target_version {
+        if needs_replay {
+            // Verify WAL covers the replay range (snapshot_version, target_version].
             let wal_store = self.wal_store.as_ref().map(Arc::clone).ok_or_else(|| {
                 MptDbError::Other("wal-first recovery requires wal store".to_string())
             })?;
+            {
+                let wal = wal_store.lock();
+                let wal_earliest = wal.earliest_version();
+                let wal_latest = wal.latest_version();
+                if wal.is_empty() ||
+                    wal_earliest > snapshot_version + 1 ||
+                    wal_latest < target_version
+                {
+                    return Err(MptDbError::Other(format!(
+                        "load_version {target_version}: no snapshot+WAL chain covers target \
+                         (best snapshot={snapshot_version}, WAL range=[{wal_earliest}, {wal_latest}])"
+                    )));
+                }
+            }
+
             let mut shadow = Self::open_replay_materializer_state(
                 &self.dir,
                 Arc::clone(&self.persisted),
@@ -1619,18 +2187,23 @@ impl MptCommitStore {
                 Some(wal_store),
                 manifest.clone(),
                 self.config.clone(),
-                durable_version,
+                snapshot_version,
             )?;
             shadow.replay_wal_catchup_to(manifest, target_version)?;
             #[cfg(test)]
             let loaded_from_checkpoint = shadow.loaded_from_checkpoint;
             #[cfg(not(test))]
             let loaded_from_checkpoint = false;
-            Ok((shadow.account_trie.committed().clone(), loaded_from_checkpoint, durable_version))
+            Ok((shadow.account_trie.committed().clone(), loaded_from_checkpoint, snapshot_version))
         } else {
             let root = manifest.get_root(target_version).unwrap_or(EMPTY_ROOT_HASH);
             let (account_trie, loaded_from_checkpoint) =
                 Self::load_account_trie_snapshot(&self.dir, &self.persisted, target_version, root)?;
+            let durable_version = if self.config.wal_first_commit {
+                self.wal_recovery_base_version(manifest.latest_version)
+            } else {
+                manifest.latest_version
+            };
             Ok((account_trie, loaded_from_checkpoint, durable_version))
         }
     }
@@ -1645,7 +2218,7 @@ impl MptCommitStore {
         #[cfg(not(test))]
         let _ = loaded_from_checkpoint;
         let checkpoint_account_trie_nodes = if loaded_from_checkpoint {
-            Some(account_trie.arena_nodes().len())
+            Some(account_trie.arena_len())
         } else if matches!(account_trie.root_ref(), CowRootRef::Empty) {
             Some(0)
         } else {
@@ -1699,8 +2272,11 @@ impl MptCommitStore {
         replay_config.wal_first_commit = false;
         replay_config.wal_shadow_validate = false;
         replay_config.async_blob_threshold = 0;
+        // Aggressive parallelism for replay materializer.
+        replay_config.parallel_storage_tries_min = 4;
+        replay_config.parallel_account_frontier_min = 2;
         let checkpoint_account_trie_nodes = if loaded_from_checkpoint {
-            Some(account_trie.arena_nodes().len())
+            Some(account_trie.arena_len())
         } else if root == EMPTY_ROOT_HASH {
             Some(0)
         } else {
@@ -1723,6 +2299,7 @@ impl MptCommitStore {
             manifest,
             wal_store,
             version,
+            initial_version: 1,
             applied_this_block: false,
             poisoned: false,
             read_only: false,
@@ -1741,6 +2318,8 @@ impl MptCommitStore {
             last_published_materialize_micros: Arc::new(AtomicU64::new(0)),
             persist_tx: None,
             persist_handle: None,
+            published_rewrite_tx: None,
+            published_rewrite_handle: None,
             async_error: Arc::new(AtomicBool::new(false)),
             async_error_detail: Arc::new(Mutex::new(None)),
             last_apply_duration: Duration::ZERO,
@@ -1786,6 +2365,11 @@ impl MptCommitStore {
         truncated
     }
 
+    /// Batch size for pre-loading WAL entries during replay.  Entries are
+    /// loaded in chunks to amortize lock acquisition and disk I/O while
+    /// keeping memory bounded.
+    const REPLAY_PREFETCH_BATCH: usize = 64;
+
     fn replay_wal_catchup_to(
         &mut self,
         committed_manifest: &VersionManifest,
@@ -1801,25 +2385,53 @@ impl MptCommitStore {
         let original_config = self.config.clone();
         self.manifest = Self::truncate_manifest_to_version(committed_manifest, base_version);
 
+        // Use aggressive parallelism thresholds during replay to maximize
+        // throughput.  Normal commit uses conservative thresholds to avoid
+        // overhead for small blocks, but replay processes many versions
+        // sequentially so every bit of per-version parallelism helps.
         let mut replay_config = original_config.clone();
         replay_config.wal_first_commit = false;
         replay_config.wal_shadow_validate = false;
         replay_config.async_blob_threshold = 0;
+        replay_config.parallel_storage_tries_min = 4;
+        replay_config.parallel_account_frontier_min = 2;
         self.config = replay_config;
 
         let replay_result = (|| -> Result<()> {
-            for version in (base_version + 1)..=target_version {
-                let entry = wal_store.lock().load_entry(version)?.ok_or_else(|| {
-                    MptDbError::Other(format!("missing wal entry during replay: version {version}"))
-                })?;
-                self.apply_wal_entry_inner(&entry)?;
-                let (replayed_version, replayed_root) = self.commit_inner()?;
-                if replayed_version != version || replayed_root != entry.state_root {
-                    return Err(MptDbError::Other(format!(
-                        "wal replay divergence at version {}: got ({}, {}), expected ({}, {})",
-                        version, replayed_version, replayed_root, version, entry.state_root
-                    )));
+            let mut next_version = base_version + 1;
+            while next_version <= target_version {
+                // Pre-fetch a batch of WAL entries to amortize lock + I/O.
+                let batch_end =
+                    (next_version + Self::REPLAY_PREFETCH_BATCH as i64 - 1).min(target_version);
+                let entries = {
+                    let wal = wal_store.lock();
+                    let mut batch = Vec::with_capacity((batch_end - next_version + 1) as usize);
+                    for version in next_version..=batch_end {
+                        let entry = wal.load_entry(version)?.ok_or_else(|| {
+                            MptDbError::Other(format!(
+                                "missing wal entry during replay: version {version}"
+                            ))
+                        })?;
+                        batch.push(entry);
+                    }
+                    batch
+                };
+
+                for entry in &entries {
+                    self.apply_wal_entry_inner(entry)?;
+                    let (replayed_version, replayed_root) = self.commit_inner()?;
+                    if replayed_version != entry.version || replayed_root != entry.state_root {
+                        return Err(MptDbError::Other(format!(
+                            "wal replay divergence at version {}: got ({}, {}), expected ({}, {})",
+                            entry.version,
+                            replayed_version,
+                            replayed_root,
+                            entry.version,
+                            entry.state_root
+                        )));
+                    }
                 }
+                next_version = batch_end + 1;
             }
             Ok(())
         })();
@@ -2023,368 +2635,8 @@ impl MptCommitStore {
         let last_published_materialize_micros = Arc::new(AtomicU64::new(0));
         #[cfg(test)]
         let async_fail_mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
-
-        // Spawn background persist worker for writable stores.
-        // The bounded channel provides natural backpressure: once it fills,
-        // commit() will block on enqueue until the worker catches up.
-        let (persist_tx, persist_handle) = if !read_only {
-            let (tx, rx) = crossbeam_channel::bounded::<PersistJob>(config.async_queue_depth);
-            let persisted_clone = Arc::clone(&persisted);
-            let published_baseline_clone = Arc::clone(&published_baseline);
-            let mut worker_published_meta = published_meta.clone();
-            let async_error_clone = Arc::clone(&async_error);
-            let async_error_detail_clone = Arc::clone(&async_error_detail);
-            let durable_version_clone = Arc::clone(&durable_version);
-            let published_version_clone = Arc::clone(&published_version);
-            let last_wal_replay_micros_clone = Arc::clone(&last_wal_replay_micros);
-            let last_durable_materialize_micros_clone =
-                Arc::clone(&last_durable_materialize_micros);
-            let last_published_materialize_micros_clone =
-                Arc::clone(&last_published_materialize_micros);
-            let wal_store_clone = wal_store.as_ref().map(Arc::clone);
-            let dir_path = dir.to_path_buf();
-            let manifest_path_clone = manifest_path.clone();
-            let worker_config = config.clone();
-            let mut replay_materializer: Option<MptCommitStore> = None;
-            #[cfg(test)]
-            let async_fail_mode_clone = Arc::clone(&async_fail_mode);
-            let handle = std::thread::Builder::new()
-                .name("mpt-persist".to_string())
-                .spawn(move || {
-                    for job in rx {
-                        if async_error_clone.load(Ordering::Relaxed) {
-                            if let Some(done) = job.done {
-                                let _ = done.send(Err(Self::current_async_error(
-                                    &async_error_detail_clone,
-                                )));
-                            }
-                            continue;
-                        }
-
-                        if !job.barrier_only {
-                            #[cfg(test)]
-                            let forced_error = match async_fail_mode_clone.load(Ordering::Relaxed) {
-                                1 => Some(MptDbError::Other(
-                                    "forced async persist failure".to_string(),
-                                )),
-                                2 => Some(MptDbError::Other(
-                                    "forced async manifest failure".to_string(),
-                                )),
-                                _ => None,
-                            };
-
-                            #[cfg(not(test))]
-                            let forced_error: Option<MptDbError> = None;
-
-                            let result = if job.replay_from_wal {
-                                if let Some(err) = forced_error {
-                                    Err(err)
-                                } else {
-                                    (|| -> Result<()> {
-                                        let durable_base =
-                                            durable_version_clone.load(Ordering::Acquire);
-                                        let need_reopen = replay_materializer
-                                            .as_ref()
-                                            .map(|materializer| {
-                                                materializer.version() != durable_base
-                                            })
-                                            .unwrap_or(true);
-                                        if need_reopen {
-                                            let manifest =
-                                                VersionManifest::load(&manifest_path_clone)?;
-                                            replay_materializer =
-                                                Some(Self::open_replay_materializer_state(
-                                                    &dir_path,
-                                                    Arc::clone(&persisted_clone),
-                                                    Arc::clone(&published_baseline_clone),
-                                                    wal_store_clone.as_ref().map(Arc::clone),
-                                                    manifest,
-                                                    worker_config.clone(),
-                                                    durable_base,
-                                                )?);
-                                        }
-                                        let materializer =
-                                            replay_materializer.as_mut().ok_or_else(|| {
-                                                MptDbError::Other(
-                                                    "missing wal replay materializer".to_string(),
-                                                )
-                                            })?;
-                                        let wal_store =
-                                            wal_store_clone.as_ref().ok_or_else(|| {
-                                                MptDbError::Other(
-                                                    "wal-first materializer requires wal store"
-                                                        .to_string(),
-                                                )
-                                            })?;
-                                        let entry = wal_store
-                                            .lock()
-                                            .load_entry(job.version)?
-                                            .ok_or_else(|| {
-                                                MptDbError::Other(format!(
-                                                    "missing wal entry for materializer version {}",
-                                                    job.version
-                                                ))
-                                            })?;
-                                        let wal_replay_start = std::time::Instant::now();
-                                        materializer.apply_wal_entry_inner(&entry)?;
-                                        let wal_replay_elapsed = wal_replay_start.elapsed();
-                                        let durable_materialize_start = std::time::Instant::now();
-                                        let (replayed_version, replayed_root) =
-                                            materializer.commit_inner()?;
-                                        let durable_materialize_elapsed =
-                                            durable_materialize_start.elapsed();
-                                        if replayed_version != entry.version ||
-                                            replayed_root != entry.state_root
-                                        {
-                                            return Err(MptDbError::Other(format!(
-                                                "wal materializer replay divergence at version {}",
-                                                job.version
-                                            )));
-                                        }
-                                        last_wal_replay_micros_clone.store(
-                                            wal_replay_elapsed.as_micros() as u64,
-                                            Ordering::Release,
-                                        );
-                                        last_durable_materialize_micros_clone.store(
-                                            durable_materialize_elapsed.as_micros() as u64,
-                                            Ordering::Release,
-                                        );
-                                        let _ = durable_version_clone.fetch_update(
-                                            Ordering::Release,
-                                            Ordering::Relaxed,
-                                            |cur| {
-                                                if job.version > cur {
-                                                    Some(job.version)
-                                                } else {
-                                                    None
-                                                }
-                                            },
-                                        );
-                                        wal_store.lock().set_durable_version(job.version)?;
-
-                                        if job.publish_baseline {
-                                            let published_materialize_start =
-                                                std::time::Instant::now();
-                                            let (publish_puts, published_deletes) = materializer
-                                                .build_published_update_from_wal_entry(&entry)?;
-                                            #[cfg(test)]
-                                            let published_meta = if async_fail_mode_clone
-                                                .load(Ordering::Relaxed) ==
-                                                3
-                                            {
-                                                Err(MptDbError::Other(
-                                                    "forced async published baseline failure"
-                                                        .to_string(),
-                                                ))
-                                            } else {
-                                                published_baseline_clone.publish_generation(
-                                                    worker_published_meta.as_ref(),
-                                                    job.version,
-                                                    entry.state_root,
-                                                    &publish_puts,
-                                                    &published_deletes,
-                                                )
-                                            }?;
-                                            #[cfg(not(test))]
-                                            let published_meta = published_baseline_clone
-                                                .publish_generation(
-                                                    worker_published_meta.as_ref(),
-                                                    job.version,
-                                                    entry.state_root,
-                                                    &publish_puts,
-                                                    &published_deletes,
-                                                )?;
-                                            worker_published_meta =
-                                                Some(published_meta.meta.clone());
-                                            materializer.published_meta =
-                                                Some(published_meta.meta.clone());
-                                            materializer.published_store = published_baseline_clone
-                                                .open_published_store(&published_meta.meta)?;
-                                            last_published_materialize_micros_clone.store(
-                                                published_materialize_start.elapsed().as_micros()
-                                                    as u64,
-                                                Ordering::Release,
-                                            );
-                                            published_version_clone
-                                                .store(job.version, Ordering::Release);
-                                        }
-                                        Ok(())
-                                    })()
-                                }
-                            } else if let Some(err) = forced_error {
-                                Err(err)
-                            } else {
-                                persisted_clone
-                                    .persist_batch(&job.blobs, true)
-                                    .and_then(|_| job.manifest.save(&job.manifest_path))
-                            };
-
-                            if let Err(e) = result {
-                                Self::report_async_error(
-                                    &async_error_clone,
-                                    &async_error_detail_clone,
-                                    &e,
-                                );
-                                tracing::error!(?e, "background persist failed");
-                            } else {
-                                if job.publish_baseline && !job.replay_from_wal {
-                                    let mut publish_puts = job.published_puts.clone();
-                                    if !job.deferred_published_roots.is_empty() {
-                                        match Self::build_publish_segments_from_roots(
-                                            &persisted_clone,
-                                            &job.deferred_published_roots,
-                                        ) {
-                                            Ok(mut rebuilt) => publish_puts.append(&mut rebuilt),
-                                            Err(e) => {
-                                                Self::report_async_error(
-                                                    &async_error_clone,
-                                                    &async_error_detail_clone,
-                                                    &e,
-                                                );
-                                                tracing::error!(
-                                                    ?e,
-                                                    "background deferred segment rebuild failed"
-                                                );
-                                                if let Some(done) = job.done {
-                                                    let _ =
-                                                        done.send(Err(Self::current_async_error(
-                                                            &async_error_detail_clone,
-                                                        )));
-                                                }
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    #[cfg(test)]
-                                    let publish_result =
-                                        if async_fail_mode_clone.load(Ordering::Relaxed) == 3 {
-                                            Err(MptDbError::Other(
-                                                "forced async published baseline failure"
-                                                    .to_string(),
-                                            ))
-                                        } else {
-                                            published_baseline_clone.publish_generation(
-                                                worker_published_meta.as_ref(),
-                                                job.version,
-                                                job.state_root,
-                                                &publish_puts,
-                                                &job.published_deletes,
-                                            )
-                                        };
-                                    #[cfg(not(test))]
-                                    let publish_result = published_baseline_clone
-                                        .publish_generation(
-                                            worker_published_meta.as_ref(),
-                                            job.version,
-                                            job.state_root,
-                                            &publish_puts,
-                                            &job.published_deletes,
-                                        );
-
-                                    let publish_result = match publish_result {
-                                        Ok(result) => {
-                                            worker_published_meta = Some(result.meta.clone());
-                                            Some(result)
-                                        }
-                                        Err(e) => {
-                                            Self::report_async_error(
-                                                &async_error_clone,
-                                                &async_error_detail_clone,
-                                                &e,
-                                            );
-                                            tracing::error!(
-                                                ?e,
-                                                "background published baseline failed"
-                                            );
-                                            None
-                                        }
-                                    };
-
-                                    let _ = publish_result;
-
-                                    if (job.version as usize) %
-                                        super::published_baseline::PUBLISHED_REWRITE_INTERVAL ==
-                                        0 ||
-                                        job.manifest.earliest_version > 0
-                                    {
-                                        if let Err(e) = published_baseline_clone
-                                            .compact_for_manifest(&job.manifest)
-                                        {
-                                            Self::report_async_error(
-                                                &async_error_clone,
-                                                &async_error_detail_clone,
-                                                &e,
-                                            );
-                                            tracing::error!(
-                                                ?e,
-                                                "background segment compaction failed"
-                                            );
-                                        }
-                                    }
-                                }
-
-                                if async_error_clone.load(Ordering::Relaxed) {
-                                    if let Some(done) = job.done {
-                                        let _ = done.send(Err(Self::current_async_error(
-                                            &async_error_detail_clone,
-                                        )));
-                                    }
-                                    continue;
-                                }
-
-                                if !job.replay_from_wal && !job.barrier_only {
-                                    // Update durable_version via CAS (only advance forward)
-                                    let _ = durable_version_clone.fetch_update(
-                                        Ordering::Release,
-                                        Ordering::Relaxed,
-                                        |cur| {
-                                            if job.version > cur {
-                                                Some(job.version)
-                                            } else {
-                                                None
-                                            }
-                                        },
-                                    );
-                                    if let Some(wal_store) = wal_store_clone.as_ref() {
-                                        if let Err(e) =
-                                            wal_store.lock().set_durable_version(job.version)
-                                        {
-                                            Self::report_async_error(
-                                                &async_error_clone,
-                                                &async_error_detail_clone,
-                                                &e,
-                                            );
-                                            tracing::error!(
-                                                ?e,
-                                                "background wal durable watermark update failed"
-                                            );
-                                        }
-                                    }
-                                    if job.publish_baseline {
-                                        published_version_clone
-                                            .store(job.version, Ordering::Release);
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(done) = job.done {
-                            let result = if async_error_clone.load(Ordering::Relaxed) {
-                                Err(Self::current_async_error(&async_error_detail_clone))
-                            } else {
-                                Ok(())
-                            };
-                            let _ = done.send(result);
-                        }
-                    }
-                })
-                .map_err(|e| MptDbError::Other(format!("spawn persist thread: {e}")))?;
-            (Some(tx), Some(handle))
-        } else {
-            (None, None)
-        };
         let checkpoint_account_trie_nodes = if account_loaded_from_checkpoint {
-            Some(account_trie.arena_nodes().len())
+            Some(account_trie.arena_len())
         } else if root == EMPTY_ROOT_HASH {
             Some(0)
         } else {
@@ -2405,6 +2657,7 @@ impl MptCommitStore {
             manifest: manifest.clone(),
             wal_store,
             version,
+            initial_version: 1,
             applied_this_block: false,
             poisoned: false,
             read_only,
@@ -2418,8 +2671,10 @@ impl MptCommitStore {
             last_wal_replay_micros,
             last_durable_materialize_micros,
             last_published_materialize_micros,
-            persist_tx,
-            persist_handle,
+            persist_tx: None,
+            persist_handle: None,
+            published_rewrite_tx: None,
+            published_rewrite_handle: None,
             async_error,
             async_error_detail,
             last_apply_duration: Duration::ZERO,
@@ -2459,6 +2714,10 @@ impl MptCommitStore {
             store.replay_wal_catchup_to(&manifest, committed_version)?;
         }
 
+        if !read_only {
+            store.start_persist_worker()?;
+        }
+
         Ok(store)
     }
 
@@ -2480,15 +2739,63 @@ impl MptCommitStore {
             ));
         }
 
-        let mut store = Self::open_with_config(dir, read_only, config)?;
-        if target_version > 0 {
-            if overwrite {
-                store.rollback(target_version)?;
-            } else {
+        if overwrite {
+            // LoadForOverwriting: truncate WAL + manifest + published BEFORE
+            // opening, so that open_with_config loads directly at the target
+            // version without replaying entries that will be discarded.
+            // This mirrors sei-db's atomic LoadForOverwriting pattern:
+            //   1. Truncate WAL after target
+            //   2. Truncate manifest after target
+            //   3. Prune published beyond target
+            //   4. Open at the (now truncated) latest version
+            Self::truncate_to_version_on_disk(dir, target_version, &config)?;
+            Self::open_with_config(dir, read_only, config)
+        } else {
+            let mut store = Self::open_with_config(dir, read_only, config)?;
+            if target_version > 0 {
                 store.load_version_target(target_version)?;
             }
+            Ok(store)
         }
-        Ok(store)
+    }
+
+    /// Pre-open truncation for LoadForOverwriting: truncate WAL, manifest,
+    /// and published baseline on disk so that subsequent `open_with_config`
+    /// loads directly at the target version.
+    ///
+    /// Mirrors sei-db's `LoadForOverwriting` which atomically:
+    ///   - downgrades current symlink
+    ///   - truncates WAL
+    ///   - prunes newer snapshots
+    fn truncate_to_version_on_disk(
+        dir: &Path,
+        target_version: i64,
+        config: &MptConfig,
+    ) -> Result<()> {
+        // Truncate manifest.
+        let manifest_path = dir.join("manifest.json");
+        if manifest_path.exists() {
+            let mut manifest = VersionManifest::load(&manifest_path)?;
+            if target_version <= manifest.latest_version {
+                manifest.truncate_after(target_version);
+                manifest.save(&manifest_path)?;
+            }
+        }
+
+        // Truncate WAL.
+        if config.wal_first_commit {
+            let mut wal_store = CommitWalStore::open(dir)?;
+            wal_store.truncate_after(target_version)?;
+        }
+
+        // Activate published baseline at target version (prunes newer generations).
+        let published_baseline = PublishedBaselineManager::open(dir)?;
+        let manifest = VersionManifest::load(&manifest_path)?;
+        let target_root = manifest.get_root(target_version).unwrap_or(EMPTY_ROOT_HASH);
+        published_baseline.activate_published_version(target_version, target_root)?;
+        let _ = published_baseline.compact_for_manifest(&manifest);
+
+        Ok(())
     }
 
     /// Try to extract storage_root from an existing account leaf in the trie.
@@ -2580,23 +2887,52 @@ impl MptCommitStore {
             }
             return Err(err);
         }
-        if self.durable_version.load(Ordering::Acquire) >= self.version {
-            return Ok(());
+        if self.durable_version.load(Ordering::Acquire) < self.version {
+            if let Some(ref tx) = self.persist_tx {
+                let (done_tx, done_rx) = crossbeam_channel::bounded::<Result<()>>(0);
+                let job = PersistJob {
+                    barrier_only: true,
+                    replay_from_wal: false,
+                    blobs: vec![],
+                    published_puts: vec![],
+                    deferred_published_roots: vec![],
+                    published_deletes: vec![],
+                    publish_baseline: false,
+                    state_root: EMPTY_ROOT_HASH,
+                    manifest: self.manifest.clone(),
+                    manifest_path: self.manifest_path.clone(),
+                    version: self.version,
+                    done: Some(done_tx),
+                };
+                if tx.send(job).is_ok() {
+                    match done_rx.recv() {
+                        Ok(result) => {
+                            if let Err(err) = result {
+                                if self.config.wal_first_commit {
+                                    self.durable_version
+                                        .store(self.wal_durable_version(), Ordering::Release);
+                                }
+                                return Err(err);
+                            }
+                        }
+                        Err(_) => {
+                            if self.config.wal_first_commit {
+                                self.durable_version
+                                    .store(self.wal_durable_version(), Ordering::Release);
+                            }
+                            return self.check_async_error();
+                        }
+                    }
+                }
+            }
         }
-        if let Some(ref tx) = self.persist_tx {
+        if let Some(ref tx) = self.published_rewrite_tx {
             let (done_tx, done_rx) = crossbeam_channel::bounded::<Result<()>>(0);
-            let job = PersistJob {
+            let job = PublishedRewriteJob {
                 barrier_only: true,
-                replay_from_wal: false,
-                blobs: vec![],
-                published_puts: vec![],
-                deferred_published_roots: vec![],
-                published_deletes: vec![],
-                publish_baseline: false,
+                target_version: 0,
                 state_root: EMPTY_ROOT_HASH,
-                manifest: self.manifest.clone(),
-                manifest_path: self.manifest_path.clone(),
-                version: self.version,
+                segments: None,
                 done: Some(done_tx),
             };
             if tx.send(job).is_ok() {
@@ -2609,7 +2945,6 @@ impl MptCommitStore {
                             }
                             return Err(err);
                         }
-                        return Ok(());
                     }
                     Err(_) => {
                         if self.config.wal_first_commit {
@@ -2669,7 +3004,17 @@ impl MptCommitStore {
     }
 
     fn wal_durable_version(&self) -> i64 {
-        self.wal_store.as_ref().map(|store| store.lock().durable_version()).unwrap_or(self.version)
+        self.wal_store
+            .as_ref()
+            .map(|store| {
+                let wal = store.lock();
+                if wal.is_empty() {
+                    self.version
+                } else {
+                    wal.durable_version()
+                }
+            })
+            .unwrap_or(self.version)
     }
 
     fn wal_recovery_base_version(&self, committed_version: i64) -> i64 {
@@ -2740,7 +3085,7 @@ impl MptCommitStore {
     }
 
     pub(crate) fn account_trie_arena_len(&self) -> usize {
-        self.account_trie.committed().arena_nodes().len()
+        self.account_trie.committed().arena_len()
     }
 }
 
@@ -2938,9 +3283,58 @@ impl MptCommitter for MptCommitStore {
         // Wrap in a struct that holds &mut self to bind lifetime
         Ok(Box::new(BoundImporter { inner: imp, store: self }))
     }
+
+    fn set_initial_version(&mut self, initial_version: i64) -> Result<()> {
+        if initial_version < 1 {
+            return Err(MptDbError::Other(format!(
+                "initial_version must be >= 1, got {initial_version}"
+            )));
+        }
+        if self.version != 0 {
+            return Err(MptDbError::Other(format!(
+                "set_initial_version requires version == 0, current version is {}",
+                self.version
+            )));
+        }
+        if !self.is_fresh_db()? {
+            return Err(MptDbError::Other("set_initial_version requires a fresh DB".to_string()));
+        }
+        self.initial_version = initial_version;
+        Ok(())
+    }
+}
+
+/// In-memory trie node statistics, mirroring sei-db's
+/// `TotalMemNodeSize` / `TotalNumOfMemNode`.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryStats {
+    /// Total number of arena nodes in the account trie.
+    pub account_trie_nodes: usize,
+    /// Number of cached storage trie handles.
+    pub storage_trie_cached: usize,
+    /// Total number of arena nodes across all cached storage tries (base copies).
+    pub storage_trie_total_nodes: usize,
 }
 
 impl MptCommitStore {
+    /// Return a snapshot of in-memory trie node statistics.
+    ///
+    /// This mirrors sei-db's `TotalMemNodeSize` / `TotalNumOfMemNode` globals.
+    /// The numbers here cover resident arena nodes only — lazy/persisted
+    /// subtrees are not counted until they are materialized.
+    pub fn memory_stats(&self) -> MemoryStats {
+        let account_trie_nodes = self.account_trie.committed().arena_len();
+        let mut storage_trie_total_nodes = 0usize;
+        for handle in self.storage_trie_handles.values() {
+            storage_trie_total_nodes += handle.base.arena_len();
+        }
+        MemoryStats {
+            account_trie_nodes,
+            storage_trie_cached: self.storage_trie_handles.len(),
+            storage_trie_total_nodes,
+        }
+    }
+
     pub fn last_commit_profile(&self) -> &CommitProfile {
         &self.last_commit_profile
     }
@@ -3355,6 +3749,7 @@ impl MptCommitStore {
             CommitWalEntry::from_dirty_accounts(
                 prepared.new_version,
                 state_root,
+                state_root, // In Ethereum MPT, account_root == state_root.
                 &self.dirty_accounts,
             )
         });
@@ -3398,11 +3793,11 @@ impl MptCommitStore {
         // Commit succeeded: update internal state
         self.manifest = saved.manifest;
         self.version = saved.new_version;
-        let checkpoint_account_trie_nodes = Some(account_cow.arena_nodes().len());
+        let checkpoint_account_trie_nodes = Some(account_cow.arena_len());
         let committed_account_trie = if state_root == EMPTY_ROOT_HASH {
             StorageTrieCow::empty()
         } else if saved.use_async {
-            account_cow.into_snapshot_cached(state_root, None, true)?
+            StorageTrieCow::from_tree(account_cow.into_materialized_tree(&self.persisted)?)
         } else {
             StorageTrieCow::from_persisted_root(state_root)
         };
@@ -3532,7 +3927,11 @@ impl<'a> super::r#trait::MptSnapshotImporter for BoundImporter<'a> {
         // releases its Arc<PersistedTrieStore>. Then close the old store
         // to release the RocksDB lock before the atomic rename in inner.close().
         self.store.persist_tx.take();
+        self.store.published_rewrite_tx.take();
         if let Some(handle) = self.store.persist_handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.store.published_rewrite_handle.take() {
             let _ = handle.join();
         }
         // Now self.store.persisted should be the only Arc reference
@@ -3756,6 +4155,7 @@ mod tests {
             account_root: B256::repeat_byte(0x77),
             deleted_accounts: Vec::new(),
             accounts: Vec::new(),
+            upgrades: Vec::new(),
         };
         store.wal_store.as_ref().unwrap().lock().append_entry(&wal_entry).unwrap();
 
@@ -3978,6 +4378,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
         config.wal_first_commit = true;
+        config.published_snapshot_interval = 1;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
         let addr = Address::repeat_byte(0x13);
@@ -4008,6 +4409,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
         config.wal_first_commit = true;
+        config.published_snapshot_interval = 1;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
         let addr = Address::repeat_byte(0x52);
 
@@ -4278,7 +4680,90 @@ mod tests {
     }
 
     #[test]
-    fn wal_first_publish_can_lag_durable_version() {
+    fn bulk_then_wal_first_flush_persist_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let mut config = MptConfig::default();
+        config.wal_first_commit = true;
+        config.published_snapshot_interval = 1;
+        let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+
+        let prepop = make_bundle(vec![
+            (
+                Address::repeat_byte(0x6a),
+                Some(default_info(1, 100)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(1), U256::ZERO, U256::from(1))],
+            ),
+            (
+                Address::repeat_byte(0x6b),
+                Some(default_info(2, 200)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(2), U256::ZERO, U256::from(2))],
+            ),
+        ]);
+        store.begin_bulk_load(BulkLoadOptions { retain_only_latest: true }).unwrap();
+        store.bulk_ingest_bundle_chunk(&prepop).unwrap();
+        store.finish_bulk_load().unwrap();
+
+        let bundle = make_bundle(vec![(
+            Address::repeat_byte(0x6a),
+            Some(default_info(3, 300)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(3), U256::ZERO, U256::from(3))],
+        )]);
+        store.apply_bundle_state(&bundle).unwrap();
+        store.commit().unwrap();
+        store.flush_persist().unwrap();
+    }
+
+    #[test]
+    fn wal_first_committed_account_trie_stays_materializable_across_lagged_commits() {
+        let dir = TempDir::new().unwrap();
+        let mut config = MptConfig::default();
+        config.wal_first_commit = true;
+        config.published_snapshot_interval = 1;
+        let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+
+        let addrs = [
+            Address::repeat_byte(0x60),
+            Address::repeat_byte(0x61),
+            Address::repeat_byte(0x62),
+            Address::repeat_byte(0x63),
+        ];
+
+        for step in 0..8u64 {
+            let addr = addrs[(step as usize) % addrs.len()];
+            let bundle = make_bundle(vec![(
+                addr,
+                Some(default_info(step + 1, 1_000 + step)),
+                revm_database::AccountStatus::Changed,
+                vec![
+                    (U256::from(1), U256::ZERO, U256::from(step + 1)),
+                    (U256::from(2), U256::ZERO, U256::from((step + 1) * 2)),
+                ],
+            )]);
+            store.apply_bundle_state(&bundle).unwrap();
+            store.commit().unwrap();
+
+            let materialized =
+                store.account_trie.committed().clone().into_materialized_tree(&store.persisted);
+            if let Err(err) = materialized {
+                panic!("step {step} committed trie lost materializability: {err}");
+            }
+        }
+
+        let followup = make_bundle(vec![(
+            addrs[0],
+            Some(default_info(99, 9_999)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(3), U256::ZERO, U256::from(999))],
+        )]);
+        store.apply_bundle_state(&followup).unwrap();
+        store.commit().unwrap();
+    }
+
+    #[test]
+    fn wal_first_publish_failure_is_nonfatal() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
         config.wal_first_commit = true;
@@ -4296,9 +4781,11 @@ mod tests {
         let (version, _) = store.commit().unwrap();
         assert_eq!(version, 1);
 
-        assert!(store.flush_persist().is_err());
+        // Published baseline failure is non-fatal: persist + WAL still work.
+        // flush_persist should succeed because the persist itself completed.
+        store.flush_persist().unwrap();
         assert_eq!(store.frontier().durable_version, 1);
-        assert_eq!(store.published_version(), None);
+        // Published may or may not have advanced depending on timing.
     }
 
     /// T5.5: single account nonce/balance update -> state_root matches reference
@@ -5370,6 +5857,7 @@ mod tests {
             account_root: B256::repeat_byte(0x88),
             deleted_accounts: Vec::new(),
             accounts: Vec::new(),
+            upgrades: Vec::new(),
         };
         dst_store.wal_store.as_ref().unwrap().lock().append_entry(&wal_entry).unwrap();
 
@@ -5727,7 +6215,7 @@ mod tests {
         let (_version, root) = store.commit().unwrap();
 
         let full = persisted::load_tree_from_root(&store.persisted, root).unwrap();
-        let full_nodes = full.arena_nodes().len();
+        let full_nodes = full.arena_len();
 
         store.load_version().unwrap();
         assert!(
@@ -6139,7 +6627,7 @@ mod tests {
     }
 
     #[test]
-    fn t6_5e_publish_failure_fails_fast() {
+    fn t6_5e_publish_failure_is_nonfatal() {
         let dir = TempDir::new().unwrap();
         let mut store = MptCommitStore::open(dir.path(), false).unwrap();
         store.set_async_fail_mode(3);
@@ -6154,8 +6642,9 @@ mod tests {
         store.apply_bundle_state(&bundle).unwrap();
         store.commit().unwrap();
 
-        assert!(store.flush_persist().is_err());
-        assert!(store.load_version().is_err());
+        // Published failure is non-fatal: flush + load_version succeed.
+        store.flush_persist().unwrap();
+        store.load_version().unwrap();
     }
 
     #[test]

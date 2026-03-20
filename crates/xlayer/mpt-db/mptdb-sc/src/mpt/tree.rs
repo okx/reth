@@ -150,7 +150,58 @@ impl MptTree {
         self.root.is_none()
     }
 
+    /// Collect all leaf entries as `(full_nibble_key, value)` pairs.
+    ///
+    /// This is used by low-frequency background snapshot rewrite paths that
+    /// need a complete view of the trie. It is intentionally not used on the
+    /// block commit hot path.
+    pub(crate) fn collect_leaf_entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut path = Vec::new();
+        if let Some(root_idx) = self.root {
+            self.collect_leaf_entries_recursive(root_idx, &mut path, &mut out);
+        }
+        out
+    }
+
     // ── Private helpers ──
+
+    fn collect_leaf_entries_recursive(
+        &self,
+        idx: u32,
+        path: &mut Vec<u8>,
+        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
+        match self.arena.get(idx) {
+            MptNode::Leaf(leaf) => {
+                let start_len = path.len();
+                path.extend(leaf.nibbles.iter());
+                out.push((path.clone(), leaf.value.clone()));
+                path.truncate(start_len);
+            }
+            MptNode::Extension(ext) => {
+                let start_len = path.len();
+                path.extend(ext.nibbles.iter());
+                if let ChildRef::Arena(child_idx) = ext.child {
+                    self.collect_leaf_entries_recursive(child_idx, path, out);
+                }
+                path.truncate(start_len);
+            }
+            MptNode::Branch(branch) => {
+                if let Some(value) = branch.value.as_ref() {
+                    out.push((path.clone(), value.clone()));
+                }
+                for (slot, child) in branch.children.iter().enumerate() {
+                    let Some(ChildRef::Arena(child_idx)) = child else {
+                        continue;
+                    };
+                    path.push(slot as u8);
+                    self.collect_leaf_entries_recursive(*child_idx, path, out);
+                    path.pop();
+                }
+            }
+        }
+    }
 
     fn get_recursive(&self, idx: u32, key: &Nibbles, offset: usize) -> Option<&[u8]> {
         match self.arena.get(idx) {
@@ -537,14 +588,20 @@ impl MptTree {
         (root_hash, dirty_blobs)
     }
 
-    /// Read-only access to the arena's node slice (for fast store serialization).
-    pub fn arena_nodes(&self) -> &[MptNode] {
-        self.arena.nodes()
+    /// Collect all arena nodes (for segment build / snapshot export).
+    pub fn arena_nodes(&self) -> Vec<MptNode> {
+        self.arena.collect_all_nodes()
     }
 
-    /// Read-only access to the arena's hash cache (for fast store serialization).
-    pub fn arena_hash_cache(&self) -> &[Option<B256>] {
-        self.arena.hash_cache_slice()
+    /// Collect the hash cache (for segment build / snapshot export).
+    pub fn arena_hash_cache(&self) -> Vec<Option<B256>> {
+        let len = self.arena.len();
+        (0..len).map(|i| self.arena.get_hash(i as u32)).collect()
+    }
+
+    /// Number of arena nodes.
+    pub fn arena_len(&self) -> usize {
+        self.arena.len()
     }
 
     /// The root node index (None = empty trie).

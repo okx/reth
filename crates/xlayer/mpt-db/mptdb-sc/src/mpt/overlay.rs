@@ -65,12 +65,13 @@ impl StorageOverlay {
         self.arena.clear_all_dirty();
     }
 
-    pub fn arena_nodes(&self) -> &[super::node::MptNode] {
-        self.arena.nodes()
+    pub fn arena_nodes(&self) -> Vec<super::node::MptNode> {
+        self.arena.collect_all_nodes()
     }
 
-    pub fn arena_hash_cache(&self) -> &[Option<alloy_primitives::B256>] {
-        self.arena.hash_cache_slice()
+    pub fn arena_hash_cache(&self) -> Vec<Option<alloy_primitives::B256>> {
+        let len = self.arena.len();
+        (0..len).map(|i| self.arena.get_hash(i as u32)).collect()
     }
 
     pub fn root_index(&self) -> Option<u32> {
