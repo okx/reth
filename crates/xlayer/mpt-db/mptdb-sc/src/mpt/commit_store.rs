@@ -829,11 +829,13 @@ impl MptCommitStore {
     fn prepare_cached_storage_trie(
         &self,
         trie: StorageTrieCow,
-        storage_root: B256,
-        published_segment: Option<&StorageTrieSegment>,
-        use_async: bool,
+        _storage_root: B256,
+        _published_segment: Option<&StorageTrieSegment>,
+        _use_async: bool,
     ) -> Result<StorageTrieCow> {
-        trie.into_snapshot_cached(storage_root, published_segment, use_async)
+        // Segment serialization already done eagerly in the storage_roots
+        // rayon loop.  Just return the pre-cached trie.
+        Ok(trie)
     }
 
     fn save_storage_version(
@@ -3493,11 +3495,16 @@ impl MptCommitStore {
                 .map(|(addr, mut handle)| -> Result<StorageTrieCommitArtifacts> {
                     let trie = handle.take_working_or_base_for_version(working_version);
                     let hash_start = std::time::Instant::now();
-                    let (root, blobs, cow) =
+                    let (root, blobs, mut cow) =
                         trie.root_hash_and_dirty_blobs(&persisted_for_hash).map_err(|err| {
                             MptDbError::Other(format!("storage trie root hash for {addr}: {err}"))
                         })?;
                     let hash_elapsed = hash_start.elapsed();
+                    // Keep the arena-based trie as-is — matching sei-db's
+                    // resident tree model.  No segment serialization in the
+                    // critical path; set_committed_base → snapshot() handles
+                    // the COW freeze for next block.
+                    cow.clear_dirty();
                     Ok(StorageTrieCommitArtifacts {
                         hashed_address: addr,
                         storage_root: root,
@@ -3515,11 +3522,12 @@ impl MptCommitStore {
                 .map(|(addr, mut handle)| -> Result<StorageTrieCommitArtifacts> {
                     let trie = handle.take_working_or_base_for_version(working_version);
                     let hash_start = std::time::Instant::now();
-                    let (root, blobs, cow) =
+                    let (root, blobs, mut cow) =
                         trie.root_hash_and_dirty_blobs(&persisted_for_hash).map_err(|err| {
                             MptDbError::Other(format!("storage trie root hash for {addr}: {err}"))
                         })?;
                     let hash_elapsed = hash_start.elapsed();
+                    cow.clear_dirty();
                     Ok(StorageTrieCommitArtifacts {
                         hashed_address: addr,
                         storage_root: root,
