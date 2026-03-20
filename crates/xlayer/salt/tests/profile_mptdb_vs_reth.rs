@@ -261,6 +261,10 @@ fn profile_b4_5_single_run_compare() {
         reth_totals.total += total_start.elapsed();
     }
 
+    // Keep the compare fair: release reth's provider/db state before measuring
+    // mpt-db so the second half is not distorted by extra memory pressure.
+    drop(factory);
+
     let dir = TempDir::new().unwrap();
     let mut store =
         MptCommitStore::open_with_config(dir.path(), false, wal_first_config()).unwrap();

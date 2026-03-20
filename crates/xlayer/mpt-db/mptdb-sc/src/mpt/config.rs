@@ -36,6 +36,9 @@ pub struct MptConfig {
     pub snapshot_write_rate_mb_per_sec: u64,
     /// Skip account-trie checkpoint writes once the committed trie grows beyond this size.
     pub checkpoint_max_account_trie_nodes: usize,
+    /// Maximum WAL size in bytes before the frontend applies backpressure.
+    /// 0 = unlimited. Enforcement is deferred to a future change.
+    pub max_wal_bytes: u64,
 }
 
 impl Default for MptConfig {
@@ -55,6 +58,7 @@ impl Default for MptConfig {
             max_published_lag: 0,
             snapshot_write_rate_mb_per_sec: 0,
             checkpoint_max_account_trie_nodes: 200_000,
+            max_wal_bytes: 0,
         }
     }
 }

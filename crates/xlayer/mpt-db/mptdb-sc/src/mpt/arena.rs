@@ -63,8 +63,8 @@ impl MutableTrieArena {
     /// Uses `Arc::make_mut` so that:
     /// - If the frozen base is uniquely owned (typical after commit — the old working trie was
     ///   consumed): patches in-place, O(overlay_size).
-    /// - If shared (another clone still holds a reference): copies then patches, O(base_size).
-    ///   This is rare in the normal commit flow.
+    /// - If shared (another clone still holds a reference): copies then patches, O(base_size). This
+    ///   is rare in the normal commit flow.
     ///
     /// This matches sei-db's model where `Copy()` is O(1) and the cost
     /// is paid on the write path, not on the snapshot path.

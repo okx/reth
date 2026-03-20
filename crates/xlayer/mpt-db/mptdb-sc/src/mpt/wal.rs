@@ -319,7 +319,7 @@ impl CommitWalStore {
             .map_err(|e| MptDbError::Other(format!("write wal record crc: {e}")))?;
         file.write_all(&payload)
             .map_err(|e| MptDbError::Other(format!("write wal record payload: {e}")))?;
-        file.sync_all().map_err(|e| MptDbError::Other(format!("fsync wal segment: {e}")))?;
+        file.sync_data().map_err(|e| MptDbError::Other(format!("fdatasync wal segment: {e}")))?;
 
         let record_end = offset + WAL_RECORD_HEADER_LEN as u64 + payload_len as u64;
         self.index.insert(entry.version, WalLocation { segment_id, offset, len: payload_len });
@@ -794,7 +794,7 @@ impl CommitWalStore {
             .map_err(|e| MptDbError::Other(format!("create wal meta tmp: {e}")))?;
         file.write_all(&bytes)
             .map_err(|e| MptDbError::Other(format!("write wal meta tmp: {e}")))?;
-        file.sync_all().map_err(|e| MptDbError::Other(format!("fsync wal meta tmp: {e}")))?;
+        file.sync_data().map_err(|e| MptDbError::Other(format!("fdatasync wal meta tmp: {e}")))?;
         drop(file);
         fs::rename(&tmp_path, &self.meta_path)
             .map_err(|e| MptDbError::Other(format!("rename wal meta: {e}")))?;
