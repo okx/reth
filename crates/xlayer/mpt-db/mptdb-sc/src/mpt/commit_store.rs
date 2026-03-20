@@ -3600,7 +3600,7 @@ impl MptCommitStore {
         // Phase 2b: compute state root and collect dirty blobs in one pass
         let account_root_start = std::time::Instant::now();
         let (state_root, account_blobs, account_cow) = account_trie
-            .root_hash_and_dirty_blobs(&self.persisted)
+            .root_hash_and_dirty_blobs_parallel(&self.persisted)
             .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?;
         let account_root_elapsed = account_root_start.elapsed();
 

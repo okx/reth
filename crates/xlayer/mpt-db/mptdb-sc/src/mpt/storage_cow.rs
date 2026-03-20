@@ -312,8 +312,25 @@ impl StorageTrieCow {
     }
 
     pub fn root_hash_and_dirty_blobs(
+        self,
+        store: &PersistedTrieStore,
+    ) -> Result<(B256, Vec<(B256, Vec<u8>)>, StorageTrieCow)> {
+        self.root_hash_and_dirty_blobs_inner(store, false)
+    }
+
+    /// Parallel variant: hash the root's 16 children in parallel.
+    /// Use for the account trie where the root is a large Branch node.
+    pub fn root_hash_and_dirty_blobs_parallel(
+        self,
+        store: &PersistedTrieStore,
+    ) -> Result<(B256, Vec<(B256, Vec<u8>)>, StorageTrieCow)> {
+        self.root_hash_and_dirty_blobs_inner(store, true)
+    }
+
+    fn root_hash_and_dirty_blobs_inner(
         mut self,
         store: &PersistedTrieStore,
+        parallel: bool,
     ) -> Result<(B256, Vec<(B256, Vec<u8>)>, StorageTrieCow)> {
         let root = match self.root.clone() {
             CowRootRef::Empty => None,
@@ -326,7 +343,11 @@ impl StorageTrieCow {
         };
         self.prune_pending_lazy_children();
 
-        let result = storage_recompute::recompute(&mut self.arena, root);
+        let result = if parallel {
+            storage_recompute::recompute_parallel(&mut self.arena, root)
+        } else {
+            storage_recompute::recompute(&mut self.arena, root)
+        };
         Ok((result.root, result.dirty_blobs, self))
     }
 
