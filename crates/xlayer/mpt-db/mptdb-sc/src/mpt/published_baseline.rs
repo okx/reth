@@ -306,6 +306,37 @@ impl PublishedBaselineManager {
         Ok(Some(meta))
     }
 
+    pub(crate) fn meta_for_version(
+        &self,
+        version: i64,
+        root: B256,
+    ) -> Result<Option<PublishedBaselineMeta>> {
+        let generation = version as u64;
+        let meta = match self.load_generation_meta(generation)? {
+            Some(meta) if meta.version == version && meta.root == root => meta,
+            _ => return Ok(None),
+        };
+        Ok(Some(PublishedBaselineMeta {
+            generation: meta.generation,
+            version: meta.version,
+            root: meta.root,
+        }))
+    }
+
+    pub(crate) fn earliest_snapshot_version(&self) -> Result<Option<i64>> {
+        let mut earliest: Option<i64> = None;
+        for generation in self.list_generations()? {
+            let Some(meta) = self.load_generation_meta(generation)? else {
+                continue;
+            };
+            earliest = Some(match earliest {
+                Some(cur) => cur.min(meta.version),
+                None => meta.version,
+            });
+        }
+        Ok(earliest)
+    }
+
     pub fn open_published_store(
         &self,
         meta: &PublishedBaselineMeta,

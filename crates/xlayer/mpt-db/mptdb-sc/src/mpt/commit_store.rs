@@ -1016,6 +1016,44 @@ impl MptCommitStore {
         dir.join("fast_storage")
     }
 
+    fn cleanup_tmp_artifacts(path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(path)
+            .map_err(|e| MptDbError::Other(format!("read dir {}: {e}", path.display())))?
+        {
+            let entry = entry.map_err(|e| {
+                MptDbError::Other(format!("read dir entry {}: {e}", path.display()))
+            })?;
+            let entry_path = entry.path();
+            let file_type = entry.file_type().map_err(|e| {
+                MptDbError::Other(format!("read file type {}: {e}", entry_path.display()))
+            })?;
+
+            let is_tmp = entry_path.extension().is_some_and(|ext| ext == "tmp");
+            if is_tmp {
+                if file_type.is_dir() {
+                    fs::remove_dir_all(&entry_path).map_err(|e| {
+                        MptDbError::Other(format!("remove tmp dir {}: {e}", entry_path.display()))
+                    })?;
+                } else {
+                    fs::remove_file(&entry_path).map_err(|e| {
+                        MptDbError::Other(format!("remove tmp file {}: {e}", entry_path.display()))
+                    })?;
+                }
+                continue;
+            }
+
+            if file_type.is_dir() {
+                Self::cleanup_tmp_artifacts(&entry_path)?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn try_load_checkpoint(dir: &Path, version: i64, root: B256) -> Result<Option<MptTree>> {
         let path = Self::checkpoint_path(dir);
         if !path.exists() {
@@ -1540,6 +1578,63 @@ impl MptCommitStore {
         }
     }
 
+    fn select_published_view_for_version(
+        published_baseline: &PublishedBaselineManager,
+        version: i64,
+        root: B256,
+    ) -> Result<(Option<PublishedBaselineMeta>, Option<PublishedBaselineReader>)> {
+        let selected = match published_baseline.load_meta()? {
+            Some(meta) if meta.version == version && meta.root == root => Some(meta),
+            _ => published_baseline.meta_for_version(version, root)?,
+        };
+        if let Some(meta) = selected {
+            let store = published_baseline.open_published_store(&meta)?;
+            if store.is_some() {
+                return Ok((Some(meta), store));
+            }
+        }
+        Ok((None, None))
+    }
+
+    fn recover_target_state(
+        &self,
+        manifest: &VersionManifest,
+        target_version: i64,
+    ) -> Result<(StorageTrieCow, bool, i64)> {
+        let committed_version = manifest.latest_version;
+        let durable_version = if self.config.wal_first_commit {
+            self.wal_recovery_base_version(committed_version)
+        } else {
+            committed_version
+        };
+
+        if self.config.wal_first_commit && durable_version < target_version {
+            let wal_store = self.wal_store.as_ref().map(Arc::clone).ok_or_else(|| {
+                MptDbError::Other("wal-first recovery requires wal store".to_string())
+            })?;
+            let mut shadow = Self::open_replay_materializer_state(
+                &self.dir,
+                Arc::clone(&self.persisted),
+                Arc::clone(&self.published_baseline),
+                Some(wal_store),
+                manifest.clone(),
+                self.config.clone(),
+                durable_version,
+            )?;
+            shadow.replay_wal_catchup_to(manifest, target_version)?;
+            #[cfg(test)]
+            let loaded_from_checkpoint = shadow.loaded_from_checkpoint;
+            #[cfg(not(test))]
+            let loaded_from_checkpoint = false;
+            Ok((shadow.account_trie.committed().clone(), loaded_from_checkpoint, durable_version))
+        } else {
+            let root = manifest.get_root(target_version).unwrap_or(EMPTY_ROOT_HASH);
+            let (account_trie, loaded_from_checkpoint) =
+                Self::load_account_trie_snapshot(&self.dir, &self.persisted, target_version, root)?;
+            Ok((account_trie, loaded_from_checkpoint, durable_version))
+        }
+    }
+
     fn restore_version_state(
         &mut self,
         manifest: VersionManifest,
@@ -1562,7 +1657,15 @@ impl MptCommitStore {
         self.checkpoint_account_trie_nodes = checkpoint_account_trie_nodes;
         self.dirty_accounts.clear();
         self.clear_storage_trie_state();
-        self.reload_published_view()?;
+        let root = self.manifest.get_root(version).unwrap_or(EMPTY_ROOT_HASH);
+        let (published_meta, published_store) =
+            Self::select_published_view_for_version(&self.published_baseline, version, root)?;
+        self.published_meta = published_meta;
+        self.published_store = published_store;
+        self.published_version.store(
+            self.published_meta.as_ref().map(|meta| meta.version).unwrap_or(0),
+            Ordering::Release,
+        );
         self.applied_this_block = false;
         self.poisoned = false;
         #[cfg(test)]
@@ -1588,15 +1691,8 @@ impl MptCommitStore {
         #[cfg(not(test))]
         let _ = loaded_from_checkpoint;
 
-        let mut published_meta = None;
-        let mut published_store = None;
-        if let Some(meta) = published_baseline.load_meta()? &&
-            meta.version == version &&
-            meta.root == root
-        {
-            published_store = published_baseline.open_published_store(&meta)?;
-            published_meta = Some(meta);
-        }
+        let (published_meta, published_store) =
+            Self::select_published_view_for_version(&published_baseline, version, root)?;
         let published_version = published_meta.as_ref().map(|meta| meta.version).unwrap_or(0);
 
         let mut replay_config = config;
@@ -1752,48 +1848,9 @@ impl MptCommitStore {
             )));
         }
 
-        let durable_version = if self.config.wal_first_commit {
-            self.wal_recovery_base_version(committed_version)
-        } else {
-            committed_version
-        };
-
-        if self.config.wal_first_commit && durable_version < target_version {
-            let wal_store = self.wal_store.as_ref().map(Arc::clone).ok_or_else(|| {
-                MptDbError::Other("wal-first load_version requires wal store".to_string())
-            })?;
-            let mut shadow = Self::open_replay_materializer_state(
-                &self.dir,
-                Arc::clone(&self.persisted),
-                Arc::clone(&self.published_baseline),
-                Some(wal_store),
-                manifest.clone(),
-                self.config.clone(),
-                durable_version,
-            )?;
-            shadow.replay_wal_catchup_to(&manifest, target_version)?;
-            #[cfg(test)]
-            let loaded_from_checkpoint = shadow.loaded_from_checkpoint;
-            #[cfg(not(test))]
-            let loaded_from_checkpoint = false;
-            let account_trie = shadow.account_trie.committed().clone();
-            self.restore_version_state(
-                manifest,
-                target_version,
-                account_trie,
-                loaded_from_checkpoint,
-            )?;
-        } else {
-            let root = manifest.get_root(target_version).unwrap_or(EMPTY_ROOT_HASH);
-            let (account_trie, loaded_from_checkpoint) =
-                Self::load_account_trie_snapshot(&self.dir, &self.persisted, target_version, root)?;
-            self.restore_version_state(
-                manifest,
-                target_version,
-                account_trie,
-                loaded_from_checkpoint,
-            )?;
-        }
+        let (account_trie, loaded_from_checkpoint, durable_version) =
+            self.recover_target_state(&manifest, target_version)?;
+        self.restore_version_state(manifest, target_version, account_trie, loaded_from_checkpoint)?;
 
         self.durable_version.store(durable_version, Ordering::Release);
         Ok(())
@@ -1856,6 +1913,21 @@ impl MptCommitStore {
         Self::open_with_config(dir, read_only, MptConfig::default())
     }
 
+    pub fn open_at_version(
+        dir: &Path,
+        read_only: bool,
+        target_version: i64,
+        overwrite: bool,
+    ) -> Result<Self> {
+        Self::open_with_config_at_version(
+            dir,
+            read_only,
+            MptConfig::default(),
+            target_version,
+            overwrite,
+        )
+    }
+
     /// Open an MptCommitStore at the given directory with custom configuration.
     ///
     /// `read_only=true` disables writes and does not acquire the exclusive lock.
@@ -1887,6 +1959,10 @@ impl MptCommitStore {
             }
             Some(lock_file)
         };
+
+        if !read_only {
+            Self::cleanup_tmp_artifacts(dir)?;
+        }
 
         let manifest_path = dir.join("manifest.json");
         let manifest = VersionManifest::load(&manifest_path)?;
@@ -2386,6 +2462,35 @@ impl MptCommitStore {
         Ok(store)
     }
 
+    pub fn open_with_config_at_version(
+        dir: &Path,
+        read_only: bool,
+        config: MptConfig,
+        target_version: i64,
+        overwrite: bool,
+    ) -> Result<Self> {
+        if overwrite && read_only {
+            return Err(MptDbError::Other(
+                "cannot open with overwrite in read-only mode".to_string(),
+            ));
+        }
+        if overwrite && target_version <= 0 {
+            return Err(MptDbError::Other(
+                "overwrite requires a positive target version".to_string(),
+            ));
+        }
+
+        let mut store = Self::open_with_config(dir, read_only, config)?;
+        if target_version > 0 {
+            if overwrite {
+                store.rollback(target_version)?;
+            } else {
+                store.load_version_target(target_version)?;
+            }
+        }
+        Ok(store)
+    }
+
     /// Try to extract storage_root from an existing account leaf in the trie.
     fn get_existing_storage_root(&self, hashed_address: &B256) -> B256 {
         let key = Nibbles::unpack(hashed_address);
@@ -2581,6 +2686,14 @@ impl MptCommitStore {
             .unwrap_or(committed_version)
     }
 
+    fn wal_prune_floor_version(&self) -> Result<i64> {
+        let mut floor = self.manifest.earliest_version;
+        if let Some(snapshot_floor) = self.published_baseline.earliest_snapshot_version()? {
+            floor = floor.min(snapshot_floor);
+        }
+        Ok(floor)
+    }
+
     /// Check if this is a fresh DB (manifest = {0->EMPTY_ROOT_HASH}, no other versions, empty
     /// store).
     fn is_fresh_db(&self) -> Result<bool> {
@@ -2684,33 +2797,34 @@ impl MptCommitter for MptCommitStore {
         // Wait for any in-flight persist jobs before modifying manifest
         self.flush_persist()?;
 
-        if target_version < self.manifest.earliest_version ||
-            target_version > self.manifest.latest_version
-        {
+        let manifest = VersionManifest::load(&self.manifest_path)?;
+        if target_version < manifest.earliest_version || target_version > manifest.latest_version {
             return Err(MptDbError::Other(format!(
                 "rollback target {} out of range [{}, {}]",
-                target_version, self.manifest.earliest_version, self.manifest.latest_version
+                target_version, manifest.earliest_version, manifest.latest_version
             )));
         }
 
-        let mut manifest_copy = self.manifest.clone();
+        let (account_trie, loaded_from_checkpoint, _durable_version) =
+            self.recover_target_state(&manifest, target_version)?;
+
+        let mut manifest_copy = manifest.clone();
         manifest_copy.truncate_after(target_version);
         manifest_copy.save(&self.manifest_path)?;
         self.rollback_shadow_wal_to(target_version)?;
         let target_root = manifest_copy.get_root(target_version).unwrap_or(EMPTY_ROOT_HASH);
         self.published_baseline.activate_published_version(target_version, target_root)?;
-        let (account_trie, loaded_from_checkpoint) = Self::load_account_trie_snapshot(
-            &self.dir,
-            &self.persisted,
-            target_version,
-            target_root,
-        )?;
         self.restore_version_state(
             manifest_copy,
             target_version,
             account_trie,
             loaded_from_checkpoint,
-        )
+        )?;
+        if self.published_baseline.compact_for_manifest(&self.manifest)? {
+            self.reload_published_view()?;
+        }
+        self.durable_version.store(target_version, Ordering::Release);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
@@ -2744,9 +2858,10 @@ impl MptCommitter for MptCommitStore {
         }
         new_manifest.earliest_version = version;
         new_manifest.save(&self.manifest_path)?;
-        self.prune_shadow_wal_before(version)?;
         self.manifest = new_manifest;
         self.maybe_compact_segment_store()?;
+        let wal_floor = self.wal_prune_floor_version()?;
+        self.prune_shadow_wal_before(wal_floor)?;
 
         Ok(())
     }
@@ -3471,6 +3586,7 @@ mod tests {
     use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
     use revm_database::{states::StorageSlot, BundleAccount};
     use revm_state::AccountInfo;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn make_bundle(
@@ -3508,6 +3624,20 @@ mod tests {
             account_id: None,
             code: None,
         }
+    }
+
+    fn wait_for_published_generation(
+        store: &MptCommitStore,
+        version: i64,
+    ) -> PublishedBaselineMeta {
+        let root = store.manifest.get_root(version).unwrap_or(EMPTY_ROOT_HASH);
+        for _ in 0..200 {
+            if let Some(meta) = store.published_baseline.meta_for_version(version, root).unwrap() {
+                return meta;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("published generation {version} did not appear");
     }
 
     #[test]
@@ -3871,6 +4001,52 @@ mod tests {
         assert!(wal.load_entry(1).unwrap().is_none());
         assert!(wal.load_entry(2).unwrap().is_some());
         assert!(wal.load_entry(3).unwrap().is_some());
+    }
+
+    #[test]
+    fn wal_prune_respects_retained_published_snapshot_floor() {
+        let dir = TempDir::new().unwrap();
+        let mut config = MptConfig::default();
+        config.wal_first_commit = true;
+        let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+        let addr = Address::repeat_byte(0x52);
+
+        let bundle1 = make_bundle(vec![(
+            addr,
+            Some(default_info(1, 100)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(11))],
+        )]);
+        store.apply_bundle_state(&bundle1).unwrap();
+        store.commit().unwrap();
+        store.flush_persist().unwrap();
+        let meta1 = wait_for_published_generation(&store, 1);
+        let held_reader = store.published_baseline.open_published_store(&meta1).unwrap().unwrap();
+
+        let bundle2 = make_bundle(vec![(
+            addr,
+            Some(default_info(2, 200)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(2), U256::ZERO, U256::from(22))],
+        )]);
+        store.apply_bundle_state(&bundle2).unwrap();
+        store.commit().unwrap();
+        store.flush_persist().unwrap();
+
+        store.prune_before(2).unwrap();
+        {
+            let wal = store.wal_store.as_ref().unwrap().lock();
+            assert_eq!(wal.earliest_version(), 1);
+            assert_eq!(wal.latest_version(), 2);
+        }
+
+        drop(held_reader);
+        store.prune_before(2).unwrap();
+        {
+            let wal = store.wal_store.as_ref().unwrap().lock();
+            assert_eq!(wal.earliest_version(), 2);
+            assert_eq!(wal.latest_version(), 2);
+        }
     }
 
     #[test]
@@ -5738,6 +5914,191 @@ mod tests {
         assert_eq!(store.version(), 1);
         assert_eq!(store.published_version(), Some(1));
         assert!(store.has_published_store());
+    }
+
+    #[test]
+    fn t6_5c2_load_version_target_rebinds_historical_published_generation() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        let addr = Address::repeat_byte(0x3a);
+
+        let bundle1 = make_bundle(vec![(
+            addr,
+            Some(default_info(1, 100)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(1))],
+        )]);
+        store.apply_bundle_state(&bundle1).unwrap();
+        store.commit().unwrap();
+        store.load_version().unwrap();
+        assert_eq!(store.published_version(), Some(1));
+
+        let bundle2 = make_bundle(vec![(
+            addr,
+            Some(default_info(2, 200)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(2), U256::ZERO, U256::from(2))],
+        )]);
+        store.apply_bundle_state(&bundle2).unwrap();
+        store.commit().unwrap();
+        store.load_version().unwrap();
+        assert_eq!(store.published_version(), Some(2));
+
+        store.load_version_target(1).unwrap();
+        assert_eq!(store.version(), 1);
+        assert_eq!(store.published_version(), Some(1));
+        assert!(store.has_published_store());
+    }
+
+    #[test]
+    fn t6_5c3_rollback_compacts_future_published_generations() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+        let addr = Address::repeat_byte(0x3b);
+
+        let bundle1 = make_bundle(vec![(
+            addr,
+            Some(default_info(1, 100)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(1), U256::ZERO, U256::from(1))],
+        )]);
+        store.apply_bundle_state(&bundle1).unwrap();
+        let (_, root1) = store.commit().unwrap();
+        store.load_version().unwrap();
+
+        let bundle2 = make_bundle(vec![(
+            addr,
+            Some(default_info(2, 200)),
+            revm_database::AccountStatus::Changed,
+            vec![(U256::from(2), U256::ZERO, U256::from(2))],
+        )]);
+        store.apply_bundle_state(&bundle2).unwrap();
+        let (_, root2) = store.commit().unwrap();
+        store.load_version().unwrap();
+        assert!(store.published_baseline.meta_for_version(2, root2).unwrap().is_some());
+
+        store.rollback(1).unwrap();
+
+        assert_eq!(store.version(), 1);
+        assert_eq!(store.published_version(), Some(1));
+        assert!(store.has_published_store());
+        assert!(store.published_baseline.meta_for_version(1, root1).unwrap().is_some());
+        assert!(store.published_baseline.meta_for_version(2, root2).unwrap().is_none());
+    }
+
+    #[test]
+    fn t6_5c4_open_cleans_tmp_artifacts() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        let tmp_paths = [
+            base.join("manifest.tmp"),
+            base.join("account_trie_checkpoint.bin.tmp"),
+            base.join("changelog").join("meta.tmp"),
+            MptCommitStore::fast_storage_root(base).join("published").join("gen-9.delta.tmp"),
+            MptCommitStore::fast_storage_root(base).join("meta").join("published.tmp"),
+        ];
+        for path in &tmp_paths {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, b"tmp").unwrap();
+        }
+
+        let tmp_dir = MptCommitStore::fast_storage_root(base).join("published").join("stale.tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        fs::write(tmp_dir.join("leftover"), b"tmp").unwrap();
+
+        let store = MptCommitStore::open(base, false).unwrap();
+        drop(store);
+
+        for path in &tmp_paths {
+            assert!(!path.exists(), "tmp artifact should be removed: {}", path.display());
+        }
+        assert!(!tmp_dir.exists(), "tmp directory should be removed");
+    }
+
+    #[test]
+    fn t6_5c5_open_at_version_loads_historical_state() {
+        let dir = TempDir::new().unwrap();
+        let addr = Address::repeat_byte(0x3c);
+
+        {
+            let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+            let bundle1 = make_bundle(vec![(
+                addr,
+                Some(default_info(1, 100)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(1), U256::ZERO, U256::from(1))],
+            )]);
+            store.apply_bundle_state(&bundle1).unwrap();
+            store.commit().unwrap();
+
+            let bundle2 = make_bundle(vec![(
+                addr,
+                Some(default_info(2, 200)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(2), U256::ZERO, U256::from(2))],
+            )]);
+            store.apply_bundle_state(&bundle2).unwrap();
+            store.commit().unwrap();
+            store.close().unwrap();
+        }
+
+        let store = MptCommitStore::open_at_version(dir.path(), false, 1, false).unwrap();
+        assert_eq!(store.version(), 1);
+        assert_eq!(store.manifest.latest_version, 2);
+        assert_eq!(store.published_version(), Some(1));
+        assert!(store.has_published_store());
+    }
+
+    #[test]
+    fn t6_5c6_open_at_version_overwrite_truncates_future_history() {
+        let dir = TempDir::new().unwrap();
+        let mut config = MptConfig::default();
+        config.wal_first_commit = true;
+        let addr = Address::repeat_byte(0x3d);
+
+        {
+            let mut store =
+                MptCommitStore::open_with_config(dir.path(), false, config.clone()).unwrap();
+            let bundle1 = make_bundle(vec![(
+                addr,
+                Some(default_info(1, 100)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(1), U256::ZERO, U256::from(1))],
+            )]);
+            store.apply_bundle_state(&bundle1).unwrap();
+            store.commit().unwrap();
+            store.flush_persist().unwrap();
+
+            let bundle2 = make_bundle(vec![(
+                addr,
+                Some(default_info(2, 200)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(2), U256::ZERO, U256::from(2))],
+            )]);
+            store.apply_bundle_state(&bundle2).unwrap();
+            store.commit().unwrap();
+            store.flush_persist().unwrap();
+            store.close().unwrap();
+        }
+
+        let store =
+            MptCommitStore::open_with_config_at_version(dir.path(), false, config.clone(), 1, true)
+                .unwrap();
+        assert_eq!(store.version(), 1);
+        assert_eq!(store.manifest.latest_version, 1);
+        assert_eq!(store.published_version(), Some(1));
+        {
+            let wal = store.wal_store.as_ref().unwrap().lock();
+            assert_eq!(wal.latest_version(), 1);
+        }
+        drop(store);
+
+        let reopened = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+        assert_eq!(reopened.version(), 1);
+        assert_eq!(reopened.manifest.latest_version, 1);
     }
 
     #[test]

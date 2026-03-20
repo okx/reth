@@ -46,6 +46,30 @@ impl MptDb {
         builder.build()
     }
 
+    pub fn open_at_version(
+        home_dir: &str,
+        sc_config: StateCommitConfig,
+        ss_config: Option<StateStoreConfig>,
+        target_version: i64,
+        overwrite: bool,
+    ) -> Result<Self> {
+        if !sc_config.enable {
+            return Err(MptDbError::Other(
+                "state-commit layer disabled; MPT SC is required".to_string(),
+            ));
+        }
+
+        let sc_path = resolve_sc_path(Path::new(home_dir), &sc_config);
+        let sc = MptCommitStore::open_at_version(&sc_path, false, target_version, overwrite)?;
+
+        let ss = match ss_config {
+            Some(ref cfg) if cfg.enable => Some(new_state_store(cfg, home_dir)?),
+            _ => None,
+        };
+
+        Ok(Self { sc, ss, home_dir: home_dir.to_string() })
+    }
+
     /// Returns a reference to the SC (State Commitment) layer.
     pub fn sc(&self) -> &MptCommitStore {
         &self.sc
@@ -177,6 +201,45 @@ mod tests {
         let mut db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();
         let result = db.load_version(3);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn t2_5c_open_at_version_nonzero() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().to_string_lossy().to_string();
+        {
+            let mut db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();
+            for _ in 0..3 {
+                db.sc_mut().apply_bundle_state(&revm_database::BundleState::default()).unwrap();
+                db.sc_mut().commit().unwrap();
+            }
+        }
+
+        let db =
+            MptDb::open_at_version(&home, StateCommitConfig::default(), None, 2, false).unwrap();
+        assert_eq!(db.version(), 2);
+        assert_eq!(db.sc().version(), 2);
+    }
+
+    #[test]
+    fn t2_5d_open_at_version_overwrite() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().to_string_lossy().to_string();
+        {
+            let mut db = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();
+            for _ in 0..3 {
+                db.sc_mut().apply_bundle_state(&revm_database::BundleState::default()).unwrap();
+                db.sc_mut().commit().unwrap();
+            }
+        }
+
+        let db =
+            MptDb::open_at_version(&home, StateCommitConfig::default(), None, 2, true).unwrap();
+        assert_eq!(db.version(), 2);
+        drop(db);
+
+        let reopened = MptDb::open(&home, StateCommitConfig::default(), None).unwrap();
+        assert_eq!(reopened.version(), 2);
     }
 
     /// T2.6: close() works
