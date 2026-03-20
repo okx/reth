@@ -254,6 +254,12 @@ impl CommitWalStore {
         self.meta.durable_version
     }
 
+    pub fn size_bytes(&self) -> u64 {
+        let segments_size = self.segments.values().map(|range| range.valid_end).sum::<u64>();
+        let meta_size = fs::metadata(&self.meta_path).map(|meta| meta.len()).unwrap_or(0);
+        segments_size + meta_size
+    }
+
     pub fn is_empty(&self) -> bool {
         self.meta.is_empty()
     }

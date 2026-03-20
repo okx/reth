@@ -615,6 +615,10 @@ impl MptCommitStore {
         self.maybe_refresh_published_view()?;
         let published_current = self.has_current_published_view();
 
+        // Two-phase approach: first check cheap filters (O(1) each),
+        // then do expensive trie walks only for cache misses.
+        // This avoids 5000× O(depth) account trie walks when 99%+ hit L2.
+        let mut need_storage_root: Vec<&DirtyAccount> = Vec::new();
         for dirty in dirty_accounts {
             if dirty.storage_wiped || dirty.storage_changes.is_empty() {
                 continue;
@@ -626,13 +630,17 @@ impl MptCommitStore {
                 self.activate_empty_trie(dirty.hashed_address);
                 continue;
             }
-
-            let existing_root = self.get_existing_storage_root(&dirty.hashed_address);
+            // Check L2 cache BEFORE the expensive trie walk.
             if self.checkout_cached_storage_trie(&dirty.hashed_address) {
                 stats.l2_hits += 1;
                 continue;
             }
+            need_storage_root.push(dirty);
+        }
 
+        // Only the cache-miss accounts need an account trie lookup.
+        for dirty in need_storage_root {
+            let existing_root = self.get_existing_storage_root(&dirty.hashed_address);
             if existing_root == EMPTY_ROOT_HASH {
                 self.activate_empty_trie(dirty.hashed_address);
             } else {
@@ -1396,6 +1404,30 @@ impl MptCommitStore {
             }
         }
 
+        if self.config.max_wal_bytes > 0 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                self.check_async_error()?;
+                let Some(wal_store) = self.wal_store.as_ref() else {
+                    break;
+                };
+                let wal_bytes = wal_store.lock().size_bytes();
+                if wal_bytes <= self.config.max_wal_bytes {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        next_version,
+                        wal_bytes,
+                        max_wal_bytes = self.config.max_wal_bytes,
+                        "backpressure: timed out waiting for WAL size to fall below limit"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
         Ok(())
     }
 
@@ -1609,15 +1641,8 @@ impl MptCommitStore {
         let async_error_detail_clone = Arc::clone(&self.async_error_detail);
         let durable_version_clone = Arc::clone(&self.durable_version);
         let published_version_clone = Arc::clone(&self.published_version);
-        let last_wal_replay_micros_clone = Arc::clone(&self.last_wal_replay_micros);
-        let last_durable_materialize_micros_clone =
-            Arc::clone(&self.last_durable_materialize_micros);
-        let last_published_materialize_micros_clone =
-            Arc::clone(&self.last_published_materialize_micros);
         let wal_store_clone = self.wal_store.as_ref().map(Arc::clone);
         let published_rewrite_tx_clone = self.published_rewrite_tx.as_ref().cloned();
-        let dir_path = self.dir.clone();
-        let manifest_path_clone = self.manifest_path.clone();
         let worker_config = self.config.clone();
         #[cfg(test)]
         let async_fail_mode_clone = Arc::clone(&self.async_fail_mode);
@@ -1625,7 +1650,6 @@ impl MptCommitStore {
         let handle = std::thread::Builder::new()
             .name("mpt-persist".to_string())
             .spawn(move || {
-                let mut replay_materializer: Option<MptCommitStore> = None;
                 // Track a pending rewrite that was dropped due to full queue,
                 // so it can be retried on the next durable version advance.
                 let mut pending_rewrite: Option<(i64, B256)> = None;
@@ -1786,6 +1810,41 @@ impl MptCommitStore {
                                         .unwrap_or(0);
                                         if floor > 0 {
                                             let _ = wal.prune_before(floor);
+                                        }
+                                    }
+                                }
+                                if worker_config.wal_first_commit {
+                                    if let Some(rewrite_tx) = published_rewrite_tx_clone.as_ref() {
+                                        let should_schedule = if pending_rewrite.is_some() {
+                                            true
+                                        } else {
+                                            let published_cur =
+                                                published_version_clone.load(Ordering::Acquire);
+                                            Self::should_rewrite_published_snapshot(
+                                                &worker_config,
+                                                published_cur,
+                                                job.version,
+                                            )
+                                        };
+                                        if should_schedule {
+                                            match Self::schedule_published_rewrite(
+                                                rewrite_tx,
+                                                job.version,
+                                                job.state_root,
+                                                None,
+                                            ) {
+                                                Ok(sent) => {
+                                                    if sent {
+                                                        pending_rewrite = None;
+                                                    } else {
+                                                        pending_rewrite =
+                                                            Some((job.version, job.state_root));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    Self::warn_nonfatal_async_error(&e);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -4628,7 +4687,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_first_commit_does_not_incrementally_publish_baseline() {
+    fn wal_first_commit_triggers_background_rewrite_publish() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
         config.wal_first_commit = true;
@@ -4647,9 +4706,13 @@ mod tests {
 
         store.flush_persist().unwrap();
         assert_eq!(store.frontier().durable_version, 1);
-        assert_eq!(store.published_version(), None);
-        assert!(!store.has_published_store());
-        assert!(store.published_baseline.load_meta().unwrap().is_none());
+        assert_eq!(store.published_version(), Some(1));
+        let root = store.manifest.get_root(1).unwrap_or(EMPTY_ROOT_HASH);
+        let published = wait_for_published_generation(&store, 1);
+        assert_eq!(published.version, 1);
+        assert_eq!(published.root, root);
+        store.maybe_refresh_published_view().unwrap();
+        assert!(store.has_published_store());
     }
 
     #[test]
