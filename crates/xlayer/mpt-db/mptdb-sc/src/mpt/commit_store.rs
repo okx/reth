@@ -1947,7 +1947,7 @@ impl MptCommitStore {
 
     fn load_account_trie_snapshot(
         dir: &Path,
-        _persisted: &PersistedTrieStore,
+        persisted: &PersistedTrieStore,
         version: i64,
         root: B256,
     ) -> Result<(StorageTrieCow, bool)> {
@@ -1957,7 +1957,13 @@ impl MptCommitStore {
                 if root == EMPTY_ROOT_HASH {
                     StorageTrieCow::empty()
                 } else {
-                    StorageTrieCow::from_persisted_root(root)
+                    // Fully materialize the account trie into memory at startup,
+                    // matching sei-db's model where trees are always resident.
+                    // This eliminates lazy loading during block processing:
+                    // preload_paths, apply_change, and root_hash all become
+                    // pure in-memory operations.
+                    let tree = super::persisted::load_tree_from_root(persisted, root)?;
+                    StorageTrieCow::from_tree(tree)
                 },
                 false,
             )),
@@ -3301,10 +3307,19 @@ impl MptCommitStore {
         let load_start = std::time::Instant::now();
         let working_version = self.current_working_version();
         self.account_trie.checkout_for_write(working_version);
-        let touched_account_keys: Vec<Nibbles> =
-            dirty_accounts.iter().map(|dirty| dirty.account_key.clone()).collect();
+        // No bulk preload_paths: matching sei-db's model where reads go
+        // directly through mmap'd segment (PersistedNode) and writes do
+        // on-demand COW (MemNode).  Only the first block after a cold start
+        // (when the trie root is Lazy) triggers batch materialization;
+        // subsequent blocks reuse the arena and resolve new paths lazily.
         if let Some(working) = self.account_trie.working.as_mut() {
-            working.preload_paths(&self.persisted, &touched_account_keys)?;
+            if working.is_lazy_root() {
+                // Cold start: batch-load all paths from segment/persisted
+                // (equivalent to sei-db's initial LoadMultiTree).
+                let touched_account_keys: Vec<Nibbles> =
+                    dirty_accounts.iter().map(|dirty| dirty.account_key.clone()).collect();
+                working.preload_paths(&self.persisted, &touched_account_keys)?;
+            }
         }
         let load_stats = self.ensure_working_storage_tries(&dirty_accounts)?;
 
@@ -3678,10 +3693,14 @@ impl MptCommitStore {
         let checkpoint_account_trie_nodes = Some(account_cow.arena_len());
         let committed_account_trie = if state_root == EMPTY_ROOT_HASH {
             StorageTrieCow::empty()
-        } else if saved.use_async {
-            StorageTrieCow::from_tree(account_cow.into_materialized_tree(&self.persisted)?)
         } else {
-            StorageTrieCow::from_persisted_root(state_root)
+            // Always keep the account trie in memory across blocks,
+            // matching sei-db's model where trees are always resident.
+            // After bulk_load the trie is fully materialized; subsequent
+            // commits only COW the modified paths.  Since apply_change
+            // never introduces new lazy children on a materialized base,
+            // the trie stays fully in-arena with no pending_lazy_children.
+            account_cow
         };
         self.account_trie.set_committed_base(saved.new_version, committed_account_trie);
         self.checkpoint_account_trie_nodes = checkpoint_account_trie_nodes;

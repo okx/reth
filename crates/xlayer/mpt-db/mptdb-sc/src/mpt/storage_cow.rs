@@ -158,6 +158,12 @@ impl StorageTrieCow {
         self.arena.len()
     }
 
+    /// Returns true if the root is a lazy reference (segment or persisted hash)
+    /// with an empty arena — i.e., the trie has never been materialized.
+    pub fn is_lazy_root(&self) -> bool {
+        matches!(self.root, CowRootRef::Lazy(_)) && self.arena.is_empty()
+    }
+
     pub fn root_index(&self) -> Option<u32> {
         match self.root {
             CowRootRef::Empty => None,
@@ -296,6 +302,9 @@ impl StorageTrieCow {
                 let tree = persisted::load_tree_paths_from_root(store, root, touched_keys)?;
                 *self = Self::from_tree(tree);
             }
+            // Arena root: no bulk preload needed.  Reads resolve lazy
+            // children on-demand (mmap segment or persisted store) and
+            // writes COW only the modified path via ensure_path_loaded.
             _ => {}
         }
 
