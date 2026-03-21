@@ -31,5 +31,5 @@ pub use transaction_trace_xlayer::{
 //  X Layer, re-export block timing module items for convenience
 pub use block_timing::{
     get_block_timing, remove_block_timing, store_block_timing, BlockTimingContext,
-    BlockTimingMetrics, BlockTimingPrometheusMetrics, BuildTiming, InsertTiming, TimingGuard,
+    BlockTimingMetrics, BlockTimingPrometheusMetrics, BuildTiming, InsertTiming,
 };

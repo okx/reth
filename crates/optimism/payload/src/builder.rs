@@ -23,7 +23,7 @@ use reth_evm::{
 // For X Layer block time
 use reth_execution_types::BlockExecutionOutput;
 use reth_node_metrics::{
-    block_timing::{store_block_timing, BlockTimingContext, BlockTimingPrometheusMetrics},
+    block_timing::{BlockTimingContext, BlockTimingPrometheusMetrics},
     transaction_trace_xlayer::{get_global_tracer, TransactionProcessId},
 };
 use reth_optimism_forks::OpHardforks;
@@ -46,7 +46,7 @@ use reth_revm::{
 use reth_storage_api::{errors::ProviderError, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use revm::context::{Block, BlockEnv};
-use std::{marker::PhantomData, sync::Arc, time::Instant};
+use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, trace, warn};
 
 // For X Layer inner tx
@@ -403,10 +403,8 @@ impl<Txs> OpBuilder<'_, Txs> {
         // X Layer: Initialize timing context with RAII and Prometheus support
         // Note: We'll get the block hash after building, so we create an empty context first
         // and update it later. For now, we use a placeholder hash.
-        let build_start = Instant::now();
-        let prom_metrics = BlockTimingPrometheusMetrics::default();
         let mut timing_ctx =
-            BlockTimingContext::new_empty_with_prometheus(B256::ZERO, prom_metrics);
+            BlockTimingContext::new_empty(B256::ZERO, BlockTimingPrometheusMetrics::default());
 
         // 1. apply pre-execution changes
         {
@@ -481,15 +479,10 @@ impl<Txs> OpBuilder<'_, Txs> {
             write_internal_transactions(&mut inspector, &executed, block_hash)?;
         }
 
-        // X Layer: Update timing context with actual block hash and total times
+        // X Layer: Update timing context with actual block hash, then drop to trigger
+        // update_totals + store immediately.
         timing_ctx.set_block_hash(block_hash);
-        // Note: update_totals() will calculate build.total from individual components,
-        // so we don't need to manually set it here
-        timing_ctx.update_totals();
-
-        // Store timing metrics for this block (will be updated with insert timing later)
-        // Context will auto-store on drop, but we can also manually store here
-        timing_ctx.store();
+        drop(timing_ctx);
 
         let payload =
             OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed));

@@ -2637,8 +2637,7 @@ where
         // Create timing context with Prometheus support
         // We'll create Prometheus metrics from the handler's metrics if needed
         use reth_node_metrics::block_timing::{BlockTimingContext, BlockTimingPrometheusMetrics};
-        let prom_metrics = BlockTimingPrometheusMetrics::default();
-        let mut timing_ctx = BlockTimingContext::new_with_prometheus(block_hash, prom_metrics);
+        let mut timing_ctx = BlockTimingContext::new(block_hash, BlockTimingPrometheusMetrics::default());
 
         // validate and execute
         let executed = {
@@ -2659,12 +2658,11 @@ where
             self.state.tree_state.insert_executed(executed.clone());
         }
         self.metrics.engine.executed_blocks.set(self.state.tree_state.block_count() as f64);
+        drop(timing_ctx);
 
         // emit insert event
         let elapsed = start.elapsed();
 
-        // X Layer: Update timing metrics (auto-updates and stores on drop)
-        timing_ctx.update_totals();
         let engine_event = if is_fork {
             ConsensusEngineEvent::ForkBlockAdded(executed.clone(), elapsed)
         } else {
