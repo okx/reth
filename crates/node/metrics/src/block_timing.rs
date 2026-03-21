@@ -231,7 +231,7 @@ impl BlockTimingContext {
     }
 
     /// Update the block hash for this context.
-    pub fn set_block_hash(&mut self, block_hash: B256) {
+    pub const fn set_block_hash(&mut self, block_hash: B256) {
         self.block_hash = block_hash;
     }
 
