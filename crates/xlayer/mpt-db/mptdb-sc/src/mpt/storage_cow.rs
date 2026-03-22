@@ -327,6 +327,43 @@ impl StorageTrieCow {
         self.root_hash_and_dirty_blobs_inner(store, true)
     }
 
+    /// Compute root hash without collecting dirty blobs.
+    /// Used in wal_first mode where blobs are never persisted to RocksDB —
+    /// matching sei-db's model where commit is pure in-memory work.
+    pub fn root_hash_only(mut self, store: &PersistedTrieStore) -> Result<(B256, StorageTrieCow)> {
+        let root = match self.root.clone() {
+            CowRootRef::Empty => None,
+            CowRootRef::Arena(idx) => Some(idx),
+            CowRootRef::Lazy(_) => self.materialize_root_subtree(store, self.root.clone())?,
+        };
+        self.root = match root {
+            Some(idx) => CowRootRef::Arena(idx),
+            None => CowRootRef::Empty,
+        };
+        self.prune_pending_lazy_children();
+        let hash = storage_recompute::recompute_hash_only(&mut self.arena, root);
+        Ok((hash, self))
+    }
+
+    /// Parallel hash-only variant for the account trie.
+    pub fn root_hash_only_parallel(
+        mut self,
+        store: &PersistedTrieStore,
+    ) -> Result<(B256, StorageTrieCow)> {
+        let root = match self.root.clone() {
+            CowRootRef::Empty => None,
+            CowRootRef::Arena(idx) => Some(idx),
+            CowRootRef::Lazy(_) => self.materialize_root_subtree(store, self.root.clone())?,
+        };
+        self.root = match root {
+            Some(idx) => CowRootRef::Arena(idx),
+            None => CowRootRef::Empty,
+        };
+        self.prune_pending_lazy_children();
+        let hash = storage_recompute::recompute_hash_only_parallel(&mut self.arena, root);
+        Ok((hash, self))
+    }
+
     fn root_hash_and_dirty_blobs_inner(
         mut self,
         store: &PersistedTrieStore,

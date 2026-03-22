@@ -46,6 +46,42 @@ pub(crate) fn recompute(arena: &mut MutableTrieArena, root: Option<u32>) -> Stor
     }
 }
 
+/// Hash-only variant: computes root hash and caches RLP/hash on arena nodes,
+/// but does NOT collect dirty blobs.  Used in wal_first mode where node blobs
+/// are not persisted to RocksDB — matching sei-db's model where commit is
+/// pure in-memory and serialization is deferred to background snapshot.
+pub(crate) fn recompute_hash_only(arena: &mut MutableTrieArena, root: Option<u32>) -> B256 {
+    match root {
+        None => alloy_trie::EMPTY_ROOT_HASH,
+        Some(root_idx) => {
+            let (hash, finalized) = compute_node_hash_only(arena, root_idx);
+            for node in &finalized {
+                arena.set_rlp(node.idx, node.rlp.clone());
+                arena.set_hash(node.idx, node.hash);
+            }
+            hash
+        }
+    }
+}
+
+/// Parallel hash-only variant for account trie root (Branch with 16 children).
+pub(crate) fn recompute_hash_only_parallel(
+    arena: &mut MutableTrieArena,
+    root: Option<u32>,
+) -> B256 {
+    match root {
+        None => alloy_trie::EMPTY_ROOT_HASH,
+        Some(root_idx) => {
+            let (hash, finalized) = compute_node_hash_only_parallel_root(arena, root_idx);
+            for node in &finalized {
+                arena.set_rlp(node.idx, node.rlp.clone());
+                arena.set_hash(node.idx, node.hash);
+            }
+            hash
+        }
+    }
+}
+
 /// Parallel variant: hash the root's children in parallel using rayon.
 /// Only effective when the root is a Branch node (16 independent subtrees).
 pub(crate) fn recompute_parallel(
@@ -188,4 +224,101 @@ fn compute_node_artifacts(arena: &MutableTrieArena, idx: u32) -> NodeArtifacts {
     }
 
     NodeArtifacts { hash: node_hash, finalized_nodes, dirty_blobs }
+}
+
+// ---------------------------------------------------------------------------
+// Hash-only variants: same RLP encode + keccak logic, but skip dirty_blobs
+// collection. Used in wal_first mode where blobs are never persisted.
+// ---------------------------------------------------------------------------
+
+fn encode_child_for_parent_hash_only(
+    arena: &MutableTrieArena,
+    child: &ChildRef,
+) -> (Vec<u8>, Vec<FinalizedNode>) {
+    match child {
+        ChildRef::Arena(idx) => {
+            let idx = *idx;
+            if !arena.is_dirty(idx) {
+                if let Some(hash) = arena.get_hash(idx) {
+                    return (hash.to_vec(), Vec::new());
+                }
+                if let Some(rlp) = arena.get_rlp(idx) {
+                    let hash = hash::hash_rlp(rlp);
+                    let embed = if rlp.len() < 32 { rlp.clone() } else { hash.to_vec() };
+                    return (embed, vec![FinalizedNode { idx, rlp: rlp.clone(), hash }]);
+                }
+            }
+            let (hash, finalized) = compute_node_hash_only(arena, idx);
+            let node_rlp = finalized.first().expect("root must exist").rlp.clone();
+            let embed = if node_rlp.len() < 32 { node_rlp } else { hash.to_vec() };
+            (embed, finalized)
+        }
+        ChildRef::Inline(rlp) => (rlp.clone(), Vec::new()),
+        ChildRef::Hash(hash) => (hash.to_vec(), Vec::new()),
+    }
+}
+
+fn compute_node_hash_only(arena: &MutableTrieArena, idx: u32) -> (B256, Vec<FinalizedNode>) {
+    let mut finalized = Vec::new();
+
+    let rlp = match arena.get(idx) {
+        MptNode::Leaf(leaf) => encode_leaf(&leaf.nibbles, &leaf.value),
+        MptNode::Extension(ext) => {
+            let (embed, child_finalized) = encode_child_for_parent_hash_only(arena, &ext.child);
+            finalized.extend(child_finalized);
+            encode_extension(&ext.nibbles, &embed)
+        }
+        MptNode::Branch(branch) => {
+            let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
+            for (slot, child) in branch.children.iter().enumerate() {
+                if let Some(child) = child {
+                    let (embed, child_finalized) = encode_child_for_parent_hash_only(arena, child);
+                    children_bytes[slot] = Some(embed);
+                    finalized.extend(child_finalized);
+                }
+            }
+            encode_branch(&children_bytes, branch.value.as_deref())
+        }
+    };
+
+    let node_hash = arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
+    finalized.insert(0, FinalizedNode { idx, rlp, hash: node_hash });
+    (node_hash, finalized)
+}
+
+fn compute_node_hash_only_parallel_root(
+    arena: &MutableTrieArena,
+    idx: u32,
+) -> (B256, Vec<FinalizedNode>) {
+    match arena.get(idx) {
+        MptNode::Branch(branch) => {
+            let child_slots: Vec<(usize, &ChildRef)> = branch
+                .children
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, child)| child.as_ref().map(|c| (slot, c)))
+                .collect();
+
+            let child_results: Vec<(usize, Vec<u8>, Vec<FinalizedNode>)> = child_slots
+                .into_par_iter()
+                .map(|(slot, child)| {
+                    let (embed, finalized) = encode_child_for_parent_hash_only(arena, child);
+                    (slot, embed, finalized)
+                })
+                .collect();
+
+            let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
+            let mut finalized = Vec::new();
+            for (slot, embed, child_finalized) in child_results {
+                children_bytes[slot] = Some(embed);
+                finalized.extend(child_finalized);
+            }
+
+            let rlp = encode_branch(&children_bytes, branch.value.as_deref());
+            let node_hash = arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
+            finalized.insert(0, FinalizedNode { idx, rlp, hash: node_hash });
+            (node_hash, finalized)
+        }
+        _ => compute_node_hash_only(arena, idx),
+    }
 }

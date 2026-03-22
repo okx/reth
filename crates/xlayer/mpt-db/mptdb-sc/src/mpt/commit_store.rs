@@ -215,6 +215,12 @@ struct PersistJob {
     /// If set, the background worker signals completion on this channel after
     /// finishing the persist. Used by `flush_persist()` to wait for drain.
     done: Option<crossbeam_channel::Sender<Result<()>>>,
+    /// Snapshot clones of committed storage tries for the worker to build
+    /// segments from in background.  Used in wal_first mode — matching
+    /// sei-db's model where the commit critical path is pure in-memory
+    /// and serialization is deferred to a background goroutine via COW
+    /// tree clone.  After `snapshot()`, cloning is O(1) (Arc clone).
+    committed_tries: Vec<(B256, B256, StorageTrieCow)>,
 }
 
 struct PublishedRewriteJob {
@@ -716,8 +722,9 @@ impl MptCommitStore {
             return Ok(());
         }
 
-        self.flush_persist()?;
-
+        // Refresh the published view without blocking — the background worker
+        // updates published_version atomically; pick up any new segments that
+        // have been published since the last refresh.
         if !published_current {
             self.reload_published_view()?;
             published_current = self.has_current_published_view();
@@ -728,6 +735,10 @@ impl MptCommitStore {
         }
 
         if !candidates.is_empty() {
+            // Remaining accounts have no published segments — typically from
+            // an earlier era (e.g., bulk_load) where segments were not
+            // published.  Their nodes are already durable in RocksDB, so
+            // lazy load is safe without flushing the async persist queue.
             stats.node_fallback_loads += candidates.len() as u64;
             for (hashed_address, existing_root) in candidates {
                 self.activate_snapshot_trie(
@@ -843,7 +854,7 @@ impl MptCommitStore {
         prepared: PreparedStorageVersion,
         all_blobs: Vec<(B256, Vec<u8>)>,
         storage_roots: &HashMap<B256, B256>,
-        storage_cache_candidates: &[(B256, StorageTrieCow)],
+        storage_cache_candidates: &mut [(B256, StorageTrieCow)],
         deferred_published_roots: Vec<(B256, B256)>,
         mode: CommitExecutionMode,
         storage_segment_build_elapsed: &mut Duration,
@@ -856,30 +867,50 @@ impl MptCommitStore {
         let mut open_published_store_elapsed = Duration::ZERO;
 
         if mode.wal_first || prepared.use_async {
-            // WAL-first and async paths share the same persist strategy:
-            // cache blobs in memory for immediate visibility, then hand them
-            // to the background persist worker for durable write.
-            // WAL-first also appends to WAL (already done by caller) for
-            // crash recovery — the worker just does IO, no replay needed.
+            // WAL-first: frontend builds segments from in-memory tries,
+            // background worker publishes them to mmap.  WAL + segments
+            // provide full crash recovery — RocksDB is no longer on the
+            // critical path.
             //
-            // This mirrors sei-db's model: frontend computes state, background
-            // only serializes.  The WAL replay materializer is reserved for
-            // crash recovery (open_with_config catch-up), not normal operation.
-            // Matching sei-db's commit: frontend does pure memory work
-            // (hash computation), WAL append is the only IO.
-            // Manifest save and blob persist are deferred to the background
-            // worker.  WAL provides crash recovery — on restart, manifest
-            // is rebuilt from WAL + last snapshot.
+            // Async (non-wal_first): legacy path — blobs + deferred roots
+            // are sent to the worker for RocksDB persist + segment build.
             self.wait_for_backpressure()?;
-            // No populate_cache: account trie + storage tries stay resident
-            // in memory (arena + LRU handles), matching sei-db's model.
+
+            // In wal_first mode, snapshot the tries so clones are O(1) (Arc
+            // clone of frozen arena).  Send clones to the worker — it builds
+            // segments in background, matching sei-db's model where commit is
+            // pure in-memory and serialization is deferred via COW tree clone.
+            let committed_tries = if mode.wal_first && mode.publish_baseline {
+                storage_cache_candidates
+                    .iter_mut()
+                    .filter_map(|(addr, trie)| {
+                        let root = storage_roots.get(addr).copied().unwrap_or(EMPTY_ROOT_HASH);
+                        if root == EMPTY_ROOT_HASH {
+                            return None;
+                        }
+                        trie.snapshot(); // freeze overlay → O(1) clone
+                        Some((*addr, root, trie.clone()))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let (job_deferred_roots, job_blobs) = if mode.wal_first {
+                // No blobs, no deferred roots — worker builds from trie clones.
+                (Vec::new(), Vec::new())
+            } else {
+                // Legacy async: worker builds segments from RocksDB.
+                (deferred_published_roots, all_blobs)
+            };
+
             let tx = self.persist_tx.as_ref().unwrap();
             let job = PersistJob {
                 barrier_only: false,
                 replay_from_wal: false,
-                blobs: all_blobs,
+                blobs: job_blobs,
                 published_puts: Vec::new(),
-                deferred_published_roots,
+                deferred_published_roots: job_deferred_roots,
                 published_deletes: prepared.published_deletes.clone(),
                 publish_baseline: mode.publish_baseline,
                 state_root: prepared.state_root,
@@ -888,6 +919,7 @@ impl MptCommitStore {
                 save_manifest: true,
                 version: prepared.new_version,
                 done: None,
+                committed_tries,
             };
             tx.send(job).map_err(|e| MptDbError::Other(format!("send persist job: {e}")))?;
         } else {
@@ -1543,6 +1575,12 @@ impl MptCommitStore {
     }
 
     fn should_save_checkpoint(&self) -> bool {
+        // In wal_first mode, always save checkpoint so cold starts can avoid
+        // RocksDB materialization. The account trie is fully resident in memory,
+        // so serialization is a fast in-memory copy + bincode encode.
+        if self.config.wal_first_commit {
+            return self.checkpoint_account_trie_nodes.is_some();
+        }
         let Some(node_count) = self.checkpoint_account_trie_nodes else {
             return false;
         };
@@ -1681,10 +1719,19 @@ impl MptCommitStore {
                         // WAL-first commits send pre-computed blobs directly.
                         // This flag is kept only for backward compatibility.
 
-                        // Non-WAL direct persist path.
                         let result = if let Some(err) = forced_error {
                             Err(err)
+                        } else if worker_config.wal_first_commit {
+                            // wal_first: skip RocksDB persist_batch — WAL +
+                            // published segments provide full durability.
+                            // Only save the manifest.
+                            if job.save_manifest {
+                                job.manifest.save(&job.manifest_path)
+                            } else {
+                                Ok(())
+                            }
                         } else {
+                            // Legacy path: persist blobs to RocksDB then manifest.
                             persisted_clone.persist_batch(&job.blobs, true).and_then(|_| {
                                 if job.save_manifest {
                                     job.manifest.save(&job.manifest_path)
@@ -1705,6 +1752,30 @@ impl MptCommitStore {
                             if job.publish_baseline && !job.replay_from_wal {
                                 let mut publish_puts = job.published_puts.clone();
                                 let mut skip_publish = false;
+
+                                // wal_first: build segments from COW trie clones
+                                // (sei-db model: serialization in background).
+                                if !job.committed_tries.is_empty() {
+                                    for (addr, root, trie) in &job.committed_tries {
+                                        let nodes = trie.arena_nodes();
+                                        let hashes = trie.arena_hash_cache();
+                                        match StorageTrieSegment::from_parts(
+                                            &nodes,
+                                            &hashes,
+                                            trie.root_index(),
+                                            *root,
+                                        ) {
+                                            Ok(segment) => {
+                                                publish_puts.push((*addr, segment));
+                                            }
+                                            Err(e) => {
+                                                Self::warn_nonfatal_async_error(&e);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Legacy path: build segments from RocksDB.
                                 if !job.deferred_published_roots.is_empty() {
                                     match Self::build_publish_segments_from_roots(
                                         &persisted_clone,
@@ -1814,6 +1885,23 @@ impl MptCommitStore {
                                     }
                                 }
                                 if worker_config.wal_first_commit {
+                                    // In wal_first mode, incremental publish_generation
+                                    // keeps segments up to date on every block.
+                                    // Auto-consolidation at REWRITE_INTERVAL depth
+                                    // bounds the delta chain.  No separate full rewrite
+                                    // needed — this matches sei-db's model where
+                                    // snapshot rewrite is triggered from the frontend
+                                    // with a tree clone, not from a background worker
+                                    // reading RocksDB.
+                                    if let Some(rewrite_tx) = published_rewrite_tx_clone.as_ref() {
+                                        let _ = rewrite_tx;
+                                        // Rewrite scheduling disabled: the rewrite worker
+                                        // would need RocksDB data that is no longer written
+                                        // in wal_first mode. Incremental publish provides
+                                        // equivalent coverage.
+                                    }
+                                } else if !worker_config.wal_first_commit {
+                                    // Legacy path: schedule full rewrites from RocksDB.
                                     if let Some(rewrite_tx) = published_rewrite_tx_clone.as_ref() {
                                         let should_schedule = if pending_rewrite.is_some() {
                                             true
@@ -2445,12 +2533,32 @@ impl MptCommitStore {
         }
 
         let manifest_path = dir.join("manifest.json");
-        let manifest = VersionManifest::load(&manifest_path)?;
+        let mut manifest = VersionManifest::load(&manifest_path)?;
         let wal_store = if config.wal_first_commit {
             Some(Arc::new(Mutex::new(CommitWalStore::open(dir)?)))
         } else {
             None
         };
+
+        // In wal_first mode, the WAL may contain entries beyond the manifest
+        // (committed to WAL but the persist worker hadn't saved the manifest
+        // before crash). Extend the manifest with those WAL entries so they
+        // are included in the replay range, recovering all committed work.
+        if config.wal_first_commit {
+            if let Some(ref wal_store) = wal_store {
+                let wal = wal_store.lock();
+                let wal_latest = wal.latest_version();
+                if wal_latest > manifest.latest_version {
+                    for v in (manifest.latest_version + 1)..=wal_latest {
+                        if let Some(entry) = wal.load_entry(v)? {
+                            manifest.add_version(v, entry.state_root)?;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         let persisted = Arc::new(PersistedTrieStore::open_with_capacity(
             &trie_nodes_dir,
@@ -2738,7 +2846,11 @@ impl MptCommitStore {
                 wal_first: self.config.wal_first_commit,
                 allow_async: !self.config.wal_first_commit,
                 save_manifest: true,
-                publish_baseline: !self.config.wal_first_commit,
+                // Always publish segments so the mmap-backed published store
+                // stays current. In wal_first mode segments are built from
+                // in-memory tries on the frontend and published by the
+                // background worker each block.
+                publish_baseline: true,
             }
         }
     }
@@ -2773,6 +2885,7 @@ impl MptCommitStore {
                     save_manifest: false,
                     version: self.version,
                     done: Some(done_tx),
+                    committed_tries: vec![],
                 };
                 if tx.send(job).is_ok() {
                     match done_rx.recv() {
@@ -3293,6 +3406,29 @@ impl MptCommitStore {
             self.prune_before(self.version)?;
         }
 
+        // After bulk_load, build a full published snapshot from RocksDB
+        // (which has all data from sync persist).  This ensures subsequent
+        // wal_first commits can load storage tries from mmap segments
+        // instead of doing expensive RocksDB random reads.  Matches
+        // sei-db where LoadMultiTree loads the full snapshot on open.
+        if self.config.wal_first_commit && self.version > 0 {
+            let root = self.manifest.get_root(self.version).unwrap_or(EMPTY_ROOT_HASH);
+            if root != EMPTY_ROOT_HASH {
+                let full_segments = Self::build_full_published_segments(&self.persisted, root)?;
+                let published_result = self.published_baseline.publish_generation(
+                    None,
+                    self.version,
+                    root,
+                    &full_segments,
+                    &[],
+                )?;
+                self.published_meta = Some(published_result.meta.clone());
+                self.published_store =
+                    self.published_baseline.open_published_store(&published_result.meta)?;
+                self.published_version.store(self.version, Ordering::Release);
+            }
+        }
+
         Ok(BulkLoadSummary {
             chunks_committed: state.chunks_committed,
             final_version: self.version,
@@ -3489,54 +3625,53 @@ impl MptCommitStore {
         let mut storage_segment_build_elapsed = Duration::ZERO;
         let persisted_for_hash = Arc::clone(&self.persisted);
 
+        // In wal_first mode, use hash-only computation (no blob collection)
+        // matching sei-db's model: commit is pure in-memory, serialization
+        // is deferred to background segment publish.
+        let hash_only = mode.wal_first;
+
+        let compute_storage_artifact = |addr: B256,
+                                        mut handle: StorageTrieHandle,
+                                        persisted: &PersistedTrieStore,
+                                        hash_only: bool|
+         -> Result<StorageTrieCommitArtifacts> {
+            let trie = handle.take_working_or_base_for_version(working_version);
+            let hash_start = std::time::Instant::now();
+            let (root, blobs, mut cow) = if hash_only {
+                let (root, cow) = trie.root_hash_only(persisted).map_err(|err| {
+                    MptDbError::Other(format!("storage trie root hash for {addr}: {err}"))
+                })?;
+                (root, Vec::new(), cow)
+            } else {
+                trie.root_hash_and_dirty_blobs(persisted).map_err(|err| {
+                    MptDbError::Other(format!("storage trie root hash for {addr}: {err}"))
+                })?
+            };
+            let hash_elapsed = hash_start.elapsed();
+            cow.clear_dirty();
+            Ok(StorageTrieCommitArtifacts {
+                hashed_address: addr,
+                storage_root: root,
+                node_blobs: blobs,
+                publish_view: StorageTriePublishView::DeferredRoot(root),
+                hash_elapsed,
+                segment_elapsed: Duration::ZERO,
+                trie: cow,
+            })
+        };
+
         let storage_artifacts: Vec<StorageTrieCommitArtifacts> = if should_parallel {
             dirty_handles
                 .into_par_iter()
-                .map(|(addr, mut handle)| -> Result<StorageTrieCommitArtifacts> {
-                    let trie = handle.take_working_or_base_for_version(working_version);
-                    let hash_start = std::time::Instant::now();
-                    let (root, blobs, mut cow) =
-                        trie.root_hash_and_dirty_blobs(&persisted_for_hash).map_err(|err| {
-                            MptDbError::Other(format!("storage trie root hash for {addr}: {err}"))
-                        })?;
-                    let hash_elapsed = hash_start.elapsed();
-                    // Keep the arena-based trie as-is — matching sei-db's
-                    // resident tree model.  No segment serialization in the
-                    // critical path; set_committed_base → snapshot() handles
-                    // the COW freeze for next block.
-                    cow.clear_dirty();
-                    Ok(StorageTrieCommitArtifacts {
-                        hashed_address: addr,
-                        storage_root: root,
-                        node_blobs: blobs,
-                        publish_view: StorageTriePublishView::DeferredRoot(root),
-                        hash_elapsed,
-                        segment_elapsed: Duration::ZERO,
-                        trie: cow,
-                    })
+                .map(|(addr, handle)| {
+                    compute_storage_artifact(addr, handle, &persisted_for_hash, hash_only)
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
             dirty_handles
                 .into_iter()
-                .map(|(addr, mut handle)| -> Result<StorageTrieCommitArtifacts> {
-                    let trie = handle.take_working_or_base_for_version(working_version);
-                    let hash_start = std::time::Instant::now();
-                    let (root, blobs, mut cow) =
-                        trie.root_hash_and_dirty_blobs(&persisted_for_hash).map_err(|err| {
-                            MptDbError::Other(format!("storage trie root hash for {addr}: {err}"))
-                        })?;
-                    let hash_elapsed = hash_start.elapsed();
-                    cow.clear_dirty();
-                    Ok(StorageTrieCommitArtifacts {
-                        hashed_address: addr,
-                        storage_root: root,
-                        node_blobs: blobs,
-                        publish_view: StorageTriePublishView::DeferredRoot(root),
-                        hash_elapsed,
-                        segment_elapsed: Duration::ZERO,
-                        trie: cow,
-                    })
+                .map(|(addr, handle)| {
+                    compute_storage_artifact(addr, handle, &persisted_for_hash, hash_only)
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -3605,11 +3740,20 @@ impl MptCommitStore {
         }
         let account_updates_elapsed = account_updates_start.elapsed();
 
-        // Phase 2b: compute state root and collect dirty blobs in one pass
+        // Phase 2b: compute state root.
+        // wal_first: hash-only (no blob collection) — matching sei-db.
+        // sync: hash + collect blobs for RocksDB persist.
         let account_root_start = std::time::Instant::now();
-        let (state_root, account_blobs, account_cow) = account_trie
-            .root_hash_and_dirty_blobs_parallel(&self.persisted)
-            .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?;
+        let (state_root, account_blobs, account_cow) = if hash_only {
+            let (root, cow) = account_trie
+                .root_hash_only_parallel(&self.persisted)
+                .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?;
+            (root, Vec::new(), cow)
+        } else {
+            account_trie
+                .root_hash_and_dirty_blobs_parallel(&self.persisted)
+                .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?
+        };
         let account_root_elapsed = account_root_start.elapsed();
 
         // Separate node blobs from tries so we can cache tries after persist
@@ -3678,7 +3822,7 @@ impl MptCommitStore {
             prepared,
             all_blobs,
             &storage_roots,
-            &storage_cache_candidates,
+            &mut storage_cache_candidates,
             deferred_published_roots,
             mode,
             &mut storage_segment_build_elapsed,
@@ -3812,6 +3956,17 @@ impl MptCommitStore {
             cache_publish: cache_publish_elapsed,
             total_commit: profile_start.elapsed(),
         };
+
+        // In wal_first mode, periodically save the account trie checkpoint
+        // so cold starts can load directly from the checkpoint file instead
+        // of materializing the entire trie from RocksDB.
+        if self.config.wal_first_commit &&
+            self.bulk_load.is_none() &&
+            saved.new_version > 0 &&
+            (saved.new_version as usize) % self.config.published_snapshot_interval == 0
+        {
+            let _ = self.save_checkpoint();
+        }
 
         Ok((saved.new_version, state_root))
     }
@@ -4329,8 +4484,9 @@ mod tests {
         store.apply_bundle_state(&bundle1).unwrap();
         let (_v1, root1) = store.commit().unwrap();
         store.flush_persist().unwrap();
-        // wal_first mode disables incremental publish, so create a
-        // published generation manually to test prune-floor logic.
+        // Create a published generation manually (overwriting the
+        // incremental publish from the persist worker) to set up a
+        // known baseline for prune-floor testing.
         let published1 =
             store.published_baseline.publish_generation(None, 1, root1, &[], &[]).unwrap();
         store.published_version.store(1, Ordering::Release);
@@ -6584,9 +6740,9 @@ mod tests {
                 .unwrap();
         assert_eq!(store.version(), 1);
         assert_eq!(store.manifest.latest_version, 1);
-        // wal_first mode never does incremental publish, so after
-        // truncate the published_version stays None.
-        assert_eq!(store.published_version(), None);
+        // After truncation to version 1, published segments from the
+        // incremental publish are preserved — published_version is 1.
+        assert_eq!(store.published_version(), Some(1));
         {
             let wal = store.wal_store.as_ref().unwrap().lock();
             assert_eq!(wal.latest_version(), 1);
