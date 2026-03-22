@@ -249,6 +249,31 @@ impl MutableTrieArena {
         &self.frozen.hash_cache
     }
 
+    /// Reference to the frozen base nodes.
+    ///
+    /// **Must be called after `freeze()`/`snapshot()`** — otherwise the
+    /// returned slice is incomplete (overlay and appended nodes are excluded).
+    /// Used by background workers to avoid the allocation of `collect_all_nodes`.
+    pub fn frozen_nodes_ref(&self) -> &[MptNode] {
+        debug_assert!(
+            self.overlay_nodes.is_empty() && self.appended_nodes.is_empty(),
+            "frozen_nodes_ref called before freeze — overlay or appended not empty"
+        );
+        &self.frozen.nodes
+    }
+
+    /// Reference to the frozen base hash cache.
+    ///
+    /// **Must be called after `freeze()`/`snapshot()`** — otherwise the
+    /// returned slice may be incomplete.
+    pub fn frozen_hash_cache_ref(&self) -> &[Option<alloy_primitives::B256>] {
+        debug_assert!(
+            self.overlay_nodes.is_empty() && self.appended_nodes.is_empty(),
+            "frozen_hash_cache_ref called before freeze — overlay or appended not empty"
+        );
+        &self.frozen.hash_cache
+    }
+
     /// Reconstruct an arena from a lean image: nodes + hash_cache only.
     /// The result is immediately frozen (shared base).
     pub fn from_lean(nodes: Vec<MptNode>, hash_cache: Vec<Option<alloy_primitives::B256>>) -> Self {

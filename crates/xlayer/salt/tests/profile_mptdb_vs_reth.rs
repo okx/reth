@@ -191,6 +191,10 @@ struct MptdbTotals {
     published_version_lag: i64,
     l2_hits: u64,
     l3_hits: u64,
+    acct_trie_checkout: Duration,
+    ensure_storage: Duration,
+    commit_acct_set_base: Duration,
+    commit_cache_prep: Duration,
 }
 
 fn fmt_ms(d: Duration) -> String {
@@ -307,6 +311,10 @@ fn profile_b4_4_single_run_compare() {
         mptdb_totals.l3_hits += profile.apply_l3_latest_hits +
             profile.apply_l3_published_hits +
             profile.apply_l3_published_post_flush_hits;
+        mptdb_totals.acct_trie_checkout += profile.apply_account_trie_checkout;
+        mptdb_totals.ensure_storage += profile.apply_ensure_storage;
+        mptdb_totals.commit_acct_set_base += profile.commit_account_set_base;
+        mptdb_totals.commit_cache_prep += profile.commit_cache_storage_prep;
     }
     store.close().unwrap();
 
@@ -469,6 +477,10 @@ fn profile_b4_5_single_run_compare() {
         mptdb_totals.l3_hits += profile.apply_l3_latest_hits +
             profile.apply_l3_published_hits +
             profile.apply_l3_published_post_flush_hits;
+        mptdb_totals.acct_trie_checkout += profile.apply_account_trie_checkout;
+        mptdb_totals.ensure_storage += profile.apply_ensure_storage;
+        mptdb_totals.commit_acct_set_base += profile.commit_account_set_base;
+        mptdb_totals.commit_cache_prep += profile.commit_cache_storage_prep;
     }
     store.close().unwrap();
 
@@ -533,6 +545,15 @@ fn profile_b4_5_single_run_compare() {
         mptdb_totals.durable_version_lag as f64 / blocks.len() as f64,
         mptdb_totals.published_version_lag as f64 / blocks.len() as f64
     );
+    println!("  --- trie_load breakdown ---");
+    println!("    acct_trie_checkout:{} ms", fmt_ms(mptdb_totals.acct_trie_checkout / blocks_len));
+    println!("    ensure_storage:    {} ms", fmt_ms(mptdb_totals.ensure_storage / blocks_len));
+    println!("  --- commit unaccounted ---");
+    println!(
+        "    acct_set_base:     {} ms",
+        fmt_ms(mptdb_totals.commit_acct_set_base / blocks_len)
+    );
+    println!("    cache_storage_prep:{} ms", fmt_ms(mptdb_totals.commit_cache_prep / blocks_len));
 
     let reth_avg = reth_totals.total / blocks_len;
     let mptdb_avg = (mptdb_totals.apply + mptdb_totals.commit) / blocks_len;
@@ -653,6 +674,10 @@ fn profile_b4_6_single_run_compare() {
         mptdb_totals.l3_hits += profile.apply_l3_latest_hits +
             profile.apply_l3_published_hits +
             profile.apply_l3_published_post_flush_hits;
+        mptdb_totals.acct_trie_checkout += profile.apply_account_trie_checkout;
+        mptdb_totals.ensure_storage += profile.apply_ensure_storage;
+        mptdb_totals.commit_acct_set_base += profile.commit_account_set_base;
+        mptdb_totals.commit_cache_prep += profile.commit_cache_storage_prep;
     }
     store.close().unwrap();
 

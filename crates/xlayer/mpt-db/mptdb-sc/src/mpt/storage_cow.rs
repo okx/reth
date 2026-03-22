@@ -153,6 +153,22 @@ impl StorageTrieCow {
         (0..len).map(|i| self.arena.get_hash(i as u32)).collect()
     }
 
+    /// Reference to the frozen base nodes — zero-copy.
+    ///
+    /// **Must be called after `snapshot()`** so that all nodes are consolidated
+    /// into the frozen base.  Used by background workers to avoid the extra
+    /// allocation of `arena_nodes()`.
+    pub fn frozen_arena_nodes_ref(&self) -> &[MptNode] {
+        self.arena.frozen_nodes_ref()
+    }
+
+    /// Reference to the frozen base hash cache — zero-copy.
+    ///
+    /// **Must be called after `snapshot()`**.
+    pub fn frozen_arena_hash_cache_ref(&self) -> &[Option<B256>] {
+        self.arena.frozen_hash_cache_ref()
+    }
+
     /// Number of arena nodes.
     pub fn arena_len(&self) -> usize {
         self.arena.len()

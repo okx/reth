@@ -94,21 +94,27 @@ impl StorageTrieHandle {
         Self { base: trie, base_version, working: None, working_version: None }
     }
 
+    /// Whether this handle has a working copy (eager or lazy-deferred).
     fn has_working(&self) -> bool {
-        self.working.is_some()
+        self.working.is_some() || self.working_version.is_some()
     }
 
     fn has_working_for_version(&self, version: i64) -> bool {
         self.working_version == Some(version)
     }
 
+    /// Lazy checkout: records the intent to write but does NOT clone the base.
+    ///
+    /// The actual clone is deferred to `take_working_or_base_for_version`,
+    /// which runs inside a rayon parallel section.  This turns 5000 sequential
+    /// heap allocations (30K HashMap/Vec allocs × ~25μs each) into parallel
+    /// work, matching sei-db's model where checkout is O(1) and the COW cost
+    /// is paid on the write path.
     fn checkout_for_write(&mut self, working_version: i64) {
         if self.working_version == Some(working_version) {
             return;
         }
-        if self.working.is_none() {
-            self.working = Some(self.base.clone());
-        }
+        // Just record the version — defer base.clone() to the parallel path.
         self.working_version = Some(working_version);
     }
 
@@ -134,7 +140,9 @@ impl StorageTrieHandle {
             return None;
         }
         self.working_version = None;
-        self.working.take()
+        // Lazy materialisation: if checkout_for_write deferred the clone,
+        // perform it now (typically inside a rayon parallel section).
+        Some(self.working.take().unwrap_or_else(|| self.base.clone()))
     }
 
     fn take_working_or_base_for_version(&mut self, version: i64) -> StorageTrieCow {
@@ -327,6 +335,14 @@ pub struct CommitProfile {
     pub open_published_store: Duration,
     pub cache_publish: Duration,
     pub total_commit: Duration,
+    /// Time to checkout (clone) the account trie for writing in apply phase.
+    pub apply_account_trie_checkout: Duration,
+    /// Time spent inside ensure_working_storage_tries (L2/L3 cache lookups).
+    pub apply_ensure_storage: Duration,
+    /// Time to freeze the account trie in set_committed_base after commit.
+    pub commit_account_set_base: Duration,
+    /// Time to prepare + cache 5000 storage tries back into L2 after commit.
+    pub commit_cache_storage_prep: Duration,
 }
 
 #[derive(Default)]
@@ -403,6 +419,8 @@ pub struct MptCommitStore {
     last_apply_duration: Duration,
     last_apply_collect_dirty_accounts: Duration,
     last_apply_get_or_load_storage_tries: Duration,
+    last_apply_account_trie_checkout: Duration,
+    last_apply_ensure_storage: Duration,
     last_apply_storage_slot_updates: Duration,
     last_apply_l3_latest_load: Duration,
     last_apply_l3_published_load: Duration,
@@ -876,19 +894,27 @@ impl MptCommitStore {
             // are sent to the worker for RocksDB persist + segment build.
             self.wait_for_backpressure()?;
 
-            // In wal_first mode, snapshot the tries so clones are O(1) (Arc
-            // clone of frozen arena).  Send clones to the worker — it builds
-            // segments in background, matching sei-db's model where commit is
-            // pure in-memory and serialization is deferred via COW tree clone.
+            // Freeze + clone in parallel: snapshot() consolidates the small
+            // overlay into the frozen base (O(overlay) because the handle's
+            // old base was already dropped by compute_storage_artifact, so
+            // Arc::make_mut is in-place).  After freeze, clone is O(1).
+            //
+            // hash_only mode skips RLP caching during root hash, keeping
+            // the overlay minimal — freeze only drains ~20 overlay entries
+            // + ~20 hash_cache entries per trie, no rlp_cache to clear.
+            //
+            // Parallel via rayon: amortizes 5000 storage tries across cores,
+            // adapting sei-db's single-tree COW model to Ethereum's two-layer
+            // trie architecture.
             let committed_tries = if mode.wal_first && mode.publish_baseline {
                 storage_cache_candidates
-                    .iter_mut()
+                    .par_iter_mut()
                     .filter_map(|(addr, trie)| {
                         let root = storage_roots.get(addr).copied().unwrap_or(EMPTY_ROOT_HASH);
                         if root == EMPTY_ROOT_HASH {
                             return None;
                         }
-                        trie.snapshot(); // freeze overlay → O(1) clone
+                        trie.snapshot();
                         Some((*addr, root, trie.clone()))
                     })
                     .collect()
@@ -1691,7 +1717,7 @@ impl MptCommitStore {
                 // Track a pending rewrite that was dropped due to full queue,
                 // so it can be retried on the next durable version advance.
                 let mut pending_rewrite: Option<(i64, B256)> = None;
-                while let Ok(job) = rx.recv() {
+                while let Ok(mut job) = rx.recv() {
                     if async_error_clone.load(Ordering::Relaxed) {
                         if let Some(done) = job.done {
                             let _ = done
@@ -1755,24 +1781,32 @@ impl MptCommitStore {
 
                                 // wal_first: build segments from COW trie clones
                                 // (sei-db model: serialization in background).
+                                //
+                                // Freeze each clone first (sole owner → Arc::make_mut
+                                // is in-place, O(overlay)).  Then build segments in
+                                // parallel via rayon using zero-copy frozen refs —
+                                // avoids the extra allocation of collect_all_nodes().
                                 if !job.committed_tries.is_empty() {
-                                    for (addr, root, trie) in &job.committed_tries {
-                                        let nodes = trie.arena_nodes();
-                                        let hashes = trie.arena_hash_cache();
-                                        match StorageTrieSegment::from_parts(
-                                            &nodes,
-                                            &hashes,
-                                            trie.root_index(),
-                                            *root,
-                                        ) {
-                                            Ok(segment) => {
-                                                publish_puts.push((*addr, segment));
-                                            }
-                                            Err(e) => {
-                                                Self::warn_nonfatal_async_error(&e);
-                                            }
-                                        }
+                                    // Sequential freeze: O(overlay) per trie, cheap.
+                                    for (_, _, trie) in &mut job.committed_tries {
+                                        trie.snapshot();
                                     }
+                                    // Parallel segment build via rayon.
+                                    let built: Vec<_> = job
+                                        .committed_tries
+                                        .par_iter()
+                                        .filter_map(|(addr, root, trie)| {
+                                            StorageTrieSegment::from_parts(
+                                                trie.frozen_arena_nodes_ref(),
+                                                trie.frozen_arena_hash_cache_ref(),
+                                                trie.root_index(),
+                                                *root,
+                                            )
+                                            .ok()
+                                            .map(|seg| (*addr, seg))
+                                        })
+                                        .collect();
+                                    publish_puts.extend(built);
                                 }
 
                                 // Legacy path: build segments from RocksDB.
@@ -2280,6 +2314,8 @@ impl MptCommitStore {
             last_apply_duration: Duration::ZERO,
             last_apply_collect_dirty_accounts: Duration::ZERO,
             last_apply_get_or_load_storage_tries: Duration::ZERO,
+            last_apply_account_trie_checkout: Duration::ZERO,
+            last_apply_ensure_storage: Duration::ZERO,
             last_apply_storage_slot_updates: Duration::ZERO,
             last_apply_l3_latest_load: Duration::ZERO,
             last_apply_l3_published_load: Duration::ZERO,
@@ -2656,6 +2692,8 @@ impl MptCommitStore {
             last_apply_duration: Duration::ZERO,
             last_apply_collect_dirty_accounts: Duration::ZERO,
             last_apply_get_or_load_storage_tries: Duration::ZERO,
+            last_apply_account_trie_checkout: Duration::ZERO,
+            last_apply_ensure_storage: Duration::ZERO,
             last_apply_storage_slot_updates: Duration::ZERO,
             last_apply_l3_latest_load: Duration::ZERO,
             last_apply_l3_published_load: Duration::ZERO,
@@ -3442,6 +3480,7 @@ impl MptCommitStore {
         let collect_elapsed = Duration::ZERO;
         let load_start = std::time::Instant::now();
         let working_version = self.current_working_version();
+        let acct_checkout_start = std::time::Instant::now();
         self.account_trie.checkout_for_write(working_version);
         // No bulk preload_paths: matching sei-db's model where reads go
         // directly through mmap'd segment (PersistedNode) and writes do
@@ -3457,7 +3496,10 @@ impl MptCommitStore {
                 working.preload_paths(&self.persisted, &touched_account_keys)?;
             }
         }
+        let acct_checkout_elapsed = acct_checkout_start.elapsed();
+        let ensure_start = std::time::Instant::now();
         let load_stats = self.ensure_working_storage_tries(&dirty_accounts)?;
+        let ensure_elapsed = ensure_start.elapsed();
 
         let get_or_load_elapsed = load_start.elapsed();
         let mut slot_updates_elapsed = Duration::ZERO;
@@ -3509,6 +3551,8 @@ impl MptCommitStore {
         self.dirty_accounts = dirty_accounts;
         self.last_apply_collect_dirty_accounts = collect_elapsed;
         self.last_apply_get_or_load_storage_tries = get_or_load_elapsed;
+        self.last_apply_account_trie_checkout = acct_checkout_elapsed;
+        self.last_apply_ensure_storage = ensure_elapsed;
         self.last_apply_storage_slot_updates = slot_updates_elapsed;
         self.last_apply_l3_latest_load = load_stats.l3_latest_load;
         self.last_apply_l3_published_load = load_stats.l3_published_load;
@@ -3852,7 +3896,9 @@ impl MptCommitStore {
             // the trie stays fully in-arena with no pending_lazy_children.
             account_cow
         };
+        let acct_set_base_start = std::time::Instant::now();
         self.account_trie.set_committed_base(saved.new_version, committed_account_trie);
+        let acct_set_base_elapsed = acct_set_base_start.elapsed();
         self.checkpoint_account_trie_nodes = checkpoint_account_trie_nodes;
         self.dirty_accounts.clear();
         self.applied_this_block = false;
@@ -3861,6 +3907,7 @@ impl MptCommitStore {
             self.maybe_compact_segment_store()?;
         }
 
+        let cache_storage_prep_start = std::time::Instant::now();
         // Fold committed working tries back into their long-lived handle bases.
         // Also write L3 fast store images (best-effort, non-fatal).
         let published_segment_map: HashMap<B256, &StorageTrieSegment> =
@@ -3909,6 +3956,7 @@ impl MptCommitStore {
         for (addr, cached_trie) in cached_storage_tries {
             self.cache_storage_trie(addr, cached_trie);
         }
+        let cache_storage_prep_elapsed = cache_storage_prep_start.elapsed();
 
         self.last_commit_profile = CommitProfile {
             apply_bundle_state: self.last_apply_duration,
@@ -3955,6 +4003,10 @@ impl MptCommitStore {
             open_published_store: saved.open_published_store_elapsed,
             cache_publish: cache_publish_elapsed,
             total_commit: profile_start.elapsed(),
+            apply_account_trie_checkout: self.last_apply_account_trie_checkout,
+            apply_ensure_storage: self.last_apply_ensure_storage,
+            commit_account_set_base: acct_set_base_elapsed,
+            commit_cache_storage_prep: cache_storage_prep_elapsed,
         };
 
         // In wal_first mode, periodically save the account trie checkpoint

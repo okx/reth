@@ -46,17 +46,22 @@ pub(crate) fn recompute(arena: &mut MutableTrieArena, root: Option<u32>) -> Stor
     }
 }
 
-/// Hash-only variant: computes root hash and caches RLP/hash on arena nodes,
-/// but does NOT collect dirty blobs.  Used in wal_first mode where node blobs
-/// are not persisted to RocksDB — matching sei-db's model where commit is
-/// pure in-memory and serialization is deferred to background snapshot.
+/// Hash-only variant: computes root hash and caches ONLY the hash on arena
+/// nodes — RLP is NOT cached.  This keeps the arena's rlp_cache empty so
+/// that the subsequent `freeze()` is cheaper (nothing to clear) and the
+/// frozen clone for the background worker carries no extra weight.
+///
+/// RLP caching across blocks is pointless in hash_only mode because
+/// `freeze()` clears the rlp_cache anyway.  Within a single hash
+/// computation, each trie node is visited exactly once (no shared
+/// subtrees in MPT), so the memoization provides no benefit.
 pub(crate) fn recompute_hash_only(arena: &mut MutableTrieArena, root: Option<u32>) -> B256 {
     match root {
         None => alloy_trie::EMPTY_ROOT_HASH,
         Some(root_idx) => {
             let (hash, finalized) = compute_node_hash_only(arena, root_idx);
             for node in &finalized {
-                arena.set_rlp(node.idx, node.rlp.clone());
+                // Only cache hash — skip set_rlp to keep overlay lean.
                 arena.set_hash(node.idx, node.hash);
             }
             hash
@@ -74,7 +79,7 @@ pub(crate) fn recompute_hash_only_parallel(
         Some(root_idx) => {
             let (hash, finalized) = compute_node_hash_only_parallel_root(arena, root_idx);
             for node in &finalized {
-                arena.set_rlp(node.idx, node.rlp.clone());
+                // Only cache hash — skip set_rlp to keep overlay lean.
                 arena.set_hash(node.idx, node.hash);
             }
             hash
