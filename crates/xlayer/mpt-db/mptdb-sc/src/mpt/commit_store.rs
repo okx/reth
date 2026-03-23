@@ -29,7 +29,8 @@ use super::{
     persisted::{self, PersistedTrieStore},
     proof,
     published_baseline::{
-        IoRateLimiter, PublishedBaselineManager, PublishedBaselineMeta, PublishedBaselineReader,
+        BulkSegmentWriter, IoRateLimiter, PublishedBaselineManager, PublishedBaselineMeta,
+        PublishedBaselineReader,
     },
     r#trait::{CommitFrontier, MptCommitter, MptGcStats, MptSnapshotExporter, MptSnapshotImporter},
     segment::StorageTrieSegment,
@@ -397,6 +398,8 @@ pub struct MptCommitStore {
     parallelism: ParallelismThresholds,
     config: MptConfig,
     bulk_load: Option<BulkLoadState>,
+    /// Streaming segment writer active during bulk_load (sei-db model).
+    bulk_segment_writer: Option<BulkSegmentWriter>,
 
     /// Latest version whose nodes and manifest are confirmed on stable storage.
     durable_version: Arc<AtomicI64>,
@@ -967,21 +970,30 @@ impl MptCommitStore {
                 manifest_save_elapsed = manifest_save_start.elapsed();
             }
             if mode.publish_baseline {
-                let publish_generation_start = std::time::Instant::now();
-                let published_meta = self.published_baseline.publish_generation(
-                    self.published_meta.as_ref(),
-                    prepared.new_version,
-                    prepared.state_root,
-                    &published_puts,
-                    &prepared.published_deletes,
-                )?;
-                publish_generation_elapsed = publish_generation_start.elapsed();
-                self.published_meta = Some(published_meta.meta.clone());
-                let open_published_store_start = std::time::Instant::now();
-                self.published_store =
-                    self.published_baseline.open_published_store(&published_meta.meta)?;
-                open_published_store_elapsed = open_published_store_start.elapsed();
-                self.published_version.store(prepared.new_version, Ordering::Release);
+                if let Some(ref mut writer) = self.bulk_segment_writer {
+                    // Streaming path: append pages to bulk file — no per-chunk
+                    // delta/meta files, no mmap reopen.  Matches sei-db's
+                    // snapshotWriter streaming directly to snapshot files.
+                    let append_start = std::time::Instant::now();
+                    writer.append_segments(&published_puts)?;
+                    publish_generation_elapsed = append_start.elapsed();
+                } else {
+                    let publish_generation_start = std::time::Instant::now();
+                    let published_meta = self.published_baseline.publish_generation(
+                        self.published_meta.as_ref(),
+                        prepared.new_version,
+                        prepared.state_root,
+                        &published_puts,
+                        &prepared.published_deletes,
+                    )?;
+                    publish_generation_elapsed = publish_generation_start.elapsed();
+                    self.published_meta = Some(published_meta.meta.clone());
+                    let open_published_store_start = std::time::Instant::now();
+                    self.published_store =
+                        self.published_baseline.open_published_store(&published_meta.meta)?;
+                    open_published_store_elapsed = open_published_store_start.elapsed();
+                    self.published_version.store(prepared.new_version, Ordering::Release);
+                }
             }
         }
 
@@ -2300,6 +2312,7 @@ impl MptCommitStore {
             },
             config: replay_config,
             bulk_load: None,
+            bulk_segment_writer: None,
             durable_version: Arc::new(AtomicI64::new(version)),
             published_version: Arc::new(AtomicI64::new(published_version)),
             last_wal_replay_micros: Arc::new(AtomicU64::new(0)),
@@ -2678,6 +2691,7 @@ impl MptCommitStore {
             parallelism,
             config,
             bulk_load: None,
+            bulk_segment_writer: None,
             durable_version,
             published_version,
             last_wal_replay_micros,
@@ -3386,6 +3400,9 @@ impl MptCommitStore {
         }
 
         self.reset_derived_state_for_new_base()?;
+        // Create streaming segment writer — matches sei-db's snapshotWriter
+        // that streams directly to snapshot files during import.
+        self.bulk_segment_writer = Some(BulkSegmentWriter::new(&self.dir)?);
         self.bulk_load = Some(BulkLoadState {
             retain_only_latest: opts.retain_only_latest,
             chunks_committed: 0,
@@ -3444,25 +3461,15 @@ impl MptCommitStore {
             self.prune_before(self.version)?;
         }
 
-        // After bulk_load, build a full published snapshot from RocksDB
-        // (which has all data from sync persist).  This ensures subsequent
-        // wal_first commits can load storage tries from mmap segments
-        // instead of doing expensive RocksDB random reads.  Matches
-        // sei-db where LoadMultiTree loads the full snapshot on open.
-        if self.config.wal_first_commit && self.version > 0 {
+        // Finalize the streaming segment writer: flush buffered page data,
+        // write ONE delta file + generation metadata, activate published meta.
+        // Then open the published store (one mmap) — matching sei-db where
+        // LoadMultiTree mmap's the completed snapshot after import.
+        if let Some(writer) = self.bulk_segment_writer.take() {
             let root = self.manifest.get_root(self.version).unwrap_or(EMPTY_ROOT_HASH);
-            if root != EMPTY_ROOT_HASH {
-                let full_segments = Self::build_full_published_segments(&self.persisted, root)?;
-                let published_result = self.published_baseline.publish_generation(
-                    None,
-                    self.version,
-                    root,
-                    &full_segments,
-                    &[],
-                )?;
-                self.published_meta = Some(published_result.meta.clone());
-                self.published_store =
-                    self.published_baseline.open_published_store(&published_result.meta)?;
+            if let Some(meta) = writer.finalize(self.version, root)? {
+                self.published_meta = Some(meta.clone());
+                self.published_store = self.published_baseline.open_published_store(&meta)?;
                 self.published_version.store(self.version, Ordering::Release);
             }
         }
@@ -3616,7 +3623,11 @@ impl MptCommitStore {
             wal_first: false,
             allow_async: false,
             save_manifest: true,
-            publish_baseline: false,
+            // Build segments from in-memory tries — the BulkSegmentWriter
+            // streams them directly to pages.data (matching sei-db's
+            // snapshotWriter).  publish_generation is skipped during
+            // bulk_load; one delta file is written at finish.
+            publish_baseline: true,
         })
     }
 
@@ -3903,7 +3914,7 @@ impl MptCommitStore {
         self.dirty_accounts.clear();
         self.applied_this_block = false;
 
-        if !saved.use_async && mode.publish_baseline {
+        if !saved.use_async && mode.publish_baseline && self.bulk_segment_writer.is_none() {
             self.maybe_compact_segment_store()?;
         }
 

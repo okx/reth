@@ -65,8 +65,15 @@ enum DeltaLookup {
     Miss,
 }
 
+/// Parsed representation of a delta file.
+///
+/// Records are loaded into HashMaps at open time so that lookup is O(1)
+/// instead of a linear scan over the mmap.  For a 1M-record delta
+/// (79 MB on disk), this trades ~52 MB of RAM for turning every
+/// per-block `open_trie` call from O(N) to O(1).
 struct PublishedDeltaMmap {
-    mmap: Mmap,
+    puts: HashMap<B256, DeltaEntry>,
+    deletes: HashSet<B256>,
 }
 
 impl PublishedDeltaMmap {
@@ -81,41 +88,46 @@ impl PublishedDeltaMmap {
         if mmap.len() < DELTA_MAGIC.len() || &mmap[..DELTA_MAGIC.len()] != DELTA_MAGIC {
             return Err(MptDbError::Other("invalid published delta header".to_string()));
         }
-        Ok(Self { mmap })
+
+        // Parse all records into HashMaps for O(1) lookup.
+        let estimated = (mmap.len() - DELTA_MAGIC.len()) / DELTA_RECORD_LEN;
+        let mut puts = HashMap::with_capacity(estimated);
+        let mut deletes = HashSet::new();
+        let mut pos = DELTA_MAGIC.len();
+        while pos + DELTA_RECORD_LEN <= mmap.len() {
+            let op = mmap[pos];
+            pos += 1;
+            let key = B256::from_slice(&mmap[pos..pos + 32]);
+            pos += 32;
+            let root = B256::from_slice(&mmap[pos..pos + 32]);
+            pos += 32;
+            let page_off = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let record_off = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let format_version = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+
+            match op {
+                DELTA_OP_PUT => {
+                    puts.insert(key, DeltaEntry { page_off, record_off, root, format_version });
+                }
+                DELTA_OP_DELETE => {
+                    deletes.insert(key);
+                }
+                _ => {}
+            }
+        }
+        // mmap is dropped here — all data is in the HashMaps.
+        Ok(Self { puts, deletes })
     }
 
     fn lookup(&self, needle: &B256) -> DeltaLookup {
-        let mut pos = DELTA_MAGIC.len();
-        while pos + DELTA_RECORD_LEN <= self.mmap.len() {
-            let op = self.mmap[pos];
-            pos += 1;
-            let key = B256::from_slice(&self.mmap[pos..pos + 32]);
-            pos += 32;
-            let root = B256::from_slice(&self.mmap[pos..pos + 32]);
-            pos += 32;
-            let mut page_off_bytes = [0u8; 8];
-            page_off_bytes.copy_from_slice(&self.mmap[pos..pos + 8]);
-            let page_off = u64::from_le_bytes(page_off_bytes);
-            pos += 8;
-            let mut record_off_bytes = [0u8; 4];
-            record_off_bytes.copy_from_slice(&self.mmap[pos..pos + 4]);
-            let record_off = u32::from_le_bytes(record_off_bytes);
-            pos += 4;
-            let mut format_bytes = [0u8; 2];
-            format_bytes.copy_from_slice(&self.mmap[pos..pos + 2]);
-            let format_version = u16::from_le_bytes(format_bytes);
-            pos += 2;
-
-            if key != *needle {
-                continue;
-            }
-            return match op {
-                DELTA_OP_PUT => {
-                    DeltaLookup::Hit(DeltaEntry { page_off, record_off, root, format_version })
-                }
-                DELTA_OP_DELETE => DeltaLookup::Deleted,
-                _ => DeltaLookup::Miss,
-            };
+        if let Some(entry) = self.puts.get(needle) {
+            return DeltaLookup::Hit(*entry);
+        }
+        if self.deletes.contains(needle) {
+            return DeltaLookup::Deleted;
         }
         DeltaLookup::Miss
     }
@@ -308,6 +320,119 @@ impl IoRateLimiter {
             let sleep_secs = excess as f64 / self.bytes_per_sec as f64;
             std::thread::sleep(std::time::Duration::from_secs_f64(sleep_secs));
         }
+    }
+}
+
+/// Streaming segment writer for bulk_load — matching sei-db's snapshotWriter.
+///
+/// Keeps `pages.data` and `pages.index` open with buffered I/O across chunk
+/// commits.  Delta records accumulate in memory (~79 bytes each).  At finalize,
+/// ONE delta file + generation metadata is written and activated.
+///
+/// This eliminates the per-chunk `publish_generation` overhead (file creation,
+/// atomic rename, generation metadata) and the post-hoc readback from RocksDB
+/// that `build_full_published_segments` required.
+pub(crate) struct BulkSegmentWriter {
+    base_dir: PathBuf,
+    data_file: std::io::BufWriter<File>,
+    pages_index_file: std::io::BufWriter<File>,
+    next_page_off: u64,
+    /// Accumulated delta records: (op, hashed_address, root, page_off, record_off, format_version)
+    delta_records: Vec<(u8, B256, B256, u64, u32, u16)>,
+    segments_written: usize,
+}
+
+impl BulkSegmentWriter {
+    pub(crate) fn new(base_dir: &Path) -> Result<Self> {
+        // Ensure directories exist.
+        fs::create_dir_all(PublishedBaselineManager::published_dir(base_dir))
+            .map_err(|e| MptDbError::Other(format!("create published dir for bulk: {e}")))?;
+        fs::create_dir_all(PublishedBaselineManager::meta_dir(base_dir))
+            .map_err(|e| MptDbError::Other(format!("create meta dir for bulk: {e}")))?;
+
+        let mut data_file = PublishedBaselineManager::open_data_file(base_dir)?;
+        let mut pages_index_file = PublishedBaselineManager::open_pages_index_file(base_dir)?;
+
+        let next_page_off = data_file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| MptDbError::Other(format!("seek pages data for bulk: {e}")))?;
+        pages_index_file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| MptDbError::Other(format!("seek pages index for bulk: {e}")))?;
+
+        Ok(Self {
+            base_dir: base_dir.to_path_buf(),
+            data_file: std::io::BufWriter::with_capacity(128 * 1024, data_file),
+            pages_index_file: std::io::BufWriter::with_capacity(64 * 1024, pages_index_file),
+            next_page_off,
+            delta_records: Vec::new(),
+            segments_written: 0,
+        })
+    }
+
+    /// Append segments from one bulk_load chunk (called per chunk).
+    ///
+    /// Writes page data + index entries to buffered files.  Accumulates
+    /// delta records in memory for the final delta file.
+    pub(crate) fn append_segments(&mut self, puts: &[(B256, StorageTrieSegment)]) -> Result<()> {
+        self.delta_records.reserve(puts.len());
+        for (hashed_address, image) in puts {
+            let entry = PublishedBaselineManager::append_page_streaming(
+                self.data_file.get_mut(),
+                self.pages_index_file.get_mut(),
+                &mut self.next_page_off,
+                image,
+            )?;
+            self.delta_records.push((
+                DELTA_OP_PUT,
+                *hashed_address,
+                image.root(),
+                entry.page_off,
+                entry.root_record_off,
+                entry.layout_version,
+            ));
+            self.segments_written += 1;
+        }
+        Ok(())
+    }
+
+    /// Finalize: flush buffers, write ONE delta file + generation metadata,
+    /// activate the published meta.  Returns the meta for `open_published_store`.
+    pub(crate) fn finalize(
+        mut self,
+        version: i64,
+        state_root: B256,
+    ) -> Result<Option<PublishedBaselineMeta>> {
+        if self.delta_records.is_empty() {
+            return Ok(None);
+        }
+
+        // Flush buffered writes.
+        self.data_file
+            .flush()
+            .map_err(|e| MptDbError::Other(format!("flush bulk pages data: {e}")))?;
+        self.pages_index_file
+            .flush()
+            .map_err(|e| MptDbError::Other(format!("flush bulk pages index: {e}")))?;
+
+        let generation = version as u64;
+
+        // ONE delta file with all records (no parent, depth=0 — clean baseline).
+        let mgr = PublishedBaselineManager::open(&self.base_dir)?;
+        PublishedBaselineManager::write_delta_file(
+            &mgr.delta_path(generation),
+            &self.delta_records,
+        )?;
+        mgr.save_generation_meta(&GenerationMeta {
+            generation,
+            version,
+            root: state_root,
+            parent_generation: None,
+            depth: 0,
+        })?;
+        let meta = PublishedBaselineMeta { generation, version, root: state_root };
+        mgr.save_meta(&meta)?;
+        Ok(Some(meta))
     }
 }
 
