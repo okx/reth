@@ -132,6 +132,67 @@ impl CommitWalEntry {
         }
     }
 
+    /// Build the account changeset from dirty_accounts.
+    /// This is the CPU-intensive part of WAL entry construction (sorting,
+    /// mapping storage changes) that does NOT depend on state_root.
+    /// Can run concurrently with account trie updates.
+    pub fn build_account_changes(dirty_accounts: &[DirtyAccount]) -> Vec<CommitWalAccountChange> {
+        let mut accounts = dirty_accounts
+            .iter()
+            .map(|dirty| {
+                let mut storage_changes = dirty
+                    .storage_changes
+                    .iter()
+                    .map(|change| CommitWalStorageChange {
+                        hashed_slot: change.hashed_slot,
+                        value: change.value,
+                    })
+                    .collect::<Vec<_>>();
+                storage_changes.sort_by(|a, b| a.hashed_slot.cmp(&b.hashed_slot));
+
+                CommitWalAccountChange {
+                    address: dirty.address,
+                    hashed_address: dirty.hashed_address,
+                    info: dirty.info.as_ref().map(|info| CommitWalAccountInfo {
+                        nonce: info.nonce,
+                        balance: info.balance,
+                        code_hash: info.code_hash,
+                    }),
+                    storage_wiped: dirty.storage_wiped,
+                    storage_known_empty: dirty.storage_known_empty,
+                    storage_changes,
+                }
+            })
+            .collect::<Vec<_>>();
+        accounts.sort_by(|a, b| a.hashed_address.cmp(&b.hashed_address));
+        accounts
+    }
+
+    /// Assemble a WAL entry from pre-built account changes + final roots.
+    pub fn from_prebuilt_changes(
+        version: i64,
+        state_root: B256,
+        account_root: B256,
+        accounts: Vec<CommitWalAccountChange>,
+        dirty_accounts: &[DirtyAccount],
+    ) -> Self {
+        let mut deleted_accounts = dirty_accounts
+            .iter()
+            .filter(|dirty| dirty.info.is_none() && dirty.storage_wiped)
+            .map(|dirty| dirty.hashed_address)
+            .collect::<Vec<_>>();
+        deleted_accounts.sort_unstable();
+        Self {
+            format_version: Self::FORMAT_VERSION,
+            version,
+            state_root,
+            account_root,
+            deleted_accounts,
+            accounts,
+            upgrades: Vec::new(),
+        }
+    }
+
     pub fn to_dirty_accounts(&self) -> Vec<DirtyAccount> {
         let mut accounts = self
             .accounts

@@ -39,7 +39,7 @@ use super::{
     storage_cow::{CowRootRef, StorageTrieCow},
     tree::MptTree,
     tree_algo,
-    wal::{CommitWalEntry, CommitWalStore},
+    wal::{CommitWalAccountChange, CommitWalEntry, CommitWalStore},
 };
 
 #[cfg(test)]
@@ -3810,6 +3810,74 @@ impl MptCommitStore {
             }
         };
 
+        // Overlap WAL changeset construction with account encode + apply.
+        // WAL changeset building (sorting 300K storage changes) is CPU-intensive
+        // but does NOT depend on state_root.  Run it on a rayon worker while
+        // the main thread does account trie updates.
+        let wal_changeset_holder: Option<
+            Arc<parking_lot::Mutex<Option<Vec<CommitWalAccountChange>>>>,
+        > = if mode.wal_first && self.dirty_accounts.len() >= 256 {
+            let holder = Arc::new(parking_lot::Mutex::new(None));
+            let holder_clone = Arc::clone(&holder);
+            // Collect the data needed for WAL changeset building.
+            // This avoids holding a borrow on self across the rayon spawn boundary.
+            let wal_dirty: Vec<_> = self
+                .dirty_accounts
+                .iter()
+                .map(|d| {
+                    (
+                        d.address,
+                        d.hashed_address,
+                        d.info.clone(),
+                        d.storage_wiped,
+                        d.storage_known_empty,
+                        d.storage_changes.clone(),
+                    )
+                })
+                .collect();
+            rayon::spawn(move || {
+                let accounts: Vec<CommitWalAccountChange> = wal_dirty
+                    .into_iter()
+                    .map(
+                        |(
+                            address,
+                            hashed_address,
+                            info,
+                            storage_wiped,
+                            storage_known_empty,
+                            storage_changes,
+                        )| {
+                            use super::wal::{CommitWalAccountInfo, CommitWalStorageChange};
+                            let mut sc: Vec<CommitWalStorageChange> = storage_changes
+                                .iter()
+                                .map(|c| CommitWalStorageChange {
+                                    hashed_slot: c.hashed_slot,
+                                    value: c.value,
+                                })
+                                .collect();
+                            sc.sort_by(|a, b| a.hashed_slot.cmp(&b.hashed_slot));
+                            CommitWalAccountChange {
+                                address,
+                                hashed_address,
+                                info: info.as_ref().map(|i| CommitWalAccountInfo {
+                                    nonce: i.nonce,
+                                    balance: i.balance,
+                                    code_hash: i.code_hash,
+                                }),
+                                storage_wiped,
+                                storage_known_empty,
+                                storage_changes: sc,
+                            }
+                        },
+                    )
+                    .collect();
+                *holder_clone.lock() = Some(accounts);
+            });
+            Some(holder)
+        } else {
+            None
+        };
+
         let account_writes: Vec<Option<Vec<u8>>> = if self.dirty_accounts.len() >= 1_024 {
             self.dirty_accounts.par_iter().map(encode_account).collect()
         } else {
@@ -3896,14 +3964,19 @@ impl MptCommitStore {
             all_blobs.len(),
             mode.allow_async,
         )?;
-        let wal_entry = mode.wal_first.then(|| {
-            CommitWalEntry::from_dirty_accounts(
+        let wal_entry = if let Some(ref holder) = wal_changeset_holder {
+            // Collect pre-built changeset from rayon task (should be done by now).
+            let accounts = holder.lock().take().unwrap_or_default();
+            Some(CommitWalEntry::from_prebuilt_changes(
                 prepared.new_version,
                 state_root,
-                state_root, // In Ethereum MPT, account_root == state_root.
+                state_root,
+                accounts,
                 &self.dirty_accounts,
-            )
-        });
+            ))
+        } else {
+            None
+        };
         let cache_publish_elapsed = cache_publish_start.elapsed();
         let mut wal_append_elapsed = Duration::ZERO;
 
