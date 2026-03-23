@@ -3775,9 +3775,14 @@ impl MptCommitStore {
         let working_version = self.current_working_version();
         self.account_trie.checkout_for_write(working_version);
         let mut account_trie = self.account_trie.take_working_or_base_for_version(working_version);
+        // Use the fast materialized path when the account trie has no lazy
+        // root (true after bulk_load and all subsequent blocks).
+        let materialized = !account_trie.is_lazy_root();
         for (dirty, encoded) in self.dirty_accounts.iter().zip(account_writes.into_iter()) {
             let key = &dirty.account_key;
-            if let Some(rlp_buf) = encoded {
+            if materialized {
+                account_trie.apply_change_materialized(key, encoded);
+            } else if let Some(rlp_buf) = encoded {
                 account_trie.apply_change(&self.persisted, key, Some(rlp_buf)).map_err(|err| {
                     MptDbError::Other(format!(
                         "account trie apply_change for {}: {err}",

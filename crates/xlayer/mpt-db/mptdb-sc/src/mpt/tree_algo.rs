@@ -83,15 +83,62 @@ pub(crate) fn insert_recursive(
         Some(idx) => {
             arena.clear_rlp(idx);
             arena.mark_dirty(idx);
-            let node = arena.get(idx).clone();
 
-            match node {
-                MptNode::Leaf(leaf) => insert_at_leaf(arena, idx, &leaf, &remaining, value),
-                MptNode::Extension(ext) => {
-                    insert_at_extension(arena, idx, &ext, key, offset, value)
-                }
+            // Extract routing info WITHOUT cloning the entire MptNode.
+            // For Branch nodes (the most common intermediate node), we only
+            // need one child ref (8 bytes) — cloning the full BranchNode
+            // (~260 bytes with 16 children) is wasteful.
+            enum Route {
+                Leaf,
+                Extension,
+                BranchDescend { nibble: usize, child_idx: Option<u32> },
+                BranchSetValue,
+            }
+            let route = match arena.get(idx) {
+                MptNode::Leaf(_) => Route::Leaf,
+                MptNode::Extension(_) => Route::Extension,
                 MptNode::Branch(branch) => {
-                    insert_at_branch(arena, idx, &branch, key, offset, value)
+                    if offset >= key.len() {
+                        Route::BranchSetValue
+                    } else {
+                        let nibble = key.get_unchecked(offset) as usize;
+                        let child_idx = branch.children[nibble].as_ref().map(|c| match c {
+                            ChildRef::Arena(i) => *i,
+                            _ => panic!("Phase 1: only Arena child refs"),
+                        });
+                        Route::BranchDescend { nibble, child_idx }
+                    }
+                }
+            };
+
+            match route {
+                Route::BranchDescend { nibble, child_idx } => {
+                    // Hot path: no full node clone needed.
+                    let new_child = insert_recursive(arena, child_idx, key, offset + 1, value);
+                    if let MptNode::Branch(b) = arena.get_mut(idx) {
+                        b.children[nibble] = Some(ChildRef::Arena(new_child));
+                    }
+                    idx
+                }
+                Route::BranchSetValue => {
+                    if let MptNode::Branch(b) = arena.get_mut(idx) {
+                        b.value = Some(value);
+                    }
+                    idx
+                }
+                Route::Leaf => {
+                    let leaf = match arena.get(idx) {
+                        MptNode::Leaf(l) => l.clone(),
+                        _ => unreachable!(),
+                    };
+                    insert_at_leaf(arena, idx, &leaf, &remaining, value)
+                }
+                Route::Extension => {
+                    let ext = match arena.get(idx) {
+                        MptNode::Extension(e) => e.clone(),
+                        _ => unreachable!(),
+                    };
+                    insert_at_extension(arena, idx, &ext, key, offset, value)
                 }
             }
         }

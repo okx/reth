@@ -237,12 +237,52 @@ impl StorageTrieCow {
         Ok(())
     }
 
+    /// Fast path for fully materialized tries (all children are Arena refs).
+    ///
+    /// Skips `ensure_path_loaded` / `ensure_delete_ready` / `prune_pending_lazy_children`
+    /// which are no-ops for materialized tries.  Eliminates the redundant
+    /// pre-walk (each level clones MptNode just to check child type), cutting
+    /// per-update cost roughly in half.
+    pub fn apply_change_materialized(&mut self, key: &Nibbles, value: Option<Vec<u8>>) {
+        let root_idx = match self.root {
+            CowRootRef::Arena(idx) => Some(idx),
+            CowRootRef::Empty => None,
+            CowRootRef::Lazy(_) => panic!("apply_change_materialized: root is Lazy"),
+        };
+        let new_root = match value {
+            Some(value) => {
+                Some(tree_algo::insert_recursive(&mut self.arena, root_idx, key, 0, value))
+            }
+            None => tree_algo::delete_recursive(&mut self.arena, root_idx, key, 0).1,
+        };
+        self.root = match new_root {
+            Some(idx) => CowRootRef::Arena(idx),
+            None => CowRootRef::Empty,
+        };
+    }
+
     pub fn apply_changes_batched(
         &mut self,
         store: &PersistedTrieStore,
         changes: &[StorageChange],
     ) -> Result<()> {
         if changes.is_empty() {
+            return Ok(());
+        }
+
+        // Fast path for fully materialized tries (Arena root, all children
+        // are Arena refs).  Skips sort/dedup/preload_batched_paths (only
+        // useful for lazy roots) and uses apply_change_materialized which
+        // eliminates the redundant ensure_path_loaded pre-walk.
+        if !self.is_lazy_root() && self.pending_lazy_children.is_empty() {
+            for change in changes {
+                let value = if change.value == alloy_primitives::U256::ZERO {
+                    None
+                } else {
+                    change.encoded_value.clone()
+                };
+                self.apply_change_materialized(&change.slot_key, value);
+            }
             return Ok(());
         }
 
