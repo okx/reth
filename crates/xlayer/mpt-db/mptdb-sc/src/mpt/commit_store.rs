@@ -1929,26 +1929,41 @@ impl MptCommitStore {
                                     |cur| if job.version > cur { Some(job.version) } else { None },
                                 );
                                 if let Some(wal_store) = wal_store_clone.as_ref() {
-                                    let mut wal = wal_store.lock();
-                                    if let Err(e) = wal.set_durable_version(job.version) {
-                                        Self::report_async_error(
-                                            &async_error_clone,
-                                            &async_error_detail_clone,
-                                            &e,
-                                        );
-                                        tracing::error!(
-                                            ?e,
-                                            "background wal durable watermark update failed"
-                                        );
-                                    } else {
-                                        let floor = Self::wal_prune_floor_for_manifest(
-                                            &job.manifest,
-                                            &published_baseline_clone,
-                                        )
-                                        .unwrap_or(0);
-                                        if floor > 0 {
-                                            let _ = wal.prune_before(floor);
+                                    // Quick lock: update durable_version in memory only
+                                    // (no disk IO) to minimize Mutex hold time and avoid
+                                    // blocking the frontend's append_entry path.
+                                    let prune_floor = {
+                                        let mut wal = wal_store.lock();
+                                        if let Err(e) = wal.set_durable_version(job.version) {
+                                            Self::report_async_error(
+                                                &async_error_clone,
+                                                &async_error_detail_clone,
+                                                &e,
+                                            );
+                                            tracing::error!(
+                                                ?e,
+                                                "background wal durable watermark update failed"
+                                            );
+                                            None
+                                        } else {
+                                            let floor = Self::wal_prune_floor_for_manifest(
+                                                &job.manifest,
+                                                &published_baseline_clone,
+                                            )
+                                            .unwrap_or(0);
+                                            if floor > 0 {
+                                                Some(floor)
+                                            } else {
+                                                None
+                                            }
                                         }
+                                    }; // lock dropped here
+                                       // Prune WAL segments outside the lock — this involves
+                                       // file IO (segment rewrite/delete) and should not block
+                                       // the frontend.
+                                    if let Some(floor) = prune_floor {
+                                        let mut wal = wal_store.lock();
+                                        let _ = wal.prune_before(floor);
                                     }
                                 }
                                 if worker_config.wal_first_commit {
@@ -2079,6 +2094,17 @@ impl MptCommitStore {
                 handle.join().map_err(|_| {
                     MptDbError::Other("published rewrite worker panicked".to_string())
                 })?;
+            }
+        }
+
+        // Flush WAL meta now that all background work is done and
+        // durable_version is final.  This was deferred from the worker's
+        // set_durable_version to reduce Mutex contention.
+        if let Some(wal_store) = self.wal_store.as_ref() {
+            if best_effort {
+                let _ = wal_store.lock().flush_meta();
+            } else {
+                wal_store.lock().flush_meta()?;
             }
         }
 
@@ -3994,6 +4020,14 @@ impl MptCommitStore {
                 state_root,
                 state_root,
                 accounts,
+                &self.dirty_accounts,
+            ))
+        } else if mode.wal_first {
+            // Small changeset (< 256 accounts): build WAL entry synchronously.
+            Some(CommitWalEntry::from_dirty_accounts(
+                prepared.new_version,
+                state_root,
+                state_root,
                 &self.dirty_accounts,
             ))
         } else {

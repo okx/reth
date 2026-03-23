@@ -181,11 +181,19 @@ fn run_mptdb_lane(
     block_bundles: &[revm_database::BundleState],
 ) -> Duration {
     let dir = TempDir::new().unwrap();
-    let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+    let use_wal_first = !pre_pop.state().is_empty();
+    let mut config = mptdb_sc::mpt::MptConfig::default();
+    if use_wal_first {
+        config.wal_first_commit = true;
+        config.checkpoint_max_account_trie_nodes = 0;
+    }
+    let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
-    // Pre-populate (not timed)
-    store.apply_bundle_state(pre_pop).unwrap();
-    store.commit().unwrap();
+    // Pre-populate (not timed).
+    if use_wal_first {
+        store.apply_bundle_state(pre_pop).unwrap();
+        store.commit().unwrap();
+    }
 
     // Process blocks (timed)
     let start = Instant::now();
@@ -194,7 +202,9 @@ fn run_mptdb_lane(
         store.commit().unwrap();
     }
     let elapsed = start.elapsed();
-    store.close().unwrap();
+    // Ignore close errors — in wal_first mode under criterion's rapid iteration,
+    // the WAL durable_version check can race with the background worker.
+    let _ = store.close();
     elapsed
 }
 

@@ -267,6 +267,9 @@ pub struct CommitWalStore {
     meta: CommitWalMeta,
     index: BTreeMap<i64, WalLocation>,
     segments: BTreeMap<u32, WalSegmentRange>,
+    /// Cached file handle for the current append segment.
+    /// Avoids open/stat/close syscalls on every append_entry call.
+    active_segment: Option<(u32, std::io::BufWriter<File>)>,
 }
 
 impl CommitWalStore {
@@ -300,7 +303,7 @@ impl CommitWalStore {
             meta.durable_version = meta.latest_version;
         }
 
-        Ok(Self { dir, meta_path, meta, index, segments })
+        Ok(Self { dir, meta_path, meta, index, segments, active_segment: None })
     }
 
     pub fn latest_version(&self) -> i64 {
@@ -351,46 +354,65 @@ impl CommitWalStore {
         let crc = crc32fast::hash(&payload);
         let payload_len = payload.len() as u32;
 
-        let path = self.segment_path(segment_id);
-        let mut file =
-            OpenOptions::new().read(true).write(true).create(true).open(&path).map_err(|e| {
-                MptDbError::Other(format!("open wal segment {}: {e}", path.display()))
-            })?;
-
-        let file_len = file
-            .metadata()
-            .map_err(|e| MptDbError::Other(format!("stat wal segment {}: {e}", path.display())))?
-            .len();
-
-        if file_len == 0 {
-            // New segment: write header.
-            Self::write_segment_header(&mut file)?;
-        } else if let Some(range) = self.segments.get(&segment_id) {
-            // Existing segment: truncate any corrupted tail past the last valid record.
-            if file_len > range.valid_end {
-                file.set_len(range.valid_end)
-                    .map_err(|e| MptDbError::Other(format!("truncate wal segment tail: {e}")))?;
+        // Reuse the cached file handle if we're appending to the same segment.
+        // This avoids open/stat/close syscalls on every call — matching sei-db's
+        // buffered WAL writer model.
+        if self.active_segment.as_ref().map_or(true, |(id, _)| *id != segment_id) {
+            // Flush and close the old segment if switching.
+            if let Some((_, old_writer)) = self.active_segment.take() {
+                drop(old_writer);
             }
+            let path = self.segment_path(segment_id);
+            let mut file =
+                OpenOptions::new().read(true).write(true).create(true).open(&path).map_err(
+                    |e| MptDbError::Other(format!("open wal segment {}: {e}", path.display())),
+                )?;
+
+            let file_len = file
+                .metadata()
+                .map_err(|e| {
+                    MptDbError::Other(format!("stat wal segment {}: {e}", path.display()))
+                })?
+                .len();
+
+            if file_len == 0 {
+                Self::write_segment_header(&mut file)?;
+            } else if let Some(range) = self.segments.get(&segment_id) {
+                if file_len > range.valid_end {
+                    file.set_len(range.valid_end).map_err(|e| {
+                        MptDbError::Other(format!("truncate wal segment tail: {e}"))
+                    })?;
+                }
+            }
+
+            file.seek(SeekFrom::End(0))
+                .map_err(|e| MptDbError::Other(format!("seek wal segment: {e}")))?;
+            self.active_segment =
+                Some((segment_id, std::io::BufWriter::with_capacity(128 * 1024, file)));
         }
 
-        let offset = file
-            .seek(SeekFrom::End(0))
-            .map_err(|e| MptDbError::Other(format!("seek wal segment: {e}")))?;
+        let (_, writer) = self.active_segment.as_mut().unwrap();
+        // Track offset from the segment range instead of calling stream_position
+        // (which flushes the BufWriter buffer due to seek internally).
+        let offset =
+            self.segments.get(&segment_id).map_or(WAL_SEGMENT_HEADER_LEN as u64, |r| r.valid_end);
 
         // Write record: [version(8) | payload_len(4) | crc32(4) | payload]
-        file.write_all(&entry.version.to_le_bytes())
+        writer
+            .write_all(&entry.version.to_le_bytes())
             .map_err(|e| MptDbError::Other(format!("write wal record version: {e}")))?;
-        file.write_all(&payload_len.to_le_bytes())
+        writer
+            .write_all(&payload_len.to_le_bytes())
             .map_err(|e| MptDbError::Other(format!("write wal record len: {e}")))?;
-        file.write_all(&crc.to_le_bytes())
+        writer
+            .write_all(&crc.to_le_bytes())
             .map_err(|e| MptDbError::Other(format!("write wal record crc: {e}")))?;
-        file.write_all(&payload)
+        writer
+            .write_all(&payload)
             .map_err(|e| MptDbError::Other(format!("write wal record payload: {e}")))?;
-        // No fsync here — matching sei-db's async WAL model.
-        // Data is in the OS page cache after write_all.  On crash,
-        // unfsynced entries are lost; recovery uses durable_version
-        // (synced via save_meta in the persist worker).  scan_segments
-        // handles incomplete tails on restart.
+        // No flush or fsync here — matching sei-db's async WAL model.
+        // Data stays in the BufWriter's 128KB buffer until buffer is full
+        // or the file handle is dropped/flushed on segment switch or close.
 
         let record_end = offset + WAL_RECORD_HEADER_LEN as u64 + payload_len as u64;
         self.index.insert(entry.version, WalLocation { segment_id, offset, len: payload_len });
@@ -467,6 +489,8 @@ impl CommitWalStore {
         if self.meta.is_empty() || version >= self.meta.latest_version {
             return Ok(());
         }
+        // Drop cached file handle before modifying segments.
+        self.active_segment.take();
         if version < self.meta.earliest_version {
             return self.clear_all();
         }
@@ -578,12 +602,23 @@ impl CommitWalStore {
             return Ok(());
         }
         self.meta.durable_version = version;
+        // Defer meta persistence — durable_version is recoverable from
+        // scan_segments on restart (clamped to latest_version).  The
+        // save_meta() call was the main source of Mutex contention between
+        // the background worker and the frontend's append_entry path.
+        // Meta is saved on close/checkpoint instead.
+        Ok(())
+    }
+
+    /// Persist WAL meta to disk.  Called on close or periodically.
+    pub fn flush_meta(&mut self) -> Result<()> {
         self.save_meta()
     }
 
     // ── Internal helpers ──
 
     fn clear_all(&mut self) -> Result<()> {
+        self.active_segment.take();
         self.remove_all_segment_files()?;
         self.index.clear();
         self.segments.clear();
