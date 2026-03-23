@@ -23,7 +23,7 @@ use reth_provider::{test_utils::create_test_provider_factory, StateWriter, TrieW
 use reth_trie::{updates::TrieUpdates, HashedPostState, KeccakKeyHasher, StateRoot};
 use reth_trie_db::DatabaseStateRoot;
 
-use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
+use mptdb_sc::mpt::{BulkLoadOptions, MptCommitStore, MptCommitter};
 
 // ---------------------------------------------------------------------------
 // Data generation (deterministic, shared by both lanes)
@@ -208,6 +208,86 @@ fn run_mptdb_lane(
     elapsed
 }
 
+const PREPOP_CHUNK_SIZE: usize = 10_000;
+
+/// Generate a BundleState for a chunk of addresses (for bulk_load).
+fn generate_account_chunk(
+    addresses: &[Address],
+    start_index: usize,
+    slots_per: usize,
+) -> revm_database::BundleState {
+    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+        PrimitivesHashMap::default();
+    for (offset, &addr) in addresses.iter().enumerate() {
+        let i = start_index + offset;
+        let info = AccountInfo {
+            nonce: i as u64,
+            balance: U256::from(1_000_000 * (i + 1)),
+            code_hash: KECCAK_EMPTY,
+            account_id: None,
+            code: None,
+        };
+        let mut storage = StorageWithOriginalValues::default();
+        for j in 0..slots_per {
+            let mut slot_bytes = [0u8; 32];
+            slot_bytes[24..32].copy_from_slice(&(j as u64).to_be_bytes());
+            storage.insert(
+                B256::from(slot_bytes).into(),
+                StorageSlot::new_changed(U256::ZERO, U256::from(j + 1)),
+            );
+        }
+        state.insert(
+            addr,
+            revm_database::BundleAccount {
+                info: Some(info),
+                original_info: None,
+                status: AccountStatus::Changed,
+                storage,
+            },
+        );
+    }
+    revm_database::BundleState {
+        state,
+        contracts: Default::default(),
+        reverts: Default::default(),
+        state_size: 0,
+        reverts_size: 0,
+    }
+}
+
+/// Run mpt-db lane with bulk_load pre-pop (for large datasets).
+/// Matches the profile test's prepopulate_mptdb_in_chunks approach.
+fn run_mptdb_lane_bulk(
+    addresses: &[Address],
+    slots_per: usize,
+    block_bundles: &[revm_database::BundleState],
+) -> Duration {
+    let dir = TempDir::new().unwrap();
+    let mut config = mptdb_sc::mpt::MptConfig::default();
+    config.wal_first_commit = true;
+    config.checkpoint_max_account_trie_nodes = 0;
+    let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+
+    // Pre-populate via bulk_load (not timed).
+    store.begin_bulk_load(BulkLoadOptions { retain_only_latest: true }).unwrap();
+    for (chunk_idx, chunk) in addresses.chunks(PREPOP_CHUNK_SIZE).enumerate() {
+        let start_index = chunk_idx * PREPOP_CHUNK_SIZE;
+        let bundle = generate_account_chunk(chunk, start_index, slots_per);
+        let _ = store.bulk_ingest_bundle_chunk(&bundle).unwrap();
+    }
+    store.finish_bulk_load().unwrap();
+
+    // Process blocks (timed)
+    let start = Instant::now();
+    for bundle in block_bundles {
+        store.apply_bundle_state(bundle).unwrap();
+        store.commit().unwrap();
+    }
+    let elapsed = start.elapsed();
+    let _ = store.close();
+    elapsed
+}
+
 // ---------------------------------------------------------------------------
 // Benchmark cases
 // ---------------------------------------------------------------------------
@@ -357,7 +437,7 @@ fn bench_b4_4_large_scale(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_mptdb_lane(&pre_pop, &blocks);
+                total += run_mptdb_lane_bulk(&addrs, 10, &blocks);
             }
             total
         })
@@ -400,7 +480,7 @@ fn bench_b4_5_near_production(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_mptdb_lane(&pre_pop, &blocks);
+                total += run_mptdb_lane_bulk(&addrs, 10, &blocks);
             }
             total
         })
@@ -443,7 +523,7 @@ fn bench_b4_6_storage_heavy_large(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_mptdb_lane(&pre_pop, &blocks);
+                total += run_mptdb_lane_bulk(&addrs, 30, &blocks);
             }
             total
         })

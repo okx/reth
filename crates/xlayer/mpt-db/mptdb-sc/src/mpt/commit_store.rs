@@ -1961,9 +1961,15 @@ impl MptCommitStore {
                                        // Prune WAL segments outside the lock — this involves
                                        // file IO (segment rewrite/delete) and should not block
                                        // the frontend.
+                                       // Prune every 16 versions to amortize the file IO cost.
+                                       // prune_before rewrites segment files — holding the WAL
+                                       // Mutex during this IO was the main contention source
+                                       // that caused B4.2's first-block 11ms WAL spike.
                                     if let Some(floor) = prune_floor {
-                                        let mut wal = wal_store.lock();
-                                        let _ = wal.prune_before(floor);
+                                        if job.version % 16 == 0 {
+                                            let mut wal = wal_store.lock();
+                                            let _ = wal.prune_before(floor);
+                                        }
                                     }
                                 }
                                 if worker_config.wal_first_commit {
