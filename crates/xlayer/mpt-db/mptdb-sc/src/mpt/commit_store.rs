@@ -79,6 +79,10 @@ struct StorageTrieHandle {
     base_version: i64,
     working: Option<StorageTrieCow>,
     working_version: Option<i64>,
+    /// Pre-computed root hash + committed trie from merged apply+hash phase.
+    /// Set during apply_dirty_accounts_inner (wal_first mode), consumed in commit.
+    /// Eliminates the second cache load of trie data between phases.
+    pre_computed: Option<(B256, StorageTrieCow)>,
 }
 
 impl StorageTrieHandle {
@@ -88,20 +92,21 @@ impl StorageTrieHandle {
             base_version,
             working: Some(trie),
             working_version: Some(working_version),
+            pre_computed: None,
         }
     }
 
     fn snapshot(base_version: i64, trie: StorageTrieCow) -> Self {
-        Self { base: trie, base_version, working: None, working_version: None }
+        Self { base: trie, base_version, working: None, working_version: None, pre_computed: None }
     }
 
-    /// Whether this handle has a working copy (eager or lazy-deferred).
+    /// Whether this handle has a working copy (eager, lazy-deferred, or pre-computed).
     fn has_working(&self) -> bool {
-        self.working.is_some() || self.working_version.is_some()
+        self.working.is_some() || self.working_version.is_some() || self.pre_computed.is_some()
     }
 
     fn has_working_for_version(&self, version: i64) -> bool {
-        self.working_version == Some(version)
+        self.working_version == Some(version) || self.pre_computed.is_some()
     }
 
     /// Lazy checkout: records the intent to write but does NOT clone the base.
@@ -120,11 +125,8 @@ impl StorageTrieHandle {
     }
 
     fn set_committed_base(&mut self, committed_version: i64, trie: StorageTrieCow) {
-        // Drop old base FIRST so its Arc reference is released.
-        // This ensures the frozen Arc strong_count == 1 when snapshot()
-        // calls Arc::make_mut, allowing in-place patch (O(overlay))
-        // instead of full copy (O(base_size)).
         self.working = None;
+        self.pre_computed = None;
         self.base = trie;
         self.base.snapshot();
         self.base_version = committed_version;
@@ -134,6 +136,7 @@ impl StorageTrieHandle {
     fn restore_working(&mut self, working_version: i64, trie: StorageTrieCow) {
         self.working = Some(trie);
         self.working_version = Some(working_version);
+        self.pre_computed = None;
     }
 
     fn take_working_for_version(&mut self, version: i64) -> Option<StorageTrieCow> {
@@ -3528,17 +3531,33 @@ impl MptCommitStore {
 
         let dirty_addresses: Vec<B256> = dirty_storage_accounts.keys().copied().collect();
         let dirty_handles = self.take_working_handles(dirty_addresses.clone());
+        // When wal_first, merge slot updates + root hash into a single rayon
+        // pass so trie data stays cache-hot.  This eliminates the second cache
+        // load that the separate storage_roots phase would incur.
+        let merge_hash = self.config.wal_first_commit;
+        let persisted_ref = &self.persisted;
         let updated_handles: Vec<(B256, StorageTrieHandle)> = dirty_handles
             .into_par_iter()
             .map(|(hashed_address, mut handle)| -> Result<(B256, StorageTrieHandle)> {
                 let trie = handle.take_working_or_base_for_version(working_version);
                 let trie = match dirty_storage_accounts.get(&hashed_address) {
                     Some(dirty) => {
-                        Self::apply_storage_changes_to_working(trie, &self.persisted, dirty)?
+                        Self::apply_storage_changes_to_working(trie, persisted_ref, dirty)?
                     }
                     None => trie,
                 };
-                handle.restore_working(working_version, trie);
+                if merge_hash {
+                    // Hash immediately while data is cache-hot.
+                    let (root, mut cow) = trie.root_hash_only(persisted_ref).map_err(|err| {
+                        MptDbError::Other(format!(
+                            "merged storage trie root hash for {hashed_address}: {err}"
+                        ))
+                    })?;
+                    cow.clear_dirty();
+                    handle.pre_computed = Some((root, cow));
+                } else {
+                    handle.restore_working(working_version, trie);
+                }
                 Ok((hashed_address, handle))
             })
             .collect::<Result<_>>()?;
@@ -3715,7 +3734,32 @@ impl MptCommitStore {
             })
         };
 
-        let storage_artifacts: Vec<StorageTrieCommitArtifacts> = if should_parallel {
+        // Check if any handle carries a pre-computed result from the merged
+        // apply+hash phase. If so, collect directly — no re-hash needed.
+        let any_pre_computed = dirty_handles.iter().any(|(_, h)| h.pre_computed.is_some());
+
+        let storage_artifacts: Vec<StorageTrieCommitArtifacts> = if any_pre_computed {
+            // Fast path: use pre-computed roots from the merged apply+hash
+            // rayon pass.  Data was hashed while still cache-hot.
+            dirty_handles
+                .into_iter()
+                .map(|(addr, mut handle)| {
+                    if let Some((root, cow)) = handle.pre_computed.take() {
+                        Ok(StorageTrieCommitArtifacts {
+                            hashed_address: addr,
+                            storage_root: root,
+                            node_blobs: Vec::new(),
+                            publish_view: StorageTriePublishView::DeferredRoot(root),
+                            hash_elapsed: Duration::ZERO,
+                            segment_elapsed: Duration::ZERO,
+                            trie: cow,
+                        })
+                    } else {
+                        compute_storage_artifact(addr, handle, &persisted_for_hash, hash_only)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else if should_parallel {
             dirty_handles
                 .into_par_iter()
                 .map(|(addr, handle)| {
