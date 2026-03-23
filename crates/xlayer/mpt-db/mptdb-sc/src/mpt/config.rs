@@ -44,7 +44,7 @@ pub struct MptConfig {
 impl Default for MptConfig {
     fn default() -> Self {
         Self {
-            storage_trie_cache_capacity: 250_000,
+            storage_trie_cache_capacity: 50_000,
             persisted_node_cache_capacity: 500_000,
             parallel_storage_tries_min: 64,
             parallel_account_frontier_min: 4,
@@ -55,7 +55,7 @@ impl Default for MptConfig {
             published_snapshot_interval: 64,
             published_rewrite_timeout_secs: 60,
             max_durable_lag: 128,
-            max_published_lag: 0,
+            max_published_lag: 16,
             snapshot_write_rate_mb_per_sec: 0,
             checkpoint_max_account_trie_nodes: 200_000,
             max_wal_bytes: 0,

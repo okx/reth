@@ -527,9 +527,17 @@ impl MptCommitStore {
         if let Some(evicted) = evicted {
             if evicted != hashed_address &&
                 self.storage_trie_cache.peek(&evicted).is_none() &&
-                self.storage_trie_handles
-                    .get(&evicted)
-                    .is_some_and(|handle| !handle.has_working())
+                self.storage_trie_handles.get(&evicted).is_some_and(|handle| {
+                    !handle.has_working() &&
+                        // In wal_first mode, only evict if the published segment
+                        // has caught up to this handle's version.  Otherwise the
+                        // trie data only exists in memory — evicting would lose it
+                        // since RocksDB has no nodes in wal_first mode.
+                        // Matches sei-db's invariant: trees stay resident until
+                        // their data is durably persisted (snapshot rewrite).
+                        (!self.config.wal_first_commit ||
+                         self.published_version.load(Ordering::Acquire) >= handle.base_version)
+                })
             {
                 self.storage_trie_handles.remove(&evicted);
             }
@@ -759,10 +767,20 @@ impl MptCommitStore {
         }
 
         if !candidates.is_empty() {
-            // Remaining accounts have no published segments — typically from
-            // an earlier era (e.g., bulk_load) where segments were not
-            // published.  Their nodes are already durable in RocksDB, so
-            // lazy load is safe without flushing the async persist queue.
+            if self.config.wal_first_commit {
+                // In wal_first mode, RocksDB has no trie nodes — the persisted
+                // fallback will fail.  This should not happen if the eviction
+                // guard in touch_cached_storage_trie works correctly.
+                tracing::warn!(
+                    count = candidates.len(),
+                    published_version = self.published_version.load(Ordering::Acquire),
+                    committed_version = self.version,
+                    "wal_first: storage tries missing from both L2 cache and published segments"
+                );
+            }
+            // Fallback to persisted nodes (RocksDB).  In wal_first mode this
+            // creates lazy nodes that may fail on access — the warning above
+            // flags the issue for investigation.
             stats.node_fallback_loads += candidates.len() as u64;
             for (hashed_address, existing_root) in candidates {
                 self.activate_snapshot_trie(
@@ -3405,7 +3423,8 @@ impl MptCommitStore {
         self.reset_derived_state_for_new_base()?;
         // Create streaming segment writer — matches sei-db's snapshotWriter
         // that streams directly to snapshot files during import.
-        self.bulk_segment_writer = Some(BulkSegmentWriter::new(&self.dir)?);
+        self.bulk_segment_writer =
+            Some(BulkSegmentWriter::new(&Self::fast_storage_root(&self.dir))?);
         self.bulk_load = Some(BulkLoadState {
             retain_only_latest: opts.retain_only_latest,
             chunks_committed: 0,
@@ -3460,20 +3479,23 @@ impl MptCommitStore {
             return Err(MptDbError::Other("bulk load is not active".to_string()));
         };
 
-        if state.retain_only_latest && self.version > self.manifest.earliest_version {
-            self.prune_before(self.version)?;
-        }
-
-        // Finalize the streaming segment writer: flush buffered page data,
-        // write ONE delta file + generation metadata, activate published meta.
-        // Then open the published store (one mmap) — matching sei-db where
-        // LoadMultiTree mmap's the completed snapshot after import.
+        // Finalize the streaming segment writer BEFORE prune — prune's
+        // compact_for_manifest may rewrite pages.data, but the delta file
+        // must exist first so the compactor knows which pages to keep.
         if let Some(writer) = self.bulk_segment_writer.take() {
             let root = self.manifest.get_root(self.version).unwrap_or(EMPTY_ROOT_HASH);
             if let Some(meta) = writer.finalize(self.version, root)? {
                 self.published_meta = Some(meta.clone());
                 self.published_store = self.published_baseline.open_published_store(&meta)?;
                 self.published_version.store(self.version, Ordering::Release);
+            }
+        }
+
+        if state.retain_only_latest && self.version > self.manifest.earliest_version {
+            self.prune_before(self.version)?;
+            // Re-open published store after compaction (pages may have moved).
+            if let Some(ref meta) = self.published_meta {
+                self.published_store = self.published_baseline.open_published_store(meta)?;
             }
         }
 
