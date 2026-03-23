@@ -171,6 +171,45 @@ fn run_reth_lane(
     start.elapsed()
 }
 
+/// Run reth lane with chunked pre-pop (for large datasets).
+/// Matches the profile test's chunked approach: 100 chunks × 10K accounts,
+/// each doing write_hashed_state + root_with_updates + write_trie_updates.
+/// This creates a more realistic MDBX trie state (incremental, not batch).
+fn run_reth_lane_chunked(
+    addresses: &[Address],
+    slots_per: usize,
+    block_bundles: &[revm_database::BundleState],
+) -> Duration {
+    let factory = create_test_provider_factory();
+
+    // Pre-populate in chunks (not timed)
+    for (chunk_idx, chunk) in addresses.chunks(PREPOP_CHUNK_SIZE).enumerate() {
+        let start_index = chunk_idx * PREPOP_CHUNK_SIZE;
+        let bundle = generate_account_chunk(chunk, start_index, slots_per);
+        let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
+        let sorted = hashed.into_sorted();
+        let rw = factory.provider_rw().unwrap();
+        rw.write_hashed_state(&sorted).unwrap();
+        let (_, updates): (B256, TrieUpdates) =
+            StateRoot::from_tx(rw.tx_ref()).root_with_updates().unwrap();
+        rw.write_trie_updates(updates).unwrap();
+        rw.commit().unwrap();
+    }
+
+    // Process blocks (timed)
+    let start = Instant::now();
+    for bundle in block_bundles {
+        let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
+        let sorted = hashed.into_sorted();
+        let rw = factory.provider_rw().unwrap();
+        let (_, updates) = StateRoot::overlay_root_with_updates(rw.tx_ref(), &sorted).unwrap();
+        rw.write_hashed_state(&sorted).unwrap();
+        rw.write_trie_updates(updates).unwrap();
+        rw.commit().unwrap();
+    }
+    start.elapsed()
+}
+
 // ---------------------------------------------------------------------------
 // mpt-db MPT lane
 // ---------------------------------------------------------------------------
@@ -427,7 +466,7 @@ fn bench_b4_4_large_scale(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_reth_lane(&pre_pop, &blocks);
+                total += run_reth_lane_chunked(&addrs, 10, &blocks);
             }
             total
         })
@@ -470,7 +509,7 @@ fn bench_b4_5_near_production(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_reth_lane(&pre_pop, &blocks);
+                total += run_reth_lane_chunked(&addrs, 10, &blocks);
             }
             total
         })
@@ -513,7 +552,7 @@ fn bench_b4_6_storage_heavy_large(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_reth_lane(&pre_pop, &blocks);
+                total += run_reth_lane_chunked(&addrs, 30, &blocks);
             }
             total
         })
