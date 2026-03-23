@@ -6,7 +6,7 @@
 
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{map::HashMap as PrimitivesHashMap, Address, B256, U256};
-use mptdb_sc::mpt::{BulkLoadOptions, CommitProfile, MptCommitStore, MptCommitter};
+use mptdb_sc::mpt::{CommitProfile, MptCommitStore, MptCommitter};
 use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use reth_provider::{test_utils::create_test_provider_factory, StateWriter, TrieWriter};
 use reth_trie::{updates::TrieUpdates, HashedPostState, KeccakKeyHasher, StateRoot};
@@ -143,13 +143,12 @@ fn prepopulate_mptdb_in_chunks(
     chunk_size: usize,
 ) -> Duration {
     let start = Instant::now();
-    store.begin_bulk_load(BulkLoadOptions { retain_only_latest: true }).unwrap();
     for (chunk_idx, chunk) in addresses.chunks(chunk_size).enumerate() {
         let start_index = chunk_idx * chunk_size;
         let bundle = generate_account_chunk(chunk, start_index, slots_per);
-        let _ = store.bulk_ingest_bundle_chunk(&bundle).unwrap();
+        store.apply_bundle_state(&bundle).unwrap();
+        store.commit().unwrap();
     }
-    store.finish_bulk_load().unwrap();
     start.elapsed()
 }
 

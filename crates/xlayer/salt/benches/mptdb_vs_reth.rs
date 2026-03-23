@@ -1,12 +1,16 @@
 //! Benchmark: mpt-db MPT vs reth MPT+MDBX.
 //!
-//! Compares two MPT implementations using identical deterministic BundleState inputs.
-//! Pre-population is excluded from measured time for both lanes.
+//! Compares two MPT implementations using identical deterministic inputs.
+//! Both systems use chunked pre-population (incremental state building),
+//! matching real blockchain behavior where state accumulates block by block.
+//! Pre-population is excluded from measured time.
 //!
 //! B4.1: fresh-state one-shot (100 accounts, 10 slots each)
 //! B4.2: pre-populated DB + single block (1K pre-pop, 200 updated)
 //! B4.3: 10 blocks incremental (1K pre-pop, 200 updates/block)
-//! B4.4: large-scale (200K pre-pop + 2K updates/block, 10 blocks) — BENCH_LARGE=1 to enable
+//! B4.4: large-scale (200K pre-pop + 2K updates/block, 10 blocks) — BENCH_LARGE=1
+//! B4.5: near-production (1M pre-pop + 5K updates/block, 10 blocks) — BENCH_LARGE=1
+//! B4.6: storage-heavy (1M pre-pop 30 slots + 10K updates/block, 10 blocks) — BENCH_LARGE=1
 
 #![allow(missing_docs, unreachable_pub)]
 
@@ -23,28 +27,35 @@ use reth_provider::{test_utils::create_test_provider_factory, StateWriter, TrieW
 use reth_trie::{updates::TrieUpdates, HashedPostState, KeccakKeyHasher, StateRoot};
 use reth_trie_db::DatabaseStateRoot;
 
-use mptdb_sc::mpt::{BulkLoadOptions, MptCommitStore, MptCommitter};
+use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
+
+const PREPOP_CHUNK_SIZE: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // Data generation (deterministic, shared by both lanes)
 // ---------------------------------------------------------------------------
 
-/// Generate `num` random accounts, each with `slots_per` storage slots.
-fn generate_accounts(
-    num: usize,
-    slots_per: usize,
-    rng: &mut StdRng,
-) -> (revm_database::BundleState, Vec<Address>) {
-    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
-        PrimitivesHashMap::default();
+/// Generate `num` random addresses.
+fn generate_addresses(num: usize, rng: &mut StdRng) -> Vec<Address> {
     let mut addresses = Vec::with_capacity(num);
     let mut addr_buf = [0u8; 20];
-
-    for i in 0..num {
+    for _ in 0..num {
         rng.fill_bytes(&mut addr_buf);
-        let addr = Address::from(addr_buf);
-        addresses.push(addr);
+        addresses.push(Address::from(addr_buf));
+    }
+    addresses
+}
 
+/// Generate a BundleState for a chunk of addresses.
+fn generate_account_chunk(
+    addresses: &[Address],
+    start_index: usize,
+    slots_per: usize,
+) -> revm_database::BundleState {
+    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+        PrimitivesHashMap::default();
+    for (offset, &addr) in addresses.iter().enumerate() {
+        let i = start_index + offset;
         let info = AccountInfo {
             nonce: i as u64,
             balance: U256::from(1_000_000 * (i + 1)),
@@ -52,7 +63,6 @@ fn generate_accounts(
             account_id: None,
             code: None,
         };
-
         let mut storage = StorageWithOriginalValues::default();
         for j in 0..slots_per {
             let mut slot_bytes = [0u8; 32];
@@ -62,7 +72,6 @@ fn generate_accounts(
                 StorageSlot::new_changed(U256::ZERO, U256::from(j + 1)),
             );
         }
-
         state.insert(
             addr,
             revm_database::BundleAccount {
@@ -73,19 +82,16 @@ fn generate_accounts(
             },
         );
     }
-
-    let bundle = revm_database::BundleState {
+    revm_database::BundleState {
         state,
         contracts: Default::default(),
         reverts: Default::default(),
         state_size: 0,
         reverts_size: 0,
-    };
-    (bundle, addresses)
+    }
 }
 
-/// Generate one block of updates: pick `count` addresses from `addresses`, bump
-/// nonce/balance/storage.
+/// Generate one block of updates: pick `count` addresses, bump nonce/balance/storage.
 fn generate_updates(
     addresses: &[Address],
     count: usize,
@@ -137,45 +143,14 @@ fn generate_updates(
 }
 
 // ---------------------------------------------------------------------------
-// reth MPT+MDBX lane
+// Unified lane functions — both use chunked pre-pop
 // ---------------------------------------------------------------------------
 
-/// Run reth MPT lane: apply pre-pop (excluded from timing), then process block_bundles.
+/// Run reth lane: chunked pre-pop (not timed) + process blocks (timed).
+///
+/// Pre-pop uses incremental chunks matching real blockchain state accumulation:
+/// each chunk writes hashed state, computes trie root, and commits.
 fn run_reth_lane(
-    pre_pop: &revm_database::BundleState,
-    block_bundles: &[revm_database::BundleState],
-) -> Duration {
-    let factory = create_test_provider_factory();
-
-    // Pre-populate (not timed)
-    let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(pre_pop.state());
-    let sorted = hashed.into_sorted();
-    let rw = factory.provider_rw().unwrap();
-    rw.write_hashed_state(&sorted).unwrap();
-    let (_, updates): (B256, TrieUpdates) =
-        StateRoot::from_tx(rw.tx_ref()).root_with_updates().unwrap();
-    rw.write_trie_updates(updates).unwrap();
-    rw.commit().unwrap();
-
-    // Process blocks (timed)
-    let start = Instant::now();
-    for bundle in block_bundles {
-        let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
-        let sorted = hashed.into_sorted();
-        let rw = factory.provider_rw().unwrap();
-        let (_, updates) = StateRoot::overlay_root_with_updates(rw.tx_ref(), &sorted).unwrap();
-        rw.write_hashed_state(&sorted).unwrap();
-        rw.write_trie_updates(updates).unwrap();
-        rw.commit().unwrap();
-    }
-    start.elapsed()
-}
-
-/// Run reth lane with chunked pre-pop (for large datasets).
-/// Matches the profile test's chunked approach: 100 chunks × 10K accounts,
-/// each doing write_hashed_state + root_with_updates + write_trie_updates.
-/// This creates a more realistic MDBX trie state (incremental, not batch).
-fn run_reth_lane_chunked(
     addresses: &[Address],
     slots_per: usize,
     block_bundles: &[revm_database::BundleState],
@@ -210,93 +185,11 @@ fn run_reth_lane_chunked(
     start.elapsed()
 }
 
-// ---------------------------------------------------------------------------
-// mpt-db MPT lane
-// ---------------------------------------------------------------------------
-
-/// Run mpt-db MPT lane: apply pre-pop (excluded from timing), then process block_bundles.
+/// Run mpt-db lane: chunked pre-pop (not timed) + process blocks (timed).
+///
+/// Pre-pop uses incremental apply_bundle_state + commit per chunk,
+/// matching real blockchain state accumulation.  wal_first mode enabled.
 fn run_mptdb_lane(
-    pre_pop: &revm_database::BundleState,
-    block_bundles: &[revm_database::BundleState],
-) -> Duration {
-    let dir = TempDir::new().unwrap();
-    let use_wal_first = !pre_pop.state().is_empty();
-    let mut config = mptdb_sc::mpt::MptConfig::default();
-    if use_wal_first {
-        config.wal_first_commit = true;
-        config.checkpoint_max_account_trie_nodes = 0;
-    }
-    let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
-
-    // Pre-populate (not timed).
-    if use_wal_first {
-        store.apply_bundle_state(pre_pop).unwrap();
-        store.commit().unwrap();
-    }
-
-    // Process blocks (timed)
-    let start = Instant::now();
-    for bundle in block_bundles {
-        store.apply_bundle_state(bundle).unwrap();
-        store.commit().unwrap();
-    }
-    let elapsed = start.elapsed();
-    // Ignore close errors — in wal_first mode under criterion's rapid iteration,
-    // the WAL durable_version check can race with the background worker.
-    let _ = store.close();
-    elapsed
-}
-
-const PREPOP_CHUNK_SIZE: usize = 10_000;
-
-/// Generate a BundleState for a chunk of addresses (for bulk_load).
-fn generate_account_chunk(
-    addresses: &[Address],
-    start_index: usize,
-    slots_per: usize,
-) -> revm_database::BundleState {
-    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
-        PrimitivesHashMap::default();
-    for (offset, &addr) in addresses.iter().enumerate() {
-        let i = start_index + offset;
-        let info = AccountInfo {
-            nonce: i as u64,
-            balance: U256::from(1_000_000 * (i + 1)),
-            code_hash: KECCAK_EMPTY,
-            account_id: None,
-            code: None,
-        };
-        let mut storage = StorageWithOriginalValues::default();
-        for j in 0..slots_per {
-            let mut slot_bytes = [0u8; 32];
-            slot_bytes[24..32].copy_from_slice(&(j as u64).to_be_bytes());
-            storage.insert(
-                B256::from(slot_bytes).into(),
-                StorageSlot::new_changed(U256::ZERO, U256::from(j + 1)),
-            );
-        }
-        state.insert(
-            addr,
-            revm_database::BundleAccount {
-                info: Some(info),
-                original_info: None,
-                status: AccountStatus::Changed,
-                storage,
-            },
-        );
-    }
-    revm_database::BundleState {
-        state,
-        contracts: Default::default(),
-        reverts: Default::default(),
-        state_size: 0,
-        reverts_size: 0,
-    }
-}
-
-/// Run mpt-db lane with bulk_load pre-pop (for large datasets).
-/// Matches the profile test's prepopulate_mptdb_in_chunks approach.
-fn run_mptdb_lane_bulk(
     addresses: &[Address],
     slots_per: usize,
     block_bundles: &[revm_database::BundleState],
@@ -307,14 +200,13 @@ fn run_mptdb_lane_bulk(
     config.checkpoint_max_account_trie_nodes = 0;
     let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
-    // Pre-populate via bulk_load (not timed).
-    store.begin_bulk_load(BulkLoadOptions { retain_only_latest: true }).unwrap();
+    // Pre-populate in chunks (not timed)
     for (chunk_idx, chunk) in addresses.chunks(PREPOP_CHUNK_SIZE).enumerate() {
         let start_index = chunk_idx * PREPOP_CHUNK_SIZE;
         let bundle = generate_account_chunk(chunk, start_index, slots_per);
-        let _ = store.bulk_ingest_bundle_chunk(&bundle).unwrap();
+        store.apply_bundle_state(&bundle).unwrap();
+        store.commit().unwrap();
     }
-    store.finish_bulk_load().unwrap();
 
     // Process blocks (timed)
     let start = Instant::now();
@@ -338,22 +230,19 @@ fn bench_b4_1_fresh_state(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(30));
 
     let mut rng = StdRng::seed_from_u64(4100);
-    let (bundle, _addrs) = generate_accounts(100, 10, &mut rng);
+    let addrs = generate_addresses(100, &mut rng);
 
-    // For a fresh-state one-shot, the entire bundle IS the block (no pre-pop).
-    let empty_pre_pop = revm_database::BundleState {
-        state: PrimitivesHashMap::default(),
-        contracts: Default::default(),
-        reverts: Default::default(),
-        state_size: 0,
-        reverts_size: 0,
-    };
+    let mut rng_block = StdRng::seed_from_u64(4101);
+    let block = generate_account_chunk(&addrs, 0, 10);
+
+    // For fresh-state, no pre-pop — the block IS the first state.
+    let empty: Vec<Address> = vec![];
 
     group.bench_function(BenchmarkId::new("reth_mpt", "100accts_10slots"), |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_reth_lane(&empty_pre_pop, &[bundle.clone()]);
+                total += run_reth_lane(&empty, 10, &[block.clone()]);
             }
             total
         })
@@ -363,7 +252,7 @@ fn bench_b4_1_fresh_state(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_mptdb_lane(&empty_pre_pop, &[bundle.clone()]);
+                total += run_mptdb_lane(&empty, 10, &[block.clone()]);
             }
             total
         })
@@ -379,7 +268,7 @@ fn bench_b4_2_prepop_single_block(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(30));
 
     let mut rng = StdRng::seed_from_u64(4200);
-    let (pre_pop, addrs) = generate_accounts(1_000, 10, &mut rng);
+    let addrs = generate_addresses(1_000, &mut rng);
 
     let mut rng_block = StdRng::seed_from_u64(4201);
     let block = generate_updates(&addrs, 200, 10, 0, &mut rng_block);
@@ -388,7 +277,7 @@ fn bench_b4_2_prepop_single_block(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_reth_lane(&pre_pop, &[block.clone()]);
+                total += run_reth_lane(&addrs, 10, &[block.clone()]);
             }
             total
         })
@@ -398,7 +287,7 @@ fn bench_b4_2_prepop_single_block(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_mptdb_lane(&pre_pop, &[block.clone()]);
+                total += run_mptdb_lane(&addrs, 10, &[block.clone()]);
             }
             total
         })
@@ -414,7 +303,7 @@ fn bench_b4_3_incremental_blocks(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(30));
 
     let mut rng = StdRng::seed_from_u64(4300);
-    let (pre_pop, addrs) = generate_accounts(1_000, 10, &mut rng);
+    let addrs = generate_addresses(1_000, &mut rng);
 
     let mut rng_blocks = StdRng::seed_from_u64(4301);
     let blocks: Vec<_> =
@@ -424,7 +313,7 @@ fn bench_b4_3_incremental_blocks(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_reth_lane(&pre_pop, &blocks);
+                total += run_reth_lane(&addrs, 10, &blocks);
             }
             total
         })
@@ -434,7 +323,7 @@ fn bench_b4_3_incremental_blocks(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_mptdb_lane(&pre_pop, &blocks);
+                total += run_mptdb_lane(&addrs, 10, &blocks);
             }
             total
         })
@@ -456,7 +345,7 @@ fn bench_b4_4_large_scale(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(60));
 
     let mut rng = StdRng::seed_from_u64(4400);
-    let (pre_pop, addrs) = generate_accounts(200_000, 10, &mut rng);
+    let addrs = generate_addresses(200_000, &mut rng);
 
     let mut rng_blocks = StdRng::seed_from_u64(4401);
     let blocks: Vec<_> =
@@ -466,7 +355,7 @@ fn bench_b4_4_large_scale(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_reth_lane_chunked(&addrs, 10, &blocks);
+                total += run_reth_lane(&addrs, 10, &blocks);
             }
             total
         })
@@ -476,7 +365,7 @@ fn bench_b4_4_large_scale(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_mptdb_lane_bulk(&addrs, 10, &blocks);
+                total += run_mptdb_lane(&addrs, 10, &blocks);
             }
             total
         })
@@ -486,7 +375,6 @@ fn bench_b4_4_large_scale(c: &mut Criterion) {
 }
 
 /// B4.5: Near-production — 1M pre-pop (10 slots each) + 5K updates/block, 10 blocks.
-/// Stresses account trie breadth with realistic update density.
 /// Gated by BENCH_LARGE=1 environment variable.
 fn bench_b4_5_near_production(c: &mut Criterion) {
     if std::env::var("BENCH_LARGE").is_err() {
@@ -499,7 +387,7 @@ fn bench_b4_5_near_production(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(120));
 
     let mut rng = StdRng::seed_from_u64(4500);
-    let (pre_pop, addrs) = generate_accounts(1_000_000, 10, &mut rng);
+    let addrs = generate_addresses(1_000_000, &mut rng);
 
     let mut rng_blocks = StdRng::seed_from_u64(4501);
     let blocks: Vec<_> =
@@ -509,7 +397,7 @@ fn bench_b4_5_near_production(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_reth_lane_chunked(&addrs, 10, &blocks);
+                total += run_reth_lane(&addrs, 10, &blocks);
             }
             total
         })
@@ -519,7 +407,7 @@ fn bench_b4_5_near_production(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_mptdb_lane_bulk(&addrs, 10, &blocks);
+                total += run_mptdb_lane(&addrs, 10, &blocks);
             }
             total
         })
@@ -529,7 +417,6 @@ fn bench_b4_5_near_production(c: &mut Criterion) {
 }
 
 /// B4.6: Storage-heavy large-scale — 1M pre-pop (30 slots each) + 10K updates/block, 10 blocks.
-/// Stresses storage trie depth and update density (~4GB working set).
 /// Gated by BENCH_LARGE=1 environment variable.
 fn bench_b4_6_storage_heavy_large(c: &mut Criterion) {
     if std::env::var("BENCH_LARGE").is_err() {
@@ -542,7 +429,7 @@ fn bench_b4_6_storage_heavy_large(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(180));
 
     let mut rng = StdRng::seed_from_u64(4600);
-    let (pre_pop, addrs) = generate_accounts(1_000_000, 30, &mut rng);
+    let addrs = generate_addresses(1_000_000, &mut rng);
 
     let mut rng_blocks = StdRng::seed_from_u64(4601);
     let blocks: Vec<_> =
@@ -552,7 +439,7 @@ fn bench_b4_6_storage_heavy_large(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_reth_lane_chunked(&addrs, 30, &blocks);
+                total += run_reth_lane(&addrs, 30, &blocks);
             }
             total
         })
@@ -562,7 +449,7 @@ fn bench_b4_6_storage_heavy_large(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_mptdb_lane_bulk(&addrs, 30, &blocks);
+                total += run_mptdb_lane(&addrs, 30, &blocks);
             }
             total
         })
