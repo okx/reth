@@ -17,6 +17,10 @@ use reth_optimism_primitives as _;
 mod consensus;
 pub use consensus::FlashBlockConsensusClient;
 
+/// Post-execution hook and type-erased extension data for flashblocks.
+pub mod hook;
+pub use hook::{FlashBlockExtension, PostExecutionHook};
+
 mod payload;
 pub use payload::{FlashBlock, PendingFlashBlock};
 

@@ -699,6 +699,8 @@ pub struct OpAddOnsBuilder<NetworkT, RpcMiddleware = Identity> {
     flashblocks_url: Option<Url>,
     /// Enable flashblock consensus client to drive chain forward.
     flashblock_consensus: bool,
+    /// Optional type-erased post-execution hook for flashblocks.
+    post_execution_hook: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl<NetworkT> Default for OpAddOnsBuilder<NetworkT> {
@@ -716,6 +718,7 @@ impl<NetworkT> Default for OpAddOnsBuilder<NetworkT> {
             tokio_runtime: None,
             flashblocks_url: None,
             flashblock_consensus: false,
+            post_execution_hook: None,
         }
     }
 }
@@ -785,6 +788,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             _nt,
             flashblocks_url,
             flashblock_consensus,
+            post_execution_hook,
             ..
         } = self;
         OpAddOnsBuilder {
@@ -800,6 +804,7 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             tokio_runtime,
             flashblocks_url,
             flashblock_consensus,
+            post_execution_hook,
         }
     }
 
@@ -812,6 +817,17 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
     /// With a flashblock consensus client to drive chain forward.
     pub const fn with_flashblock_consensus(mut self, flashblock_consensus: bool) -> Self {
         self.flashblock_consensus = flashblock_consensus;
+        self
+    }
+
+    /// Sets a [`PostExecutionHook`] that runs after each flashblock execution.
+    ///
+    /// [`PostExecutionHook`]: reth_optimism_flashblocks::PostExecutionHook
+    pub fn with_post_execution_hook<NP: reth_primitives_traits::NodePrimitives + 'static>(
+        mut self,
+        hook: std::sync::Arc<dyn reth_optimism_flashblocks::PostExecutionHook<NP>>,
+    ) -> Self {
+        self.post_execution_hook = Some(std::sync::Arc::new(hook));
         self
     }
 }
@@ -840,17 +856,24 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
             tokio_runtime,
             flashblocks_url,
             flashblock_consensus,
+            post_execution_hook,
             ..
         } = self;
 
+        let mut eth_api_builder = OpEthApiBuilder::default()
+            .with_sequencer(sequencer_url.clone())
+            .with_sequencer_headers(sequencer_headers.clone())
+            .with_min_suggested_priority_fee(min_suggested_priority_fee)
+            .with_flashblocks(flashblocks_url)
+            .with_flashblock_consensus(flashblock_consensus);
+
+        if let Some(hook) = post_execution_hook {
+            eth_api_builder = eth_api_builder.with_raw_post_execution_hook(Box::new(hook));
+        }
+
         OpAddOns::new(
             RpcAddOns::new(
-                OpEthApiBuilder::default()
-                    .with_sequencer(sequencer_url.clone())
-                    .with_sequencer_headers(sequencer_headers.clone())
-                    .with_min_suggested_priority_fee(min_suggested_priority_fee)
-                    .with_flashblocks(flashblocks_url)
-                    .with_flashblock_consensus(flashblock_consensus),
+                eth_api_builder,
                 PVB::default(),
                 EB::default(),
                 EVB::default(),

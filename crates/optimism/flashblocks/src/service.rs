@@ -1,6 +1,7 @@
 use crate::{
-    cache::SequenceManager, worker::FlashBlockBuilder, FlashBlock, FlashBlockCompleteSequence,
-    FlashBlockCompleteSequenceRx, InProgressFlashBlockRx, PendingFlashBlock,
+    cache::SequenceManager, hook::PostExecutionHook, worker::FlashBlockBuilder, FlashBlock,
+    FlashBlockCompleteSequence, FlashBlockCompleteSequenceRx, InProgressFlashBlockRx,
+    PendingFlashBlock,
 };
 use alloy_primitives::B256;
 use futures_util::{FutureExt, Stream, StreamExt};
@@ -44,7 +45,7 @@ pub struct FlashBlockService<
     received_flashblocks_tx: tokio::sync::broadcast::Sender<Arc<FlashBlock>>,
 
     /// Executes flashblock sequences to build pending blocks.
-    builder: FlashBlockBuilder<EvmConfig, Provider>,
+    builder: FlashBlockBuilder<EvmConfig, Provider, N>,
     /// Task executor for spawning block build jobs.
     spawner: TaskExecutor,
     /// Currently running block build job with start time and result receiver.
@@ -84,13 +85,32 @@ where
         spawner: TaskExecutor,
         engine_handle: ConsensusEngineHandle<P>,
     ) -> Self {
+        Self::with_hook(incoming_flashblock_rx, evm_config, provider, spawner, engine_handle, None)
+    }
+
+    /// Constructs a new `FlashBlockService` with an optional [`PostExecutionHook`].
+    ///
+    /// The hook is called after each flashblock execution to produce extension data
+    /// that is attached to the resulting [`PendingFlashBlock`].
+    pub fn with_hook(
+        incoming_flashblock_rx: S,
+        evm_config: EvmConfig,
+        provider: Provider,
+        spawner: TaskExecutor,
+        engine_handle: ConsensusEngineHandle<P>,
+        post_execution_hook: Option<Arc<dyn PostExecutionHook<N>>>,
+    ) -> Self {
         let (in_progress_tx, _) = watch::channel(None);
         let (received_flashblocks_tx, _) = tokio::sync::broadcast::channel(128);
+        let mut builder = FlashBlockBuilder::new(evm_config, provider);
+        if let Some(hook) = post_execution_hook {
+            builder = builder.with_post_execution_hook(hook);
+        }
         Self {
             incoming_flashblock_rx,
             in_progress_tx,
             received_flashblocks_tx,
-            builder: FlashBlockBuilder::new(evm_config, provider),
+            builder,
             spawner,
             job: None,
             sequences: Arc::new(SequenceManager::new(engine_handle)),

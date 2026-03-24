@@ -1,3 +1,4 @@
+use crate::hook::FlashBlockExtension;
 use alloy_primitives::B256;
 use derive_more::Deref;
 use reth_primitives_traits::NodePrimitives;
@@ -22,11 +23,15 @@ pub struct PendingFlashBlock<N: NodePrimitives> {
     pub hashed_state: HashedPostState,
     /// Flag if the [`PendingBlock`] will compute stateroot.
     pub compute_state_root: bool,
+    /// Optional type-erased extension data produced by a [`PostExecutionHook`].
+    ///
+    /// [`PostExecutionHook`]: crate::hook::PostExecutionHook
+    pub extension: Option<FlashBlockExtension>,
 }
 
 impl<N: NodePrimitives> PendingFlashBlock<N> {
     /// Create new pending flashblock.
-    pub const fn new(
+    pub fn new(
         pending: PendingBlock<N>,
         last_flashblock_index: u64,
         last_flashblock_hash: B256,
@@ -39,7 +44,14 @@ impl<N: NodePrimitives> PendingFlashBlock<N> {
             last_flashblock_hash,
             hashed_state,
             compute_state_root,
+            extension: None,
         }
+    }
+
+    /// Sets the extension data on this pending flashblock.
+    pub fn with_extension(mut self, extension: FlashBlockExtension) -> Self {
+        self.extension = Some(extension);
+        self
     }
 }
 

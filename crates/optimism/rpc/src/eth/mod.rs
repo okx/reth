@@ -105,7 +105,7 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
     }
 
     /// Build a [`OpEthApi`] using [`OpEthApiBuilder`].
-    pub const fn builder() -> OpEthApiBuilder<Rpc> {
+    pub fn builder() -> OpEthApiBuilder<Rpc> {
         OpEthApiBuilder::new()
     }
 
@@ -446,7 +446,6 @@ pub type OpRpcConvert<N, NetworkT> = RpcConverter<
 >;
 
 /// Builds [`OpEthApi`] for Optimism.
-#[derive(Debug)]
 pub struct OpEthApiBuilder<NetworkT = Optimism> {
     /// Sequencer client, configured to forward submitted transactions to sequencer of given OP
     /// network.
@@ -465,8 +464,27 @@ pub struct OpEthApiBuilder<NetworkT = Optimism> {
     /// `newPayload` and `forkchoiceUpdated` calls, advancing the canonical chain state.
     /// Requires `flashblocks_url` to be set.
     flashblock_consensus: bool,
+    /// Optional type-erased [`PostExecutionHook`] passed to the flashblocks service.
+    ///
+    /// Stored as `Box<dyn Any>` wrapping an `Arc<dyn PostExecutionHook<N>>`.
+    /// Downcast to the concrete `NodePrimitives` type in [`build_eth_api`].
+    ///
+    /// [`PostExecutionHook`]: reth_optimism_flashblocks::PostExecutionHook
+    post_execution_hook: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// Marker for network types.
     _nt: PhantomData<NetworkT>,
+}
+
+impl<NetworkT> std::fmt::Debug for OpEthApiBuilder<NetworkT> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpEthApiBuilder")
+            .field("sequencer_url", &self.sequencer_url)
+            .field("min_suggested_priority_fee", &self.min_suggested_priority_fee)
+            .field("flashblocks_url", &self.flashblocks_url)
+            .field("flashblock_consensus", &self.flashblock_consensus)
+            .field("has_post_execution_hook", &self.post_execution_hook.is_some())
+            .finish()
+    }
 }
 
 impl<NetworkT> Default for OpEthApiBuilder<NetworkT> {
@@ -477,6 +495,7 @@ impl<NetworkT> Default for OpEthApiBuilder<NetworkT> {
             min_suggested_priority_fee: 1_000_000,
             flashblocks_url: None,
             flashblock_consensus: false,
+            post_execution_hook: None,
             _nt: PhantomData,
         }
     }
@@ -484,13 +503,14 @@ impl<NetworkT> Default for OpEthApiBuilder<NetworkT> {
 
 impl<NetworkT> OpEthApiBuilder<NetworkT> {
     /// Creates a [`OpEthApiBuilder`] instance from core components.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             sequencer_url: None,
             sequencer_headers: Vec::new(),
             min_suggested_priority_fee: 1_000_000,
             flashblocks_url: None,
             flashblock_consensus: false,
+            post_execution_hook: None,
             _nt: PhantomData,
         }
     }
@@ -522,6 +542,35 @@ impl<NetworkT> OpEthApiBuilder<NetworkT> {
     /// With flashblock consensus client enabled to drive chain forward
     pub const fn with_flashblock_consensus(mut self, flashblock_consensus: bool) -> Self {
         self.flashblock_consensus = flashblock_consensus;
+        self
+    }
+
+    /// Sets a [`PostExecutionHook`] that will be called after each flashblock execution.
+    ///
+    /// The hook is type-erased here and downcast to the concrete `NodePrimitives`
+    /// type when the flashblocks service is started.
+    ///
+    /// [`PostExecutionHook`]: reth_optimism_flashblocks::PostExecutionHook
+    /// Sets a [`PostExecutionHook`] that will be called after each flashblock execution.
+    ///
+    /// The hook is type-erased here and downcast to the concrete `NodePrimitives`
+    /// type when the flashblocks service is started.
+    ///
+    /// [`PostExecutionHook`]: reth_optimism_flashblocks::PostExecutionHook
+    pub fn with_post_execution_hook<NP: reth_primitives_traits::NodePrimitives + 'static>(
+        mut self,
+        hook: std::sync::Arc<dyn reth_optimism_flashblocks::PostExecutionHook<NP>>,
+    ) -> Self {
+        self.post_execution_hook = Some(std::sync::Arc::new(hook));
+        self
+    }
+
+    /// Sets a pre-wrapped post-execution hook (already type-erased).
+    pub fn with_raw_post_execution_hook(
+        mut self,
+        hook: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        self.post_execution_hook = Some(std::sync::Arc::from(hook));
         self
     }
 }
@@ -560,8 +609,15 @@ where
             min_suggested_priority_fee,
             flashblocks_url,
             flashblock_consensus,
+            post_execution_hook,
             ..
         } = self;
+
+        // Downcast the type-erased hook to the concrete `NodePrimitives` type.
+        type NP<N> = <<N as FullNodeTypes>::Types as reth_node_api::NodeTypes>::Primitives;
+        type Hook<N> = std::sync::Arc<dyn reth_optimism_flashblocks::PostExecutionHook<NP<N>>>;
+        let hook: Option<Hook<N>> =
+            post_execution_hook.and_then(|erased| erased.downcast_ref::<Hook<N>>().cloned());
         let rpc_converter =
             RpcConverter::new(OpReceiptConverter::new(ctx.components.provider().clone()))
                 .with_mapper(OpTxInfoMapper::new(ctx.components.provider().clone()));
@@ -581,12 +637,13 @@ where
 
             let (tx, pending_rx) = watch::channel(None);
             let stream = WsFlashBlockStream::new(ws_url);
-            let service = FlashBlockService::new(
+            let service = FlashBlockService::with_hook(
                 stream,
                 ctx.components.evm_config().clone(),
                 ctx.components.provider().clone(),
                 ctx.components.task_executor().clone(),
                 ctx.engine_handle.clone(),
+                hook,
             );
 
             let flashblocks_sequence = service.block_sequence_broadcaster().clone();

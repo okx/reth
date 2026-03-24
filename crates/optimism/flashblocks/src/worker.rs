@@ -1,4 +1,4 @@
-use crate::PendingFlashBlock;
+use crate::{hook::PostExecutionHook, PendingFlashBlock};
 use alloy_eips::{eip2718::WithEncoded, BlockNumberOrTag};
 use alloy_primitives::B256;
 use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
@@ -20,15 +20,33 @@ use std::{
 use tracing::trace;
 
 /// The `FlashBlockBuilder` builds [`PendingBlock`] out of a sequence of transactions.
-#[derive(Debug)]
-pub(crate) struct FlashBlockBuilder<EvmConfig, Provider> {
+pub(crate) struct FlashBlockBuilder<EvmConfig, Provider, N: NodePrimitives> {
     evm_config: EvmConfig,
     provider: Provider,
+    /// Optional post-execution hook for attaching extension data (e.g., innertx traces).
+    post_execution_hook: Option<Arc<dyn PostExecutionHook<N>>>,
 }
 
-impl<EvmConfig, Provider> FlashBlockBuilder<EvmConfig, Provider> {
-    pub(crate) const fn new(evm_config: EvmConfig, provider: Provider) -> Self {
-        Self { evm_config, provider }
+impl<EvmConfig: std::fmt::Debug, Provider: std::fmt::Debug, N: NodePrimitives> std::fmt::Debug
+    for FlashBlockBuilder<EvmConfig, Provider, N>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlashBlockBuilder")
+            .field("evm_config", &self.evm_config)
+            .field("provider", &self.provider)
+            .field("has_hook", &self.post_execution_hook.is_some())
+            .finish()
+    }
+}
+
+impl<EvmConfig, Provider, N: NodePrimitives> FlashBlockBuilder<EvmConfig, Provider, N> {
+    pub(crate) fn new(evm_config: EvmConfig, provider: Provider) -> Self {
+        Self { evm_config, provider, post_execution_hook: None }
+    }
+
+    pub(crate) fn with_post_execution_hook(mut self, hook: Arc<dyn PostExecutionHook<N>>) -> Self {
+        self.post_execution_hook = Some(hook);
+        self
     }
 
     pub(crate) const fn provider(&self) -> &Provider {
@@ -45,7 +63,7 @@ pub(crate) struct BuildArgs<I> {
     pub(crate) compute_state_root: bool,
 }
 
-impl<N, EvmConfig, Provider> FlashBlockBuilder<EvmConfig, Provider>
+impl<N, EvmConfig, Provider> FlashBlockBuilder<EvmConfig, Provider, N>
 where
     N: NodePrimitives,
     EvmConfig: ConfigureEvm<Primitives = N, NextBlockEnvCtx: From<OpFlashblockPayloadBase> + Unpin>,
@@ -120,13 +138,21 @@ where
                 ),
             ),
         );
-        let pending_flashblock = PendingFlashBlock::new(
+        let mut pending_flashblock = PendingFlashBlock::new(
             pending_block,
             args.last_flashblock_index,
             args.last_flashblock_hash,
             hashed_state,
             args.compute_state_root,
         );
+
+        // Run post-execution hook to produce extension data (e.g., innertx traces).
+        if let Some(hook) = &self.post_execution_hook {
+            let block = pending_flashblock.block();
+            if let Some(ext) = hook.on_executed(block) {
+                pending_flashblock.extension = Some(ext);
+            }
+        }
 
         Ok(Some((pending_flashblock, request_cache)))
     }
@@ -172,8 +198,14 @@ where
     }
 }
 
-impl<EvmConfig: Clone, Provider: Clone> Clone for FlashBlockBuilder<EvmConfig, Provider> {
+impl<EvmConfig: Clone, Provider: Clone, N: NodePrimitives> Clone
+    for FlashBlockBuilder<EvmConfig, Provider, N>
+{
     fn clone(&self) -> Self {
-        Self { evm_config: self.evm_config.clone(), provider: self.provider.clone() }
+        Self {
+            evm_config: self.evm_config.clone(),
+            provider: self.provider.clone(),
+            post_execution_hook: self.post_execution_hook.clone(),
+        }
     }
 }
