@@ -330,6 +330,8 @@ pub struct CommitProfile {
     pub storage_roots_prefill: Duration,
     pub storage_roots_take_handles: Duration,
     pub storage_roots_fast_path_collect: Duration,
+    pub storage_roots_fast_path_extract: Duration,
+    pub storage_roots_fast_path_release: Duration,
     pub storage_roots_fast_path_drop: Duration,
     pub storage_roots_fallback_collect: Duration,
     pub storage_roots_merge: Duration,
@@ -341,6 +343,8 @@ pub struct CommitProfile {
     pub account_updates: Duration,
     pub account_root_and_blobs: Duration,
     pub wal_append: Duration,
+    pub wal_append_lock_wait: Duration,
+    pub wal_append_write: Duration,
     pub wal_replay: Duration,
     pub durable_materialize: Duration,
     pub published_materialize: Duration,
@@ -471,6 +475,8 @@ pub struct MptCommitStore {
     last_apply_branch_collapse_to_extension: u64,
     last_apply_extension_leaf_merges: u64,
     last_apply_extension_extension_merges: u64,
+    last_wal_append_lock_wait: Duration,
+    last_wal_append_write: Duration,
     last_commit_profile: CommitProfile,
     checkpoint_account_trie_nodes: Option<usize>,
     shutdown_complete: bool,
@@ -2551,6 +2557,8 @@ impl MptCommitStore {
             last_apply_branch_collapse_to_extension: 0,
             last_apply_extension_leaf_merges: 0,
             last_apply_extension_extension_merges: 0,
+            last_wal_append_lock_wait: Duration::ZERO,
+            last_wal_append_write: Duration::ZERO,
             last_commit_profile: CommitProfile::default(),
             checkpoint_account_trie_nodes,
             shutdown_complete: false,
@@ -2937,6 +2945,8 @@ impl MptCommitStore {
             last_apply_branch_collapse_to_extension: 0,
             last_apply_extension_leaf_merges: 0,
             last_apply_extension_extension_merges: 0,
+            last_wal_append_lock_wait: Duration::ZERO,
+            last_wal_append_write: Duration::ZERO,
             last_commit_profile: CommitProfile::default(),
             checkpoint_account_trie_nodes,
             shutdown_complete: false,
@@ -3211,8 +3221,14 @@ impl MptCommitStore {
         let Some(wal_store) = self.wal_store.as_ref() else {
             return Ok(());
         };
+        let lock_wait_start = std::time::Instant::now();
         let mut wal_store = wal_store.lock();
+        let lock_wait = lock_wait_start.elapsed();
+        let write_start = std::time::Instant::now();
         wal_store.append_entry(entry)?;
+        let write_elapsed = write_start.elapsed();
+        self.last_wal_append_lock_wait = lock_wait;
+        self.last_wal_append_write = write_elapsed;
 
         if self.config.wal_shadow_validate {
             let stored = wal_store.load_entry(entry.version)?;
@@ -3892,6 +3908,8 @@ impl MptCommitStore {
             HashMap::with_capacity(self.dirty_accounts.len());
         let storage_start = std::time::Instant::now();
         let mut storage_roots_fast_path_elapsed = Duration::ZERO;
+        let mut storage_roots_fast_path_extract_elapsed = Duration::ZERO;
+        let mut storage_roots_fast_path_release_elapsed = Duration::ZERO;
         let mut storage_roots_fast_path_drop_elapsed = Duration::ZERO;
         let mut storage_roots_fallback_elapsed = Duration::ZERO;
         let storage_roots_merge_elapsed;
@@ -3977,6 +3995,7 @@ impl MptCommitStore {
             for (addr, mut handle) in dirty_handles {
                 if let Some((root, cow)) = handle.pre_computed.take() {
                     storage_roots_precomputed_handles += 1;
+                    let extract_start = std::time::Instant::now();
                     artifacts.push(StorageTrieCommitArtifacts {
                         hashed_address: addr,
                         storage_root: root,
@@ -3986,10 +4005,13 @@ impl MptCommitStore {
                         segment_elapsed: Duration::ZERO,
                         trie: cow,
                     });
+                    storage_roots_fast_path_extract_elapsed += extract_start.elapsed();
                     // Drop the old base immediately so Arc::make_mut in the
                     // parallel snapshot pass below sees refcount=1 and can
                     // freeze in-place rather than copying all trie nodes.
+                    let release_start = std::time::Instant::now();
                     drop(handle);
+                    storage_roots_fast_path_release_elapsed += release_start.elapsed();
                 } else {
                     storage_roots_rehashed_handles += 1;
                     artifacts.push(compute_storage_artifact(
@@ -4253,6 +4275,8 @@ impl MptCommitStore {
         };
         let cache_publish_elapsed = cache_publish_start.elapsed();
         let mut wal_append_elapsed = Duration::ZERO;
+        self.last_wal_append_lock_wait = Duration::ZERO;
+        self.last_wal_append_write = Duration::ZERO;
 
         // Check test failpoint: ManifestSave
         #[cfg(test)]
@@ -4393,6 +4417,8 @@ impl MptCommitStore {
             storage_roots_prefill: storage_roots_prefill_elapsed,
             storage_roots_take_handles: storage_roots_take_handles_elapsed,
             storage_roots_fast_path_collect: storage_roots_fast_path_elapsed,
+            storage_roots_fast_path_extract: storage_roots_fast_path_extract_elapsed,
+            storage_roots_fast_path_release: storage_roots_fast_path_release_elapsed,
             storage_roots_fast_path_drop: storage_roots_fast_path_drop_elapsed,
             storage_roots_fallback_collect: storage_roots_fallback_elapsed,
             storage_roots_merge: storage_roots_merge_elapsed,
@@ -4404,6 +4430,8 @@ impl MptCommitStore {
             account_updates: account_updates_elapsed,
             account_root_and_blobs: account_root_elapsed,
             wal_append: saved.wal_append_elapsed,
+            wal_append_lock_wait: self.last_wal_append_lock_wait,
+            wal_append_write: self.last_wal_append_write,
             wal_replay: Duration::from_micros(self.last_wal_replay_micros.load(Ordering::Acquire)),
             durable_materialize: Duration::from_micros(
                 self.last_durable_materialize_micros.load(Ordering::Acquire),

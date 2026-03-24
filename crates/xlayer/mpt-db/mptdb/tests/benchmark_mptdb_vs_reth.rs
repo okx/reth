@@ -7,6 +7,10 @@
 
 mod common;
 
+#[cfg(all(feature = "jemalloc", unix))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use common::mptdb_vs_reth_support::{
     benchmark_iterations_from_env, print_mpt_benchmark, print_reth_benchmark, run_mpt_benchmark,
     run_reth_benchmark, scenario_b4_1, scenario_b4_2, scenario_b4_3, scenario_b4_4, scenario_b4_5,

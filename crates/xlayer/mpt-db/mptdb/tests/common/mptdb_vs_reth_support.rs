@@ -41,12 +41,16 @@ pub struct MptdbTotals {
     pub storage_roots_prefill: Duration,
     pub storage_roots_take_handles: Duration,
     pub storage_roots_fast_path: Duration,
+    pub storage_roots_fast_path_extract: Duration,
+    pub storage_roots_fast_path_release: Duration,
     pub storage_roots_fast_path_drop: Duration,
     pub storage_roots_fallback: Duration,
     pub storage_roots_merge: Duration,
     pub account_updates: Duration,
     pub account_root: Duration,
     pub wal_append: Duration,
+    pub wal_append_lock_wait: Duration,
+    pub wal_append_write: Duration,
     pub wal_replay: Duration,
     pub durable_materialize: Duration,
     pub published_materialize: Duration,
@@ -347,12 +351,16 @@ fn accumulate_mptdb_profile(totals: &mut MptdbTotals, profile: &CommitProfile) {
     totals.storage_roots_prefill += profile.storage_roots_prefill;
     totals.storage_roots_take_handles += profile.storage_roots_take_handles;
     totals.storage_roots_fast_path += profile.storage_roots_fast_path_collect;
+    totals.storage_roots_fast_path_extract += profile.storage_roots_fast_path_extract;
+    totals.storage_roots_fast_path_release += profile.storage_roots_fast_path_release;
     totals.storage_roots_fast_path_drop += profile.storage_roots_fast_path_drop;
     totals.storage_roots_fallback += profile.storage_roots_fallback_collect;
     totals.storage_roots_merge += profile.storage_roots_merge;
     totals.account_updates += profile.account_updates;
     totals.account_root += profile.account_root_and_blobs;
     totals.wal_append += profile.wal_append;
+    totals.wal_append_lock_wait += profile.wal_append_lock_wait;
+    totals.wal_append_write += profile.wal_append_write;
     totals.wal_replay += profile.wal_replay;
     totals.durable_materialize += profile.durable_materialize;
     totals.published_materialize += profile.published_materialize;
@@ -712,6 +720,14 @@ pub fn print_mpt_run(run: &MptRun) {
         fmt_ms(run.totals.storage_roots_fast_path / run.blocks_len)
     );
     println!(
+        "      extract:         {} ms",
+        fmt_ms(run.totals.storage_roots_fast_path_extract / run.blocks_len)
+    );
+    println!(
+        "      release:         {} ms",
+        fmt_ms(run.totals.storage_roots_fast_path_release / run.blocks_len)
+    );
+    println!(
         "    fast_path_drop:    {} ms",
         fmt_ms(run.totals.storage_roots_fast_path_drop / run.blocks_len)
     );
@@ -726,6 +742,11 @@ pub fn print_mpt_run(run: &MptRun) {
     println!("  account_updates:     {} ms", fmt_ms(run.totals.account_updates / run.blocks_len));
     println!("  account_root:        {} ms", fmt_ms(run.totals.account_root / run.blocks_len));
     println!("  wal_append:          {} ms", fmt_ms(run.totals.wal_append / run.blocks_len));
+    println!(
+        "    wal_lock_wait:     {} ms",
+        fmt_ms(run.totals.wal_append_lock_wait / run.blocks_len)
+    );
+    println!("    wal_write:         {} ms", fmt_ms(run.totals.wal_append_write / run.blocks_len));
     println!(
         "  segment_build:       {} ms",
         fmt_ms(run.totals.storage_segment_build / run.blocks_len)

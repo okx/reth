@@ -6355,6 +6355,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tikv-jemallocator",
  "tracing",
 ]
 
