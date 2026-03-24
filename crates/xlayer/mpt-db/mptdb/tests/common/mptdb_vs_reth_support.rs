@@ -64,6 +64,7 @@ pub struct MptdbTotals {
     pub l3_hits: u64,
     pub acct_trie_checkout: Duration,
     pub ensure_storage: Duration,
+    pub storage_root_lookup: Duration,
     pub commit_acct_set_base: Duration,
     pub commit_cache_prep: Duration,
     pub storage_root_handles: u64,
@@ -371,6 +372,7 @@ fn accumulate_mptdb_profile(totals: &mut MptdbTotals, profile: &CommitProfile) {
         profile.apply_l3_published_post_flush_hits;
     totals.acct_trie_checkout += profile.apply_account_trie_checkout;
     totals.ensure_storage += profile.apply_ensure_storage;
+    totals.storage_root_lookup += profile.apply_storage_root_lookup;
     totals.commit_acct_set_base += profile.commit_account_set_base;
     totals.commit_cache_prep += profile.commit_cache_storage_prep;
     totals.storage_root_handles += profile.storage_roots_working_handles;
@@ -689,6 +691,11 @@ pub fn print_mpt_run(run: &MptRun) {
         fmt_ms(run.totals.acct_trie_checkout / run.blocks_len)
     );
     println!("    ensure_storage:    {} ms", fmt_ms(run.totals.ensure_storage / run.blocks_len));
+    println!(
+        "      root_lookup:     {} ms",
+        fmt_ms(run.totals.storage_root_lookup / run.blocks_len)
+    );
+    println!("      l3_published:    {} ms", fmt_ms(run.totals.l3_published / run.blocks_len));
     println!("  slot_updates:        {} ms", fmt_ms(run.totals.slot_updates / run.blocks_len));
     println!("  commit:              {} ms", fmt_ms(run.totals.commit / run.blocks_len));
     println!("  storage_roots:       {} ms", fmt_ms(run.totals.storage_roots / run.blocks_len));

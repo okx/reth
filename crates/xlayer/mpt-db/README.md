@@ -25,40 +25,59 @@ mpt-db keeps the account trie and storage tries resident in memory with a WAL (W
 | `mptdb-ledger` | Ledger integration |
 | `mptdb` | Top-level facade crate |
 
-## Running benchmarks
+## Running benchmarks and profiles
 
-### Criterion benchmarks (B4.1–B4.6)
-
-Small-scale (B4.1–B4.3):
-
-```bash
-cargo bench -p xlayer-salt --bench mptdb_vs_reth
-```
-
-Large-scale (B4.4–B4.6, requires more time and memory):
-
-```bash
-BENCH_LARGE=1 cargo bench -p xlayer-salt --bench mptdb_vs_reth
-```
-
-Run a single benchmark:
-
-```bash
-cargo bench -p xlayer-salt --bench mptdb_vs_reth -- "B4.3"
-BENCH_LARGE=1 cargo bench -p xlayer-salt --bench mptdb_vs_reth -- "B4.5"
-```
+Benchmarks and profile tests live in `mptdb/tests/`.
 
 ### Profile tests (detailed per-block breakdown)
 
+Profile tests show granular per-phase timing (trie_load, slot_updates, storage_roots, account_updates, wal_append, etc.).
+
 ```bash
-# B4.4
-cargo test -p xlayer-salt --release --test profile_mptdb_vs_reth profile_b4_4_single_run_compare -- --ignored --nocapture
+# B4.4 (~35s)
+cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_4_mpt_only -- --ignored --nocapture --exact
 
-# B4.5
-cargo test -p xlayer-salt --release --test profile_mptdb_vs_reth profile_b4_5_single_run_compare -- --ignored --nocapture
+# B4.5 (~2 min)
+cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_5_mpt_only -- --ignored --nocapture --exact
 
-# B4.6 (needs ~100GB free disk space)
-cargo test -p xlayer-salt --release --test profile_mptdb_vs_reth profile_b4_6_single_run_compare -- --ignored --nocapture
+# B4.6 (~6 min, needs ~80GB free disk)
+cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_6_mpt_only -- --ignored --nocapture --exact
+
+# Compare both reth and mpt-db side by side
+cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_5_single_run_compare -- --ignored --nocapture --exact
+cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_6_single_run_compare -- --ignored --nocapture --exact
+
+# reth-only (skip mpt-db pre-pop to save disk)
+cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_6_reth_only -- --ignored --nocapture --exact
+```
+
+### Benchmark tests (repeated runs, averaged)
+
+```bash
+# Single iteration (fast validation)
+MPT_BENCH_ITERS=1 cargo test -p mptdb --release --test benchmark_mptdb_vs_reth bench_b4_2_mpt_only -- --ignored --nocapture --exact
+MPT_BENCH_ITERS=1 cargo test -p mptdb --release --test benchmark_mptdb_vs_reth bench_b4_5_mpt_only -- --ignored --nocapture --exact
+
+# Multiple iterations (stable average, default=3)
+cargo test -p mptdb --release --test benchmark_mptdb_vs_reth bench_b4_4_mpt_only -- --ignored --nocapture --exact
+
+# Compare reth vs mpt-db
+MPT_BENCH_ITERS=1 cargo test -p mptdb --release --test benchmark_mptdb_vs_reth bench_b4_5_reth_only -- --ignored --nocapture --exact
+```
+
+### Quick regression check
+
+After any change to mpt-db core (`mptdb-sc/src/mpt/`):
+
+```bash
+# 1. Compile check
+cargo check -p mptdb-sc --tests
+
+# 2. Quick profile (B4.4, ~35s)
+cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_4_mpt_only -- --ignored --nocapture --exact
+
+# 3. Medium profile (B4.5, ~2 min)
+cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_5_mpt_only -- --ignored --nocapture --exact
 ```
 
 ## Benchmark results
@@ -77,8 +96,8 @@ Each updated account has its nonce and balance modified, plus **all** of its sto
 | B4.2 | 1K | 10 | 200 | 1 | 5.73 ms | 2.98 ms | **1.9x** |
 | B4.3 | 1K | 10 | 200 | 10 | 5.39 ms | 2.38 ms | **2.3x** |
 | B4.4 | 200K | 10 | 2K | 10 | 285 ms | 39.6 ms | **7.2x** |
-| B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 191 ms | **6.3x** |
-| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 946 ms | **9.0x** |
+| B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 164 ms | **7.4x** |
+| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 948 ms | **9.0x** |
 
 ### Workload vs real-world comparison
 
@@ -108,13 +127,15 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 | `write_hashed_state` | 844 ms |
 | `commit` | 276 ms |
 
-**mpt-db (946 ms/block):**
+**mpt-db (948 ms/block):**
 
 | Phase | Time |
 |-------|------|
-| `trie_load` (L2 cache + L3 segment load) | 533 ms |
-| `slot_updates` (apply + hash merged) | 149 ms |
-| `account_updates` (serial account trie) | 52 ms |
-| `wal_append` | 27 ms |
-| `storage_roots` (collect pre-computed) | 18 ms |
+| `trie_load` (L2 cache + L3 segment load) | 567 ms |
+| `slot_updates` (apply + hash merged) | 142 ms |
+| `account_updates` (serial account trie) | 51 ms |
+| `storage_roots` (collect + parallel snapshot) | 58 ms |
+| `wal_append` | 23 ms |
 | `account_root` (parallel hash) | 13 ms |
+
+L2 hits: 1,991/block, L3 hits: 7,957/block (cache_capacity=50K → 200K LRU limit, covers ~20% of 1M accounts).

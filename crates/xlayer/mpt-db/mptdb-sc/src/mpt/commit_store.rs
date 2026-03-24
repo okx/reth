@@ -357,6 +357,8 @@ pub struct CommitProfile {
     pub apply_account_trie_checkout: Duration,
     /// Time spent inside ensure_working_storage_tries (L2/L3 cache lookups).
     pub apply_ensure_storage: Duration,
+    /// Time spent looking up storage_root from the account trie for L2 misses.
+    pub apply_storage_root_lookup: Duration,
     /// Time to freeze the account trie in set_committed_base after commit.
     pub commit_account_set_base: Duration,
     /// Time to prepare + cache 5000 storage tries back into L2 after commit.
@@ -370,6 +372,7 @@ struct StorageTrieLoadStats {
     l3_published_hits: u64,
     l3_published_post_flush_hits: u64,
     node_fallback_loads: u64,
+    storage_root_lookup: Duration,
     l3_latest_load: Duration,
     l3_published_load: Duration,
 }
@@ -434,10 +437,6 @@ pub struct MptCommitStore {
     published_rewrite_tx: Option<crossbeam_channel::Sender<PublishedRewriteJob>>,
     /// Handle to the background published snapshot rewrite worker.
     published_rewrite_handle: Option<JoinHandle<()>>,
-    /// Channel to retire old storage trie bases off the foreground commit path.
-    storage_retire_tx: Option<crossbeam_channel::Sender<Vec<StorageTrieCow>>>,
-    /// Handle to the background storage retire worker.
-    storage_retire_handle: Option<JoinHandle<()>>,
     /// Channel to save account trie checkpoints off the shutdown path.
     checkpoint_save_tx: Option<crossbeam_channel::Sender<AccountTrieCheckpoint>>,
     /// Handle to the background checkpoint worker.
@@ -446,13 +445,13 @@ pub struct MptCommitStore {
     checkpoint_saved_version: Arc<AtomicI64>,
     async_error: Arc<AtomicBool>,
     async_error_detail: Arc<Mutex<Option<String>>>,
-    deferred_retired_storage_tries: Vec<StorageTrieCow>,
     pending_checkpoint: Option<AccountTrieCheckpoint>,
     last_apply_duration: Duration,
     last_apply_collect_dirty_accounts: Duration,
     last_apply_get_or_load_storage_tries: Duration,
     last_apply_account_trie_checkout: Duration,
     last_apply_ensure_storage: Duration,
+    last_apply_storage_root_lookup: Duration,
     last_apply_storage_slot_updates: Duration,
     last_apply_l3_latest_load: Duration,
     last_apply_l3_published_load: Duration,
@@ -487,26 +486,6 @@ pub struct MptCommitStore {
 impl MptCommitStore {
     fn diagnostics_enabled() -> bool {
         std::env::var_os("MPT_DEBUG_DIAGNOSTICS").is_some()
-    }
-
-    fn start_storage_retire_worker(&mut self) -> Result<()> {
-        if self.read_only || self.storage_retire_tx.is_some() {
-            return Ok(());
-        }
-
-        let (tx, rx) = crossbeam_channel::bounded::<Vec<StorageTrieCow>>(1);
-        let handle = std::thread::Builder::new()
-            .name("mpt-retire".to_string())
-            .spawn(move || {
-                while let Ok(batch) = rx.recv() {
-                    drop(batch);
-                }
-            })
-            .map_err(|e| MptDbError::Other(format!("spawn storage retire thread: {e}")))?;
-
-        self.storage_retire_tx = Some(tx);
-        self.storage_retire_handle = Some(handle);
-        Ok(())
     }
 
     fn write_checkpoint_file(dir: &Path, checkpoint: &AccountTrieCheckpoint) -> Result<()> {
@@ -602,28 +581,6 @@ impl MptCommitStore {
             Err(crossbeam_channel::TrySendError::Disconnected(_checkpoint)) => {}
         }
         Ok(())
-    }
-
-    fn schedule_deferred_storage_retire(&mut self, retired: Vec<StorageTrieCow>) {
-        let previous = std::mem::replace(&mut self.deferred_retired_storage_tries, retired);
-        if previous.is_empty() {
-            return;
-        }
-
-        let Some(tx) = self.storage_retire_tx.as_ref() else {
-            drop(previous);
-            return;
-        };
-
-        match tx.try_send(previous) {
-            Ok(()) => {}
-            Err(crossbeam_channel::TrySendError::Full(previous)) => {
-                self.deferred_retired_storage_tries.extend(previous);
-            }
-            Err(crossbeam_channel::TrySendError::Disconnected(previous)) => {
-                drop(previous);
-            }
-        }
     }
 
     /// Next version that will be assigned on commit.
@@ -840,6 +797,7 @@ impl MptCommitStore {
         }
 
         // Only the cache-miss accounts need an account trie lookup.
+        let storage_root_lookup_start = std::time::Instant::now();
         for dirty in need_storage_root {
             let existing_root = self.get_existing_storage_root(&dirty.hashed_address);
             if existing_root == EMPTY_ROOT_HASH {
@@ -848,6 +806,7 @@ impl MptCommitStore {
                 latest_candidates.push((dirty.hashed_address, existing_root));
             }
         }
+        stats.storage_root_lookup = storage_root_lookup_start.elapsed();
 
         let mut storage_loads =
             self.load_latest_storage_tries(latest_candidates, published_current, &mut stats)?;
@@ -996,7 +955,6 @@ impl MptCommitStore {
         persisted: &PersistedTrieStore,
         dirty: &DirtyAccount,
     ) -> Result<StorageTrieCow> {
-        trie.reserve_for_expected_updates(dirty.storage_changes.len());
         trie.apply_changes_batched(persisted, &dirty.storage_changes)?;
         Ok(trie)
     }
@@ -1868,7 +1826,6 @@ impl MptCommitStore {
             return Ok(());
         }
 
-        self.start_storage_retire_worker()?;
         self.start_checkpoint_worker()?;
 
         if self.published_rewrite_tx.is_none() {
@@ -2214,8 +2171,6 @@ impl MptCommitStore {
             return if best_effort { Ok(()) } else { self.check_async_error() };
         }
 
-        let final_retire_batch = std::mem::take(&mut self.deferred_retired_storage_tries);
-
         let diagnostics = Self::diagnostics_enabled();
         if best_effort {
             let flush_start = diagnostics.then(std::time::Instant::now);
@@ -2238,14 +2193,6 @@ impl MptCommitStore {
 
         self.persist_tx.take();
         self.published_rewrite_tx.take();
-        if !final_retire_batch.is_empty() {
-            if let Some(tx) = self.storage_retire_tx.as_ref() {
-                let _ = tx.send(final_retire_batch);
-            } else {
-                drop(final_retire_batch);
-            }
-        }
-        self.storage_retire_tx.take();
         if let Some(handle) = self.persist_handle.take() {
             let join_start = diagnostics.then(std::time::Instant::now);
             if best_effort {
@@ -2266,19 +2213,6 @@ impl MptCommitStore {
                 handle.join().map_err(|_| {
                     MptDbError::Other("published rewrite worker panicked".to_string())
                 })?;
-            }
-        }
-        if let Some(handle) = self.storage_retire_handle.take() {
-            let join_start = diagnostics.then(std::time::Instant::now);
-            if best_effort {
-                let _ = handle.join();
-            } else {
-                handle
-                    .join()
-                    .map_err(|_| MptDbError::Other("storage retire worker panicked".to_string()))?;
-            }
-            if let Some(start) = join_start {
-                eprintln!("[mptdiag] shutdown join storage retire {:?}", start.elapsed());
             }
         }
         self.checkpoint_save_tx.take();
@@ -2582,8 +2516,6 @@ impl MptCommitStore {
             persist_handle: None,
             published_rewrite_tx: None,
             published_rewrite_handle: None,
-            storage_retire_tx: None,
-            storage_retire_handle: None,
             checkpoint_save_tx: None,
             checkpoint_save_handle: None,
             checkpoint_saved_version: Arc::new(AtomicI64::new(if loaded_from_checkpoint {
@@ -2593,13 +2525,13 @@ impl MptCommitStore {
             })),
             async_error: Arc::new(AtomicBool::new(false)),
             async_error_detail: Arc::new(Mutex::new(None)),
-            deferred_retired_storage_tries: Vec::new(),
             pending_checkpoint: None,
             last_apply_duration: Duration::ZERO,
             last_apply_collect_dirty_accounts: Duration::ZERO,
             last_apply_get_or_load_storage_tries: Duration::ZERO,
             last_apply_account_trie_checkout: Duration::ZERO,
             last_apply_ensure_storage: Duration::ZERO,
+            last_apply_storage_root_lookup: Duration::ZERO,
             last_apply_storage_slot_updates: Duration::ZERO,
             last_apply_l3_latest_load: Duration::ZERO,
             last_apply_l3_published_load: Duration::ZERO,
@@ -2974,20 +2906,18 @@ impl MptCommitStore {
             persist_handle: None,
             published_rewrite_tx: None,
             published_rewrite_handle: None,
-            storage_retire_tx: None,
-            storage_retire_handle: None,
             checkpoint_save_tx: None,
             checkpoint_save_handle: None,
             checkpoint_saved_version,
             async_error,
             async_error_detail,
-            deferred_retired_storage_tries: Vec::new(),
             pending_checkpoint: None,
             last_apply_duration: Duration::ZERO,
             last_apply_collect_dirty_accounts: Duration::ZERO,
             last_apply_get_or_load_storage_tries: Duration::ZERO,
             last_apply_account_trie_checkout: Duration::ZERO,
             last_apply_ensure_storage: Duration::ZERO,
+            last_apply_storage_root_lookup: Duration::ZERO,
             last_apply_storage_slot_updates: Duration::ZERO,
             last_apply_l3_latest_load: Duration::ZERO,
             last_apply_l3_published_load: Duration::ZERO,
@@ -3843,13 +3773,13 @@ impl MptCommitStore {
                 }
             Ok((hashed_address, handle))
         };
-        let should_parallel_apply =
-            self.parallelism.should_parallelize_storage_tries(dirty_handles.len());
-        let updated_handles: Vec<(B256, StorageTrieHandle)> = if should_parallel_apply {
-            dirty_handles.into_par_iter().map(apply_one).collect::<Result<_>>()?
-        } else {
-            dirty_handles.into_iter().map(apply_one).collect::<Result<_>>()?
-        };
+        // Always use rayon parallel iteration regardless of handle count.
+        // Parallel utilizes all cores' memory bandwidth simultaneously — even
+        // 300 tasks on 12 cores is faster than serial because scattered 60KB
+        // tries cause cache misses that serial would serialize into a bottleneck.
+        // See: .claude/problems/b4_7_performance_gap.md (Fix 2: rejected)
+        let updated_handles: Vec<(B256, StorageTrieHandle)> =
+            dirty_handles.into_par_iter().map(apply_one).collect::<Result<_>>()?;
         self.reinsert_handles(updated_handles);
 
         for hashed_address in &dirty_addresses {
@@ -3868,6 +3798,7 @@ impl MptCommitStore {
         self.last_apply_get_or_load_storage_tries = get_or_load_elapsed;
         self.last_apply_account_trie_checkout = acct_checkout_elapsed;
         self.last_apply_ensure_storage = ensure_elapsed;
+        self.last_apply_storage_root_lookup = load_stats.storage_root_lookup;
         self.last_apply_storage_slot_updates = slot_updates_elapsed;
         self.last_apply_l3_latest_load = load_stats.l3_latest_load;
         self.last_apply_l3_published_load = load_stats.l3_published_load;
@@ -3966,8 +3897,6 @@ impl MptCommitStore {
         let storage_roots_merge_elapsed;
         let mut storage_roots_precomputed_handles = 0u64;
         let mut storage_roots_rehashed_handles = 0u64;
-        let defer_storage_retire = mode.wal_first;
-        let mut deferred_retired_storage_tries = Vec::new();
 
         // Pre-fill DELETE and REUSE cases (no trie computation needed)
         let storage_prefill_start = std::time::Instant::now();
@@ -4057,14 +3986,10 @@ impl MptCommitStore {
                         segment_elapsed: Duration::ZERO,
                         trie: cow,
                     });
-                    if defer_storage_retire {
-                        deferred_retired_storage_tries
-                            .push(handle.take_committed_base_for_retire());
-                    } else {
-                        let drop_start = std::time::Instant::now();
-                        drop(handle);
-                        storage_roots_fast_path_drop_elapsed += drop_start.elapsed();
-                    }
+                    // Drop the old base immediately so Arc::make_mut in the
+                    // parallel snapshot pass below sees refcount=1 and can
+                    // freeze in-place rather than copying all trie nodes.
+                    drop(handle);
                 } else {
                     storage_roots_rehashed_handles += 1;
                     artifacts.push(compute_storage_artifact(
@@ -4076,6 +4001,19 @@ impl MptCommitStore {
                 }
             }
             storage_roots_fast_path_elapsed = fast_path_start.elapsed();
+
+            // Parallel snapshot pass: all old bases are now dropped, so
+            // Arc::make_mut fires in-place (refcount=1) for every trie.
+            // After this, each trie's frozen.nodes is an independent Arc —
+            // the subsequent trie.clone() in save_storage_version is O(1).
+            let snap_start = std::time::Instant::now();
+            if should_parallel {
+                artifacts.par_iter_mut().for_each(|a| a.trie.snapshot());
+            } else {
+                artifacts.iter_mut().for_each(|a| a.trie.snapshot());
+            }
+            storage_roots_fast_path_drop_elapsed = snap_start.elapsed();
+
             artifacts
         } else if should_parallel {
             let fallback_start = std::time::Instant::now();
@@ -4428,10 +4366,6 @@ impl MptCommitStore {
         }
         let cache_storage_prep_elapsed = cache_storage_prep_start.elapsed();
 
-        if defer_storage_retire && !deferred_retired_storage_tries.is_empty() {
-            self.schedule_deferred_storage_retire(deferred_retired_storage_tries);
-        }
-
         self.last_commit_profile = CommitProfile {
             apply_bundle_state: self.last_apply_duration,
             apply_collect_dirty_accounts: self.last_apply_collect_dirty_accounts,
@@ -4488,6 +4422,7 @@ impl MptCommitStore {
             total_commit: profile_start.elapsed(),
             apply_account_trie_checkout: self.last_apply_account_trie_checkout,
             apply_ensure_storage: self.last_apply_ensure_storage,
+            apply_storage_root_lookup: self.last_apply_storage_root_lookup,
             commit_account_set_base: acct_set_base_elapsed,
             commit_cache_storage_prep: cache_storage_prep_elapsed,
         };
