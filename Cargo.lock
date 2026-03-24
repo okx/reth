@@ -6338,6 +6338,7 @@ checksum = "1fafa6961cabd9c63bcd77a45d7e3b7f3b552b70417831fb0f56db717e72407e"
 name = "mptdb"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-primitives",
  "mptdb-common",
  "mptdb-proto",
@@ -6345,6 +6346,10 @@ dependencies = [
  "mptdb-ss",
  "mptdb-traits",
  "mptdb-wal",
+ "rand 0.9.2",
+ "reth-provider",
+ "reth-trie",
+ "reth-trie-db",
  "revm-database",
  "revm-state 9.0.0",
  "serde",

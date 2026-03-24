@@ -17,13 +17,19 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rand = { workspace = true }
 mptdb-common = { workspace = true }
 mptdb-traits = { workspace = true }
 mptdb-proto = { workspace = true }
+mptdb-sc = { workspace = true }
 mptdb-ss = { workspace = true }
 mptdb-wal = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 alloy-primitives = { workspace = true }
+alloy-consensus = { workspace = true }
 revm-database = { workspace = true }
 revm-state = { workspace = true }
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-trie = { workspace = true }
+reth-trie-db = { workspace = true }

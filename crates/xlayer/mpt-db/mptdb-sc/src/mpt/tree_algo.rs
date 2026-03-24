@@ -1,5 +1,8 @@
 use alloy_trie::Nibbles;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 
 use super::{
     arena::MutableTrieArena,
@@ -28,8 +31,17 @@ static BRANCH_COLLAPSE_TO_LEAF: AtomicU64 = AtomicU64::new(0);
 static BRANCH_COLLAPSE_TO_EXTENSION: AtomicU64 = AtomicU64::new(0);
 static EXTENSION_LEAF_MERGES: AtomicU64 = AtomicU64::new(0);
 static EXTENSION_EXTENSION_MERGES: AtomicU64 = AtomicU64::new(0);
+static STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+fn stats_enabled() -> bool {
+    *STATS_ENABLED.get_or_init(|| std::env::var_os("MPT_PROFILE_TREE_STATS").is_some())
+}
 
 pub(crate) fn reset_stats() {
+    if !stats_enabled() {
+        return;
+    }
     SLOT_INSERTS.store(0, Ordering::Relaxed);
     SLOT_DELETES.store(0, Ordering::Relaxed);
     LEAF_SPLITS.store(0, Ordering::Relaxed);
@@ -42,6 +54,9 @@ pub(crate) fn reset_stats() {
 }
 
 pub(crate) fn snapshot_stats() -> TreeAlgoStats {
+    if !stats_enabled() {
+        return TreeAlgoStats::default();
+    }
     TreeAlgoStats {
         slot_inserts: SLOT_INSERTS.load(Ordering::Relaxed),
         slot_deletes: SLOT_DELETES.load(Ordering::Relaxed),
@@ -56,11 +71,15 @@ pub(crate) fn snapshot_stats() -> TreeAlgoStats {
 }
 
 pub(crate) fn note_slot_insert() {
-    SLOT_INSERTS.fetch_add(1, Ordering::Relaxed);
+    if stats_enabled() {
+        SLOT_INSERTS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub(crate) fn note_slot_delete() {
-    SLOT_DELETES.fetch_add(1, Ordering::Relaxed);
+    if stats_enabled() {
+        SLOT_DELETES.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Insert a key-value pair into the trie rooted at `node_idx`.

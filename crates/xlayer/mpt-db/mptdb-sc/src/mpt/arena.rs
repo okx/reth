@@ -58,6 +58,17 @@ impl MutableTrieArena {
         }
     }
 
+    pub fn reserve_overlay_entries(&mut self, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        self.overlay_nodes.reserve(additional);
+        self.appended_nodes.reserve(additional);
+        self.rlp_cache.reserve(additional);
+        self.hash_cache_overlay.reserve(additional);
+        self.dirty.reserve(additional);
+    }
+
     /// Consolidate overlay + appended into the frozen base.
     ///
     /// Uses `Arc::make_mut` so that:
@@ -295,12 +306,21 @@ impl Serialize for MutableTrieArena {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("MutableTrieArena", 2)?;
+        if self.overlay_nodes.is_empty() &&
+            self.appended_nodes.is_empty() &&
+            self.hash_cache_overlay.is_empty()
+        {
+            s.serialize_field("nodes", &*self.frozen.nodes)?;
+            s.serialize_field("hash_cache", &*self.frozen.hash_cache)?;
+            return s.end();
+        }
+
         let all_nodes = self.collect_all_nodes();
         let mut hash_cache = Vec::with_capacity(all_nodes.len());
         for i in 0..all_nodes.len() {
             hash_cache.push(self.get_hash(i as u32));
         }
-        let mut s = serializer.serialize_struct("MutableTrieArena", 2)?;
         s.serialize_field("nodes", &all_nodes)?;
         s.serialize_field("hash_cache", &hash_cache)?;
         s.end()

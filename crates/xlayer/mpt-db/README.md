@@ -69,14 +69,27 @@ Machine: Apple M-series, 32GB RAM, SSD.
 
 ### Summary
 
-| Test | Pre-pop accounts | Slots/account | Updates/block | Blocks | reth per-block | mpt-db per-block | Speedup |
-|------|-----------------|---------------|---------------|--------|---------------|-----------------|---------|
+Each updated account has its nonce and balance modified, plus **all** of its storage slots rewritten. For example, B4.6 with 10K accounts updated × 30 slots = 300K storage slot changes per block.
+
+| Test | Pre-pop accounts | Storage slots per account | Accounts updated per block | Blocks | reth per-block | mpt-db per-block | Speedup |
+|------|-----------------|--------------------------|---------------------------|--------|---------------|-----------------|---------|
 | B4.1 | 0 (fresh) | 10 | 100 | 1 | 1.26 ms | 1.31 ms | 1.0x |
 | B4.2 | 1K | 10 | 200 | 1 | 5.73 ms | 2.98 ms | **1.9x** |
 | B4.3 | 1K | 10 | 200 | 10 | 5.39 ms | 2.38 ms | **2.3x** |
 | B4.4 | 200K | 10 | 2K | 10 | 285 ms | 39.6 ms | **7.2x** |
 | B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 191 ms | **6.3x** |
 | B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 946 ms | **9.0x** |
+
+### Workload vs real-world comparison
+
+| Test | Slot changes/block | Real-world equivalent |
+|------|-------------------|----------------------|
+| B4.3 | 2K | Light L1 block |
+| B4.4 | 20K | Typical Ethereum mainnet block |
+| B4.5 | 50K | Busy mainnet / moderate L2 |
+| B4.6 | 300K | High-throughput L2 / stress test |
+
+Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4–B4.5 are the most representative of current mainnet workloads. B4.6 targets future high-throughput scenarios (increased gas limit, L2 sequencers).
 
 ### Analysis
 

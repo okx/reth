@@ -140,6 +140,12 @@ impl StorageTrieCow {
         self.arena.snapshot();
     }
 
+    /// Clear pending lazy children.  After commit, all accessed paths are
+    /// materialized in the arena — stale lazy refs are no longer needed.
+    pub fn clear_pending_lazy(&mut self) {
+        self.pending_lazy_children.clear();
+    }
+
     /// Collect all arena nodes into a contiguous Vec.
     ///
     /// Only used by low-frequency paths (segment build, snapshot export).
@@ -472,6 +478,26 @@ impl StorageTrieCow {
                 CowRootRef::Lazy(_) => unreachable!("materialized tree cannot keep lazy root"),
             },
         })
+    }
+
+    pub fn clone_materialized_tree_if_ready(&self) -> Option<MptTree> {
+        if !self.pending_lazy_children.is_empty() {
+            return None;
+        }
+        let root = match self.root {
+            CowRootRef::Arena(idx) => Some(idx),
+            CowRootRef::Empty => None,
+            CowRootRef::Lazy(_) => return None,
+        };
+        Some(MptTree { arena: self.arena.clone(), root })
+    }
+
+    pub fn reserve_for_expected_updates(&mut self, expected_changes: usize) {
+        if expected_changes == 0 {
+            return;
+        }
+        let reserve = expected_changes.saturating_mul(4);
+        self.arena.reserve_overlay_entries(reserve);
     }
 
     fn get_arena_recursive(
