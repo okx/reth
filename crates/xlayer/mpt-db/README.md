@@ -92,16 +92,17 @@ cargo test -p mptdb --release --features jemalloc --test profile_mptdb_vs_reth p
 cargo test -p mptdb --release --features jemalloc --test profile_mptdb_vs_reth profile_b4_5_mpt_only -- --ignored --nocapture --exact
 ```
 
-### B4.7 bottleneck diagnosis fields
+### Profile output fields
 
-The profile output includes split fields for commit hot spots:
+The profile output includes granular sub-timers for commit hot spots:
 
-- `storage_roots.fast_path_collect.extract`: collecting pre-computed roots/trie refs.
-- `storage_roots.fast_path_collect.release`: dropping old storage trie bases (allocator free path).
-- `wal_append.wal_lock_wait`: wait time before acquiring WAL mutex.
-- `wal_append.wal_write`: append time after lock is acquired.
-
-In current B4.7 runs, `fast_path_collect.release` is typically dominant while `wal_lock_wait` is near zero, indicating allocator/free behavior (not WAL lock contention) is the primary source of commit spikes.
+- `storage_roots.fast_path_collect.extract`: collecting pre-computed roots/trie refs (should be ~0ms).
+- `storage_roots.fast_path_collect.release`: dropping old storage trie handles. With overlay capacity recycling this is ~0ms.
+- `storage_roots.fast_path_drop`: parallel in-place snapshot pass (freezes overlay into frozen base).
+- `wal_append.wal_lock_wait`: wait before acquiring WAL mutex (should be ~0ms).
+- `wal_append.wal_write`: actual buffered WAL write time.
+- `persist`: time in `save_storage_version` including `wait_for_backpressure()` and sending committed tries to background worker.
+- `cache_prep`: time for `cache_storage_trie` loop (LRU updates, `set_committed_base` for each dirty handle).
 
 ## Benchmark results
 
@@ -118,9 +119,10 @@ Each updated account has its nonce and balance modified, plus **all** of its sto
 | B4.1 | 0 (fresh) | 10 | 100 | 1 | 1.26 ms | 1.31 ms | 1.0x |
 | B4.2 | 1K | 10 | 200 | 1 | 5.73 ms | 2.98 ms | **1.9x** |
 | B4.3 | 1K | 10 | 200 | 10 | 5.39 ms | 2.38 ms | **2.3x** |
-| B4.4 | 200K | 10 | 2K | 10 | 285 ms | 39.6 ms | **7.2x** |
-| B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 164 ms | **7.4x** |
-| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 948 ms | **9.0x** |
+| B4.4 | 200K | 10 | 2K | 10 | 285 ms | 46 ms | **6.2x** |
+| B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 147 ms | **8.2x** |
+| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 838 ms | **10.2x** |
+| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 703 ms | **2.8x** |
 
 ### Workload vs real-world comparison
 
@@ -137,7 +139,8 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 
 - **Small datasets (B4.1–B4.3)**: reth's MDBX keeps everything in page cache, so both systems are fast. mpt-db's advantage is modest (1–2x) because the WAL append overhead is a significant fraction of the per-block time.
 - **Large datasets (B4.4–B4.6)**: reth's MDBX page cache becomes cold as the dataset exceeds cache capacity. Random reads from disk dominate reth's `overlay_root_with_updates` and `write_trie_updates`. mpt-db's in-memory tries are unaffected by dataset size, giving **7–9x** speedup.
-- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each creates a ~4GB working set. reth spends 3.2s on root computation + 4.2s writing trie updates. mpt-db's merged apply+hash phase completes in 946ms total.
+- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each creates a ~4GB working set. reth spends 3.2s on root computation + 4.2s writing trie updates. mpt-db completes in 838ms with overlay capacity recycling eliminating per-block HashMap churn.
+- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). Few large tries (300 nodes each) limit rayon parallelism. Overlay recycling reduced handle drop cost from ~540ms to ~0ms; remaining bottleneck is `trie_load` from frequent published-view refreshes.
 
 ### B4.6 detailed breakdown
 
@@ -150,15 +153,16 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 | `write_hashed_state` | 844 ms |
 | `commit` | 276 ms |
 
-**mpt-db (948 ms/block):**
+**mpt-db (838 ms/block):**
 
 | Phase | Time |
 |-------|------|
-| `trie_load` (L2 cache + L3 segment load) | 567 ms |
-| `slot_updates` (apply + hash merged) | 142 ms |
-| `account_updates` (serial account trie) | 51 ms |
-| `storage_roots` (collect + parallel snapshot) | 58 ms |
-| `wal_append` | 23 ms |
-| `account_root` (parallel hash) | 13 ms |
+| `trie_load` (L2 cache + L3 segment load) | 467 ms |
+| `slot_updates` (apply + hash merged, no resize with overlay recycling) | 145 ms |
+| `account_updates` (serial account trie) | 53 ms |
+| `storage_roots` (collect + parallel snapshot) | 49 ms |
+| `wal_append` | 25 ms |
+| `account_root` (parallel hash) | 11 ms |
+| `persist` + `cache_prep` | 17 ms |
 
 L2 hits: 1,991/block, L3 hits: 7,957/block (cache_capacity=50K → 200K LRU limit, covers ~20% of 1M accounts).

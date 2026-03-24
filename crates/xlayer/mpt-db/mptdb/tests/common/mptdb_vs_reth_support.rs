@@ -747,6 +747,9 @@ pub fn print_mpt_run(run: &MptRun) {
         fmt_ms(run.totals.wal_append_lock_wait / run.blocks_len)
     );
     println!("    wal_write:         {} ms", fmt_ms(run.totals.wal_append_write / run.blocks_len));
+    println!("  persist:             {} ms", fmt_ms(run.totals.persist / run.blocks_len));
+    println!("  cache_publish:       {} ms", fmt_ms(run.totals.cache_publish / run.blocks_len));
+    println!("  cache_prep:          {} ms", fmt_ms(run.totals.commit_cache_prep / run.blocks_len));
     println!(
         "  segment_build:       {} ms",
         fmt_ms(run.totals.storage_segment_build / run.blocks_len)

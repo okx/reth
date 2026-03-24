@@ -145,13 +145,30 @@ impl StorageTrieHandle {
             return None;
         }
         self.working_version = None;
-        // Lazy materialisation: if checkout_for_write deferred the clone,
-        // perform it now (typically inside a rayon parallel section).
-        Some(self.working.take().unwrap_or_else(|| self.base.clone()))
+        if let Some(working) = self.working.take() {
+            return Some(working);
+        }
+        // Lazy materialisation: checkout_for_write deferred the clone; do it
+        // now inside the rayon parallel section.  Use clone_frozen_only +
+        // steal so the base ends up with zero-capacity overlays (O(1) drop)
+        // and the working copy starts with pre-allocated capacity (no resizes).
+        let mut working = self.base.clone_frozen_only();
+        working.steal_overlay_capacity_from(&mut self.base);
+        Some(working)
     }
 
     fn take_working_or_base_for_version(&mut self, version: i64) -> StorageTrieCow {
-        self.take_working_for_version(version).unwrap_or_else(|| self.base.clone())
+        self.take_working_for_version(version).unwrap_or_else(|| {
+            // Fallback: handle was not checked out via checkout_for_write
+            // (e.g. account has no storage changes in this block but handle
+            // exists in cache from a prior block).  Still apply the steal so
+            // the working copy gets any pre-allocated overlay capacity, and
+            // the base ends up with zero-capacity overlays (O(1) drop if the
+            // caller discards the handle after this call).
+            let mut working = self.base.clone_frozen_only();
+            working.steal_overlay_capacity_from(&mut self.base);
+            working
+        })
     }
 
     fn take_committed_base_for_retire(&mut self) -> StorageTrieCow {

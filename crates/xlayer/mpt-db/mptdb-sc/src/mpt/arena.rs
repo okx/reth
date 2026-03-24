@@ -58,6 +58,60 @@ impl MutableTrieArena {
         }
     }
 
+    /// Clone only the frozen base (O(1) Arc clone).
+    ///
+    /// Returns a new arena with shared frozen data but zero-capacity overlay
+    /// HashMaps.  Intended to be paired with `steal_overlay_capacity_from` so
+    /// the caller can transfer pre-allocated overlay backing from the donor
+    /// instead of starting each block with zero-capacity structures.
+    pub fn clone_frozen_only(&self) -> Self {
+        Self {
+            frozen: self.frozen.clone(),
+            overlay_nodes: HashMap::new(),
+            appended_nodes: Vec::new(),
+            rlp_cache: HashMap::new(),
+            hash_cache_overlay: HashMap::new(),
+            dirty: HashMap::new(),
+        }
+    }
+
+    /// Steal the donor's cleared (but capacity-holding) overlay backing.
+    ///
+    /// Called immediately after `clone_frozen_only` to transfer the pre-allocated
+    /// HashMap/Vec backing from the donor (whose overlays were drained by the
+    /// previous `freeze()`) into self.  The donor receives zero-capacity
+    /// replacements, making its subsequent `drop` O(1).
+    ///
+    /// Precondition: both self and donor overlays must be empty (zero entries).
+    /// Self has zero capacity (just cloned frozen-only); donor has capacity from
+    /// the previous block's apply phase, which was cleared by `freeze()`.
+    pub fn steal_overlay_capacity_from(&mut self, donor: &mut Self) {
+        debug_assert!(
+            self.overlay_nodes.is_empty(),
+            "self overlay_nodes must be empty before steal"
+        );
+        debug_assert!(
+            self.hash_cache_overlay.is_empty(),
+            "self hash_cache_overlay must be empty before steal"
+        );
+        debug_assert!(self.dirty.is_empty(), "self dirty must be empty before steal");
+        debug_assert!(
+            donor.overlay_nodes.is_empty(),
+            "donor overlay_nodes must be empty (freeze() not called?)"
+        );
+        debug_assert!(
+            donor.hash_cache_overlay.is_empty(),
+            "donor hash_cache_overlay must be empty (freeze() not called?)"
+        );
+        debug_assert!(donor.dirty.is_empty(), "donor dirty must be empty (freeze() not called?)");
+
+        std::mem::swap(&mut self.overlay_nodes, &mut donor.overlay_nodes);
+        std::mem::swap(&mut self.appended_nodes, &mut donor.appended_nodes);
+        std::mem::swap(&mut self.hash_cache_overlay, &mut donor.hash_cache_overlay);
+        std::mem::swap(&mut self.rlp_cache, &mut donor.rlp_cache);
+        std::mem::swap(&mut self.dirty, &mut donor.dirty);
+    }
+
     pub fn reserve_overlay_entries(&mut self, additional: usize) {
         if additional == 0 {
             return;

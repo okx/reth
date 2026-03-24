@@ -61,6 +61,33 @@ impl StorageTrieCow {
         }
     }
 
+    /// Clone only the frozen base, with zero-capacity overlay structures.
+    ///
+    /// Cheaper than a full `clone()` when the caller intends to immediately
+    /// call `steal_overlay_capacity_from` to transfer pre-allocated backing
+    /// from the donor handle.
+    pub fn clone_frozen_only(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            arena: self.arena.clone_frozen_only(),
+            pending_lazy_children: HashMap::new(),
+        }
+    }
+
+    /// Transfer pre-allocated overlay capacity from `donor` into self.
+    ///
+    /// Transfers arena overlay backing AND `pending_lazy_children` from donor
+    /// into self.  Donor's overlays must be empty (drained by `snapshot()` +
+    /// `clear_pending_lazy()` via `set_committed_base`).  After the transfer,
+    /// donor holds zero-capacity structures (O(1) drop) while self has
+    /// pre-allocated backing (no HashMap resizes on first block of writes).
+    pub fn steal_overlay_capacity_from(&mut self, donor: &mut Self) {
+        self.arena.steal_overlay_capacity_from(&mut donor.arena);
+        // pending_lazy_children is always cleared by set_committed_base ->
+        // clear_pending_lazy() before steal is called, so capacity is
+        // typically zero.  Skip swap — not worth the complexity.
+    }
+
     pub fn from_segment_page(page: Arc<SegmentPageLease>) -> Self {
         let reader =
             StorageTrieSegmentReader::open_shared_page(&page, page.root(), page.root_record_off())
