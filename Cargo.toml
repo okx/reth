@@ -797,7 +797,7 @@ banderwagon = { path = "../megaEth/salt/banderwagon" }
 ipa-multipoint = { path = "../megaEth/salt/ipa-multipoint" }
 
 # qmdb (LayerZero Quick Merkle Database)
-qmdb = { path = "../megaEth/qmdb/qmdb", default-features = false }
+qmdb = { git = "https://github.com/LayerZero-Labs/qmdb", rev = "8def52e603824ac328e8ba25e076340607268e40", default-features = false }
 
 # networking
 ipnet = "2.11"

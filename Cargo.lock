@@ -4874,6 +4874,7 @@ dependencies = [
 [[package]]
 name = "hpfile"
 version = "0.3.0"
+source = "git+https://github.com/LayerZero-Labs/qmdb?rev=8def52e603824ac328e8ba25e076340607268e40#8def52e603824ac328e8ba25e076340607268e40"
 dependencies = [
  "anyhow",
  "dashmap 6.1.0",
@@ -7716,6 +7717,7 @@ dependencies = [
 [[package]]
 name = "qmdb"
 version = "0.2.0"
+source = "git+https://github.com/LayerZero-Labs/qmdb?rev=8def52e603824ac328e8ba25e076340607268e40#8def52e603824ac328e8ba25e076340607268e40"
 dependencies = [
  "aead",
  "aes-gcm",
