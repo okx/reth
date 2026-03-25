@@ -342,18 +342,32 @@ impl StorageTrieCow {
         let mut ordered: Vec<&StorageChange> = changes.iter().collect();
         ordered.sort_by(|a, b| a.slot_key.cmp(&b.slot_key));
 
+        // Collect touched keys and compute has_deletes on the EFFECTIVE
+        // (deduplicated) changes only.  When the same slot appears multiple
+        // times, the last entry wins; a slot that ends non-zero is not a delete
+        // even if an intermediate entry was zero.
         let mut touched_keys = Vec::with_capacity(ordered.len());
+        let mut has_deletes = false;
         let mut idx = 0usize;
         while idx < ordered.len() {
             let change = ordered[idx];
+            // Skip to the last entry for this slot key (last write wins).
             while idx + 1 < ordered.len() && ordered[idx + 1].slot_key == change.slot_key {
                 idx += 1;
             }
-            touched_keys.push(change.slot_key.clone());
+            let effective = ordered[idx];
+            touched_keys.push(effective.slot_key.clone());
+            if effective.value == alloy_primitives::U256::ZERO {
+                has_deletes = true;
+            }
             idx += 1;
         }
 
-        self.preload_batched_paths(store, &touched_keys)?;
+        // Deletes can trigger branch collapse which needs untouched siblings.
+        // trace_paths only materializes touched paths, leaving siblings as
+        // ChildRef::Hash — collapse can't access them.  Skip batch preload
+        // when effective deletes exist; apply_change materializes on-demand.
+        self.preload_batched_paths(store, &touched_keys, has_deletes)?;
 
         let mut idx = 0usize;
         while idx < ordered.len() {
@@ -379,13 +393,14 @@ impl StorageTrieCow {
         store: &PersistedTrieStore,
         touched_keys: &[Nibbles],
     ) -> Result<()> {
-        self.preload_batched_paths(store, touched_keys)
+        self.preload_batched_paths(store, touched_keys, false)
     }
 
     fn preload_batched_paths(
         &mut self,
         store: &PersistedTrieStore,
         touched_keys: &[Nibbles],
+        has_deletes: bool,
     ) -> Result<()> {
         if touched_keys.is_empty() {
             return Ok(());
@@ -395,12 +410,27 @@ impl StorageTrieCow {
             CowRootRef::Lazy(CowLazyNodeRef::Segment(root_ref))
                 if self.arena.is_empty() && self.pending_lazy_children.is_empty() =>
             {
-                // Keep the segment root lazy. `trace_paths()` materializes only
-                // touched paths but does not preserve deferred segment children,
-                // which can break subsequent delete/collapse when untouched
-                // siblings are needed. Let apply_change() materialize on-demand
-                // via `mutate_segment_node` so pending segment refs stay valid.
-                let _ = root_ref;
+                if has_deletes {
+                    // Deletes can trigger branch collapse which needs untouched
+                    // siblings. trace_paths() only materializes touched paths
+                    // and leaves siblings as ChildRef::Hash — collapse can't
+                    // access them. Skip batch preload; apply_change() will
+                    // materialize on-demand via pending_lazy_children.
+                    let _ = root_ref;
+                } else {
+                    // Pure updates (no deletes): batch-preload touched paths
+                    // from the segment. This is much faster than per-slot
+                    // on-demand materialization (~3x for B4.6).
+                    let reader = StorageTrieSegmentReader::open_shared_page(
+                        root_ref.page_lease(),
+                        root_ref.page_lease().root(),
+                        root_ref.page_lease().root_record_off(),
+                    )?;
+                    let trace = reader.cursor().trace_paths(touched_keys)?;
+                    let (arena, root) = trace.into_parts();
+                    self.arena = arena;
+                    self.root = root.map(CowRootRef::Arena).unwrap_or(CowRootRef::Empty);
+                }
             }
             CowRootRef::Lazy(CowLazyNodeRef::Persisted(root))
                 if self.arena.is_empty() && self.pending_lazy_children.is_empty() =>

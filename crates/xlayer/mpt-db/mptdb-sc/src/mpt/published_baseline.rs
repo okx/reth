@@ -71,9 +71,10 @@ enum DeltaLookup {
 /// instead of a linear scan over the mmap.  For a 1M-record delta
 /// (79 MB on disk), this trades ~52 MB of RAM for turning every
 /// per-block `open_trie` call from O(N) to O(1).
+#[derive(Clone)]
 struct PublishedDeltaMmap {
-    puts: HashMap<B256, DeltaEntry>,
-    deletes: HashSet<B256>,
+    puts: Arc<HashMap<B256, DeltaEntry>>,
+    deletes: Arc<HashSet<B256>>,
 }
 
 impl PublishedDeltaMmap {
@@ -119,7 +120,7 @@ impl PublishedDeltaMmap {
             }
         }
         // mmap is dropped here — all data is in the HashMaps.
-        Ok(Self { puts, deletes })
+        Ok(Self { puts: Arc::new(puts), deletes: Arc::new(deletes) })
     }
 
     fn lookup(&self, needle: &B256) -> DeltaLookup {
@@ -142,9 +143,39 @@ pub struct PublishedBaselineReader {
     meta: PublishedBaselineMeta,
     deltas: Vec<PublishedDeltaMmap>,
     data_mmap: Arc<Mmap>,
+    /// Stable identifier of pages.data when this reader was opened.  Used by
+    /// `try_extend_published_store` to detect if the file was replaced by
+    /// compaction (atomic rename), which invalidates old locators.
+    data_file_id: u128,
     leases: Arc<Mutex<HashMap<u64, usize>>>,
     pinned_records: Mutex<HashSet<(u64, u32)>>,
     record_pins: Arc<Mutex<HashMap<(u64, u32), usize>>>,
+}
+
+/// Returns a platform-specific file identifier that changes when a file is
+/// replaced via atomic rename.
+fn data_file_id(file: &File) -> u128 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().map(|m| m.ino() as u128).unwrap_or(0)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Keep full file index plus volume serial to avoid truncation collisions.
+        file.metadata()
+            .map(|m| {
+                let file_index = m.file_index().unwrap_or(0) as u128;
+                let volume_serial = m.volume_serial_number().map(u128::from).unwrap_or(0);
+                (volume_serial << 64) | file_index
+            })
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        0
+    }
 }
 
 pub struct PublishedTrieMaterialized {
@@ -511,6 +542,7 @@ impl PublishedBaselineManager {
         };
         let deltas = self.load_delta_chain(&gen_meta)?;
         let data_file = Self::open_data_file(&self.base_dir)?;
+        let file_id = data_file_id(&data_file);
         let data_mmap = unsafe {
             MmapOptions::new()
                 .map(&data_file)
@@ -521,6 +553,66 @@ impl PublishedBaselineManager {
             meta: meta.clone(),
             deltas,
             data_mmap: Arc::new(data_mmap),
+            data_file_id: file_id,
+            leases: Arc::clone(&self.leases),
+            pinned_records: Mutex::new(HashSet::new()),
+            record_pins: Arc::clone(&self.record_pins),
+        }))
+    }
+
+    /// Incrementally extend an existing reader with one new generation delta.
+    ///
+    /// When the new generation's parent is the existing reader's generation,
+    /// only the single new delta file needs to be parsed (O(new_entries)).
+    /// This avoids re-parsing the full delta chain (O(all_historical_entries))
+    /// on every block in wal_first mode.
+    ///
+    /// Returns None if the incremental extend is not possible (parent mismatch),
+    /// in which case the caller should fall back to `open_published_store`.
+    pub fn try_extend_published_store(
+        &self,
+        meta: &PublishedBaselineMeta,
+        existing: &PublishedBaselineReader,
+    ) -> Result<Option<PublishedBaselineReader>> {
+        let gen_meta = match self.load_generation_meta(meta.generation)? {
+            Some(gen_meta) if gen_meta.version == meta.version && gen_meta.root == meta.root => {
+                gen_meta
+            }
+            _ => return Ok(None),
+        };
+        // Only extend if the new generation's direct parent is the existing reader.
+        if gen_meta.parent_generation != Some(existing.meta.generation) {
+            return Ok(None);
+        }
+        // Load only the single new delta and prepend it to the existing chain.
+        // Clone the existing deltas (O(1) because the HashMaps are Arc-shared).
+        let new_delta = PublishedDeltaMmap::open(&self.delta_path(gen_meta.generation))?;
+        let mut deltas = Vec::with_capacity(existing.deltas.len() + 1);
+        deltas.push(new_delta);
+        deltas.extend(existing.deltas.iter().cloned());
+
+        // Re-mmap the data file to see any new segment pages appended by the
+        // persist worker since the last open.
+        let data_file = Self::open_data_file(&self.base_dir)?;
+        // Compact replaces pages.data via atomic rename → new file, new inode.
+        // Compare the file id of the current file against the one stored in the
+        // existing reader.  If they differ, the file was replaced and old delta
+        // locators are invalid — fall back to full rebuild.
+        let current_file_id = data_file_id(&data_file);
+        if current_file_id != existing.data_file_id {
+            return Ok(None);
+        }
+        let data_mmap = unsafe {
+            MmapOptions::new()
+                .map(&data_file)
+                .map_err(|e| MptDbError::Other(format!("mmap published baseline data: {e}")))?
+        };
+        self.acquire_generation_lease(meta.generation);
+        Ok(Some(PublishedBaselineReader {
+            meta: meta.clone(),
+            deltas,
+            data_mmap: Arc::new(data_mmap),
+            data_file_id: current_file_id,
             leases: Arc::clone(&self.leases),
             pinned_records: Mutex::new(HashSet::new()),
             record_pins: Arc::clone(&self.record_pins),

@@ -385,6 +385,8 @@ pub struct CommitProfile {
     pub apply_account_trie_checkout: Duration,
     /// Time spent inside ensure_working_storage_tries (L2/L3 cache lookups).
     pub apply_ensure_storage: Duration,
+    /// Time spent in maybe_refresh_published_view() during ensure_storage.
+    pub apply_published_view_refresh: Duration,
     /// Time spent looking up storage_root from the account trie for L2 misses.
     pub apply_storage_root_lookup: Duration,
     /// Time to freeze the account trie in set_committed_base after commit.
@@ -403,6 +405,7 @@ struct StorageTrieLoadStats {
     storage_root_lookup: Duration,
     l3_latest_load: Duration,
     l3_published_load: Duration,
+    refresh_elapsed: Duration,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -479,6 +482,7 @@ pub struct MptCommitStore {
     last_apply_get_or_load_storage_tries: Duration,
     last_apply_account_trie_checkout: Duration,
     last_apply_ensure_storage: Duration,
+    last_apply_published_view_refresh: Duration,
     last_apply_storage_root_lookup: Duration,
     last_apply_storage_slot_updates: Duration,
     last_apply_l3_latest_load: Duration,
@@ -827,9 +831,13 @@ impl MptCommitStore {
         // Only refresh the published view when we actually have L3 candidates.
         // All-L2-hit blocks (common for hot-set workloads like B4.7) skip the
         // reload_published_view() I/O entirely, saving ~100ms per block.
+        let mut refresh_elapsed = Duration::ZERO;
         if !need_storage_root.is_empty() {
+            let refresh_start = std::time::Instant::now();
             self.maybe_refresh_published_view()?;
+            refresh_elapsed = refresh_start.elapsed();
         }
+        stats.refresh_elapsed = refresh_elapsed;
         let published_current = self.has_current_published_view();
 
         // Only the cache-miss accounts need an account trie lookup.
@@ -1836,8 +1844,31 @@ impl MptCommitStore {
         let loaded_meta = self.published_baseline.load_meta()?;
         match loaded_meta {
             Some(meta) if meta.version > 0 => {
-                self.published_store = self.published_baseline.open_published_store(&meta)?;
-                self.published_meta = Some(meta);
+                let same_generation =
+                    self.published_meta.as_ref().map_or(false, |m| m.generation == meta.generation);
+                if same_generation {
+                    // Generation unchanged: delta HashMap is still valid.
+                    if let Some(ref mut m) = self.published_meta {
+                        m.version = meta.version;
+                        m.root = meta.root;
+                    }
+                } else if let Some(ref existing) = self.published_store {
+                    // Try incremental extend: load only the single new delta
+                    // instead of re-parsing the full historical chain.
+                    // Falls back to full rebuild if the parent chain doesn't match.
+                    let extended =
+                        self.published_baseline.try_extend_published_store(&meta, existing)?;
+                    self.published_meta = Some(meta.clone());
+                    if extended.is_some() {
+                        self.published_store = extended;
+                    } else {
+                        self.published_store =
+                            self.published_baseline.open_published_store(&meta)?;
+                    }
+                } else {
+                    self.published_store = self.published_baseline.open_published_store(&meta)?;
+                    self.published_meta = Some(meta);
+                }
             }
             _ => {
                 self.published_meta = None;
@@ -2628,6 +2659,7 @@ impl MptCommitStore {
             last_apply_get_or_load_storage_tries: Duration::ZERO,
             last_apply_account_trie_checkout: Duration::ZERO,
             last_apply_ensure_storage: Duration::ZERO,
+            last_apply_published_view_refresh: Duration::ZERO,
             last_apply_storage_root_lookup: Duration::ZERO,
             last_apply_storage_slot_updates: Duration::ZERO,
             last_apply_l3_latest_load: Duration::ZERO,
@@ -3048,6 +3080,7 @@ impl MptCommitStore {
             last_apply_get_or_load_storage_tries: Duration::ZERO,
             last_apply_account_trie_checkout: Duration::ZERO,
             last_apply_ensure_storage: Duration::ZERO,
+            last_apply_published_view_refresh: Duration::ZERO,
             last_apply_storage_root_lookup: Duration::ZERO,
             last_apply_storage_slot_updates: Duration::ZERO,
             last_apply_l3_latest_load: Duration::ZERO,
@@ -3954,6 +3987,7 @@ impl MptCommitStore {
         self.last_apply_get_or_load_storage_tries = get_or_load_elapsed;
         self.last_apply_account_trie_checkout = acct_checkout_elapsed;
         self.last_apply_ensure_storage = ensure_elapsed;
+        self.last_apply_published_view_refresh = load_stats.refresh_elapsed;
         self.last_apply_storage_root_lookup = load_stats.storage_root_lookup;
         self.last_apply_storage_slot_updates = slot_updates_elapsed;
         self.last_apply_l3_latest_load = load_stats.l3_latest_load;
@@ -4596,6 +4630,7 @@ impl MptCommitStore {
             total_commit: profile_start.elapsed(),
             apply_account_trie_checkout: self.last_apply_account_trie_checkout,
             apply_ensure_storage: self.last_apply_ensure_storage,
+            apply_published_view_refresh: self.last_apply_published_view_refresh,
             apply_storage_root_lookup: self.last_apply_storage_root_lookup,
             commit_account_set_base: acct_set_base_elapsed,
             commit_cache_storage_prep: cache_storage_prep_elapsed,

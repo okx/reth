@@ -72,6 +72,7 @@ pub struct MptdbTotals {
     pub acct_trie_checkout: Duration,
     pub ensure_storage: Duration,
     pub storage_root_lookup: Duration,
+    pub published_view_refresh: Duration,
     pub commit_acct_set_base: Duration,
     pub commit_cache_prep: Duration,
     pub storage_root_handles: u64,
@@ -387,6 +388,7 @@ fn accumulate_mptdb_profile(totals: &mut MptdbTotals, profile: &CommitProfile) {
     totals.acct_trie_checkout += profile.apply_account_trie_checkout;
     totals.ensure_storage += profile.apply_ensure_storage;
     totals.storage_root_lookup += profile.apply_storage_root_lookup;
+    totals.published_view_refresh += profile.apply_published_view_refresh;
     totals.commit_acct_set_base += profile.commit_account_set_base;
     totals.commit_cache_prep += profile.commit_cache_storage_prep;
     totals.storage_root_handles += profile.storage_roots_working_handles;
@@ -665,6 +667,13 @@ pub fn run_mpt_only_profile(scenario: ProfileScenario) -> MptRun {
     } else {
         prepopulate_mpt_profile(&mut store, scenario, &addrs)
     };
+    // Wait for the background persist worker to finish publishing all pre-pop
+    // segments before starting timed profile blocks.  Without this, early
+    // profile blocks may miss L3 segment lookups (worker not yet done) and
+    // fall back to persisted store, causing run-to-run timing instability.
+    if scenario.prepop_accounts > 0 {
+        store.flush_persist().unwrap();
+    }
     let mut mptdb_totals = MptdbTotals::default();
     for block in &blocks {
         let apply_start = Instant::now();
@@ -708,6 +717,10 @@ pub fn print_mpt_run(run: &MptRun) {
     println!(
         "      root_lookup:     {} ms",
         fmt_ms(run.totals.storage_root_lookup / run.blocks_len)
+    );
+    println!(
+        "      view_refresh:    {} ms",
+        fmt_ms(run.totals.published_view_refresh / run.blocks_len)
     );
     println!("      l3_published:    {} ms", fmt_ms(run.totals.l3_published / run.blocks_len));
     println!("  slot_updates:        {} ms", fmt_ms(run.totals.slot_updates / run.blocks_len));

@@ -119,10 +119,10 @@ Each updated account has its nonce and balance modified, plus **all** of its sto
 | B4.1 | 0 (fresh) | 10 | 100 | 1 | 1.26 ms | 1.31 ms | 1.0x |
 | B4.2 | 1K | 10 | 200 | 1 | 5.73 ms | 2.98 ms | **1.9x** |
 | B4.3 | 1K | 10 | 200 | 10 | 5.39 ms | 2.38 ms | **2.3x** |
-| B4.4 | 200K | 10 | 2K | 10 | 285 ms | 46 ms | **6.2x** |
-| B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 147 ms | **8.2x** |
+| B4.4 | 200K | 10 | 2K | 10 | 285 ms | 24 ms | **11.9x** |
+| B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 83 ms | **14.6x** |
 | B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 838 ms | **10.2x** |
-| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 703 ms | **2.8x** |
+| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 436 ms | **4.6x** |
 
 ### Workload vs real-world comparison
 
@@ -138,9 +138,9 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 ### Analysis
 
 - **Small datasets (B4.1–B4.3)**: reth's MDBX keeps everything in page cache, so both systems are fast. mpt-db's advantage is modest (1–2x) because the WAL append overhead is a significant fraction of the per-block time.
-- **Large datasets (B4.4–B4.6)**: reth's MDBX page cache becomes cold as the dataset exceeds cache capacity. Random reads from disk dominate reth's `overlay_root_with_updates` and `write_trie_updates`. mpt-db's in-memory tries are unaffected by dataset size, giving **7–9x** speedup.
-- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each creates a ~4GB working set. reth spends 3.2s on root computation + 4.2s writing trie updates. mpt-db completes in 838ms with overlay capacity recycling eliminating per-block HashMap churn.
-- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). Few large tries (300 nodes each) limit rayon parallelism. Overlay recycling reduced handle drop cost from ~540ms to ~0ms; remaining bottleneck is `trie_load` from frequent published-view refreshes.
+- **Large datasets (B4.4–B4.6)**: reth's MDBX page cache becomes cold as the dataset exceeds cache capacity. Random reads from disk dominate reth's `overlay_root_with_updates` and `write_trie_updates`. mpt-db's in-memory tries are unaffected by dataset size, giving **10–15x** speedup for B4.4/B4.5.
+- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each. mpt-db completes in ~838ms; overlay capacity recycling eliminates per-block HashMap churn (~540ms drop cost → 0ms).
+- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). Overlay recycling + parallel hash for large tries + incremental published-view refresh brings B4.7 from 703ms to 436ms (-38%).
 
 ### B4.6 detailed breakdown
 
@@ -153,16 +153,17 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 | `write_hashed_state` | 844 ms |
 | `commit` | 276 ms |
 
-**mpt-db (838 ms/block):**
+**mpt-db (~838–1050 ms/block, varies with OS page cache):**
 
 | Phase | Time |
 |-------|------|
-| `trie_load` (L2 cache + L3 segment load) | 467 ms |
-| `slot_updates` (apply + hash merged, no resize with overlay recycling) | 145 ms |
-| `account_updates` (serial account trie) | 53 ms |
-| `storage_roots` (collect + parallel snapshot) | 49 ms |
-| `wal_append` | 25 ms |
-| `account_root` (parallel hash) | 11 ms |
-| `persist` + `cache_prep` | 17 ms |
+| `trie_load` (L2 cache + L3 segment load) | 467–720 ms |
+| `slot_updates` (apply + hash merged) | 145–165 ms |
+| `account_updates` (serial account trie) | 50–65 ms |
+| `storage_roots` (collect + parallel snapshot) | 45–55 ms |
+| `wal_append` | 22–30 ms |
+| `account_root` (parallel hash) | 10–13 ms |
+| `persist` + `cache_prep` | 15–20 ms |
 
-L2 hits: 1,991/block, L3 hits: 7,957/block (cache_capacity=50K → 200K LRU limit, covers ~20% of 1M accounts).
+L2 hits: 1,991/block, L3 hits: 7,957/block (cache_capacity=50K → 200K LRU limit).
+`trie_load` variance is dominated by macOS mmap page cache state for L3 segment decodes.
