@@ -1855,15 +1855,15 @@ impl MptCommitStore {
                         m.version = meta.version;
                         m.root = meta.root;
                     }
-                } else if let Some(ref existing) = self.published_store {
+                } else if let Some(existing) = self.published_store.take() {
                     // Try incremental extend: load only the single new delta
                     // instead of re-parsing the full historical chain.
                     // Falls back to full rebuild if the parent chain doesn't match.
                     let extended =
                         self.published_baseline.try_extend_published_store(&meta, existing)?;
                     self.published_meta = Some(meta.clone());
-                    if extended.is_some() {
-                        self.published_store = extended;
+                    if let Some(reader) = extended {
+                        self.published_store = Some(reader);
                     } else {
                         self.published_store =
                             self.published_baseline.open_published_store(&meta)?;

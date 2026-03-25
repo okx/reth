@@ -59,12 +59,6 @@ struct DeltaEntry {
     format_version: u16,
 }
 
-enum DeltaLookup {
-    Hit(DeltaEntry),
-    Deleted,
-    Miss,
-}
-
 /// Parsed representation of a delta file.
 ///
 /// Records are loaded into HashMaps at open time so that lookup is O(1)
@@ -122,16 +116,6 @@ impl PublishedDeltaMmap {
         // mmap is dropped here — all data is in the HashMaps.
         Ok(Self { puts: Arc::new(puts), deletes: Arc::new(deletes) })
     }
-
-    fn lookup(&self, needle: &B256) -> DeltaLookup {
-        if let Some(entry) = self.puts.get(needle) {
-            return DeltaLookup::Hit(*entry);
-        }
-        if self.deletes.contains(needle) {
-            return DeltaLookup::Deleted;
-        }
-        DeltaLookup::Miss
-    }
 }
 
 #[derive(Clone)]
@@ -142,6 +126,10 @@ pub(crate) struct PublishedGenerationResult {
 pub struct PublishedBaselineReader {
     meta: PublishedBaselineMeta,
     deltas: Vec<PublishedDeltaMmap>,
+    /// Merged latest PUT index across the delta chain (newest wins).
+    merged_puts: HashMap<B256, DeltaEntry>,
+    /// Merged latest DELETE tombstones across the delta chain (newest wins).
+    merged_deletes: HashSet<B256>,
     data_mmap: Arc<Mmap>,
     /// Stable identifier of pages.data when this reader was opened.  Used by
     /// `try_extend_published_store` to detect if the file was replaced by
@@ -269,12 +257,11 @@ impl PublishedBaselineReader {
     }
 
     fn lookup_entry(&self, hashed_address: &B256) -> Result<Option<DeltaEntry>> {
-        for delta in &self.deltas {
-            match delta.lookup(hashed_address) {
-                DeltaLookup::Hit(entry) => return Ok(Some(entry)),
-                DeltaLookup::Deleted => return Ok(None),
-                DeltaLookup::Miss => {}
-            }
+        if let Some(entry) = self.merged_puts.get(hashed_address) {
+            return Ok(Some(*entry));
+        }
+        if self.merged_deletes.contains(hashed_address) {
+            return Ok(None);
         }
         Ok(None)
     }
@@ -541,6 +528,7 @@ impl PublishedBaselineManager {
             _ => return Ok(None),
         };
         let deltas = self.load_delta_chain(&gen_meta)?;
+        let (merged_puts, merged_deletes) = Self::build_merged_lookup(&deltas);
         let data_file = Self::open_data_file(&self.base_dir)?;
         let file_id = data_file_id(&data_file);
         let data_mmap = unsafe {
@@ -552,6 +540,8 @@ impl PublishedBaselineManager {
         Ok(Some(PublishedBaselineReader {
             meta: meta.clone(),
             deltas,
+            merged_puts,
+            merged_deletes,
             data_mmap: Arc::new(data_mmap),
             data_file_id: file_id,
             leases: Arc::clone(&self.leases),
@@ -572,7 +562,7 @@ impl PublishedBaselineManager {
     pub fn try_extend_published_store(
         &self,
         meta: &PublishedBaselineMeta,
-        existing: &PublishedBaselineReader,
+        mut existing: PublishedBaselineReader,
     ) -> Result<Option<PublishedBaselineReader>> {
         let gen_meta = match self.load_generation_meta(meta.generation)? {
             Some(gen_meta) if gen_meta.version == meta.version && gen_meta.root == meta.root => {
@@ -580,16 +570,53 @@ impl PublishedBaselineManager {
             }
             _ => return Ok(None),
         };
-        // Only extend if the new generation's direct parent is the existing reader.
-        if gen_meta.parent_generation != Some(existing.meta.generation) {
-            return Ok(None);
+        // Walk the parent chain from the new generation back to the existing reader's
+        // generation, collecting intermediate generations in reverse (newest first).
+        // This handles the case where the background worker is multiple versions behind
+        // the main thread, preventing fallback to full rebuild on every view refresh.
+        const MAX_FAST_FORWARD: usize = 32;
+        let mut chain: Vec<GenerationMeta> = Vec::new();
+        chain.push(gen_meta);
+        loop {
+            let tip = chain.last().unwrap();
+            if tip.parent_generation == Some(existing.meta.generation) {
+                // Found the link — chain is complete.
+                break;
+            }
+            if tip.parent_generation.is_none() || chain.len() >= MAX_FAST_FORWARD {
+                // Chain doesn't reach the existing reader within the depth limit.
+                return Ok(None);
+            }
+            let parent_gen = tip.parent_generation.unwrap();
+            match self.load_generation_meta(parent_gen)? {
+                Some(parent_meta) => chain.push(parent_meta),
+                None => return Ok(None),
+            }
         }
-        // Load only the single new delta and prepend it to the existing chain.
-        // Clone the existing deltas (O(1) because the HashMaps are Arc-shared).
-        let new_delta = PublishedDeltaMmap::open(&self.delta_path(gen_meta.generation))?;
-        let mut deltas = Vec::with_capacity(existing.deltas.len() + 1);
-        deltas.push(new_delta);
-        deltas.extend(existing.deltas.iter().cloned());
+        // chain is ordered newest→oldest; reverse to get oldest→newest for apply order.
+        chain.reverse();
+
+        // Load deltas for each intermediate generation (now oldest→newest).
+        let mut new_deltas: Vec<PublishedDeltaMmap> = Vec::with_capacity(chain.len());
+        for step in &chain {
+            let delta = PublishedDeltaMmap::open(&self.delta_path(step.generation))?;
+            new_deltas.push(delta);
+        }
+
+        // Build the new delta list: new deltas (oldest first) followed by existing.
+        let mut deltas = Vec::with_capacity(existing.deltas.len() + new_deltas.len());
+        // Prepend in newest-first order (new_deltas is oldest→newest, so reverse).
+        for d in new_deltas.iter().rev() {
+            deltas.push(d.clone());
+        }
+        deltas.extend(std::mem::take(&mut existing.deltas));
+
+        // Apply each new delta onto the merged lookup in oldest→newest order.
+        let mut merged_puts = std::mem::take(&mut existing.merged_puts);
+        let mut merged_deletes = std::mem::take(&mut existing.merged_deletes);
+        for delta in &new_deltas {
+            Self::apply_delta_to_merged_lookup(&mut merged_puts, &mut merged_deletes, delta);
+        }
 
         // Re-mmap the data file to see any new segment pages appended by the
         // persist worker since the last open.
@@ -611,6 +638,8 @@ impl PublishedBaselineManager {
         Ok(Some(PublishedBaselineReader {
             meta: meta.clone(),
             deltas,
+            merged_puts,
+            merged_deletes,
             data_mmap: Arc::new(data_mmap),
             data_file_id: current_file_id,
             leases: Arc::clone(&self.leases),
@@ -1046,6 +1075,48 @@ impl PublishedBaselineManager {
             cursor = gen_meta.parent_generation;
         }
         Ok(deltas)
+    }
+
+    fn build_merged_lookup(
+        deltas: &[PublishedDeltaMmap],
+    ) -> (HashMap<B256, DeltaEntry>, HashSet<B256>) {
+        let mut merged_puts = HashMap::new();
+        let mut merged_deletes = HashSet::new();
+        let mut seen = HashSet::new();
+
+        // Deltas are ordered newest -> oldest.
+        for delta in deltas {
+            // Match per-delta lookup semantics: PUT wins over DELETE in the same delta.
+            for (key, entry) in delta.puts.iter() {
+                if seen.insert(*key) {
+                    merged_puts.insert(*key, *entry);
+                }
+            }
+            for key in delta.deletes.iter() {
+                if seen.insert(*key) {
+                    merged_deletes.insert(*key);
+                }
+            }
+        }
+
+        (merged_puts, merged_deletes)
+    }
+
+    fn apply_delta_to_merged_lookup(
+        merged_puts: &mut HashMap<B256, DeltaEntry>,
+        merged_deletes: &mut HashSet<B256>,
+        delta: &PublishedDeltaMmap,
+    ) {
+        // Newest delta overrides historical state.
+        for key in delta.deletes.iter() {
+            merged_puts.remove(key);
+            merged_deletes.insert(*key);
+        }
+        // PUT wins over DELETE inside the same delta (matches previous lookup semantics).
+        for (key, entry) in delta.puts.iter() {
+            merged_deletes.remove(key);
+            merged_puts.insert(*key, *entry);
+        }
     }
 
     fn published_dir(base: &Path) -> PathBuf {
