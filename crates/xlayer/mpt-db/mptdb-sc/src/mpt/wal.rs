@@ -29,13 +29,19 @@ const WAL_RECORD_HEADER_LEN: usize = 8 + 4 + 4;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommitWalStorageChange {
     pub hashed_slot: B256,
-    pub value: U256,
+    /// Storage slot value as raw big-endian bytes.  Stored as `[u8; 32]`
+    /// rather than `U256` to avoid bincode's 8-byte length prefix for
+    /// `serialize_bytes`, reducing payload size by 8 bytes per slot
+    /// (~480KB per block for B4.7's 60K slot changes).
+    pub value: [u8; 32],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommitWalAccountInfo {
     pub nonce: u64,
-    pub balance: U256,
+    /// Account balance as raw big-endian bytes (same rationale as
+    /// `CommitWalStorageChange::value`).
+    pub balance: [u8; 32],
     pub code_hash: B256,
 }
 
@@ -100,7 +106,7 @@ impl CommitWalEntry {
                     .iter()
                     .map(|change| CommitWalStorageChange {
                         hashed_slot: change.hashed_slot,
-                        value: change.value,
+                        value: change.value.to_be_bytes(),
                     })
                     .collect::<Vec<_>>();
                 storage_changes.sort_by(|a, b| a.hashed_slot.cmp(&b.hashed_slot));
@@ -110,7 +116,7 @@ impl CommitWalEntry {
                     hashed_address: dirty.hashed_address,
                     info: dirty.info.as_ref().map(|info| CommitWalAccountInfo {
                         nonce: info.nonce,
-                        balance: info.balance,
+                        balance: info.balance.to_be_bytes(),
                         code_hash: info.code_hash,
                     }),
                     storage_wiped: dirty.storage_wiped,
@@ -145,7 +151,7 @@ impl CommitWalEntry {
                     .iter()
                     .map(|change| CommitWalStorageChange {
                         hashed_slot: change.hashed_slot,
-                        value: change.value,
+                        value: change.value.to_be_bytes(),
                     })
                     .collect::<Vec<_>>();
                 storage_changes.sort_by(|a, b| a.hashed_slot.cmp(&b.hashed_slot));
@@ -155,7 +161,7 @@ impl CommitWalEntry {
                     hashed_address: dirty.hashed_address,
                     info: dirty.info.as_ref().map(|info| CommitWalAccountInfo {
                         nonce: info.nonce,
-                        balance: info.balance,
+                        balance: info.balance.to_be_bytes(),
                         code_hash: info.code_hash,
                     }),
                     storage_wiped: dirty.storage_wiped,
@@ -203,7 +209,7 @@ impl CommitWalEntry {
                 account_key: Nibbles::unpack(account.hashed_address),
                 info: account.info.as_ref().map(|info| AccountInfo {
                     nonce: info.nonce,
-                    balance: info.balance,
+                    balance: U256::from_be_bytes(info.balance),
                     code_hash: info.code_hash,
                     account_id: None,
                     code: None,
@@ -213,12 +219,14 @@ impl CommitWalEntry {
                 storage_changes: account
                     .storage_changes
                     .iter()
-                    .map(|change| StorageChange {
-                        hashed_slot: change.hashed_slot,
-                        slot_key: Nibbles::unpack(change.hashed_slot),
-                        value: change.value,
-                        encoded_value: (change.value != U256::ZERO)
-                            .then(|| alloy_rlp::encode(change.value)),
+                    .map(|change| {
+                        let value = U256::from_be_bytes(change.value);
+                        StorageChange {
+                            hashed_slot: change.hashed_slot,
+                            slot_key: Nibbles::unpack(change.hashed_slot),
+                            value,
+                            encoded_value: (value != U256::ZERO).then(|| alloy_rlp::encode(value)),
+                        }
                     })
                     .collect(),
             })
@@ -364,7 +372,7 @@ impl CommitWalStore {
 
         let segment_id = self.next_append_segment_id();
         let serialize_start = std::time::Instant::now();
-        let payload = bincode::serialize(entry)
+        let payload = postcard::to_stdvec(entry)
             .map_err(|e| MptDbError::Other(format!("serialize wal entry: {e}")))?;
         let serialize_elapsed = serialize_start.elapsed();
         let crc_start = std::time::Instant::now();
@@ -456,6 +464,104 @@ impl CommitWalStore {
         Ok(())
     }
 
+    /// Write a pre-serialized WAL record.  Called when serialize+CRC were
+    /// computed outside the lock; only the file write + index update happen here.
+    ///
+    /// `version` must equal `meta.latest_version + 1`.
+    /// `payload` is the bincode-encoded `CommitWalEntry`.
+    /// `crc` is the CRC32C of `payload`.
+    pub fn append_prebuilt(&mut self, version: i64, payload: &[u8], crc: u32) -> Result<()> {
+        if version <= 0 {
+            return Err(MptDbError::Other("wal entry version must be positive".to_string()));
+        }
+        if !self.meta.is_empty() && version != self.meta.latest_version + 1 {
+            return Err(MptDbError::Other(format!(
+                "wal append out of order: expected {}, got {}",
+                self.meta.latest_version + 1,
+                version
+            )));
+        }
+        if self.index.contains_key(&version) {
+            return Err(MptDbError::Other(format!(
+                "wal entry already exists for version {}",
+                version
+            )));
+        }
+
+        let segment_id = self.next_append_segment_id();
+        let payload_len = payload.len() as u32;
+
+        if self.active_segment.as_ref().map_or(true, |(id, _)| *id != segment_id) {
+            if let Some((_, old_writer)) = self.active_segment.take() {
+                drop(old_writer);
+            }
+            let path = self.segment_path(segment_id);
+            let mut file =
+                OpenOptions::new().read(true).write(true).create(true).open(&path).map_err(
+                    |e| MptDbError::Other(format!("open wal segment {}: {e}", path.display())),
+                )?;
+            let file_len = file
+                .metadata()
+                .map_err(|e| {
+                    MptDbError::Other(format!("stat wal segment {}: {e}", path.display()))
+                })?
+                .len();
+            if file_len == 0 {
+                Self::write_segment_header(&mut file)?;
+            } else if let Some(range) = self.segments.get(&segment_id) {
+                if file_len > range.valid_end {
+                    file.set_len(range.valid_end).map_err(|e| {
+                        MptDbError::Other(format!("truncate wal segment tail: {e}"))
+                    })?;
+                }
+            }
+            file.seek(SeekFrom::End(0))
+                .map_err(|e| MptDbError::Other(format!("seek wal segment: {e}")))?;
+            self.active_segment =
+                Some((segment_id, std::io::BufWriter::with_capacity(128 * 1024, file)));
+        }
+
+        let (_, writer) = self.active_segment.as_mut().unwrap();
+        let offset =
+            self.segments.get(&segment_id).map_or(WAL_SEGMENT_HEADER_LEN as u64, |r| r.valid_end);
+
+        writer
+            .write_all(&version.to_le_bytes())
+            .map_err(|e| MptDbError::Other(format!("write wal record version: {e}")))?;
+        writer
+            .write_all(&payload_len.to_le_bytes())
+            .map_err(|e| MptDbError::Other(format!("write wal record len: {e}")))?;
+        writer
+            .write_all(&crc.to_le_bytes())
+            .map_err(|e| MptDbError::Other(format!("write wal record crc: {e}")))?;
+        writer
+            .write_all(payload)
+            .map_err(|e| MptDbError::Other(format!("write wal record payload: {e}")))?;
+        writer.flush().map_err(|e| MptDbError::Other(format!("flush wal segment: {e}")))?;
+
+        let record_end = offset + WAL_RECORD_HEADER_LEN as u64 + payload_len as u64;
+        self.index.insert(version, WalLocation { segment_id, offset, len: payload_len });
+        self.segments
+            .entry(segment_id)
+            .and_modify(|range| {
+                range.last_version = version;
+                range.entries += 1;
+                range.valid_end = record_end;
+            })
+            .or_insert(WalSegmentRange {
+                first_version: version,
+                last_version: version,
+                entries: 1,
+                valid_end: record_end,
+            });
+
+        if self.meta.is_empty() {
+            self.meta.earliest_version = version;
+        }
+        self.meta.latest_version = version;
+        Ok(())
+    }
+
     // ── Read path ──
 
     pub fn load_entry(&self, version: i64) -> Result<Option<CommitWalEntry>> {
@@ -494,7 +600,7 @@ impl CommitWalStore {
             )));
         }
 
-        let entry = bincode::deserialize(&payload)
+        let entry = postcard::from_bytes(&payload)
             .map_err(|e| MptDbError::Other(format!("parse wal record payload: {e}")))?;
         Ok(Some(entry))
     }
@@ -619,7 +725,11 @@ impl CommitWalStore {
             return Ok(());
         }
         self.meta.durable_version = version;
-        self.save_meta()?;
+        // Defer meta persistence — durable_version is recoverable from
+        // scan_segments on restart (clamped to latest_version).  Calling
+        // save_meta() here writes a JSON file inside the WAL mutex, blocking
+        // the frontend's concurrent append_entry calls.  Meta is flushed on
+        // close or via flush_meta() instead.
         Ok(())
     }
 
@@ -681,7 +791,7 @@ impl CommitWalStore {
             let mut count = 0usize;
 
             for entry in &kept_entries {
-                let payload = bincode::serialize(entry)
+                let payload = postcard::to_stdvec(entry)
                     .map_err(|e| MptDbError::Other(format!("serialize wal entry: {e}")))?;
                 let crc = crc32fast::hash(&payload);
                 let payload_len = payload.len() as u32;
@@ -1038,6 +1148,10 @@ mod tests {
         wal.append_entry(&sample_entry(1)).unwrap();
         wal.append_entry(&sample_entry(2)).unwrap();
         wal.set_durable_version(2).unwrap();
+        // flush_meta() is required to persist durable_version to disk.
+        // set_durable_version() only updates in-memory to avoid holding the
+        // WAL mutex while doing file I/O (which would block concurrent appends).
+        wal.flush_meta().unwrap();
 
         let reopened = CommitWalStore::open(dir.path()).unwrap();
         assert_eq!(reopened.durable_version(), 2);
@@ -1119,7 +1233,7 @@ mod tests {
                     hashed_address: B256::repeat_byte(i as u8),
                     info: Some(CommitWalAccountInfo {
                         nonce: i as u64,
-                        balance: U256::from(i),
+                        balance: U256::from(i).to_be_bytes(),
                         code_hash: B256::repeat_byte(i as u8),
                     }),
                     storage_wiped: false,

@@ -400,6 +400,10 @@ pub fn fmt_ms(d: Duration) -> String {
     format!("{:.1}", d.as_secs_f64() * 1000.0)
 }
 
+fn profile_trace_enabled() -> bool {
+    env::var_os("MPT_PROFILE_TRACE").is_some()
+}
+
 pub fn scenario_b4_1() -> ProfileScenario {
     ProfileScenario {
         code: "B4.1",
@@ -661,6 +665,7 @@ pub fn run_mpt_only_profile(scenario: ProfileScenario) -> MptRun {
     let dir = TempDir::new().unwrap();
     let mut store =
         MptCommitStore::open_with_config(dir.path(), false, wal_first_config()).unwrap();
+    let trace_enabled = profile_trace_enabled();
 
     let mptdb_prepop = if scenario.prepop_accounts == 0 {
         Duration::ZERO
@@ -675,13 +680,35 @@ pub fn run_mpt_only_profile(scenario: ProfileScenario) -> MptRun {
         store.flush_persist().unwrap();
     }
     let mut mptdb_totals = MptdbTotals::default();
-    for block in &blocks {
+    for (block_idx, block) in blocks.iter().enumerate() {
         let apply_start = Instant::now();
         store.apply_bundle_state(block).unwrap();
         mptdb_totals.apply += apply_start.elapsed();
 
         let ((_version, _root), profile): ((i64, B256), CommitProfile) =
             store.commit_with_profile().unwrap();
+        if trace_enabled {
+            let l3_hits = profile.apply_l3_latest_hits +
+                profile.apply_l3_published_hits +
+                profile.apply_l3_published_post_flush_hits;
+            println!(
+                "  block {:>2}: total={} apply={} commit={} trie_load={} slot_updates={} \
+storage_roots={} wal_append={} wal_lock_wait={} l3_load={} l3_hits={} root_handles={}/{}",
+                block_idx + 1,
+                fmt_ms(profile.apply_bundle_state + profile.total_commit),
+                fmt_ms(profile.apply_bundle_state),
+                fmt_ms(profile.total_commit),
+                fmt_ms(profile.apply_get_or_load_storage_tries),
+                fmt_ms(profile.apply_storage_slot_updates),
+                fmt_ms(profile.storage_roots),
+                fmt_ms(profile.wal_append),
+                fmt_ms(profile.wal_append_lock_wait),
+                fmt_ms(profile.apply_l3_published_load),
+                l3_hits,
+                profile.storage_roots_precomputed_handles,
+                profile.storage_roots_working_handles,
+            );
+        }
         accumulate_mptdb_profile(&mut mptdb_totals, &profile);
     }
     store.close().unwrap();

@@ -508,6 +508,9 @@ pub struct MptCommitStore {
     last_wal_serialize: Duration,
     last_wal_crc: Duration,
     last_wal_payload_bytes: u32,
+    /// Reusable serialization buffer for WAL entries.  Serialize/CRC happen
+    /// outside the WAL mutex; the lock only covers file write + index update.
+    wal_serialize_buf: Vec<u8>,
     last_commit_profile: CommitProfile,
     checkpoint_account_trie_nodes: Option<usize>,
     shutdown_complete: bool,
@@ -2685,6 +2688,7 @@ impl MptCommitStore {
             last_wal_serialize: Duration::ZERO,
             last_wal_crc: Duration::ZERO,
             last_wal_payload_bytes: 0,
+            wal_serialize_buf: Vec::new(),
             last_commit_profile: CommitProfile::default(),
             checkpoint_account_trie_nodes,
             shutdown_complete: false,
@@ -3106,6 +3110,7 @@ impl MptCommitStore {
             last_wal_serialize: Duration::ZERO,
             last_wal_crc: Duration::ZERO,
             last_wal_payload_bytes: 0,
+            wal_serialize_buf: Vec::new(),
             last_commit_profile: CommitProfile::default(),
             checkpoint_account_trie_nodes,
             shutdown_complete: false,
@@ -3376,22 +3381,39 @@ impl MptCommitStore {
         self.check_async_error()
     }
 
-    /// Write WAL entry synchronously (serialize + CRC + metadata + file write).
+    /// Write WAL entry synchronously.  Serialize + CRC run outside the WAL
+    /// mutex (using a reusable buffer) so the lock only covers the file write
+    /// and index update — reducing contention with the background worker's
+    /// concurrent `set_durable_version` calls.
     fn append_shadow_wal_entry(&mut self, entry: &CommitWalEntry) -> Result<()> {
         let Some(wal_store) = self.wal_store.as_ref() else {
             return Ok(());
         };
+
+        // ── Serialize + CRC outside the lock (CPU work, no shared state) ──
+        let serialize_start = std::time::Instant::now();
+        self.wal_serialize_buf.clear();
+        postcard::to_io(entry, &mut self.wal_serialize_buf)
+            .map_err(|e| MptDbError::Other(format!("serialize wal entry: {e}")))?;
+        let serialize_elapsed = serialize_start.elapsed();
+        let crc_start = std::time::Instant::now();
+        let crc = crc32fast::hash(&self.wal_serialize_buf);
+        let crc_elapsed = crc_start.elapsed();
+        let payload_len = self.wal_serialize_buf.len() as u32;
+
+        // ── Lock: file write + index update only ──
         let lock_wait_start = std::time::Instant::now();
         let mut wal_store = wal_store.lock();
         let lock_wait = lock_wait_start.elapsed();
         let write_start = std::time::Instant::now();
-        wal_store.append_entry(entry)?;
+        wal_store.append_prebuilt(entry.version, &self.wal_serialize_buf, crc)?;
         let write_elapsed = write_start.elapsed();
+
         self.last_wal_append_lock_wait = lock_wait;
         self.last_wal_append_write = write_elapsed;
-        self.last_wal_serialize = wal_store.last_serialize_elapsed;
-        self.last_wal_crc = wal_store.last_crc_elapsed;
-        self.last_wal_payload_bytes = wal_store.last_payload_bytes;
+        self.last_wal_serialize = serialize_elapsed;
+        self.last_wal_crc = crc_elapsed;
+        self.last_wal_payload_bytes = payload_len;
 
         if self.config.wal_shadow_validate {
             let stored = wal_store.load_entry(entry.version)?;
@@ -4314,7 +4336,7 @@ impl MptCommitStore {
                                 .iter()
                                 .map(|c| CommitWalStorageChange {
                                     hashed_slot: c.hashed_slot,
-                                    value: c.value,
+                                    value: c.value.to_be_bytes(),
                                 })
                                 .collect();
                             sc.sort_by(|a, b| a.hashed_slot.cmp(&b.hashed_slot));
@@ -4323,7 +4345,7 @@ impl MptCommitStore {
                                 hashed_address,
                                 info: info.as_ref().map(|i| CommitWalAccountInfo {
                                     nonce: i.nonce,
-                                    balance: i.balance,
+                                    balance: i.balance.to_be_bytes(),
                                     code_hash: i.code_hash,
                                 }),
                                 storage_wiped,

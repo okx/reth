@@ -23,6 +23,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 schnellru = { workspace = true }
 bincode = { workspace = true }
+postcard = { workspace = true }
 crc32fast = { workspace = true }
 memmap2 = { workspace = true }
 
