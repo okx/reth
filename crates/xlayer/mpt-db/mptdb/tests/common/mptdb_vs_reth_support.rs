@@ -51,6 +51,9 @@ pub struct MptdbTotals {
     pub wal_append: Duration,
     pub wal_append_lock_wait: Duration,
     pub wal_append_write: Duration,
+    pub wal_serialize: Duration,
+    pub wal_crc: Duration,
+    pub wal_payload_bytes: u64,
     pub wal_replay: Duration,
     pub durable_materialize: Duration,
     pub published_materialize: Duration,
@@ -361,6 +364,9 @@ fn accumulate_mptdb_profile(totals: &mut MptdbTotals, profile: &CommitProfile) {
     totals.wal_append += profile.wal_append;
     totals.wal_append_lock_wait += profile.wal_append_lock_wait;
     totals.wal_append_write += profile.wal_append_write;
+    totals.wal_serialize += profile.wal_serialize;
+    totals.wal_crc += profile.wal_crc;
+    totals.wal_payload_bytes += profile.wal_payload_bytes as u64;
     totals.wal_replay += profile.wal_replay;
     totals.durable_materialize += profile.durable_materialize;
     totals.published_materialize += profile.published_materialize;
@@ -747,6 +753,12 @@ pub fn print_mpt_run(run: &MptRun) {
         fmt_ms(run.totals.wal_append_lock_wait / run.blocks_len)
     );
     println!("    wal_write:         {} ms", fmt_ms(run.totals.wal_append_write / run.blocks_len));
+    println!(
+        "      serialize:       {} ms ({} KB)",
+        fmt_ms(run.totals.wal_serialize / run.blocks_len),
+        run.totals.wal_payload_bytes / run.blocks_len as u64 / 1024
+    );
+    println!("      crc:             {} ms", fmt_ms(run.totals.wal_crc / run.blocks_len));
     println!("  persist:             {} ms", fmt_ms(run.totals.persist / run.blocks_len));
     println!("  cache_publish:       {} ms", fmt_ms(run.totals.cache_publish / run.blocks_len));
     println!("  cache_prep:          {} ms", fmt_ms(run.totals.commit_cache_prep / run.blocks_len));

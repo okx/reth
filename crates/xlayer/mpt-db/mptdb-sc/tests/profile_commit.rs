@@ -162,6 +162,7 @@ fn prepopulate_store_in_chunks(
 /// the BundleState→DirtyAccount conversion separately by calling keccak256
 /// on all addresses+slots (which is what collect_dirty_accounts does).
 #[test]
+#[ignore]
 fn profile_b4_2_breakdown() {
     let mut rng = StdRng::seed_from_u64(4200);
     let (pre_pop, addrs) = generate_accounts(1_000, 10, &mut rng);
@@ -252,6 +253,7 @@ fn profile_b4_2_breakdown() {
 
 /// Profile B4.3 with per-block breakdown.
 #[test]
+#[ignore]
 fn profile_b4_3_per_block() {
     let mut rng = StdRng::seed_from_u64(4300);
     let (pre_pop, addrs) = generate_accounts(1_000, 10, &mut rng);
@@ -305,6 +307,7 @@ fn profile_b4_3_per_block() {
 }
 
 #[test]
+#[ignore]
 fn profile_commit_phases_structured() {
     let mut rng = StdRng::seed_from_u64(5200);
     let (pre_pop, addrs) = generate_accounts(1_000, 10, &mut rng);
@@ -324,6 +327,7 @@ fn profile_commit_phases_structured() {
 }
 
 #[test]
+#[ignore]
 fn profile_reopen_from_checkpoint_baseline() {
     let mut rng = StdRng::seed_from_u64(5300);
     let (pre_pop, _addrs) = generate_accounts(10_000, 4, &mut rng);

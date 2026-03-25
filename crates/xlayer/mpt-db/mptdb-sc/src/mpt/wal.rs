@@ -270,6 +270,10 @@ pub struct CommitWalStore {
     /// Cached file handle for the current append segment.
     /// Avoids open/stat/close syscalls on every append_entry call.
     active_segment: Option<(u32, std::io::BufWriter<File>)>,
+    /// Diagnostic: last append_entry sub-phase timings.
+    pub last_serialize_elapsed: std::time::Duration,
+    pub last_crc_elapsed: std::time::Duration,
+    pub last_payload_bytes: u32,
 }
 
 impl CommitWalStore {
@@ -303,7 +307,17 @@ impl CommitWalStore {
             meta.durable_version = meta.latest_version;
         }
 
-        Ok(Self { dir, meta_path, meta, index, segments, active_segment: None })
+        Ok(Self {
+            dir,
+            meta_path,
+            meta,
+            index,
+            segments,
+            active_segment: None,
+            last_serialize_elapsed: std::time::Duration::ZERO,
+            last_crc_elapsed: std::time::Duration::ZERO,
+            last_payload_bytes: 0,
+        })
     }
 
     pub fn latest_version(&self) -> i64 {
@@ -349,16 +363,20 @@ impl CommitWalStore {
         }
 
         let segment_id = self.next_append_segment_id();
+        let serialize_start = std::time::Instant::now();
         let payload = bincode::serialize(entry)
             .map_err(|e| MptDbError::Other(format!("serialize wal entry: {e}")))?;
+        let serialize_elapsed = serialize_start.elapsed();
+        let crc_start = std::time::Instant::now();
         let crc = crc32fast::hash(&payload);
+        let crc_elapsed = crc_start.elapsed();
         let payload_len = payload.len() as u32;
+        self.last_serialize_elapsed = serialize_elapsed;
+        self.last_crc_elapsed = crc_elapsed;
+        self.last_payload_bytes = payload_len;
 
         // Reuse the cached file handle if we're appending to the same segment.
-        // This avoids open/stat/close syscalls on every call — matching sei-db's
-        // buffered WAL writer model.
         if self.active_segment.as_ref().map_or(true, |(id, _)| *id != segment_id) {
-            // Flush and close the old segment if switching.
             if let Some((_, old_writer)) = self.active_segment.take() {
                 drop(old_writer);
             }
@@ -392,8 +410,6 @@ impl CommitWalStore {
         }
 
         let (_, writer) = self.active_segment.as_mut().unwrap();
-        // Track offset from the segment range instead of calling stream_position
-        // (which flushes the BufWriter buffer due to seek internally).
         let offset =
             self.segments.get(&segment_id).map_or(WAL_SEGMENT_HEADER_LEN as u64, |r| r.valid_end);
 
@@ -410,9 +426,12 @@ impl CommitWalStore {
         writer
             .write_all(&payload)
             .map_err(|e| MptDbError::Other(format!("write wal record payload: {e}")))?;
-        // No flush or fsync here — matching sei-db's async WAL model.
-        // Data stays in the BufWriter's 128KB buffer until buffer is full
-        // or the file handle is dropped/flushed on segment switch or close.
+        // Flush the BufWriter so the record is visible to readers that open
+        // the same segment file (e.g. load_entry, CommitWalStore::open rescan).
+        // This only writes any remaining buffered bytes to the OS page cache —
+        // no fsync, no disk durability guarantee.  Matches the existing
+        // "no fsync" WAL model while fixing read-after-write visibility.
+        writer.flush().map_err(|e| MptDbError::Other(format!("flush wal segment: {e}")))?;
 
         let record_end = offset + WAL_RECORD_HEADER_LEN as u64 + payload_len as u64;
         self.index.insert(entry.version, WalLocation { segment_id, offset, len: payload_len });
@@ -434,8 +453,6 @@ impl CommitWalStore {
             self.meta.earliest_version = entry.version;
         }
         self.meta.latest_version = entry.version;
-        // Skip save_meta here — earliest/latest are recoverable from scan_segments.
-        // Only durable_version (set via set_durable_version) needs explicit meta persistence.
         Ok(())
     }
 
@@ -602,11 +619,7 @@ impl CommitWalStore {
             return Ok(());
         }
         self.meta.durable_version = version;
-        // Defer meta persistence — durable_version is recoverable from
-        // scan_segments on restart (clamped to latest_version).  The
-        // save_meta() call was the main source of Mutex contention between
-        // the background worker and the frontend's append_entry path.
-        // Meta is saved on close/checkpoint instead.
+        self.save_meta()?;
         Ok(())
     }
 

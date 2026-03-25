@@ -85,25 +85,30 @@ impl MutableTrieArena {
     /// Precondition: both self and donor overlays must be empty (zero entries).
     /// Self has zero capacity (just cloned frozen-only); donor has capacity from
     /// the previous block's apply phase, which was cleared by `freeze()`.
+    /// Returns true if the overlay is in a reusable state: no pending node
+    /// modifications that haven't been frozen.  `hash_cache_overlay` may be
+    /// non-empty (populated by `root_hash_only` after `freeze()` early-exits
+    /// when there are no node changes) — this is legitimate and the entries
+    /// are valid for the shared frozen base.
+    pub fn is_overlay_reusable(&self) -> bool {
+        self.overlay_nodes.is_empty() && self.appended_nodes.is_empty() && self.dirty.is_empty()
+    }
+
     pub fn steal_overlay_capacity_from(&mut self, donor: &mut Self) {
         debug_assert!(
             self.overlay_nodes.is_empty(),
             "self overlay_nodes must be empty before steal"
-        );
-        debug_assert!(
-            self.hash_cache_overlay.is_empty(),
-            "self hash_cache_overlay must be empty before steal"
         );
         debug_assert!(self.dirty.is_empty(), "self dirty must be empty before steal");
         debug_assert!(
             donor.overlay_nodes.is_empty(),
             "donor overlay_nodes must be empty (freeze() not called?)"
         );
-        debug_assert!(
-            donor.hash_cache_overlay.is_empty(),
-            "donor hash_cache_overlay must be empty (freeze() not called?)"
-        );
         debug_assert!(donor.dirty.is_empty(), "donor dirty must be empty (freeze() not called?)");
+        // Note: hash_cache_overlay is NOT required to be empty — freeze()
+        // early-exits without draining it when overlay_nodes is empty.
+        // Swapping it into self gives the working trie valid cached hashes
+        // for unchanged nodes in the shared frozen base.
 
         std::mem::swap(&mut self.overlay_nodes, &mut donor.overlay_nodes);
         std::mem::swap(&mut self.appended_nodes, &mut donor.appended_nodes);

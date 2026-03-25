@@ -1181,10 +1181,15 @@ impl PublishedBaselineManager {
         }
 
         let start = locator.page_off as usize;
-        let page_header =
-            read_page_header(old_data.get(start..).ok_or_else(|| {
-                MptDbError::Other("segment remap page out of bounds".to_string())
-            })?)?;
+        let page_header = read_page_header(old_data.get(start..).ok_or_else(|| {
+            MptDbError::Other(format!(
+                "segment remap page out of bounds: page_off={}, data_len={}, root={}, record_off={}",
+                locator.page_off,
+                old_data.len(),
+                locator.root,
+                locator.record_off
+            ))
+        })?)?;
         if page_header.root_record_off != locator.record_off {
             return Err(MptDbError::Other("segment remap root record offset mismatch".to_string()));
         }

@@ -81,6 +81,11 @@ impl StorageTrieCow {
     /// `clear_pending_lazy()` via `set_committed_base`).  After the transfer,
     /// donor holds zero-capacity structures (O(1) drop) while self has
     /// pre-allocated backing (no HashMap resizes on first block of writes).
+    /// Returns true if the overlay is in a reusable state for steal.
+    pub fn is_overlay_reusable(&self) -> bool {
+        self.arena.is_overlay_reusable()
+    }
+
     pub fn steal_overlay_capacity_from(&mut self, donor: &mut Self) {
         self.arena.steal_overlay_capacity_from(&mut donor.arena);
         // pending_lazy_children is always cleared by set_committed_base ->
@@ -375,15 +380,12 @@ impl StorageTrieCow {
             CowRootRef::Lazy(CowLazyNodeRef::Segment(root_ref))
                 if self.arena.is_empty() && self.pending_lazy_children.is_empty() =>
             {
-                let reader = StorageTrieSegmentReader::open_shared_page(
-                    root_ref.page_lease(),
-                    root_ref.page_lease().root(),
-                    root_ref.page_lease().root_record_off(),
-                )?;
-                let trace = reader.cursor().trace_paths(touched_keys)?;
-                let (arena, root) = trace.into_parts();
-                self.arena = arena;
-                self.root = root.map(CowRootRef::Arena).unwrap_or(CowRootRef::Empty);
+                // Keep the segment root lazy. `trace_paths()` materializes only
+                // touched paths but does not preserve deferred segment children,
+                // which can break subsequent delete/collapse when untouched
+                // siblings are needed. Let apply_change() materialize on-demand
+                // via `mutate_segment_node` so pending segment refs stay valid.
+                let _ = root_ref;
             }
             CowRootRef::Lazy(CowLazyNodeRef::Persisted(root))
                 if self.arena.is_empty() && self.pending_lazy_children.is_empty() =>
