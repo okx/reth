@@ -136,10 +136,25 @@ impl StorageTrieCow {
             return Ok(Self::empty());
         }
 
-        if !use_async && let Some(segment) = published_segment {
+        // If a pre-built published segment is available (sync path), convert
+        // to lazy segment reference immediately — keeps L2 cache lightweight.
+        if let Some(segment) = published_segment {
             return Ok(Self::from_segment_page(segment.clone().into_page_lease()));
         }
 
+        // Async path (wal_first): background worker builds segments later.
+        // Don't serialize the trie into a segment here — that work would be
+        // duplicated by the worker.  Just keep the materialized trie as-is;
+        // it will be converted to a lazy reference when the worker publishes
+        // and the L2 entry is reloaded from L3 on a future cache miss.
+        if use_async {
+            self.clear_dirty();
+            return Ok(self);
+        }
+
+        // Sync path without pre-built segment: build segment inline so the
+        // L2 cache stores a lightweight lazy reference instead of the full
+        // materialized arena.
         if let Some(root_idx) = self.root_index() {
             let nodes = self.arena_nodes();
             let hashes = self.arena_hash_cache();
