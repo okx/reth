@@ -98,9 +98,18 @@ impl StorageTrieCow {
             StorageTrieSegmentReader::open_shared_page(&page, page.root(), page.root_record_off())
                 .expect("segment page lease should always reference a valid trie page");
         let root = reader.root_ref().expect("segment page lease should expose a root node ref");
+        let node_count = reader.node_count();
+        // Pre-allocate overlay capacity based on the segment's node count.
+        // L3-loaded tries start from scratch (no steal_overlay_capacity_from
+        // benefit). Without pre-sizing, preload_batched_paths triggers 7-8
+        // HashMap resizes per ~50-node trie. With pre-sizing, no resizes occur.
+        let mut arena = MutableTrieArena::new();
+        if node_count > 0 {
+            arena.reserve_overlay_entries(node_count);
+        }
         Self {
             root: CowRootRef::Lazy(CowLazyNodeRef::Segment(root)),
-            arena: MutableTrieArena::new(),
+            arena,
             pending_lazy_children: HashMap::new(),
         }
     }
@@ -142,19 +151,13 @@ impl StorageTrieCow {
             return Ok(Self::from_segment_page(segment.clone().into_page_lease()));
         }
 
-        // Async path (wal_first): background worker builds segments later.
-        // Don't serialize the trie into a segment here — that work would be
-        // duplicated by the worker.  Just keep the materialized trie as-is;
-        // it will be converted to a lazy reference when the worker publishes
-        // and the L2 entry is reloaded from L3 on a future cache miss.
-        if use_async {
-            self.clear_dirty();
-            return Ok(self);
-        }
-
-        // Sync path without pre-built segment: build segment inline so the
-        // L2 cache stores a lightweight lazy reference instead of the full
-        // materialized arena.
+        // Build segment inline so the L2 cache stores a lightweight lazy
+        // reference instead of the full materialized arena.  For the async
+        // path the worker will independently build and persist its own segment;
+        // the inline segment here is for L2 cache only and is held alive by
+        // the Arc inside the StorageTrieCow.  In non-wal_first mode RocksDB
+        // provides the fallback if the trie is evicted before the worker
+        // publishes, so this is safe regardless of use_async.
         if let Some(root_idx) = self.root_index() {
             let nodes = self.arena_nodes();
             let hashes = self.arena_hash_cache();

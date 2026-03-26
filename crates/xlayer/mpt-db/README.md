@@ -10,6 +10,11 @@ mpt-db keeps the account trie and storage tries resident in memory with a WAL (W
 - **WAL-first commits**: Block commits append a WAL entry (buffered, no fsync) and send trie data to a background worker. RocksDB is not on the critical path.
 - **Published segments**: The background worker serializes storage tries into mmap-backed segment files. Reads go through L2 cache (in-memory handles) or L3 (mmap segments).
 - **Merged apply+hash phase**: Storage slot updates and root hash computation run in a single rayon parallel pass, keeping trie data CPU-cache-hot.
+- **Overlay capacity recycling**: After each block the working trie steals the cleared-but-capacity-holding overlay HashMaps from the previous base, eliminating per-block HashMap resize allocations.
+- **Deferred handle drop**: Evicted L2 handles are dropped at the start of the next block's trie-load phase rather than on the commit critical path, removing ~400K small allocator frees from the hot path.
+- **L3 overlay pre-allocation**: Storage tries loaded from published segments are pre-sized based on their page node count, eliminating HashMap resizes during path materialisation.
+- **Multi-gen try_extend**: The published-view refresh fast path can fast-forward across multiple background-worker generations, preventing fallback to full chain rebuild under any worker lag.
+- **Empty-trie lifecycle control**: Empty-storage handles activated during apply are removed from `storage_trie_handles` after commit, preventing unbounded map growth and LRU slot pollution.
 
 ### Crate structure
 
@@ -121,8 +126,8 @@ Each updated account has its nonce and balance modified, plus **all** of its sto
 | B4.3 | 1K | 10 | 200 | 10 | 5.39 ms | 2.38 ms | **2.3x** |
 | B4.4 | 200K | 10 | 2K | 10 | 285 ms | 24 ms | **11.9x** |
 | B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 83 ms | **14.6x** |
-| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 838 ms | **10.2x** |
-| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 436 ms | **4.6x** |
+| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 839 ms | **10.1x** |
+| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 245 ms | **8.1x** |
 
 ### Workload vs real-world comparison
 
@@ -139,8 +144,8 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 
 - **Small datasets (B4.1–B4.3)**: reth's MDBX keeps everything in page cache, so both systems are fast. mpt-db's advantage is modest (1–2x) because the WAL append overhead is a significant fraction of the per-block time.
 - **Large datasets (B4.4–B4.6)**: reth's MDBX page cache becomes cold as the dataset exceeds cache capacity. Random reads from disk dominate reth's `overlay_root_with_updates` and `write_trie_updates`. mpt-db's in-memory tries are unaffected by dataset size, giving **10–15x** speedup for B4.4/B4.5.
-- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each. mpt-db completes in ~838ms; overlay capacity recycling eliminates per-block HashMap churn (~540ms drop cost → 0ms).
-- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). Overlay recycling + parallel hash for large tries + incremental published-view refresh brings B4.7 from 703ms to 436ms (-38%).
+- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each. mpt-db completes in ~839ms. The dominant cost is L3 segment load (10K L2 misses/block): deferred handle drop removes ~195ms of synchronous allocator pressure from the critical path; L3 overlay pre-allocation eliminates per-trie HashMap resize chains.
+- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). Overlay capacity recycling + parallel hash for large tries + deferred handle drop + incremental published-view refresh brings B4.7 from ~395ms to ~245ms (-38%).
 
 ### B4.6 detailed breakdown
 
@@ -153,17 +158,19 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 | `write_hashed_state` | 844 ms |
 | `commit` | 276 ms |
 
-**mpt-db (~838–1050 ms/block, varies with OS page cache):**
+**mpt-db (~839 ms/block):**
 
-| Phase | Time |
-|-------|------|
-| `trie_load` (L2 cache + L3 segment load) | 467–720 ms |
-| `slot_updates` (apply + hash merged) | 145–165 ms |
-| `account_updates` (serial account trie) | 50–65 ms |
-| `storage_roots` (collect + parallel snapshot) | 45–55 ms |
-| `wal_append` | 22–30 ms |
-| `account_root` (parallel hash) | 10–13 ms |
-| `persist` + `cache_prep` | 15–20 ms |
+| Phase | Time | Notes |
+|-------|------|-------|
+| `trie_load` (L2 cache + L3 segment load) | ~630 ms | L2 hits: ~2K, L3 hits: ~8K/block |
+| `slot_updates` (apply + hash merged) | ~155 ms | |
+| `commit` | ~170 ms | |
+| `storage_roots` (collect + parallel snapshot) | ~55 ms | `fast_path_drop` ~36ms (deferred to next block start) |
+| `wal_append` | ~25 ms | |
+| `account_updates` | ~65 ms | |
+| `account_root` (parallel hash) | ~12 ms | |
 
-L2 hits: 1,991/block, L3 hits: 7,957/block (cache_capacity=50K → 200K LRU limit).
-`trie_load` variance is dominated by macOS mmap page cache state for L3 segment decodes.
+L2 hits: ~2K/block, L3 hits: ~8K/block (cache_capacity=50K × 4 = 200K LRU limit).
+Primary bottleneck is L3 `pub_open` (mmap page access for 8K tries/block) and `changes_preload`
+(path materialisation). See `.claude/problems/b4_6_hotspot_code_analysis.md` for root cause
+analysis and planned optimisations.

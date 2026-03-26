@@ -48,6 +48,13 @@ use super::storage_cow::CowLazyNodeRef;
 #[cfg(test)]
 use alloy_primitives::U256;
 
+// B2 (SLRU / frequency-aware eviction) is deferred.
+// A two-LruMap SLRU doubles the hash-table memory footprint vs a single
+// LruMap, causing a measurable B4.5 regression (~50 ms) that outweighs the
+// B4.6 gain.  The right implementation needs a single underlying map with a
+// custom schnellru limiter that skips protected entries during eviction.
+// Tracked in arena-overlay-reuse.md TODO section.
+
 /// Test-only failure injection points for deterministic failure testing.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -514,6 +521,13 @@ pub struct MptCommitStore {
     last_commit_profile: CommitProfile,
     checkpoint_account_trie_nodes: Option<usize>,
     shutdown_complete: bool,
+    /// Handles evicted from the LRU during the current block's trie_load phase.
+    /// Dropped at the start of the NEXT block's ensure_working_storage_tries so
+    /// that the deallocation cost falls outside the commit critical path.
+    pending_drops: Vec<StorageTrieHandle>,
+    /// Addresses activated as empty tries this block (bypassed LRU registration).
+    /// Drained after commit to remove zero-value handles from storage_trie_handles.
+    empty_trie_activations: Vec<B256>,
     #[cfg(test)]
     loaded_from_checkpoint: bool,
 
@@ -699,7 +713,14 @@ impl MptCommitStore {
                          self.published_version.load(Ordering::Acquire) >= handle.base_version)
                 })
             {
-                self.storage_trie_handles.remove(&evicted);
+                // Defer the actual drop to the start of the next block's
+                // ensure_working_storage_tries. Dropping Vec<MptNode> + sub-
+                // allocations (Nibbles, value bytes) for ~50 nodes per handle
+                // at 8K evictions/block = ~400K small frees on the critical
+                // path. Deferring moves this cost off the pub_activate wall time.
+                if let Some(handle) = self.storage_trie_handles.remove(&evicted) {
+                    self.pending_drops.push(handle);
+                }
             }
         }
     }
@@ -776,6 +797,10 @@ impl MptCommitStore {
                 StorageTrieCow::empty(),
             ),
         );
+        // Empty tries are never registered in the LRU (no cross-block value).
+        // Track them so we can remove them from storage_trie_handles after
+        // commit, preventing unbounded map growth and LRU slot pollution.
+        self.empty_trie_activations.push(hashed_address);
     }
 
     fn contains_working_trie(&self, hashed_address: &B256) -> bool {
@@ -805,6 +830,12 @@ impl MptCommitStore {
         &mut self,
         dirty_accounts: &[DirtyAccount],
     ) -> Result<StorageTrieLoadStats> {
+        // Drop handles that were evicted from the LRU during the previous
+        // block's pub_activate phase. Doing it here rather than at eviction
+        // time keeps ~400K small frees (Nibbles + value bytes per MptNode)
+        // off the commit critical path.
+        drop(std::mem::take(&mut self.pending_drops));
+
         let mut stats = StorageTrieLoadStats::default();
         let mut latest_candidates: Vec<(B256, B256)> = Vec::new();
 
@@ -2618,6 +2649,9 @@ impl MptCommitStore {
                 replay_config.storage_trie_cache_capacity,
             ),
             dirty_accounts: Vec::new(),
+            pending_drops: Vec::new(),
+            empty_trie_activations: Vec::new(),
+
             persisted,
             published_baseline,
             published_meta,
@@ -3047,6 +3081,8 @@ impl MptCommitStore {
             storage_trie_handles: HashMap::new(),
             storage_trie_cache: Self::new_storage_trie_cache(config.storage_trie_cache_capacity),
             dirty_accounts: Vec::new(),
+            pending_drops: Vec::new(),
+            empty_trie_activations: Vec::new(),
             persisted,
             published_baseline,
             published_meta,
@@ -4587,6 +4623,16 @@ impl MptCommitStore {
         for (addr, cached_trie) in cached_storage_tries {
             self.cache_storage_trie(addr, cached_trie);
         }
+
+        // Remove empty-trie handles that were activated this block but never
+        // registered in the LRU. They have no cross-block value and would
+        // otherwise accumulate indefinitely in storage_trie_handles.
+        for addr in std::mem::take(&mut self.empty_trie_activations) {
+            if self.storage_trie_cache.peek(&addr).is_none() {
+                self.storage_trie_handles.remove(&addr);
+            }
+        }
+
         let cache_storage_prep_elapsed = cache_storage_prep_start.elapsed();
 
         self.last_commit_profile = CommitProfile {

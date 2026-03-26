@@ -369,6 +369,10 @@ impl<'a> StorageTrieSegmentReader<'a> {
         self.root
     }
 
+    pub fn node_count(&self) -> usize {
+        self.node_count as usize
+    }
+
     pub fn root_ref(&self) -> Result<SegmentNodeRef> {
         let lease = self.lease.as_ref().ok_or_else(|| {
             MptDbError::Other("segment root ref requires shared page lease".to_string())
