@@ -129,7 +129,8 @@ impl MutableTrieArena {
     ///
     /// `target` is the expected maximum usage for the next block.  We shrink
     /// only when `capacity > SHRINK_RATIO × target` to avoid thrashing.
-    pub fn shrink_overlay_if_oversized(&mut self, target: usize) {
+    /// Shrink overlay HashMaps if oversized.  Returns true if shrink occurred.
+    pub fn shrink_overlay_if_oversized(&mut self, target: usize) -> bool {
         const SHRINK_RATIO: usize = 4;
         if self.overlay_nodes.capacity() > SHRINK_RATIO * target.max(1) {
             self.overlay_nodes.shrink_to(target);
@@ -137,6 +138,9 @@ impl MutableTrieArena {
             self.rlp_cache.shrink_to(target);
             self.hash_cache_overlay.shrink_to(target);
             self.dirty.shrink_to(target);
+            true
+        } else {
+            false
         }
     }
 

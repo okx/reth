@@ -83,24 +83,44 @@ impl StorageTrieCow {
     /// pre-allocated backing (no HashMap resizes on first block of writes).
     /// Returns true if the overlay is in a reusable state for steal.
     pub fn is_overlay_reusable(&self) -> bool {
-        self.arena.is_overlay_reusable()
+        // pending_lazy_children must be empty before steal.  Values can contain
+        // CowChildRef::Lazy(CowLazyNodeRef::Inline(Vec<u8>)) — heap allocations
+        // from the calling thread.  Swapping a non-empty map across rayon
+        // thread boundaries causes cross-thread deallocation which triggers
+        // jemalloc guard pages.  set_committed_base -> clear_pending_lazy()
+        // ensures this is empty in the normal commit flow.
+        self.arena.is_overlay_reusable() && self.pending_lazy_children.is_empty()
     }
 
     /// Transfer overlay capacity from donor.  If `watermark_target` is Some,
     /// shrink the transferred capacity when it greatly exceeds the expected
     /// usage for the next block (watermark policy: shrink if capacity > 4×target).
+    /// Returns true if a shrink was triggered.
     pub fn steal_overlay_capacity_from(
         &mut self,
         donor: &mut Self,
         watermark_target: Option<usize>,
-    ) {
+    ) -> bool {
         self.arena.steal_overlay_capacity_from(&mut donor.arena);
-        if let Some(target) = watermark_target {
-            self.arena.shrink_overlay_if_oversized(target);
+        let shrank = if let Some(target) = watermark_target {
+            self.arena.shrink_overlay_if_oversized(target)
+        } else {
+            false
+        };
+        // Transfer pending_lazy_children capacity from donor.
+        // Safe to swap only when donor is empty: values can contain
+        // CowChildRef::Lazy(CowLazyNodeRef::Inline(Vec<u8>)) — cross-thread
+        // deallocation of non-empty maps triggers jemalloc guard pages.
+        // is_overlay_reusable() already guarantees empty when steal is reached,
+        // but double-check here for defence in depth.
+        debug_assert!(
+            donor.pending_lazy_children.is_empty(),
+            "pending_lazy_children must be empty before steal (clear_pending_lazy not called?)"
+        );
+        if donor.pending_lazy_children.is_empty() {
+            std::mem::swap(&mut self.pending_lazy_children, &mut donor.pending_lazy_children);
         }
-        // pending_lazy_children is always cleared by set_committed_base ->
-        // clear_pending_lazy() before steal is called, so capacity is
-        // typically zero.  Skip swap — not worth the complexity.
+        shrank
     }
 
     pub fn overlay_capacity(&self) -> usize {

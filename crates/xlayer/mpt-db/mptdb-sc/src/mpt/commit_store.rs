@@ -92,6 +92,17 @@ struct StorageTrieHandle {
     pre_computed: Option<(B256, StorageTrieCow)>,
 }
 
+/// Outcome of take_working_or_base_for_version, for observability counters.
+#[derive(Clone, Copy)]
+enum OverlayOutcome {
+    /// Overlay capacity was stolen from the base (lazy or clone path with reuse).
+    Stolen { shrank: bool, reused_bytes: usize },
+    /// Fell back to `base.clone()` — fresh heap allocation, no capacity reuse.
+    FreshClone,
+    /// A pre-materialised working trie already existed; no steal needed.
+    ExistingWorking,
+}
+
 impl StorageTrieHandle {
     fn activate(base_version: i64, working_version: i64, trie: StorageTrieCow) -> Self {
         Self {
@@ -141,6 +152,11 @@ impl StorageTrieHandle {
         self.working_version = None;
     }
 
+    /// Whether the base overlay is in a state where capacity steal would succeed.
+    fn base_is_overlay_reusable(&self) -> bool {
+        self.base.is_overlay_reusable()
+    }
+
     fn restore_working(&mut self, working_version: i64, trie: StorageTrieCow) {
         self.working = Some(trie);
         self.working_version = Some(working_version);
@@ -152,42 +168,40 @@ impl StorageTrieHandle {
         version: i64,
         overlay_reuse: bool,
         watermark: Option<usize>,
-    ) -> Option<StorageTrieCow> {
+    ) -> Option<(StorageTrieCow, OverlayOutcome)> {
         if self.working_version != Some(version) {
             return None;
         }
         self.working_version = None;
         if let Some(working) = self.working.take() {
-            return Some(working);
+            return Some((working, OverlayOutcome::ExistingWorking));
         }
         // Lazy materialisation: checkout_for_write deferred the clone; do it
         // now inside the rayon parallel section.  Use clone_frozen_only +
         // steal so the base ends up with zero-capacity overlays (O(1) drop)
         // and the working copy starts with pre-allocated capacity (no resizes).
         if overlay_reuse {
+            let reused_bytes = self.base.overlay_capacity();
             let mut working = self.base.clone_frozen_only();
-            working.steal_overlay_capacity_from(&mut self.base, watermark);
-            Some(working)
+            let shrank = working.steal_overlay_capacity_from(&mut self.base, watermark);
+            Some((working, OverlayOutcome::Stolen { shrank, reused_bytes }))
         } else {
-            Some(self.base.clone())
+            Some((self.base.clone(), OverlayOutcome::FreshClone))
         }
     }
 
-    /// Clone the base for a new working copy.  When the base overlay is in a
-    /// reusable state (no pending node modifications), steal its pre-allocated
-    /// HashMap/Vec capacity so the working copy avoids resize overhead and the
-    /// base drops cheaply.  Otherwise fall back to a regular clone.
     fn clone_base_with_steal(
         &mut self,
         overlay_reuse: bool,
         watermark: Option<usize>,
-    ) -> StorageTrieCow {
+    ) -> (StorageTrieCow, OverlayOutcome) {
         if overlay_reuse && self.base.is_overlay_reusable() {
+            let reused_bytes = self.base.overlay_capacity();
             let mut working = self.base.clone_frozen_only();
-            working.steal_overlay_capacity_from(&mut self.base, watermark);
-            working
+            let shrank = working.steal_overlay_capacity_from(&mut self.base, watermark);
+            (working, OverlayOutcome::Stolen { shrank, reused_bytes })
         } else {
-            self.base.clone()
+            (self.base.clone(), OverlayOutcome::FreshClone)
         }
     }
 
@@ -196,9 +210,12 @@ impl StorageTrieHandle {
         version: i64,
         overlay_reuse: bool,
         watermark: Option<usize>,
-    ) -> StorageTrieCow {
-        self.take_working_for_version(version, overlay_reuse, watermark)
-            .unwrap_or_else(|| self.clone_base_with_steal(overlay_reuse, watermark))
+    ) -> (StorageTrieCow, OverlayOutcome) {
+        if let Some(result) = self.take_working_for_version(version, overlay_reuse, watermark) {
+            result
+        } else {
+            self.clone_base_with_steal(overlay_reuse, watermark)
+        }
     }
 
     fn take_committed_base_for_retire(&mut self) -> StorageTrieCow {
@@ -423,12 +440,16 @@ pub struct CommitProfile {
     // ── Overlay reuse observability ───────────────────────────────────────
     /// Number of storage tries that successfully stole overlay capacity from
     /// the previous block's base (overlay_reuse_enabled + is_overlay_reusable).
-    pub overlay_reuse_hits: u64,
-    /// Number of storage tries that fell back to a fresh clone because the
-    /// base overlay was not in a reusable state.
-    pub overlay_reuse_misses: u64,
+    /// Tries where overlay capacity was stolen from the base (lazy or clone path).
+    pub overlay_stolen: u64,
+    /// Tries that fell back to `base.clone()` — fresh heap allocation, no reuse.
+    pub overlay_fresh_clone: u64,
+    /// Tries where a pre-materialised working trie already existed (no steal needed).
+    pub overlay_existing_working: u64,
     /// Number of overlay shrink_to_fit calls triggered by watermark policy.
     pub overlay_shrink_events: u64,
+    /// Total overlay capacity entries transferred across all steals this block.
+    pub overlay_reused_capacity_bytes: u64,
     /// Watermark (max overlay node count) recorded at the end of this block.
     pub overlay_watermark: usize,
 }
@@ -568,6 +589,11 @@ pub struct MptCommitStore {
     /// tries in the previous committed block.  Used as the watermark target for
     /// overlay capacity shrink decisions on steal.
     overlay_watermark: usize,
+    last_overlay_stolen: u64,
+    last_overlay_fresh_clone: u64,
+    last_overlay_existing_working: u64,
+    last_overlay_shrink_events: u64,
+    last_overlay_reuse_capacity_bytes: u64,
     #[cfg(test)]
     loaded_from_checkpoint: bool,
 
@@ -2714,6 +2740,11 @@ impl MptCommitStore {
             empty_trie_activations: Vec::new(),
             deferred_evictions: std::collections::VecDeque::new(),
             overlay_watermark: 0,
+            last_overlay_stolen: 0,
+            last_overlay_fresh_clone: 0,
+            last_overlay_existing_working: 0,
+            last_overlay_shrink_events: 0,
+            last_overlay_reuse_capacity_bytes: 0,
 
             persisted,
             published_baseline,
@@ -3148,6 +3179,11 @@ impl MptCommitStore {
             empty_trie_activations: Vec::new(),
             deferred_evictions: std::collections::VecDeque::new(),
             overlay_watermark: 0,
+            last_overlay_stolen: 0,
+            last_overlay_fresh_clone: 0,
+            last_overlay_existing_working: 0,
+            last_overlay_shrink_events: 0,
+            last_overlay_reuse_capacity_bytes: 0,
             persisted,
             published_baseline,
             published_meta,
@@ -4049,12 +4085,27 @@ impl MptCommitStore {
         // load that the separate storage_roots phase would incur.
         let merge_hash = self.config.wal_first_commit;
         let persisted_ref = &self.persisted;
+        let apply_stolen = std::sync::atomic::AtomicU64::new(0);
+        let apply_fresh = std::sync::atomic::AtomicU64::new(0);
+        let apply_existing = std::sync::atomic::AtomicU64::new(0);
+        let apply_shrink = std::sync::atomic::AtomicU64::new(0);
+        let apply_capacity = std::sync::atomic::AtomicU64::new(0);
         // Use parallel iteration only when there are enough handles to amortize
         // rayon dispatch overhead + allocator contention.  For fewer handles
         // (e.g., 300 contracts in B4.7), sequential is 41x faster due to
         // zero cache thrashing and zero malloc lock contention.
         let apply_one = |(hashed_address, mut handle): (B256, StorageTrieHandle)| -> Result<(B256, StorageTrieHandle)> {
-                let trie = handle.take_working_or_base_for_version(working_version, self.config.overlay_reuse_enabled, Some(self.overlay_watermark));
+                let (trie, outcome) = handle.take_working_or_base_for_version(working_version, self.config.overlay_reuse_enabled, Some(self.overlay_watermark));
+                use OverlayOutcome::*;
+                match outcome {
+                    Stolen { shrank, reused_bytes } => {
+                        apply_stolen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        apply_capacity.fetch_add(reused_bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                        if shrank { apply_shrink.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    }
+                    FreshClone => { apply_fresh.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    ExistingWorking => { apply_existing.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                }
                 let trie = match dirty_storage_accounts.get(&hashed_address) {
                     Some(dirty) => {
                         Self::apply_storage_changes_to_working(trie, persisted_ref, dirty)?
@@ -4093,6 +4144,13 @@ impl MptCommitStore {
         let updated_handles: Vec<(B256, StorageTrieHandle)> =
             dirty_handles.into_par_iter().map(apply_one).collect::<Result<_>>()?;
         self.reinsert_handles(updated_handles);
+        self.last_overlay_stolen += apply_stolen.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_overlay_fresh_clone += apply_fresh.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_overlay_existing_working +=
+            apply_existing.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_overlay_shrink_events += apply_shrink.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_overlay_reuse_capacity_bytes +=
+            apply_capacity.load(std::sync::atomic::Ordering::Relaxed);
 
         for hashed_address in &dirty_addresses {
             if !self.contains_working_trie(hashed_address) {
@@ -4135,6 +4193,16 @@ impl MptCommitStore {
     }
 
     fn apply_bundle_state_inner(&mut self, bundle: &BundleState) -> Result<()> {
+        // Reset overlay reuse counters here so they accumulate across both
+        // the apply phase (apply_dirty_accounts_inner) and the subsequent
+        // commit phase (commit_inner_with_mode), giving a true per-block total.
+        // Reset per-block overlay reuse counters — must happen in apply (not commit)
+        // so both apply-phase and commit-phase steals are included in the total.
+        self.last_overlay_stolen = 0;
+        self.last_overlay_fresh_clone = 0;
+        self.last_overlay_existing_working = 0;
+        self.last_overlay_shrink_events = 0;
+        self.last_overlay_reuse_capacity_bytes = 0;
         let collect_start = std::time::Instant::now();
         let dirty_accounts = state::collect_dirty_accounts(bundle)?;
         let collect_elapsed = collect_start.elapsed();
@@ -4250,16 +4318,38 @@ impl MptCommitStore {
         // is deferred to background segment publish.
         let hash_only = mode.wal_first;
 
+        let commit_stolen = std::sync::atomic::AtomicU64::new(0);
+        let commit_fresh = std::sync::atomic::AtomicU64::new(0);
+        let commit_existing = std::sync::atomic::AtomicU64::new(0);
+        let commit_shrink = std::sync::atomic::AtomicU64::new(0);
+        let commit_capacity = std::sync::atomic::AtomicU64::new(0);
         let compute_storage_artifact = |addr: B256,
                                         mut handle: StorageTrieHandle,
                                         persisted: &PersistedTrieStore,
                                         hash_only: bool|
          -> Result<StorageTrieCommitArtifacts> {
-            let trie = handle.take_working_or_base_for_version(
+            let (trie, outcome) = handle.take_working_or_base_for_version(
                 working_version,
                 self.config.overlay_reuse_enabled,
                 Some(self.overlay_watermark),
             );
+            use OverlayOutcome::*;
+            match outcome {
+                Stolen { shrank, reused_bytes } => {
+                    commit_stolen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    commit_capacity
+                        .fetch_add(reused_bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                    if shrank {
+                        commit_shrink.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                FreshClone => {
+                    commit_fresh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                ExistingWorking => {
+                    commit_existing.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             let hash_start = std::time::Instant::now();
             let (root, blobs, mut cow) = if hash_only {
                 let (root, cow) = trie.root_hash_only(persisted).map_err(|err| {
@@ -4370,6 +4460,15 @@ impl MptCommitStore {
             storage_segment_build_elapsed += artifact.segment_elapsed;
         }
         storage_roots_merge_elapsed = merge_start.elapsed();
+
+        // Accumulate commit-phase reuse stats.
+        self.last_overlay_stolen += commit_stolen.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_overlay_fresh_clone += commit_fresh.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_overlay_existing_working +=
+            commit_existing.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_overlay_shrink_events += commit_shrink.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_overlay_reuse_capacity_bytes +=
+            commit_capacity.load(std::sync::atomic::Ordering::Relaxed);
 
         let storage_roots_elapsed = storage_start.elapsed();
 
@@ -4784,9 +4883,11 @@ impl MptCommitStore {
             apply_storage_root_lookup: self.last_apply_storage_root_lookup,
             commit_account_set_base: acct_set_base_elapsed,
             commit_cache_storage_prep: cache_storage_prep_elapsed,
-            overlay_reuse_hits: 0,
-            overlay_reuse_misses: 0,
-            overlay_shrink_events: 0,
+            overlay_stolen: self.last_overlay_stolen,
+            overlay_fresh_clone: self.last_overlay_fresh_clone,
+            overlay_existing_working: self.last_overlay_existing_working,
+            overlay_shrink_events: self.last_overlay_shrink_events,
+            overlay_reused_capacity_bytes: self.last_overlay_reuse_capacity_bytes,
             overlay_watermark: self.overlay_watermark,
         };
 
