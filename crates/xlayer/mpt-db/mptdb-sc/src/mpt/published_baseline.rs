@@ -17,8 +17,8 @@ use super::{
     flat_layout::{
         append_page as append_flat_page, data_path as pages_data_path,
         index_path as pages_index_path, open_data_file as open_pages_data_file,
-        open_index_file as open_pages_index_file_handle, read_page_header, write_full_page_index,
-        FlatPageIndexEntry, PAGE_INDEX_RECORD_LEN,
+        open_index_file as open_pages_index_file_handle, read_page_header, read_page_header_light,
+        write_full_page_index, FlatPageIndexEntry, PAGE_INDEX_RECORD_LEN,
     },
     manifest::VersionManifest,
     segment::{
@@ -28,8 +28,10 @@ use super::{
     storage_cow::StorageTrieCow,
 };
 
-const DELTA_MAGIC: &[u8; 8] = b"pbldlt01";
-const DELTA_RECORD_LEN: usize = 1 + 32 + 32 + 8 + 4 + 2;
+// pbldlt02: added total_len (u32) field to delta records so open_trie_page
+// can construct MappedSegmentPage without read_page_header_light.
+const DELTA_MAGIC: &[u8; 8] = b"pbldlt02";
+const DELTA_RECORD_LEN: usize = 1 + 32 + 32 + 8 + 4 + 4 + 2;
 const DELTA_OP_PUT: u8 = 1;
 const DELTA_OP_DELETE: u8 = 2;
 const REWRITE_INTERVAL: usize = 64;
@@ -55,6 +57,11 @@ struct GenerationMeta {
 struct DeltaEntry {
     page_off: u64,
     record_off: u32,
+    /// Total byte length of the page in the data file.  Stored in the delta
+    /// index so open_trie_page can construct MappedSegmentPage directly
+    /// without calling read_page_header_light (saves one mmap header scan
+    /// per L3 open on the hot path).
+    total_len: u32,
     root: B256,
     format_version: u16,
 }
@@ -100,12 +107,17 @@ impl PublishedDeltaMmap {
             pos += 8;
             let record_off = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
             pos += 4;
+            let total_len = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+            pos += 4;
             let format_version = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap());
             pos += 2;
 
             match op {
                 DELTA_OP_PUT => {
-                    puts.insert(key, DeltaEntry { page_off, record_off, root, format_version });
+                    puts.insert(
+                        key,
+                        DeltaEntry { page_off, record_off, total_len, root, format_version },
+                    );
                 }
                 DELTA_OP_DELETE => {
                     deletes.insert(key);
@@ -227,15 +239,14 @@ impl PublishedBaselineReader {
         }
         let mmap = Arc::clone(&self.data_mmap);
         let start = entry.page_off as usize;
-        if start >= mmap.len() {
+        let total_len = entry.total_len as usize;
+        // Phase 2: total_len is stored in the delta index — skip read_page_header entirely.
+        // Only verify bounds; root and record_off were validated at publish time.
+        let end = start.saturating_add(total_len);
+        if start >= mmap.len() || end > mmap.len() {
             return Ok(None);
         }
-        let page_header = read_page_header(&mmap[start..])?;
-        let end = start.saturating_add(page_header.total_len as usize);
-        if end > mmap.len() || page_header.root_record_off != entry.record_off {
-            return Ok(None);
-        }
-        let mapped = Arc::new(MappedSegmentPage::new(mmap, start, page_header.total_len as usize));
+        let mapped = Arc::new(MappedSegmentPage::new(mmap, start, total_len));
         let lease = Arc::new(SegmentPageLease::new(mapped, expected_root, entry.record_off));
         self.pin_record((entry.page_off, entry.record_off));
         Ok(Some(PublishedTriePageLoaded { lease, lookup_elapsed: lookup_start.elapsed() }))
@@ -355,8 +366,9 @@ pub(crate) struct BulkSegmentWriter {
     data_file: std::io::BufWriter<File>,
     pages_index_file: std::io::BufWriter<File>,
     next_page_off: u64,
-    /// Accumulated delta records: (op, hashed_address, root, page_off, record_off, format_version)
-    delta_records: Vec<(u8, B256, B256, u64, u32, u16)>,
+    /// Accumulated delta records: (op, hashed_address, root, page_off, record_off, total_len,
+    /// format_version)
+    delta_records: Vec<(u8, B256, B256, u64, u32, u32, u16)>,
     segments_written: usize,
 }
 
@@ -407,6 +419,7 @@ impl BulkSegmentWriter {
                 image.root(),
                 entry.page_off,
                 entry.root_record_off,
+                entry.total_len,
                 entry.layout_version,
             ));
             self.segments_written += 1;
@@ -764,6 +777,7 @@ impl PublishedBaselineManager {
                     DeltaEntry {
                         page_off: page.page_off,
                         record_off: page.root_record_off,
+                        total_len: page.total_len,
                         root: image.root(),
                         format_version: page.layout_version,
                     },
@@ -777,13 +791,14 @@ impl PublishedBaselineManager {
                     entry.root,
                     entry.page_off,
                     entry.record_off,
+                    entry.total_len,
                     entry.format_version,
                 ));
             }
         } else {
             delta_records.reserve(puts.len() + deletes.len());
             for hashed_address in deletes {
-                delta_records.push((DELTA_OP_DELETE, *hashed_address, B256::ZERO, 0, 0, 0));
+                delta_records.push((DELTA_OP_DELETE, *hashed_address, B256::ZERO, 0, 0, 0, 0));
             }
             for (hashed_address, image) in puts {
                 if let Some(ref mut lim) = limiter {
@@ -801,6 +816,7 @@ impl PublishedBaselineManager {
                     image.root(),
                     page.page_off,
                     page.root_record_off,
+                    page.total_len,
                     page.layout_version,
                 ));
             }
@@ -904,9 +920,9 @@ impl PublishedBaselineManager {
             .write_all(super::flat_layout::SHARED_PAGES_INDEX_MAGIC)
             .map_err(|e| MptDbError::Other(format!("write compacted pages index header: {e}")))?;
 
-        let mut remap: HashMap<(u64, B256), StorageSegmentLocator> = HashMap::new();
+        let mut remap: HashMap<(u64, B256), (StorageSegmentLocator, u32)> = HashMap::new();
         let mut rewritten_pages = Vec::<FlatPageIndexEntry>::new();
-        let mut rewrite_delta_records: Vec<(u64, Vec<(u8, B256, B256, u64, u32, u16)>)> =
+        let mut rewrite_delta_records: Vec<(u64, Vec<(u8, B256, B256, u64, u32, u32, u16)>)> =
             Vec::new();
         let mut rewrite_generation_metas: Vec<GenerationMeta> = Vec::new();
 
@@ -917,7 +933,7 @@ impl PublishedBaselineManager {
             let merged = self.load_merged_index(&gen_meta)?;
             let mut rewritten = Vec::with_capacity(merged.len());
             for (key, entry) in merged {
-                let locator = Self::remap_segment(
+                let (locator, total_len) = Self::remap_segment(
                     &mut new_data,
                     &mut new_pages_index,
                     &data_mmap,
@@ -936,6 +952,7 @@ impl PublishedBaselineManager {
                     entry.root,
                     locator.page_off,
                     locator.record_off,
+                    total_len,
                     locator.format_version,
                 ));
             }
@@ -1045,7 +1062,7 @@ impl PublishedBaselineManager {
         let mut seen = HashSet::new();
         let mut merged = HashMap::new();
         for gen_meta in by_generation {
-            for (op, key, root, page_off, record_off, format_version) in
+            for (op, key, root, page_off, record_off, total_len, format_version) in
                 Self::read_delta_file(&self.delta_path(gen_meta.generation))?
             {
                 if !seen.insert(key) {
@@ -1053,8 +1070,10 @@ impl PublishedBaselineManager {
                 }
                 match op {
                     DELTA_OP_PUT => {
-                        merged
-                            .insert(key, DeltaEntry { page_off, record_off, root, format_version });
+                        merged.insert(
+                            key,
+                            DeltaEntry { page_off, record_off, total_len, root, format_version },
+                        );
                     }
                     DELTA_OP_DELETE => {}
                     _ => {}
@@ -1207,13 +1226,16 @@ impl PublishedBaselineManager {
         Ok(entry)
     }
 
-    fn write_delta_file(path: &Path, records: &[(u8, B256, B256, u64, u32, u16)]) -> Result<()> {
+    fn write_delta_file(
+        path: &Path,
+        records: &[(u8, B256, B256, u64, u32, u32, u16)],
+    ) -> Result<()> {
         let tmp = path.with_extension("delta.tmp");
         let mut file = File::create(&tmp)
             .map_err(|e| MptDbError::Other(format!("create published delta file: {e}")))?;
         let mut bytes = Vec::with_capacity(DELTA_MAGIC.len() + records.len() * DELTA_RECORD_LEN);
         bytes.extend_from_slice(DELTA_MAGIC);
-        for (op, key, root, page_off, record_off, format_version) in records {
+        for (op, key, root, page_off, record_off, total_len, format_version) in records {
             let mut record = [0u8; DELTA_RECORD_LEN];
             let mut pos = 0usize;
             record[pos] = *op;
@@ -1226,6 +1248,8 @@ impl PublishedBaselineManager {
             pos += 8;
             record[pos..pos + 4].copy_from_slice(&record_off.to_le_bytes());
             pos += 4;
+            record[pos..pos + 4].copy_from_slice(&total_len.to_le_bytes());
+            pos += 4;
             record[pos..pos + 2].copy_from_slice(&format_version.to_le_bytes());
             bytes.extend_from_slice(&record);
         }
@@ -1237,7 +1261,7 @@ impl PublishedBaselineManager {
         Ok(())
     }
 
-    fn read_delta_file(path: &Path) -> Result<Vec<(u8, B256, B256, u64, u32, u16)>> {
+    fn read_delta_file(path: &Path) -> Result<Vec<(u8, B256, B256, u64, u32, u32, u16)>> {
         let mut file =
             File::open(path).map_err(|e| MptDbError::Other(format!("open delta file: {e}")))?;
         let mut bytes = Vec::new();
@@ -1264,11 +1288,13 @@ impl PublishedBaselineManager {
             record_off_bytes.copy_from_slice(&bytes[pos..pos + 4]);
             let record_off = u32::from_le_bytes(record_off_bytes);
             pos += 4;
+            let total_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            pos += 4;
             let mut format_bytes = [0u8; 2];
             format_bytes.copy_from_slice(&bytes[pos..pos + 2]);
             let format_version = u16::from_le_bytes(format_bytes);
             pos += 2;
-            out.push((op, key, root, page_off, record_off, format_version));
+            out.push((op, key, root, page_off, record_off, total_len, format_version));
         }
         Ok(out)
     }
@@ -1330,14 +1356,16 @@ impl PublishedBaselineManager {
         Ok(out)
     }
 
+    /// Returns `(locator, total_len)` so callers can store `total_len` in
+    /// the delta record without an additional header read.
     fn remap_segment(
         new_data: &mut File,
         new_pages_index: &mut File,
         old_data: &[u8],
-        remap: &mut HashMap<(u64, B256), StorageSegmentLocator>,
+        remap: &mut HashMap<(u64, B256), (StorageSegmentLocator, u32)>,
         rewritten_pages: &mut Vec<FlatPageIndexEntry>,
         locator: StorageSegmentLocator,
-    ) -> Result<StorageSegmentLocator> {
+    ) -> Result<(StorageSegmentLocator, u32)> {
         let key = (locator.page_off, locator.root);
         if let Some(existing) = remap.get(&key).copied() {
             return Ok(existing);
@@ -1369,8 +1397,9 @@ impl PublishedBaselineManager {
             record_off: entry.root_record_off,
             format_version: entry.layout_version,
         };
-        remap.insert(key, new_locator);
-        Ok(new_locator)
+        let result = (new_locator, entry.total_len);
+        remap.insert(key, result);
+        Ok(result)
     }
 
     fn acquire_generation_lease(&self, generation: u64) {

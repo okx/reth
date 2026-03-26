@@ -449,7 +449,7 @@ pub struct CommitProfile {
     /// Number of overlay shrink_to_fit calls triggered by watermark policy.
     pub overlay_shrink_events: u64,
     /// Total overlay capacity entries transferred across all steals this block.
-    pub overlay_reused_capacity_bytes: u64,
+    pub overlay_reused_capacity_entries: u64,
     /// Watermark (max overlay node count) recorded at the end of this block.
     pub overlay_watermark: usize,
 }
@@ -593,7 +593,7 @@ pub struct MptCommitStore {
     last_overlay_fresh_clone: u64,
     last_overlay_existing_working: u64,
     last_overlay_shrink_events: u64,
-    last_overlay_reuse_capacity_bytes: u64,
+    last_overlay_reuse_capacity_entries: u64,
     #[cfg(test)]
     loaded_from_checkpoint: bool,
 
@@ -2744,7 +2744,7 @@ impl MptCommitStore {
             last_overlay_fresh_clone: 0,
             last_overlay_existing_working: 0,
             last_overlay_shrink_events: 0,
-            last_overlay_reuse_capacity_bytes: 0,
+            last_overlay_reuse_capacity_entries: 0,
 
             persisted,
             published_baseline,
@@ -3183,7 +3183,7 @@ impl MptCommitStore {
             last_overlay_fresh_clone: 0,
             last_overlay_existing_working: 0,
             last_overlay_shrink_events: 0,
-            last_overlay_reuse_capacity_bytes: 0,
+            last_overlay_reuse_capacity_entries: 0,
             persisted,
             published_baseline,
             published_meta,
@@ -4149,7 +4149,7 @@ impl MptCommitStore {
         self.last_overlay_existing_working +=
             apply_existing.load(std::sync::atomic::Ordering::Relaxed);
         self.last_overlay_shrink_events += apply_shrink.load(std::sync::atomic::Ordering::Relaxed);
-        self.last_overlay_reuse_capacity_bytes +=
+        self.last_overlay_reuse_capacity_entries +=
             apply_capacity.load(std::sync::atomic::Ordering::Relaxed);
 
         for hashed_address in &dirty_addresses {
@@ -4202,7 +4202,7 @@ impl MptCommitStore {
         self.last_overlay_fresh_clone = 0;
         self.last_overlay_existing_working = 0;
         self.last_overlay_shrink_events = 0;
-        self.last_overlay_reuse_capacity_bytes = 0;
+        self.last_overlay_reuse_capacity_entries = 0;
         let collect_start = std::time::Instant::now();
         let dirty_accounts = state::collect_dirty_accounts(bundle)?;
         let collect_elapsed = collect_start.elapsed();
@@ -4467,7 +4467,7 @@ impl MptCommitStore {
         self.last_overlay_existing_working +=
             commit_existing.load(std::sync::atomic::Ordering::Relaxed);
         self.last_overlay_shrink_events += commit_shrink.load(std::sync::atomic::Ordering::Relaxed);
-        self.last_overlay_reuse_capacity_bytes +=
+        self.last_overlay_reuse_capacity_entries +=
             commit_capacity.load(std::sync::atomic::Ordering::Relaxed);
 
         let storage_roots_elapsed = storage_start.elapsed();
@@ -4887,7 +4887,7 @@ impl MptCommitStore {
             overlay_fresh_clone: self.last_overlay_fresh_clone,
             overlay_existing_working: self.last_overlay_existing_working,
             overlay_shrink_events: self.last_overlay_shrink_events,
-            overlay_reused_capacity_bytes: self.last_overlay_reuse_capacity_bytes,
+            overlay_reused_capacity_entries: self.last_overlay_reuse_capacity_entries,
             overlay_watermark: self.overlay_watermark,
         };
 

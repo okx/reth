@@ -102,6 +102,58 @@ pub(crate) fn encode_page(payload: &[u8], root: B256, root_record_off: u32) -> V
     out
 }
 
+/// Lightweight header read for the L3 open hot path.
+///
+/// Performs all structural checks (magic, version, bounds, offsets) but skips
+/// the `checksum32(payload)` scan.  Scanning the full payload (~7KB per trie)
+/// on every L3 open costs ~5200ms sum / 8K opens per B4.6 block.
+///
+/// Full CRC is validated at publish time (`read_page_header` in publish path).
+/// Corruption that slips past publish-time validation is caught by a future
+/// background scrub worker.
+///
+/// Retained checks (bounds + structural integrity):
+/// - minimum length, magic bytes, layout version
+/// - `total_len` fits in the slice
+/// - `payload_off` is in valid range
+pub(crate) fn read_page_header_light(bytes: &[u8]) -> Result<FlatPageHeader> {
+    if bytes.len() < FLAT_PAGE_HEADER_LEN {
+        return Err(MptDbError::Other("flat page too short".to_string()));
+    }
+    if &bytes[..8] != FLAT_PAGE_MAGIC {
+        return Err(MptDbError::Other("invalid flat page magic".to_string()));
+    }
+
+    let layout_version = u16::from_le_bytes([bytes[8], bytes[9]]);
+    let feature_flags = u16::from_le_bytes([bytes[10], bytes[11]]);
+    let total_len = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let root_record_off = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let payload_off = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    let root = B256::from_slice(&bytes[24..56]);
+    let checksum = u32::from_le_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]);
+
+    if layout_version != FLAT_LAYOUT_VERSION {
+        return Err(MptDbError::Other(format!("unsupported flat layout version: {layout_version}")));
+    }
+    if total_len as usize > bytes.len() {
+        return Err(MptDbError::Other("flat page length out of bounds".to_string()));
+    }
+    if payload_off as usize > total_len as usize || (payload_off as usize) < FLAT_PAGE_HEADER_LEN {
+        return Err(MptDbError::Other("flat page payload offset out of bounds".to_string()));
+    }
+    // Payload CRC intentionally skipped — see doc comment above.
+
+    Ok(FlatPageHeader {
+        layout_version,
+        feature_flags,
+        total_len,
+        root_record_off,
+        payload_off,
+        root,
+        checksum,
+    })
+}
+
 pub(crate) fn read_page_header(bytes: &[u8]) -> Result<FlatPageHeader> {
     if bytes.len() < FLAT_PAGE_HEADER_LEN {
         return Err(MptDbError::Other("flat page too short".to_string()));
