@@ -57,34 +57,38 @@ pub fn decode_path(compact: &[u8]) -> Result<(Nibbles, bool), &'static str> {
     Ok((Nibbles::from_nibbles(&nibs), is_leaf))
 }
 
-/// Encode a leaf node: RLP([compact_path, value])
-pub fn encode_leaf(nibbles: &Nibbles, value: &[u8]) -> Vec<u8> {
-    let path = encode_path(nibbles, true);
-    let mut buf = Vec::new();
-    let payload_len = rlp_bytes_len(&path) + rlp_bytes_len(value);
-    Header { list: true, payload_length: payload_len }.encode(&mut buf);
-    encode_bytes(&path, &mut buf);
-    encode_bytes(value, &mut buf);
-    buf
+/// Encode a leaf node into an existing buffer: RLP([compact_path, value])
+///
+/// The caller must `clear()` `buf` before calling if it needs a clean slate.
+pub fn encode_leaf_into(buf: &mut Vec<u8>, nibbles: &Nibbles, value: &[u8]) {
+    let path_rlp_len = path_compact_rlp_len(nibbles.len());
+    let payload_len = path_rlp_len + rlp_bytes_len(value);
+    Header { list: true, payload_length: payload_len }.encode(buf);
+    write_path_rlp(buf, nibbles, true);
+    encode_bytes(value, buf);
 }
 
-/// Encode an extension node: RLP([compact_path, child_rlp_or_hash])
-pub fn encode_extension(nibbles: &Nibbles, child_rlp_or_hash: &[u8]) -> Vec<u8> {
-    let path = encode_path(nibbles, false);
-    let mut buf = Vec::new();
-    let payload_len = rlp_bytes_len(&path) + child_embed_len(child_rlp_or_hash);
-    Header { list: true, payload_length: payload_len }.encode(&mut buf);
-    encode_bytes(&path, &mut buf);
-    embed_child_bytes(child_rlp_or_hash, &mut buf);
-    buf
+/// Encode an extension node into an existing buffer: RLP([compact_path, child_rlp_or_hash])
+///
+/// The caller must `clear()` `buf` before calling if it needs a clean slate.
+pub fn encode_extension_into(buf: &mut Vec<u8>, nibbles: &Nibbles, child_rlp_or_hash: &[u8]) {
+    let path_rlp_len = path_compact_rlp_len(nibbles.len());
+    let payload_len = path_rlp_len + child_embed_len(child_rlp_or_hash);
+    Header { list: true, payload_length: payload_len }.encode(buf);
+    write_path_rlp(buf, nibbles, false);
+    embed_child_bytes(child_rlp_or_hash, buf);
 }
 
-/// Encode a branch node: RLP([child0, child1, ..., child15, value])
+/// Encode a branch node into an existing buffer: RLP([child0, ..., child15, value])
 ///
 /// children_bytes: each child's embedding bytes (inline RLP or 32-byte hash), None = empty (0x80)
 /// value: branch node's own value, None = empty
-pub fn encode_branch(children_bytes: &[Option<Vec<u8>>; 16], value: Option<&[u8]>) -> Vec<u8> {
-    let mut buf = Vec::new();
+/// The caller must `clear()` `buf` before calling if it needs a clean slate.
+pub fn encode_branch_into(
+    buf: &mut Vec<u8>,
+    children_bytes: &[Option<Vec<u8>>; 16],
+    value: Option<&[u8]>,
+) {
     let mut payload_len = 0usize;
     for child in children_bytes {
         match child {
@@ -96,19 +100,40 @@ pub fn encode_branch(children_bytes: &[Option<Vec<u8>>; 16], value: Option<&[u8]
         None => payload_len += 1, // 0x80
         Some(v) => payload_len += rlp_bytes_len(v),
     }
-
-    Header { list: true, payload_length: payload_len }.encode(&mut buf);
-
+    Header { list: true, payload_length: payload_len }.encode(buf);
     for child in children_bytes {
         match child {
             None => buf.push(0x80),
-            Some(bytes) => embed_child_bytes(bytes, &mut buf),
+            Some(bytes) => embed_child_bytes(bytes, buf),
         }
     }
     match value {
         None => buf.push(0x80),
-        Some(v) => encode_bytes(v, &mut buf),
+        Some(v) => encode_bytes(v, buf),
     }
+}
+
+/// Encode a leaf node: RLP([compact_path, value])
+pub fn encode_leaf(nibbles: &Nibbles, value: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_leaf_into(&mut buf, nibbles, value);
+    buf
+}
+
+/// Encode an extension node: RLP([compact_path, child_rlp_or_hash])
+pub fn encode_extension(nibbles: &Nibbles, child_rlp_or_hash: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_extension_into(&mut buf, nibbles, child_rlp_or_hash);
+    buf
+}
+
+/// Encode a branch node: RLP([child0, child1, ..., child15, value])
+///
+/// children_bytes: each child's embedding bytes (inline RLP or 32-byte hash), None = empty (0x80)
+/// value: branch node's own value, None = empty
+pub fn encode_branch(children_bytes: &[Option<Vec<u8>>; 16], value: Option<&[u8]>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_branch_into(&mut buf, children_bytes, value);
     buf
 }
 
@@ -169,6 +194,60 @@ fn encode_bytes(data: &[u8], buf: &mut Vec<u8>) {
 fn rlp_bytes_len(data: &[u8]) -> usize {
     let slice: &[u8] = data;
     slice.length()
+}
+
+/// RLP-encoded byte length of a compact path with `nib_len` nibbles.
+///
+/// Compact encoding is always `1 + nib_len / 2` bytes.  The first byte is
+/// always a flag (0x00/0x10/0x20/0x30 | optional nibble), so always < 0x80.
+/// RLP rules for byte strings:
+/// - compact_len == 1: single byte < 0x80 → no header, 1 byte total.
+/// - compact_len  > 1: 0x80 + len header → 1 + compact_len bytes total.
+fn path_compact_rlp_len(nib_len: usize) -> usize {
+    let compact_len = 1 + nib_len / 2;
+    if compact_len == 1 {
+        1
+    } else {
+        1 + compact_len
+    }
+}
+
+/// Write RLP-encoded compact path directly into `buf` — no intermediate Vec.
+///
+/// Equivalent to `encode_bytes(&encode_path(nibbles, is_leaf), buf)` but
+/// avoids all intermediate allocations.  Uses `Nibbles::iter()` to stream
+/// nibble values without calling `to_vec()`.
+///
+/// # Panics (debug only)
+/// Asserts `compact_len <= 55` — valid for all Ethereum key lengths (max 64
+/// nibbles → compact_len 33).  Compact paths exceeding 55 bytes would require
+/// a long-form RLP string header that this function does not implement.
+fn write_path_rlp(buf: &mut Vec<u8>, nibbles: &Nibbles, is_leaf: bool) {
+    let flag = if is_leaf { 0x20u8 } else { 0x00u8 };
+    let nib_len = nibbles.len();
+    let compact_len = 1 + nib_len / 2;
+    // Ethereum compact paths are at most 33 bytes (64 nibbles → compact_len 33).
+    // Long-form RLP string header (payload > 55 bytes) is not implemented here.
+    debug_assert!(compact_len <= 55, "compact_len {compact_len} exceeds short-string RLP limit");
+    // Write RLP string header (omitted for single byte < 0x80).
+    if compact_len > 1 {
+        buf.push(0x80 + compact_len as u8);
+    }
+    // Stream nibbles via iterator — zero allocation.
+    let mut iter = nibbles.iter();
+    if nib_len % 2 == 1 {
+        // Odd: first byte encodes flag + first nibble.
+        let first = iter.next().unwrap_or(0);
+        buf.push(flag | 0x10 | first);
+    } else {
+        // Even: first byte is just the flag.
+        buf.push(flag);
+    }
+    // Pack remaining nibbles in pairs.
+    while let Some(hi) = iter.next() {
+        let lo = iter.next().unwrap_or(0);
+        buf.push((hi << 4) | lo);
+    }
 }
 
 /// Length of an embedded child in parent's RLP.

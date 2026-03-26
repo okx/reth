@@ -3,7 +3,10 @@ use rayon::prelude::*;
 
 use super::{
     arena::MutableTrieArena,
-    encoding::{encode_branch, encode_extension, encode_leaf},
+    encoding::{
+        encode_branch, encode_branch_into, encode_extension, encode_extension_into, encode_leaf,
+        encode_leaf_into,
+    },
     hash,
     node::{ChildRef, MptNode},
 };
@@ -59,7 +62,10 @@ pub(crate) fn recompute_hash_only(arena: &mut MutableTrieArena, root: Option<u32
     match root {
         None => alloy_trie::EMPTY_ROOT_HASH,
         Some(root_idx) => {
-            let (hash, _root_rlp, nodes) = compute_node_hash_only(arena, root_idx);
+            // Both buffers allocated once per trie and reused across all nodes.
+            let mut rlp_buf = Vec::with_capacity(600); // branch node ≈ 550 bytes
+            let mut nodes = Vec::new();
+            let (hash, _embed) = compute_node_hash_only(arena, root_idx, &mut rlp_buf, &mut nodes);
             for (idx, h) in nodes {
                 arena.set_hash(idx, h);
             }
@@ -76,7 +82,7 @@ pub(crate) fn recompute_hash_only_parallel(
     match root {
         None => alloy_trie::EMPTY_ROOT_HASH,
         Some(root_idx) => {
-            let (hash, _root_rlp, nodes) = compute_node_hash_only_parallel_root(arena, root_idx);
+            let (hash, nodes) = compute_node_hash_only_parallel_root(arena, root_idx);
             for (idx, h) in nodes {
                 arena.set_hash(idx, h);
             }
@@ -234,72 +240,94 @@ fn compute_node_artifacts(arena: &MutableTrieArena, idx: u32) -> NodeArtifacts {
 // collection. Used in wal_first mode where blobs are never persisted.
 // ---------------------------------------------------------------------------
 
-/// Returns `(embed_for_parent, nodes_to_cache)`.
-/// `nodes_to_cache` is a lightweight `Vec<(u32, B256)>` — no RLP stored.
-/// The RLP is computed locally to produce the hash / embed, then dropped.
+/// Returns `embed_for_parent`.
+/// Appends any newly computed `(idx, hash)` pairs to `nodes`.
+/// `rlp_buf` is a shared scratch buffer reused across recursive calls.
 fn encode_child_for_parent_hash_only(
     arena: &MutableTrieArena,
     child: &ChildRef,
-) -> (Vec<u8>, Vec<(u32, B256)>) {
+    rlp_buf: &mut Vec<u8>,
+    nodes: &mut Vec<(u32, B256)>,
+) -> Vec<u8> {
     match child {
         ChildRef::Arena(idx) => {
             let idx = *idx;
+            // Fast path: clean node with cached hash or RLP — no encoding needed.
             if !arena.is_dirty(idx) {
                 if let Some(hash) = arena.get_hash(idx) {
-                    return (hash.to_vec(), Vec::new());
+                    return hash.to_vec();
                 }
                 if let Some(rlp) = arena.get_rlp(idx) {
                     let hash = hash::hash_rlp(rlp);
                     let embed = if rlp.len() < 32 { rlp.clone() } else { hash.to_vec() };
-                    return (embed, vec![(idx, hash)]);
+                    nodes.push((idx, hash));
+                    return embed;
                 }
             }
-            let (hash, node_rlp, nodes) = compute_node_hash_only(arena, idx);
-            let embed = if node_rlp.len() < 32 { node_rlp } else { hash.to_vec() };
-            (embed, nodes)
+            // Dirty node: recurse with shared buffers.
+            let (_hash, embed) = compute_node_hash_only(arena, idx, rlp_buf, nodes);
+            embed
         }
-        ChildRef::Inline(rlp) => (rlp.clone(), Vec::new()),
-        ChildRef::Hash(hash) => (hash.to_vec(), Vec::new()),
+        ChildRef::Inline(rlp) => rlp.clone(),
+        ChildRef::Hash(hash) => hash.to_vec(),
     }
 }
 
-/// Returns `(hash_of_this_node, rlp_of_this_node, nodes_to_cache)`.
+/// Returns `(hash_of_this_node, embed_for_parent)`.
+/// Appends all newly computed `(idx, hash)` pairs to `nodes`.
 ///
-/// The rlp is returned so the caller can compute the inline-vs-hash embed for
-/// the parent without needing to store it in the collected nodes.  All nodes
-/// in `nodes_to_cache` are lightweight `(idx, hash)` pairs — no RLP stored.
-fn compute_node_hash_only(arena: &MutableTrieArena, idx: u32) -> (B256, Vec<u8>, Vec<(u32, B256)>) {
-    let mut nodes: Vec<(u32, B256)> = Vec::new();
-
-    let rlp = match arena.get(idx) {
-        MptNode::Leaf(leaf) => encode_leaf(&leaf.nibbles, &leaf.value),
+/// `embed_for_parent` is the inline RLP bytes (if < 32 bytes) or the 32-byte
+/// hash (if >= 32 bytes) — already computed, ready for the parent to use.
+///
+/// `rlp_buf` and `nodes` are caller-owned and reused across the entire trie
+/// traversal: one allocation each per trie, not per node.
+fn compute_node_hash_only(
+    arena: &MutableTrieArena,
+    idx: u32,
+    rlp_buf: &mut Vec<u8>,
+    nodes: &mut Vec<(u32, B256)>,
+) -> (B256, Vec<u8>) {
+    rlp_buf.clear();
+    match arena.get(idx) {
+        MptNode::Leaf(leaf) => {
+            encode_leaf_into(rlp_buf, &leaf.nibbles, &leaf.value);
+        }
         MptNode::Extension(ext) => {
-            let (embed, child_nodes) = encode_child_for_parent_hash_only(arena, &ext.child);
-            nodes.extend(child_nodes);
-            encode_extension(&ext.nibbles, &embed)
+            // Encode child first (uses rlp_buf internally, extracts embed).
+            let embed = encode_child_for_parent_hash_only(arena, &ext.child, rlp_buf, nodes);
+            // Child is done with rlp_buf — encode this extension node.
+            rlp_buf.clear();
+            encode_extension_into(rlp_buf, &ext.nibbles, &embed);
         }
         MptNode::Branch(branch) => {
             let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
             for (slot, child) in branch.children.iter().enumerate() {
                 if let Some(child) = child {
-                    let (embed, child_nodes) = encode_child_for_parent_hash_only(arena, child);
+                    // embed extracted before next child touches rlp_buf.
+                    let embed = encode_child_for_parent_hash_only(arena, child, rlp_buf, nodes);
                     children_bytes[slot] = Some(embed);
-                    nodes.extend(child_nodes);
                 }
             }
-            encode_branch(&children_bytes, branch.value.as_deref())
+            // All children done — encode this branch node.
+            rlp_buf.clear();
+            encode_branch_into(rlp_buf, &children_bytes, branch.value.as_deref());
         }
-    };
+    }
 
-    let node_hash = arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
+    let node_hash = arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(rlp_buf));
+    let embed = if rlp_buf.len() < 32 {
+        rlp_buf.to_vec() // inline: small clone (< 32 bytes), unavoidable
+    } else {
+        node_hash.to_vec() // hash ref: 32 bytes, unavoidable
+    };
     nodes.push((idx, node_hash));
-    (node_hash, rlp, nodes)
+    (node_hash, embed)
 }
 
 fn compute_node_hash_only_parallel_root(
     arena: &MutableTrieArena,
     idx: u32,
-) -> (B256, Vec<u8>, Vec<(u32, B256)>) {
+) -> (B256, Vec<(u32, B256)>) {
     match arena.get(idx) {
         MptNode::Branch(branch) => {
             let child_slots: Vec<(usize, &ChildRef)> = branch
@@ -309,10 +337,14 @@ fn compute_node_hash_only_parallel_root(
                 .filter_map(|(slot, child)| child.as_ref().map(|c| (slot, c)))
                 .collect();
 
+            // Each rayon task gets its own rlp_buf and nodes — no shared mutable state.
             let child_results: Vec<(usize, Vec<u8>, Vec<(u32, B256)>)> = child_slots
                 .into_par_iter()
                 .map(|(slot, child)| {
-                    let (embed, nodes) = encode_child_for_parent_hash_only(arena, child);
+                    let mut rlp_buf = Vec::with_capacity(600);
+                    let mut nodes = Vec::new();
+                    let embed =
+                        encode_child_for_parent_hash_only(arena, child, &mut rlp_buf, &mut nodes);
                     (slot, embed, nodes)
                 })
                 .collect();
@@ -324,11 +356,18 @@ fn compute_node_hash_only_parallel_root(
                 nodes.extend(child_nodes);
             }
 
-            let rlp = encode_branch(&children_bytes, branch.value.as_deref());
-            let node_hash = arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
+            // Root branch node encoded serially after rayon collect — own rlp_buf.
+            let mut root_buf = Vec::with_capacity(600);
+            encode_branch_into(&mut root_buf, &children_bytes, branch.value.as_deref());
+            let node_hash = arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&root_buf));
             nodes.push((idx, node_hash));
-            (node_hash, rlp, nodes)
+            (node_hash, nodes)
         }
-        _ => compute_node_hash_only(arena, idx),
+        _ => {
+            let mut rlp_buf = Vec::with_capacity(600);
+            let mut nodes = Vec::new();
+            let (hash, _embed) = compute_node_hash_only(arena, idx, &mut rlp_buf, &mut nodes);
+            (hash, nodes)
+        }
     }
 }
