@@ -147,7 +147,12 @@ impl StorageTrieHandle {
         self.pre_computed = None;
     }
 
-    fn take_working_for_version(&mut self, version: i64) -> Option<StorageTrieCow> {
+    fn take_working_for_version(
+        &mut self,
+        version: i64,
+        overlay_reuse: bool,
+        watermark: Option<usize>,
+    ) -> Option<StorageTrieCow> {
         if self.working_version != Some(version) {
             return None;
         }
@@ -159,27 +164,41 @@ impl StorageTrieHandle {
         // now inside the rayon parallel section.  Use clone_frozen_only +
         // steal so the base ends up with zero-capacity overlays (O(1) drop)
         // and the working copy starts with pre-allocated capacity (no resizes).
-        let mut working = self.base.clone_frozen_only();
-        working.steal_overlay_capacity_from(&mut self.base);
-        Some(working)
+        if overlay_reuse {
+            let mut working = self.base.clone_frozen_only();
+            working.steal_overlay_capacity_from(&mut self.base, watermark);
+            Some(working)
+        } else {
+            Some(self.base.clone())
+        }
     }
 
     /// Clone the base for a new working copy.  When the base overlay is in a
     /// reusable state (no pending node modifications), steal its pre-allocated
     /// HashMap/Vec capacity so the working copy avoids resize overhead and the
     /// base drops cheaply.  Otherwise fall back to a regular clone.
-    fn clone_base_with_steal(&mut self) -> StorageTrieCow {
-        if self.base.is_overlay_reusable() {
+    fn clone_base_with_steal(
+        &mut self,
+        overlay_reuse: bool,
+        watermark: Option<usize>,
+    ) -> StorageTrieCow {
+        if overlay_reuse && self.base.is_overlay_reusable() {
             let mut working = self.base.clone_frozen_only();
-            working.steal_overlay_capacity_from(&mut self.base);
+            working.steal_overlay_capacity_from(&mut self.base, watermark);
             working
         } else {
             self.base.clone()
         }
     }
 
-    fn take_working_or_base_for_version(&mut self, version: i64) -> StorageTrieCow {
-        self.take_working_for_version(version).unwrap_or_else(|| self.clone_base_with_steal())
+    fn take_working_or_base_for_version(
+        &mut self,
+        version: i64,
+        overlay_reuse: bool,
+        watermark: Option<usize>,
+    ) -> StorageTrieCow {
+        self.take_working_for_version(version, overlay_reuse, watermark)
+            .unwrap_or_else(|| self.clone_base_with_steal(overlay_reuse, watermark))
     }
 
     fn take_committed_base_for_retire(&mut self) -> StorageTrieCow {
@@ -400,6 +419,18 @@ pub struct CommitProfile {
     pub commit_account_set_base: Duration,
     /// Time to prepare + cache 5000 storage tries back into L2 after commit.
     pub commit_cache_storage_prep: Duration,
+
+    // ── Overlay reuse observability ───────────────────────────────────────
+    /// Number of storage tries that successfully stole overlay capacity from
+    /// the previous block's base (overlay_reuse_enabled + is_overlay_reusable).
+    pub overlay_reuse_hits: u64,
+    /// Number of storage tries that fell back to a fresh clone because the
+    /// base overlay was not in a reusable state.
+    pub overlay_reuse_misses: u64,
+    /// Number of overlay shrink_to_fit calls triggered by watermark policy.
+    pub overlay_shrink_events: u64,
+    /// Watermark (max overlay node count) recorded at the end of this block.
+    pub overlay_watermark: usize,
 }
 
 #[derive(Default)]
@@ -528,6 +559,15 @@ pub struct MptCommitStore {
     /// Addresses activated as empty tries this block (bypassed LRU registration).
     /// Drained after commit to remove zero-value handles from storage_trie_handles.
     empty_trie_activations: Vec<B256>,
+    /// Addresses whose LRU eviction was blocked by the wal_first guard
+    /// (published_version < base_version).  Drained at the start of each
+    /// touch_cached_storage_trie call once the published segment has caught up.
+    /// Ordered by insertion time: once the front is still blocked, the rest are too.
+    deferred_evictions: std::collections::VecDeque<B256>,
+    /// Rolling high-water mark of overlay node count across all dirty storage
+    /// tries in the previous committed block.  Used as the watermark target for
+    /// overlay capacity shrink decisions on steal.
+    overlay_watermark: usize,
     #[cfg(test)]
     loaded_from_checkpoint: bool,
 
@@ -687,6 +727,27 @@ impl MptCommitStore {
             return;
         }
 
+        // Drain deferred evictions whose wal_first guard has now cleared.
+        // Queue is ordered by insertion time, so stop at the first still-blocked entry.
+        if self.config.wal_first_commit && !self.deferred_evictions.is_empty() {
+            let published = self.published_version.load(Ordering::Acquire);
+            while let Some(front) = self.deferred_evictions.front().copied() {
+                match self.storage_trie_handles.get(&front) {
+                    Some(handle) if !handle.has_working() && published >= handle.base_version => {
+                        self.deferred_evictions.pop_front();
+                        if let Some(handle) = self.storage_trie_handles.remove(&front) {
+                            self.pending_drops.push(handle);
+                        }
+                    }
+                    None => {
+                        // Already removed by some other path (e.g. selfdestruct).
+                        self.deferred_evictions.pop_front();
+                    }
+                    _ => break, // Guard still active; rest of queue is also blocked.
+                }
+            }
+        }
+
         let evicted = if self.storage_trie_cache.peek(&hashed_address).is_none() &&
             self.storage_trie_cache.len() >= limit
         {
@@ -699,27 +760,27 @@ impl MptCommitStore {
         let _ = self.storage_trie_cache.get_or_insert(hashed_address, || ());
 
         if let Some(evicted) = evicted {
-            if evicted != hashed_address &&
-                self.storage_trie_cache.peek(&evicted).is_none() &&
-                self.storage_trie_handles.get(&evicted).is_some_and(|handle| {
+            if evicted != hashed_address && self.storage_trie_cache.peek(&evicted).is_none() {
+                let published = self.published_version.load(Ordering::Acquire);
+                let can_evict = self.storage_trie_handles.get(&evicted).is_some_and(|handle| {
                     !handle.has_working() &&
                         // In wal_first mode, only evict if the published segment
                         // has caught up to this handle's version.  Otherwise the
                         // trie data only exists in memory — evicting would lose it
                         // since RocksDB has no nodes in wal_first mode.
-                        // Matches sei-db's invariant: trees stay resident until
-                        // their data is durably persisted (snapshot rewrite).
-                        (!self.config.wal_first_commit ||
-                         self.published_version.load(Ordering::Acquire) >= handle.base_version)
-                })
-            {
-                // Defer the actual drop to the start of the next block's
-                // ensure_working_storage_tries. Dropping Vec<MptNode> + sub-
-                // allocations (Nibbles, value bytes) for ~50 nodes per handle
-                // at 8K evictions/block = ~400K small frees on the critical
-                // path. Deferring moves this cost off the pub_activate wall time.
-                if let Some(handle) = self.storage_trie_handles.remove(&evicted) {
-                    self.pending_drops.push(handle);
+                        (!self.config.wal_first_commit || published >= handle.base_version)
+                });
+                if can_evict {
+                    if let Some(handle) = self.storage_trie_handles.remove(&evicted) {
+                        self.pending_drops.push(handle);
+                    }
+                } else if self.config.wal_first_commit &&
+                    self.storage_trie_handles.contains_key(&evicted)
+                {
+                    // Guard blocked removal: defer until published_version catches up.
+                    // The handle stays in storage_trie_handles; we track the address
+                    // here so it gets cleaned up once the segment is published.
+                    self.deferred_evictions.push_back(evicted);
                 }
             }
         }
@@ -2651,6 +2712,8 @@ impl MptCommitStore {
             dirty_accounts: Vec::new(),
             pending_drops: Vec::new(),
             empty_trie_activations: Vec::new(),
+            deferred_evictions: std::collections::VecDeque::new(),
+            overlay_watermark: 0,
 
             persisted,
             published_baseline,
@@ -3083,6 +3146,8 @@ impl MptCommitStore {
             dirty_accounts: Vec::new(),
             pending_drops: Vec::new(),
             empty_trie_activations: Vec::new(),
+            deferred_evictions: std::collections::VecDeque::new(),
+            overlay_watermark: 0,
             persisted,
             published_baseline,
             published_meta,
@@ -3989,7 +4054,7 @@ impl MptCommitStore {
         // (e.g., 300 contracts in B4.7), sequential is 41x faster due to
         // zero cache thrashing and zero malloc lock contention.
         let apply_one = |(hashed_address, mut handle): (B256, StorageTrieHandle)| -> Result<(B256, StorageTrieHandle)> {
-                let trie = handle.take_working_or_base_for_version(working_version);
+                let trie = handle.take_working_or_base_for_version(working_version, self.config.overlay_reuse_enabled, Some(self.overlay_watermark));
                 let trie = match dirty_storage_accounts.get(&hashed_address) {
                     Some(dirty) => {
                         Self::apply_storage_changes_to_working(trie, persisted_ref, dirty)?
@@ -4190,7 +4255,11 @@ impl MptCommitStore {
                                         persisted: &PersistedTrieStore,
                                         hash_only: bool|
          -> Result<StorageTrieCommitArtifacts> {
-            let trie = handle.take_working_or_base_for_version(working_version);
+            let trie = handle.take_working_or_base_for_version(
+                working_version,
+                self.config.overlay_reuse_enabled,
+                Some(self.overlay_watermark),
+            );
             let hash_start = std::time::Instant::now();
             let (root, blobs, mut cow) = if hash_only {
                 let (root, cow) = trie.root_hash_only(persisted).map_err(|err| {
@@ -4575,6 +4644,19 @@ impl MptCommitStore {
         }
 
         let cache_storage_prep_start = std::time::Instant::now();
+
+        // Update overlay watermark: track the max overlay capacity across all
+        // dirty tries committed this block.  Used in steal_overlay_capacity_from
+        // to shrink oversized retained capacity on the next block's checkout.
+        {
+            let block_max = storage_cache_candidates
+                .iter()
+                .map(|(_, trie)| trie.overlay_capacity())
+                .max()
+                .unwrap_or(0);
+            self.overlay_watermark = block_max;
+        }
+
         // Fold committed working tries back into their long-lived handle bases.
         // Also write L3 fast store images (best-effort, non-fatal).
         let published_segment_map: HashMap<B256, &StorageTrieSegment> =
@@ -4702,6 +4784,10 @@ impl MptCommitStore {
             apply_storage_root_lookup: self.last_apply_storage_root_lookup,
             commit_account_set_base: acct_set_base_elapsed,
             commit_cache_storage_prep: cache_storage_prep_elapsed,
+            overlay_reuse_hits: 0,
+            overlay_reuse_misses: 0,
+            overlay_shrink_events: 0,
+            overlay_watermark: self.overlay_watermark,
         };
 
         // In wal_first mode, periodically save the account trie checkpoint

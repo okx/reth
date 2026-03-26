@@ -86,11 +86,25 @@ impl StorageTrieCow {
         self.arena.is_overlay_reusable()
     }
 
-    pub fn steal_overlay_capacity_from(&mut self, donor: &mut Self) {
+    /// Transfer overlay capacity from donor.  If `watermark_target` is Some,
+    /// shrink the transferred capacity when it greatly exceeds the expected
+    /// usage for the next block (watermark policy: shrink if capacity > 4×target).
+    pub fn steal_overlay_capacity_from(
+        &mut self,
+        donor: &mut Self,
+        watermark_target: Option<usize>,
+    ) {
         self.arena.steal_overlay_capacity_from(&mut donor.arena);
+        if let Some(target) = watermark_target {
+            self.arena.shrink_overlay_if_oversized(target);
+        }
         // pending_lazy_children is always cleared by set_committed_base ->
         // clear_pending_lazy() before steal is called, so capacity is
         // typically zero.  Skip swap — not worth the complexity.
+    }
+
+    pub fn overlay_capacity(&self) -> usize {
+        self.arena.overlay_capacity()
     }
 
     pub fn from_segment_page(page: Arc<SegmentPageLease>) -> Self {

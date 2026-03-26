@@ -39,6 +39,12 @@ pub struct MptConfig {
     /// Maximum WAL size in bytes before the frontend applies backpressure.
     /// 0 = unlimited. Enforcement is deferred to a future change.
     pub max_wal_bytes: u64,
+    /// Enable overlay capacity stealing between consecutive blocks.
+    /// When true (default), the working trie inherits the cleared overlay
+    /// capacity from the previous base, eliminating per-block HashMap resizes.
+    /// Set to false to disable and fall back to fresh allocations — useful for
+    /// bisecting regressions or diagnosing allocator issues in production.
+    pub overlay_reuse_enabled: bool,
 }
 
 impl Default for MptConfig {
@@ -59,6 +65,7 @@ impl Default for MptConfig {
             snapshot_write_rate_mb_per_sec: 0,
             checkpoint_max_account_trie_nodes: 200_000,
             max_wal_bytes: 0,
+            overlay_reuse_enabled: true,
         }
     }
 }

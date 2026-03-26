@@ -117,6 +117,29 @@ impl MutableTrieArena {
         std::mem::swap(&mut self.dirty, &mut donor.dirty);
     }
 
+    /// Return the current overlay capacity (number of entries the overlay
+    /// HashMaps can hold without reallocation).  Used for watermark tracking.
+    pub fn overlay_capacity(&self) -> usize {
+        self.overlay_nodes.capacity()
+    }
+
+    /// Shrink overlay HashMaps to the given capacity hint if their current
+    /// capacity significantly exceeds it.  Called after steal when the donor's
+    /// retained capacity is much larger than recent usage (watermark policy).
+    ///
+    /// `target` is the expected maximum usage for the next block.  We shrink
+    /// only when `capacity > SHRINK_RATIO × target` to avoid thrashing.
+    pub fn shrink_overlay_if_oversized(&mut self, target: usize) {
+        const SHRINK_RATIO: usize = 4;
+        if self.overlay_nodes.capacity() > SHRINK_RATIO * target.max(1) {
+            self.overlay_nodes.shrink_to(target);
+            self.appended_nodes.shrink_to(target);
+            self.rlp_cache.shrink_to(target);
+            self.hash_cache_overlay.shrink_to(target);
+            self.dirty.shrink_to(target);
+        }
+    }
+
     pub fn reserve_overlay_entries(&mut self, additional: usize) {
         if additional == 0 {
             return;
