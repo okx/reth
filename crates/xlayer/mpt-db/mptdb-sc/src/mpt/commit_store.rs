@@ -55,6 +55,152 @@ use alloy_primitives::U256;
 // custom schnellru limiter that skips protected entries during eviction.
 // Tracked in arena-overlay-reuse.md TODO section.
 
+const L2_FREQ_SKETCH_ROWS: usize = 4;
+const L2_FREQ_SKETCH_WIDTH: usize = 256;
+const L2_FREQ_SKETCH_AGE_INTERVAL: u64 = 65_536;
+const L2_FREQ_SEEDS: [u32; L2_FREQ_SKETCH_ROWS] =
+    [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
+
+#[derive(Clone)]
+struct CountMinSketch {
+    counters: [[u16; L2_FREQ_SKETCH_WIDTH]; L2_FREQ_SKETCH_ROWS],
+    samples: u64,
+}
+
+impl CountMinSketch {
+    fn observe(&mut self, key: &B256) {
+        let bytes = key.as_slice();
+        for row in 0..L2_FREQ_SKETCH_ROWS {
+            let idx = Self::index(bytes, row);
+            self.counters[row][idx] = self.counters[row][idx].saturating_add(1);
+        }
+        self.samples = self.samples.saturating_add(1);
+        if self.samples >= L2_FREQ_SKETCH_AGE_INTERVAL {
+            for row in &mut self.counters {
+                for value in row.iter_mut() {
+                    *value >>= 1;
+                }
+            }
+            self.samples = 0;
+        }
+    }
+
+    fn estimate(&self, key: &B256) -> u16 {
+        let bytes = key.as_slice();
+        let mut min = u16::MAX;
+        for row in 0..L2_FREQ_SKETCH_ROWS {
+            let idx = Self::index(bytes, row);
+            min = min.min(self.counters[row][idx]);
+        }
+        min
+    }
+
+    fn index(bytes: &[u8], row: usize) -> usize {
+        let off = row * 4;
+        let mut chunk = [0u8; 4];
+        chunk.copy_from_slice(&bytes[off..off + 4]);
+        let mixed = u32::from_le_bytes(chunk) ^ L2_FREQ_SEEDS[row];
+        (mixed as usize) & (L2_FREQ_SKETCH_WIDTH - 1)
+    }
+}
+
+impl Default for CountMinSketch {
+    fn default() -> Self {
+        Self { counters: [[0u16; L2_FREQ_SKETCH_WIDTH]; L2_FREQ_SKETCH_ROWS], samples: 0 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheTouchOutcome {
+    Rejected,
+    Hit,
+    Inserted { evicted: Option<B256> },
+}
+
+struct FreqAwareCache {
+    lru: LruMap<B256, (), ByLength>,
+    sketch: CountMinSketch,
+    capacity: usize,
+    admission_enabled: bool,
+}
+
+impl FreqAwareCache {
+    fn new(capacity: usize, admission_enabled: bool) -> Self {
+        Self {
+            lru: LruMap::new(ByLength::new(capacity.max(1) as u32)),
+            sketch: CountMinSketch::default(),
+            capacity,
+            admission_enabled,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn contains(&self, key: &B256) -> bool {
+        self.lru.peek(key).is_some()
+    }
+
+    fn touch_if_present(&mut self, key: &B256) -> bool {
+        // Hit check first — no sketch overhead for non-LRU keys.
+        if self.lru.get(key).is_some() {
+            return true;
+        }
+        false
+    }
+
+    fn touch(&mut self, key: B256) -> CacheTouchOutcome {
+        if self.capacity == 0 {
+            return CacheTouchOutcome::Rejected;
+        }
+
+        // Hit check before observe: L2 hits are the common case and must not
+        // pay sketch overhead. observe() is only needed for admission decisions.
+        if self.lru.get(&key).is_some() {
+            return CacheTouchOutcome::Hit;
+        }
+
+        // New key — record access frequency before making the admission decision.
+        self.observe(&key);
+
+        let mut evicted = None;
+        if self.lru.len() >= self.capacity {
+            let tail = self.lru.peek_oldest().map(|(oldest, _)| *oldest);
+            if self.admission_enabled &&
+                tail.is_some_and(|tail_key| {
+                    self.sketch.estimate(&key) < self.sketch.estimate(&tail_key)
+                })
+            {
+                return CacheTouchOutcome::Rejected;
+            }
+            evicted = tail;
+        }
+
+        let _ = self.lru.get_or_insert(key, || ());
+        CacheTouchOutcome::Inserted { evicted }
+    }
+
+    fn remove(&mut self, key: &B256) {
+        self.lru.remove(key);
+    }
+
+    fn clear(&mut self) {
+        self.lru.clear();
+        self.sketch = CountMinSketch::default();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lru.is_empty()
+    }
+
+    fn observe(&mut self, key: &B256) {
+        if self.admission_enabled {
+            self.sketch.observe(key);
+        }
+    }
+}
+
 /// Test-only failure injection points for deterministic failure testing.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -484,8 +630,8 @@ pub struct MptCommitStore {
     /// Long-lived per-account storage trie handles. Working block-local state is carried in the
     /// handle's optional `working` trie rather than a separate map.
     storage_trie_handles: HashMap<B256, StorageTrieHandle>,
-    /// Cross-block LRU index for resident storage trie bases.
-    storage_trie_cache: LruMap<B256, (), ByLength>,
+    /// Cross-block storage trie cache with optional frequency-based admission.
+    storage_trie_cache: FreqAwareCache,
     dirty_accounts: Vec<DirtyAccount>,
 
     persisted: Arc<PersistedTrieStore>,
@@ -577,6 +723,9 @@ pub struct MptCommitStore {
     /// Dropped at the start of the NEXT block's ensure_working_storage_tries so
     /// that the deallocation cost falls outside the commit critical path.
     pending_drops: Vec<StorageTrieHandle>,
+    /// Addresses whose L2 admission was rejected by frequency filter.
+    /// Cleaned up after commit if still absent from LRU.
+    rejected_activations: Vec<B256>,
     /// Addresses activated as empty tries this block (bypassed LRU registration).
     /// Drained after commit to remove zero-value handles from storage_trie_handles.
     empty_trie_activations: Vec<B256>,
@@ -606,6 +755,16 @@ pub struct MptCommitStore {
 impl MptCommitStore {
     fn diagnostics_enabled() -> bool {
         std::env::var_os("MPT_DEBUG_DIAGNOSTICS").is_some()
+    }
+
+    fn l2_freq_admission_enabled_from_env() -> bool {
+        std::env::var("MPT_L2_FREQ_ADMISSION")
+            .ok()
+            .map(|v| {
+                let lower = v.trim().to_ascii_lowercase();
+                !(lower == "0" || lower == "false" || lower == "off" || lower == "no")
+            })
+            .unwrap_or(true)
     }
 
     fn write_checkpoint_file(dir: &Path, checkpoint: &AccountTrieCheckpoint) -> Result<()> {
@@ -723,9 +882,9 @@ impl MptCommitStore {
         }
     }
 
-    fn new_storage_trie_cache(capacity: usize) -> LruMap<B256, (), ByLength> {
+    fn new_storage_trie_cache(capacity: usize) -> FreqAwareCache {
         let limit = Self::storage_trie_cache_limit(capacity);
-        LruMap::new(ByLength::new(limit.max(1) as u32))
+        FreqAwareCache::new(limit, Self::l2_freq_admission_enabled_from_env())
     }
 
     fn checkout_cached_storage_trie(&mut self, hashed_address: &B256) -> bool {
@@ -734,9 +893,7 @@ impl MptCommitStore {
             return false;
         };
         handle.checkout_for_write(working_version);
-        if self.storage_trie_cache.peek(hashed_address).is_some() {
-            let _ = self.storage_trie_cache.get(hashed_address);
-        }
+        let _ = self.storage_trie_cache.touch_if_present(hashed_address);
         true
     }
 
@@ -747,10 +904,9 @@ impl MptCommitStore {
             .map(|handle| handle.working.unwrap_or(handle.base))
     }
 
-    fn touch_cached_storage_trie(&mut self, hashed_address: B256) {
-        let limit = Self::storage_trie_cache_limit(self.config.storage_trie_cache_capacity);
-        if limit == 0 {
-            return;
+    fn touch_cached_storage_trie(&mut self, hashed_address: B256) -> bool {
+        if self.storage_trie_cache.capacity() == 0 {
+            return false;
         }
 
         // Drain deferred evictions whose wal_first guard has now cleared.
@@ -774,19 +930,17 @@ impl MptCommitStore {
             }
         }
 
-        let evicted = if self.storage_trie_cache.peek(&hashed_address).is_none() &&
-            self.storage_trie_cache.len() >= limit
-        {
-            self.storage_trie_cache.peek_oldest().map(|(oldest, _)| *oldest)
-        } else {
-            None
+        let evicted = match self.storage_trie_cache.touch(hashed_address) {
+            CacheTouchOutcome::Rejected => {
+                // Frequency admission rejects this key: keep cache unchanged.
+                return false;
+            }
+            CacheTouchOutcome::Hit => return true,
+            CacheTouchOutcome::Inserted { evicted } => evicted,
         };
 
-        self.storage_trie_cache.remove(&hashed_address);
-        let _ = self.storage_trie_cache.get_or_insert(hashed_address, || ());
-
         if let Some(evicted) = evicted {
-            if evicted != hashed_address && self.storage_trie_cache.peek(&evicted).is_none() {
+            if evicted != hashed_address && !self.storage_trie_cache.contains(&evicted) {
                 let published = self.published_version.load(Ordering::Acquire);
                 let can_evict = self.storage_trie_handles.get(&evicted).is_some_and(|handle| {
                     !handle.has_working() &&
@@ -810,11 +964,12 @@ impl MptCommitStore {
                 }
             }
         }
+        true
     }
 
     fn cache_storage_trie(&mut self, hashed_address: B256, trie: StorageTrieCow) {
         let committed_version = self.version;
-        let already_cached = self.storage_trie_cache.peek(&hashed_address).is_some();
+        let already_cached = self.storage_trie_cache.contains(&hashed_address);
         if let Some(handle) = self.storage_trie_handles.get_mut(&hashed_address) {
             handle.set_committed_base(committed_version, trie);
         } else {
@@ -822,23 +977,26 @@ impl MptCommitStore {
                 .insert(hashed_address, StorageTrieHandle::snapshot(committed_version, trie));
         }
         if !already_cached {
-            self.touch_cached_storage_trie(hashed_address);
+            if !self.touch_cached_storage_trie(hashed_address) {
+                self.rejected_activations.push(hashed_address);
+            }
         }
     }
 
     fn clear_storage_trie_state(&mut self) {
         self.storage_trie_cache.clear();
         self.storage_trie_handles.clear();
+        self.rejected_activations.clear();
     }
 
     #[cfg(test)]
     fn storage_trie_cache_contains(&self, hashed_address: &B256) -> bool {
-        self.storage_trie_cache.peek(hashed_address).is_some()
+        self.storage_trie_cache.contains(hashed_address)
     }
 
     #[cfg(test)]
     fn clone_cached_storage_trie(&mut self, hashed_address: &B256) -> Option<StorageTrieCow> {
-        if self.storage_trie_cache.peek(hashed_address).is_none() {
+        if !self.storage_trie_cache.contains(hashed_address) {
             return None;
         }
         let handle = self.storage_trie_handles.get(hashed_address)?;
@@ -872,7 +1030,9 @@ impl MptCommitStore {
             hashed_address,
             StorageTrieHandle::activate(self.version, self.current_working_version(), trie),
         );
-        self.touch_cached_storage_trie(hashed_address);
+        if !self.touch_cached_storage_trie(hashed_address) {
+            self.rejected_activations.push(hashed_address);
+        }
     }
 
     fn activate_empty_trie(&mut self, hashed_address: B256) {
@@ -2737,6 +2897,7 @@ impl MptCommitStore {
             ),
             dirty_accounts: Vec::new(),
             pending_drops: Vec::new(),
+            rejected_activations: Vec::new(),
             empty_trie_activations: Vec::new(),
             deferred_evictions: std::collections::VecDeque::new(),
             overlay_watermark: 0,
@@ -3176,6 +3337,7 @@ impl MptCommitStore {
             storage_trie_cache: Self::new_storage_trie_cache(config.storage_trie_cache_capacity),
             dirty_accounts: Vec::new(),
             pending_drops: Vec::new(),
+            rejected_activations: Vec::new(),
             empty_trie_activations: Vec::new(),
             deferred_evictions: std::collections::VecDeque::new(),
             overlay_watermark: 0,
@@ -4805,11 +4967,35 @@ impl MptCommitStore {
             self.cache_storage_trie(addr, cached_trie);
         }
 
+        // Admission-rejected handles are intentionally not inserted into L2.
+        // Remove them after commit if they are still uncached to avoid map growth.
+        for addr in std::mem::take(&mut self.rejected_activations) {
+            if !self.storage_trie_cache.contains(&addr) {
+                let published = self.published_version.load(Ordering::Acquire);
+                let can_remove = self.storage_trie_handles.get(&addr).is_some_and(|handle| {
+                    !handle.has_working() &&
+                        (!self.config.wal_first_commit || published >= handle.base_version)
+                });
+                if can_remove {
+                    if let Some(handle) = self.storage_trie_handles.remove(&addr) {
+                        self.pending_drops.push(handle);
+                    }
+                } else if self.config.wal_first_commit &&
+                    self.storage_trie_handles.contains_key(&addr)
+                {
+                    // Reuse the same deferred queue/guard used by regular LRU evictions:
+                    // once published_version catches up, touch_cached_storage_trie will drain
+                    // and retire these handles safely.
+                    self.deferred_evictions.push_back(addr);
+                }
+            }
+        }
+
         // Remove empty-trie handles that were activated this block but never
         // registered in the LRU. They have no cross-block value and would
         // otherwise accumulate indefinitely in storage_trie_handles.
         for addr in std::mem::take(&mut self.empty_trie_activations) {
-            if self.storage_trie_cache.peek(&addr).is_none() {
+            if !self.storage_trie_cache.contains(&addr) {
                 self.storage_trie_handles.remove(&addr);
             }
         }
