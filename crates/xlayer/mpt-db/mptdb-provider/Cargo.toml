@@ -32,8 +32,23 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 alloy-primitives = { workspace = true }
+alloy-consensus = { workspace = true }
 revm-database = { workspace = true }
 revm-state = { workspace = true }
+revm = { workspace = true, features = ["std"] }
 reth-storage-api = { workspace = true }
 reth-execution-types = { workspace = true }
 reth-primitives-traits = { workspace = true }
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-db = { workspace = true, features = ["test-utils"] }
+reth-chainspec = { workspace = true, features = ["test-utils"] }
+reth-static-file = { workspace = true }
+reth-ethereum-primitives = { workspace = true }
+reth-trie = { workspace = true }
+reth-trie-db = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "block_execution"
+harness = false

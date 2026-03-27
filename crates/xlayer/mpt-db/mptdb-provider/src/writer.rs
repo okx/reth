@@ -29,6 +29,32 @@ pub struct MptDbStateWriter<R> {
 }
 
 impl<R> MptDbStateWriter<R> {
+    /// Pre-populate mpt-db with genesis/initial state from a `BundleState`.
+    ///
+    /// Writes the full bundle to both SC (apply + commit) and SS (sync write).
+    /// Must be called once before the first `write_state` call.
+    ///
+    /// The SS version used is `block_number + 1` (same convention as write_state).
+    pub fn pre_populate(
+        &self,
+        bundle: &revm_database::BundleState,
+        block_number: u64,
+    ) -> ProviderResult<()> {
+        // SC: apply + commit
+        {
+            let mut sc = self.sc.lock();
+            sc.apply_bundle_state(bundle).map_err(map_err)?;
+            sc.commit().map_err(map_err)?;
+        }
+        // SS: sync write so data is immediately readable
+        let ss_version = block_number as i64 + 1;
+        let cs = bundle_to_ss_changeset(bundle);
+        self.ss.apply_changeset_sync(ss_version, &cs).map_err(map_err)?;
+        Ok(())
+    }
+}
+
+impl<R> MptDbStateWriter<R> {
     pub fn new(ss: Arc<EVMStateStore>, sc: Arc<Mutex<MptCommitStore>>) -> Self {
         Self { ss, sc, _phantom: std::marker::PhantomData }
     }
