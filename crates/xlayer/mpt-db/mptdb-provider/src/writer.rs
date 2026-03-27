@@ -1,9 +1,10 @@
 //! `StateWriter` for mpt-db.
+//!
+//! EVM reads are served by reth's PlainState (MDBX) via `StateProviderOverride`.
+//! This writer only commits to SC (MPT state root) — SS writes are removed.
 
 use mptdb_common::error::MptDbError;
-use mptdb_sc::mpt::{ss_changeset::bundle_to_ss_changeset, MptCommitStore, MptCommitter};
-use mptdb_ss::evm::store::EVMStateStore;
-use mptdb_traits::ss::StateStore as _;
+use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
 use parking_lot::Mutex;
 use reth_execution_types::ExecutionOutcome;
 use reth_storage_api::{
@@ -21,42 +22,33 @@ fn map_err(e: MptDbError) -> ProviderError {
     ProviderError::Database(reth_storage_api::errors::db::DatabaseError::Other(e.to_string()))
 }
 
-/// `StateWriter` that commits blocks to mpt-db (SC + SS).
+/// `StateWriter` that commits blocks to mpt-db SC only.
+///
+/// EVM reads are delegated to reth's PlainState (MDBX) via `StateProviderOverride`.
+/// SC provides state root computation and proof generation.
 pub struct MptDbStateWriter<R> {
-    pub ss: Arc<EVMStateStore>,
     pub sc: Arc<Mutex<MptCommitStore>>,
     _phantom: std::marker::PhantomData<R>,
 }
 
 impl<R> MptDbStateWriter<R> {
-    /// Pre-populate mpt-db with genesis/initial state from a `BundleState`.
-    ///
-    /// Writes the full bundle to both SC (apply + commit) and SS (sync write).
+    /// Pre-populate SC with genesis/initial state from a `BundleState`.
     /// Must be called once before the first `write_state` call.
-    ///
-    /// The SS version used is `block_number + 1` (same convention as write_state).
     pub fn pre_populate(
         &self,
         bundle: &revm_database::BundleState,
-        block_number: u64,
+        _block_number: u64,
     ) -> ProviderResult<()> {
-        // SC: apply + commit
-        {
-            let mut sc = self.sc.lock();
-            sc.apply_bundle_state(bundle).map_err(map_err)?;
-            sc.commit().map_err(map_err)?;
-        }
-        // SS: sync write so data is immediately readable
-        let ss_version = block_number as i64 + 1;
-        let cs = bundle_to_ss_changeset(bundle);
-        self.ss.apply_changeset_sync(ss_version, &cs).map_err(map_err)?;
+        let mut sc = self.sc.lock();
+        sc.apply_bundle_state(bundle).map_err(map_err)?;
+        sc.commit().map_err(map_err)?;
         Ok(())
     }
 }
 
 impl<R> MptDbStateWriter<R> {
-    pub fn new(ss: Arc<EVMStateStore>, sc: Arc<Mutex<MptCommitStore>>) -> Self {
-        Self { ss, sc, _phantom: std::marker::PhantomData }
+    pub fn new(sc: Arc<Mutex<MptCommitStore>>) -> Self {
+        Self { sc, _phantom: std::marker::PhantomData }
     }
 }
 
@@ -71,23 +63,9 @@ impl<R: reth_primitives_traits::Receipt + 'static> StateWriter for MptDbStateWri
     ) -> ProviderResult<()> {
         let input: WriteStateInput<'_, R> = execution_outcome.into();
         let bundle = input.state();
-        let first_block = input.first_block();
-
-        // 1. SC: apply_bundle_state + commit (synchronous)
-        {
-            let mut sc = self.sc.lock();
-            sc.apply_bundle_state(bundle).map_err(map_err)?;
-            sc.commit().map_err(map_err)?;
-        }
-
-        // 2. SS: write changeset (WAL sync on calling thread, RocksDB async)
-        // SS version = first_block + 1 to match SC's version semantics.
-        // MVCC skips version 0 (maps to 1), so we use block_number + 1 to
-        // guarantee each block occupies a distinct SS version.
-        let ss_version = first_block as i64 + 1;
-        let ss_changeset = bundle_to_ss_changeset(bundle);
-        self.ss.apply_changeset_async(ss_version, &ss_changeset).map_err(map_err)?;
-
+        let mut sc = self.sc.lock();
+        sc.apply_bundle_state(bundle).map_err(map_err)?;
+        sc.commit().map_err(map_err)?;
         Ok(())
     }
 
@@ -108,10 +86,10 @@ impl<R: reth_primitives_traits::Receipt + 'static> StateWriter for MptDbStateWri
         Ok(()) // no-op: mptdb-sc manages its own MPT
     }
 
-    fn remove_state_above(&self, _block: alloy_primitives::BlockNumber) -> ProviderResult<()> {
-        Err(ProviderError::Database(reth_storage_api::errors::db::DatabaseError::Other(
-            "mpt-db: remove_state_above (reorg) not yet implemented".into(),
-        )))
+    fn remove_state_above(&self, block: alloy_primitives::BlockNumber) -> ProviderResult<()> {
+        // SC version = block_number + 1; rollback to the version after `block`.
+        let target_version = block as i64 + 1;
+        self.sc.lock().rollback(target_version).map_err(map_err)
     }
 
     fn take_state_above(

@@ -110,10 +110,10 @@ fn write_block_get_root(
 
 fn make_provider(
     sc: Arc<Mutex<MptCommitStore>>,
-    ss: Arc<EVMStateStore>,
+    _ss: Arc<EVMStateStore>,
     version: i64,
 ) -> MptDbStateProvider {
-    MptDbStateProvider::new(ss, sc, version, noop_fallback(), noop_block_id())
+    MptDbStateProvider::new(sc, version, noop_fallback(), noop_block_id())
 }
 
 // Not needed — write_block_get_root uses apply_changeset_sync.

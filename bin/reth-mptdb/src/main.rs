@@ -1,19 +1,20 @@
 //! Reth node with mptdb as the state backend.
 //!
 //! Architecture:
-//! - **SS layer** (EVMStateStore): flat KV, O(1) account/storage reads during EVM execution
 //! - **SC layer** (MptCommitStore): always-resident MPT, computes state root per block
+//! - **PlainState** (reth MDBX): account/storage reads during EVM execution
 //!
 //! Integration points:
-//! - `StateProviderOverride`: routes account/storage reads to SS during EVM execution
-//! - `on_canonical_commit`: writes each canonical block's state to SC + SS
+//! - `StateProviderOverride`: wraps reth's default provider so state_root / proof calls are served
+//!   by SC while EVM reads (basic_account/storage) delegate to reth's PlainState via the
+//!   `default_provider` passed to the override callback.
+//! - `on_canonical_commit`: commits each canonical block's state changes to SC.
 //!
 //! Unlike reth-qmdb, state root validation is NOT skipped because mptdb uses
 //! Keccak-256 paths (same as Ethereum), so roots are valid.
 //!
 //! Environment variables:
 //! - `MPTDB_SC_PATH`: override SC data directory (default: datadir/mptdb/sc)
-//! - `MPTDB_SS_PATH`: override SS data directory (default: datadir/mptdb/ss)
 
 #![allow(missing_docs)]
 
@@ -23,10 +24,8 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::map::HashMap;
 use clap::{Args, Parser};
-use mptdb_common::config::StateStoreConfig;
 use mptdb_provider::{MptDbStateProvider, MptDbStateWriter};
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter as _};
-use mptdb_ss::factory::new_state_store;
 use parking_lot::Mutex;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_ethereum_primitives::Receipt as EthReceipt;
@@ -35,10 +34,7 @@ use reth_node_ethereum::EthereumNode;
 use reth_storage_api::StateWriter;
 use revm_database::{states::StorageSlot, AccountStatus, BundleAccount, BundleState};
 use revm_state::AccountInfo;
-use std::sync::{
-    atomic::{AtomicI64, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use tracing::info;
 
 /// No extra CLI args for reth-mptdb (all config via env vars).
@@ -159,8 +155,8 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    if let Err(err) = reth_ethereum_cli::Cli::<EthereumChainSpecParser, MptdbArgs>::parse()
-        .run(|builder, _args: MptdbArgs| async move {
+    if let Err(err) = reth_ethereum_cli::Cli::<EthereumChainSpecParser, MptdbArgs>::parse().run(
+        |builder, _args: MptdbArgs| async move {
             info!(target: "reth::cli", "Launching mptdb node");
 
             // ── mptdb paths ────────────────────────────────────────────────
@@ -168,27 +164,16 @@ fn main() {
             let sc_path = std::env::var("MPTDB_SC_PATH")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| data_dir.data_dir().join("mptdb").join("sc"));
-            let ss_path = std::env::var("MPTDB_SS_PATH")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| data_dir.data_dir().join("mptdb").join("ss"));
 
             std::fs::create_dir_all(&sc_path)?;
-            std::fs::create_dir_all(&ss_path)?;
 
-            info!(target: "reth::cli", sc = %sc_path.display(), ss = %ss_path.display(), "Opening mptdb");
+            info!(target: "reth::cli", sc = %sc_path.display(), "Opening mptdb");
 
-            // ── Open SC + SS ───────────────────────────────────────────────
+            // ── Open SC ────────────────────────────────────────────────────
             let sc = Arc::new(Mutex::new(
                 MptCommitStore::open(&sc_path, false)
                     .map_err(|e| eyre::eyre!("failed to open SC: {e}"))?,
             ));
-            let ss_config = StateStoreConfig {
-                db_directory: ss_path.to_string_lossy().to_string(),
-                keep_last_version: true,
-                ..Default::default()
-            };
-            let ss = new_state_store(&ss_config, &data_dir.data_dir().to_string_lossy())
-                .map_err(|e| eyre::eyre!("failed to open SS: {e}"))?;
 
             // ── Genesis pre-population ─────────────────────────────────────
             // Only populate if SC is at version 0 (fresh DB).
@@ -212,10 +197,7 @@ fn main() {
                                 .map(|(k, v)| {
                                     (
                                         (*k).into(),
-                                        StorageSlot::new_changed(
-                                            Default::default(),
-                                            (*v).into(),
-                                        ),
+                                        StorageSlot::new_changed(Default::default(), (*v).into()),
                                     )
                                 })
                                 .collect()
@@ -239,7 +221,7 @@ fn main() {
                     reverts_size: 0,
                 };
 
-                let writer = MptDbStateWriter::<EthReceipt>::new(ss.clone(), sc.clone());
+                let writer = MptDbStateWriter::<EthReceipt>::new(sc.clone());
                 writer
                     .pre_populate(&genesis_bundle, 0)
                     .map_err(|e| eyre::eyre!("genesis pre_populate failed: {e}"))?;
@@ -256,55 +238,45 @@ fn main() {
                 );
             }
 
-            // ── on_canonical_commit: persist each canonical block to SC+SS ─
-            // Track block number for SS version mapping (SS version = block_number + 1).
+            // ── on_canonical_commit: commit each canonical block's state to SC ─
             let sc_for_commit = sc.clone();
-            let ss_for_commit = ss.clone();
-            let commit_block_counter = Arc::new(AtomicI64::new(0));
-            let counter_for_commit = commit_block_counter.clone();
 
-            let on_canonical_commit =
-                Box::new(move |bundle: &revm_database::BundleState| {
-                    let block_number =
-                        counter_for_commit.fetch_add(1, Ordering::Relaxed) as u64;
-                    let writer =
-                        MptDbStateWriter::<EthReceipt>::new(ss_for_commit.clone(), sc_for_commit.clone());
-                    let outcome = reth_execution_types::ExecutionOutcome::<EthReceipt>::new(
-                        bundle.clone(),
-                        Default::default(),
-                        block_number + 1, // first_block (1-indexed)
-                        Default::default(),
+            let on_canonical_commit = Box::new(move |bundle: &revm_database::BundleState| {
+                let writer = MptDbStateWriter::<EthReceipt>::new(sc_for_commit.clone());
+                let outcome = reth_execution_types::ExecutionOutcome::<EthReceipt>::new(
+                    bundle.clone(),
+                    Default::default(),
+                    0, // first_block placeholder (unused by SC writer)
+                    Default::default(),
+                );
+                if let Err(e) = writer.write_state(
+                    &outcome,
+                    revm_database::OriginalValuesKnown::Yes,
+                    reth_storage_api::StateWriteConfig::default(),
+                ) {
+                    tracing::error!(
+                        target: "reth::cli",
+                        error = %e,
+                        "mptdb on_canonical_commit failed"
                     );
-                    if let Err(e) = writer.write_state(
-                        &outcome,
-                        revm_database::OriginalValuesKnown::Yes,
-                        reth_storage_api::StateWriteConfig::default(),
-                    ) {
-                        tracing::error!(
-                            target: "reth::cli",
-                            block = block_number,
-                            error = %e,
-                            "mptdb on_canonical_commit failed"
-                        );
-                    }
-                });
+                }
+            });
 
-            // ── StateProviderOverride: EVM reads go through SS ─────────────
+            // ── StateProviderOverride: SC provides state_root/proof; EVM reads
+            //   delegate to reth's default_provider (PlainState via MDBX). ──
             let sc_for_override = sc.clone();
-            let ss_for_override = ss.clone();
             let noop_block_id: Arc<dyn reth_storage_api::BlockIdReader + Send + Sync> =
                 Arc::new(reth_storage_api::noop::NoopProvider::default());
 
             let state_override: reth_provider::providers::StateProviderOverride =
                 Arc::new(move |default_provider| {
-                    // SS version for "latest" = sc.version() (= block_number + 1)
                     let version = sc_for_override.lock().version().max(0);
-                    // Wrap Box<dyn StateProvider + Send> in Mutex for Arc<dyn StateProvider + Send + Sync>
+                    // Wrap Box<dyn StateProvider + Send> in DefaultProviderWrapper
+                    // to satisfy Arc<dyn StateProvider + Send + Sync>.
                     let fallback: Arc<dyn StateProvider + Send + Sync> =
                         Arc::new(DefaultProviderWrapper(default_provider));
                     Box::new(MptDbStateProvider::new(
-                        ss_for_override.clone(),
-                        sc_for_override.clone(),
+                        Arc::clone(&sc_for_override),
                         version,
                         fallback,
                         noop_block_id.clone(),
@@ -320,10 +292,9 @@ fn main() {
             let task_executor = builder.task_executor().clone();
             let data_dir = builder.config().datadir();
 
-            let launcher =
-                EngineNodeLauncher::new(task_executor, data_dir, engine_tree_config)
-                    .with_on_canonical_commit(on_canonical_commit)
-                    .with_state_provider_override(state_override);
+            let launcher = EngineNodeLauncher::new(task_executor, data_dir, engine_tree_config)
+                .with_on_canonical_commit(on_canonical_commit)
+                .with_state_provider_override(state_override);
 
             // ── Launch ─────────────────────────────────────────────────────
             let NodeHandle { node: _node, node_exit_future } = builder
@@ -335,8 +306,8 @@ fn main() {
 
             info!(target: "reth::cli", "mptdb node launched");
             node_exit_future.await
-        })
-    {
+        },
+    ) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }

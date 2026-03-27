@@ -4,7 +4,6 @@ use crate::provider::MptDbStateProvider;
 use alloy_eips::{BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{BlockHash, BlockNumber, B256};
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter as _};
-use mptdb_ss::evm::store::EVMStateStore;
 use parking_lot::Mutex;
 use reth_chainspec::ChainInfo;
 use reth_storage_api::{
@@ -14,32 +13,27 @@ use reth_storage_api::{
 };
 use std::sync::Arc;
 
-// historical_fallback uses Arc<Mutex<StateProviderBox>> in provider.rs.
-// No unsafe Sync wrapper needed.
-
 pub struct MptDbStateProviderFactory {
-    pub ss: Arc<EVMStateStore>,
     pub sc: Arc<Mutex<MptCommitStore>>,
-    /// Fallback for non-state data (bytecode, block hashes).
+    /// Fallback provider for EVM reads and non-state data (bytecode, block hashes).
+    /// In production this is unused at factory level (reads come via StateProviderOverride).
+    /// In benchmark contexts, this is a MDBX-backed provider or bytecode-only stub.
     pub fallback: Arc<dyn StateProvider + Send + Sync>,
     pub block_id_reader: Arc<dyn BlockIdReader + Send + Sync>,
-    /// Optional factory for creating MDBX-backed historical state providers.
-    /// Used when SS data at the requested version has been pruned (Phase 2).
-    /// If `None`, pruned-data queries return a `ProviderError` with a clear message.
+    /// Optional factory for version-specific historical providers.
     pub historical_fallback_factory: Option<Arc<dyn StateProviderFactory + Send + Sync>>,
 }
 
 impl MptDbStateProviderFactory {
     pub fn new(
-        ss: Arc<EVMStateStore>,
         sc: Arc<Mutex<MptCommitStore>>,
         fallback: Arc<dyn StateProvider + Send + Sync>,
         block_id_reader: Arc<dyn BlockIdReader + Send + Sync>,
     ) -> Self {
-        Self { ss, sc, fallback, block_id_reader, historical_fallback_factory: None }
+        Self { sc, fallback, block_id_reader, historical_fallback_factory: None }
     }
 
-    /// Configure a MDBX-backed factory for historical fallback when SS data is pruned.
+    /// Configure a MDBX-backed factory for version-specific historical providers.
     pub fn with_historical_fallback(
         mut self,
         factory: Arc<dyn StateProviderFactory + Send + Sync>,
@@ -48,35 +42,18 @@ impl MptDbStateProviderFactory {
         self
     }
 
-    /// Create a `MptDbStateProvider` at `version`, optionally attaching a
-    /// historical MDBX provider when SS data at `version` may be pruned.
+    /// Create a `MptDbStateProvider` at `version`.
     fn make_provider(&self, version: i64) -> MptDbStateProvider {
-        let mut provider = MptDbStateProvider::new(
-            Arc::clone(&self.ss),
+        MptDbStateProvider::new(
             Arc::clone(&self.sc),
             version,
             Arc::clone(&self.fallback),
             Arc::clone(&self.block_id_reader),
-        );
-        // If SS doesn't have this version and we have a MDBX fallback, attach it.
-        if !self.ss.is_version_available(version) {
-            if let Some(factory) = &self.historical_fallback_factory {
-                // block_number = version - 1 (SS version = block_number + 1)
-                let block = (version - 1).max(0) as u64;
-                if let Ok(hf) = factory.history_by_block_number(block) {
-                    provider = provider.with_historical_fallback(hf);
-                }
-            }
-        }
-        provider
+        )
     }
 
     fn latest_version(&self) -> i64 {
-        // SC version = block_number + 1; SS version = block_number + 1.
-        // Both SC and SS use the same version number for the same block.
-        // SC version 0 = fresh DB (no blocks); SC version 1 = block 0.
-        // SS version for block N = N + 1 (MVCC skips version 0).
-        // So latest SS version = SC version (they are identical).
+        // SC version = block_number + 1 (version 0 = fresh DB, no blocks).
         self.sc.lock().version().max(0)
     }
 }
