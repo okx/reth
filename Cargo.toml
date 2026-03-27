@@ -195,6 +195,7 @@ members = [
     "crates/xlayer/mpt-db/mptdb-ledger",
     "crates/xlayer/mpt-db/mptdb",
     "crates/xlayer/mpt-db/mptdb-provider",
+    "bin/reth-mptdb",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]

@@ -11,7 +11,7 @@
 #![allow(missing_docs, unreachable_pub)]
 
 use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{Address, TxKind, B256, U256};
+use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use mptdb_common::config::StateStoreConfig;
 use mptdb_provider::MptDbStateWriter;
@@ -62,6 +62,22 @@ impl InMemoryCache {
         self.accounts.insert(
             addr,
             AccountInfo { nonce, balance, code_hash: KECCAK_EMPTY, code: None, account_id: None },
+        );
+    }
+
+    fn insert_contract(&mut self, addr: Address, bytecode: Bytes) {
+        let code_hash = keccak256(&bytecode);
+        let bytecode = revm::bytecode::Bytecode::new_raw(bytecode);
+        self.code_by_hash.insert(code_hash, bytecode.clone());
+        self.accounts.insert(
+            addr,
+            AccountInfo {
+                nonce: 1,
+                balance: U256::ZERO,
+                code_hash,
+                code: Some(bytecode),
+                account_id: None,
+            },
         );
     }
 
@@ -376,5 +392,114 @@ fn bench_eth_transfer(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_eth_transfer);
+// ── ERC20 benchmark ───────────────────────────────────────────────────────────
+// Minimal ERC-20 (transfer + balanceOf), solc 0.8.30, 393 bytes.
+// Balances at slot keccak256(abi.encode(holder, 0)).
+// ERC20 workload exercises storage-trie writes — the area where mptdb
+// has its main architectural advantage over reth MDBX.
+
+const ERC20_CONTRACT: Address = Address::new([0xC0; 20]);
+
+static ERC20_RUNTIME_BYTECODE: [u8; 393] = {
+    const HEX: &[u8] = b"608060405234801561000f575f5ffd5b5060043610610034575f3560e01c806370a0823114610038578063a9059cbb1461006a575b5f5ffd5b610057610046366004610104565b5f6020819052908152604090205481565b6040519081526020015b60405180910390f35b61007d610078366004610124565b61008d565b6040519015158152602001610061565b335f908152602081905260408120805483919083906100ad908490610160565b90915550506001600160a01b0383165f90815260208190526040812080548492906100d9908490610173565b9091555060019150505b92915050565b80356001600160a01b03811681146100ff575f5ffd5b919050565b5f60208284031215610114575f5ffd5b61011d826100e9565b9392505050565b5f5f60408385031215610135575f5ffd5b61013e836100e9565b946020939093013593505050565b634e487b7160e01b5f52601160045260245ffd5b818103818111156100e3576100e361014c565b808201808211156100e3576100e361014c56fea26469706673582212202ab3fe360a062c91ad12f573bd1c234812f445f817ce8adbad19c108f60a822d64736f6c634300081e0033";
+    const fn h(c: u8) -> u8 {
+        if c >= b'0' && c <= b'9' {
+            c - b'0'
+        } else {
+            c - b'a' + 10
+        }
+    }
+    let mut out = [0u8; 393];
+    let mut i = 0;
+    while i < 393 {
+        out[i] = h(HEX[i * 2]) << 4 | h(HEX[i * 2 + 1]);
+        i += 1;
+    }
+    out
+};
+
+fn erc20_balance_slot(holder: Address) -> U256 {
+    let mut buf = [0u8; 64];
+    buf[12..32].copy_from_slice(holder.as_slice());
+    U256::from_be_bytes(keccak256(buf).0)
+}
+
+fn encode_transfer(to: Address, amount: U256) -> Bytes {
+    let mut data = Vec::with_capacity(68);
+    data.extend_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]); // transfer(address,uint256)
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(to.as_slice());
+    data.extend_from_slice(&amount.to_be_bytes::<32>());
+    Bytes::from(data)
+}
+
+fn setup_erc20(cache: &mut InMemoryCache, addresses: &[Address]) {
+    cache.insert_contract(ERC20_CONTRACT, Bytes::from_static(&ERC20_RUNTIME_BYTECODE));
+    let slots = cache.storage.entry(ERC20_CONTRACT).or_default();
+    for &addr in addresses {
+        slots.insert(erc20_balance_slot(addr), U256::from(1_000_000u64));
+    }
+}
+
+fn generate_erc20_block_txs(
+    addresses: &[Address],
+    cache: &InMemoryCache,
+    rng: &mut StdRng,
+) -> Vec<Vec<TxEnv>> {
+    let mut nonces: HashMap<Address, u64> =
+        cache.accounts.iter().map(|(&a, i)| (a, i.nonce)).collect();
+    let mut blocks = Vec::with_capacity(NUM_BLOCKS);
+    for _ in 0..NUM_BLOCKS {
+        let mut used = std::collections::HashSet::new();
+        let mut txs = Vec::with_capacity(TXS_PER_BLOCK);
+        while txs.len() < TXS_PER_BLOCK {
+            let sender_idx = rng.random_range(0..addresses.len());
+            if !used.insert(sender_idx) {
+                continue;
+            }
+            let sender = addresses[sender_idx];
+            let receiver = addresses[rng.random_range(0..addresses.len())];
+            let nonce = nonces.get(&sender).copied().unwrap_or(0);
+            txs.push(TxEnv {
+                caller: sender,
+                kind: TxKind::Call(ERC20_CONTRACT),
+                value: U256::ZERO,
+                gas_limit: 100_000,
+                gas_price: 0,
+                nonce,
+                chain_id: Some(1),
+                data: encode_transfer(receiver, U256::from(100u64)),
+                ..Default::default()
+            });
+            *nonces.entry(sender).or_insert(0) += 1;
+        }
+        blocks.push(txs);
+    }
+    blocks
+}
+
+fn bench_erc20_transfer(c: &mut Criterion) {
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut cache = InMemoryCache::new();
+    let addresses = setup_accounts(&mut cache, &mut rng);
+    setup_erc20(&mut cache, &addresses);
+    let block_txs = generate_erc20_block_txs(&addresses, &cache, &mut rng);
+    let id = format!("{PRE_POP_ACCOUNTS}acc_{TXS_PER_BLOCK}tx_{NUM_BLOCKS}blk");
+
+    let mut group = c.benchmark_group("erc20_transfer");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(600));
+
+    group.bench_with_input(BenchmarkId::new("mptdb", &id), &(), |b, _| {
+        run_mptdb_bench(b, &cache, &block_txs, "mptdb/erc20");
+    });
+
+    group.bench_with_input(BenchmarkId::new("reth_mdbx", &id), &(), |b, _| {
+        run_reth_mdbx_bench(b, &cache, &block_txs, "reth_mdbx/erc20");
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_eth_transfer, bench_erc20_transfer);
 criterion_main!(benches);

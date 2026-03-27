@@ -1,0 +1,102 @@
+[package]
+name = "reth-mptdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Reth node with mptdb state backend (SS flat-KV + SC MPT)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-chainspec.workspace = true
+reth-node-builder.workspace = true
+reth-node-core.workspace = true
+reth-provider.workspace = true
+reth-cli-util.workspace = true
+reth-engine-primitives.workspace = true
+
+# ethereum
+reth-ethereum-cli.workspace = true
+reth-node-ethereum.workspace = true
+reth-ethereum-engine-primitives.workspace = true
+reth-ethereum-payload-builder.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm.workspace = true
+reth-node-api.workspace = true
+reth-transaction-pool.workspace = true
+reth-basic-payload-builder.workspace = true
+reth-payload-builder.workspace = true
+reth-payload-builder-primitives.workspace = true
+reth-payload-primitives.workspace = true
+reth-revm.workspace = true
+reth-storage-api.workspace = true
+reth-execution-types.workspace = true
+reth-errors.workspace = true
+reth-primitives-traits.workspace = true
+reth-consensus-common.workspace = true
+reth-node-metrics.workspace = true
+reth-trie-common.workspace = true
+
+# mptdb
+mptdb-provider.workspace = true
+mptdb-sc.workspace = true
+mptdb-ss.workspace = true
+mptdb-common.workspace = true
+
+# alloy
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+
+# revm
+revm-database.workspace = true
+revm-state.workspace = true
+
+# async
+tokio = { workspace = true, features = ["sync", "macros", "time", "rt-multi-thread"] }
+
+# misc
+clap = { workspace = true, features = ["derive", "env"] }
+eyre.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[features]
+default = ["jemalloc", "asm-keccak", "otlp", "js-tracer", "keccak-cache-global"]
+
+otlp = [
+    "reth-ethereum-cli/otlp",
+    "reth-node-core/otlp",
+]
+
+jemalloc = [
+    "reth-cli-util/jemalloc",
+    "reth-node-core/jemalloc",
+    "reth-ethereum-cli/jemalloc",
+]
+
+asm-keccak = [
+    "reth-node-core/asm-keccak",
+    "reth-ethereum-cli/asm-keccak",
+    "reth-node-ethereum/asm-keccak",
+    "mptdb-sc/asm-keccak",
+]
+
+js-tracer = [
+    "reth-node-ethereum/js-tracer",
+]
+
+keccak-cache-global = [
+    "reth-node-ethereum/keccak-cache-global",
+]
+
+dev = ["reth-ethereum-cli/dev"]
+
+[[bin]]
+name = "reth-mptdb"
+path = "src/main.rs"
