@@ -1,11 +1,12 @@
 use mptdb_common::{config::StateStoreConfig, evm_keys::EvmKeyKind};
 
 /// Number of active EVM store types with separate DBs.
-pub const NUM_EVM_STORE_TYPES: usize = 5;
+pub const NUM_EVM_STORE_TYPES: usize = 6;
 
 /// Returns all active EVM store types.
 pub fn all_evm_store_types() -> Vec<EvmKeyKind> {
     vec![
+        EvmKeyKind::Account,
         EvmKeyKind::Nonce,
         EvmKeyKind::CodeHash,
         EvmKeyKind::Code,
@@ -17,6 +18,7 @@ pub fn all_evm_store_types() -> Vec<EvmKeyKind> {
 /// Returns human-readable directory name for an EVM store type.
 pub fn store_type_name(st: EvmKeyKind) -> &'static str {
     match st {
+        EvmKeyKind::Account => "account",
         EvmKeyKind::Nonce => "nonce",
         EvmKeyKind::CodeHash => "codehash",
         EvmKeyKind::Code => "code",
@@ -41,12 +43,13 @@ mod tests {
     #[test]
     fn test_all_evm_store_types() {
         let types = all_evm_store_types();
-        assert_eq!(types.len(), 5);
-        assert_eq!(types[0], EvmKeyKind::Nonce);
-        assert_eq!(types[1], EvmKeyKind::CodeHash);
-        assert_eq!(types[2], EvmKeyKind::Code);
-        assert_eq!(types[3], EvmKeyKind::Storage);
-        assert_eq!(types[4], EvmKeyKind::Legacy);
+        assert_eq!(types.len(), 6);
+        assert_eq!(types[0], EvmKeyKind::Account); // new: merged (nonce, balance, code_hash)
+        assert_eq!(types[1], EvmKeyKind::Nonce);
+        assert_eq!(types[2], EvmKeyKind::CodeHash);
+        assert_eq!(types[3], EvmKeyKind::Code);
+        assert_eq!(types[4], EvmKeyKind::Storage);
+        assert_eq!(types[5], EvmKeyKind::Legacy);
     }
 
     #[test]

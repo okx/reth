@@ -16,6 +16,7 @@ pub mod proof;
 pub mod published_baseline;
 pub mod segment;
 pub mod snapshot;
+pub mod ss_changeset;
 pub mod state;
 pub mod storage_cow;
 pub(crate) mod storage_recompute;

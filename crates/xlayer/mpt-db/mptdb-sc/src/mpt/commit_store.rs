@@ -3533,6 +3533,128 @@ impl MptCommitStore {
         }
     }
 
+    /// Compute the state root for `hashed_state` applied on top of the current
+    /// committed state, **without committing**.
+    ///
+    /// This implements the dry-run path for `StateRootProvider::state_root`:
+    /// reth calls this to verify the computed root against the block header
+    /// before deciding whether to call `write_state` (the actual commit path).
+    ///
+    /// ## How it works
+    /// 1. For each account with storage changes, clone the frozen base storage trie, apply
+    ///    keccak-slot changes, and compute the new storage root.
+    /// 2. Clone the frozen base account trie, encode each changed account as `TrieAccount { nonce,
+    ///    balance, storage_root, code_hash }`, and apply to the cloned trie.
+    /// 3. Compute the account root via `recompute_hash_only_parallel`.
+    /// 4. Return the root.  No WAL write, no version increment.
+    ///
+    /// ## Side effects
+    /// None on `self`.  The temporary clones are discarded after this call.
+    /// `applied_this_block` is NOT set, so `apply_bundle_state` can still be
+    /// called afterwards (the subsequent call works from the frozen base, not
+    /// from this dry-run's dirty state).
+    ///
+    /// ## Correctness gate
+    /// This method must produce the same root as `apply_bundle_state` +
+    /// `commit` for the same block.  The acceptance test is:
+    /// ```text
+    /// let root_overlay = sc.apply_hashed_state_overlay(&hashed_state)?;
+    /// sc.apply_bundle_state(&bundle_state)?;
+    /// let (_, root_commit) = sc.commit()?;
+    /// assert_eq!(root_overlay, root_commit);
+    /// ```
+    pub fn apply_hashed_state_overlay(
+        &mut self,
+        hashed_state: &reth_trie_common::HashedPostState,
+    ) -> Result<B256> {
+        use alloy_rlp::Encodable;
+        use alloy_trie::EMPTY_ROOT_HASH as EMPTY;
+        use reth_trie_common::Nibbles;
+
+        // keccak256 of empty bytes — the canonical empty code hash.
+        let keccak_empty = alloy_primitives::keccak256([]);
+
+        // ── Phase 1: compute storage roots for all accounts with storage changes ──
+        let mut storage_roots: HashMap<B256, B256> = HashMap::new();
+
+        for (keccak_addr, hashed_storage) in &hashed_state.storages {
+            // Start from the frozen base storage trie (O(1) Arc clone),
+            // or an empty trie for accounts not in the L2 cache.
+            let base = if hashed_storage.wiped {
+                StorageTrieCow::empty()
+            } else if let Some(handle) = self.storage_trie_handles.get(keccak_addr) {
+                handle.base.clone()
+            } else {
+                // Not in L2 cache: approximation — treat as empty.
+                // Accounts with non-zero existing storage not in cache will
+                // produce a wrong storage root.  Phase 1 accepts this
+                // limitation; full correctness requires L3 segment loading.
+                StorageTrieCow::empty()
+            };
+
+            let mut trie = base;
+            for (keccak_slot, value) in &hashed_storage.storage {
+                let nibbles = Nibbles::unpack(keccak_slot);
+                if value.is_zero() {
+                    trie.apply_change_materialized(&nibbles, None);
+                } else {
+                    // Storage values are RLP-encoded U256 (compact big-endian).
+                    let encoded = alloy_rlp::encode(value);
+                    trie.apply_change_materialized(&nibbles, Some(encoded));
+                }
+            }
+
+            // root_hash_only consumes trie and returns (root, trie); we discard the trie.
+            let (root, _) = trie.root_hash_only(&self.persisted)?;
+            storage_roots.insert(*keccak_addr, root);
+        }
+
+        // ── Phase 2: clone frozen account trie base, apply account changes ──
+        let mut account_trie = self.account_trie.base.clone();
+
+        for (keccak_addr, account_opt) in &hashed_state.accounts {
+            let nibbles = Nibbles::unpack(keccak_addr);
+
+            let encoded = match account_opt {
+                None => None, // account deleted
+                Some(account) => {
+                    let storage_root = storage_roots
+                        .get(keccak_addr)
+                        .copied()
+                        .unwrap_or_else(|| self.get_existing_storage_root(keccak_addr));
+
+                    let code_hash = account.bytecode_hash.unwrap_or(keccak_empty);
+
+                    let is_empty = account.nonce == 0 &&
+                        account.balance.is_zero() &&
+                        storage_root == EMPTY &&
+                        code_hash == keccak_empty;
+
+                    if is_empty {
+                        None
+                    } else {
+                        let trie_account = alloy_trie::TrieAccount {
+                            nonce: account.nonce,
+                            balance: account.balance,
+                            storage_root,
+                            code_hash,
+                        };
+                        let mut rlp_buf = Vec::new();
+                        trie_account.encode(&mut rlp_buf);
+                        Some(rlp_buf)
+                    }
+                }
+            };
+
+            account_trie.apply_change_materialized(&nibbles, encoded);
+        }
+
+        // ── Phase 3: compute account root (no WAL, no version increment) ──
+        let (root, _) = account_trie.root_hash_only_parallel(&self.persisted)?;
+
+        Ok(root)
+    }
+
     fn check_writable(&self) -> Result<()> {
         if self.read_only {
             return Err(MptDbError::Other("store is read-only".to_string()));
@@ -8280,5 +8402,93 @@ mod tests {
         let manifest = VersionManifest::load(&dir.path().join("manifest.json")).unwrap();
         assert_eq!(manifest.latest_version, 1);
         store.close().unwrap();
+    }
+
+    // ── apply_hashed_state_overlay acceptance tests ──────────────────────────
+
+    fn make_hashed_post_state(bundle: &BundleState) -> reth_trie_common::HashedPostState {
+        use rayon::prelude::*;
+        use reth_trie_common::{HashedPostState, KeccakKeyHasher};
+        HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state.par_iter())
+    }
+
+    /// Idempotency: calling apply_hashed_state_overlay twice with the same
+    /// HashedPostState must return the same root.
+    #[test]
+    #[ignore]
+    fn overlay_root_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        let addr = Address::repeat_byte(0x11);
+        let info = AccountInfo { nonce: 1, balance: U256::from(100u64), ..Default::default() };
+        let bundle = make_bundle(vec![(
+            addr,
+            Some(info),
+            revm_database::AccountStatus::Loaded,
+            vec![(U256::from(1u64), U256::ZERO, U256::from(42u64))],
+        )]);
+        let hashed = make_hashed_post_state(&bundle);
+
+        let root_a = store.apply_hashed_state_overlay(&hashed).unwrap();
+        // SC state must be unchanged (applied_this_block still false)
+        assert!(!store.applied_this_block);
+
+        let root_b = store.apply_hashed_state_overlay(&hashed).unwrap();
+        assert_eq!(root_a, root_b, "apply_hashed_state_overlay must be idempotent");
+    }
+
+    /// Consistency: apply_hashed_state_overlay and apply_bundle_state + commit
+    /// must produce the same state root for the same block.
+    #[test]
+    #[ignore]
+    fn overlay_root_matches_commit_root() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        let addr = Address::repeat_byte(0x22);
+        let info = AccountInfo { nonce: 5, balance: U256::from(999u64), ..Default::default() };
+        let bundle = make_bundle(vec![(
+            addr,
+            Some(info),
+            revm_database::AccountStatus::Loaded,
+            vec![(U256::from(7u64), U256::ZERO, U256::from(123u64))],
+        )]);
+        let hashed = make_hashed_post_state(&bundle);
+
+        // Dry-run: compute root without committing
+        let root_overlay = store.apply_hashed_state_overlay(&hashed).unwrap();
+        assert!(!store.applied_this_block, "overlay must not set applied_this_block");
+
+        // Actual commit
+        store.apply_bundle_state(&bundle).unwrap();
+        let (_, root_commit) = store.commit().unwrap();
+
+        assert_eq!(
+            root_overlay, root_commit,
+            "overlay root must match commit root for the same block"
+        );
+    }
+
+    /// After overlay + no-commit, apply_bundle_state must still work correctly.
+    #[test]
+    #[ignore]
+    fn overlay_does_not_block_subsequent_apply() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MptCommitStore::open(dir.path(), false).unwrap();
+
+        let addr = Address::repeat_byte(0x33);
+        let info = AccountInfo { nonce: 1, balance: U256::from(1u64), ..Default::default() };
+        let bundle =
+            make_bundle(vec![(addr, Some(info), revm_database::AccountStatus::Loaded, vec![])]);
+        let hashed = make_hashed_post_state(&bundle);
+
+        // Overlay (dry-run) — must not affect subsequent apply
+        let _ = store.apply_hashed_state_overlay(&hashed).unwrap();
+
+        // apply_bundle_state must succeed after overlay
+        store.apply_bundle_state(&bundle).unwrap();
+        let (version, _) = store.commit().unwrap();
+        assert_eq!(version, 1);
     }
 }

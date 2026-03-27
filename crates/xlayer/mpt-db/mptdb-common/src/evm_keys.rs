@@ -24,6 +24,16 @@ pub const CODE_SIZE_KEY_PREFIX: u8 = 0x09;
 /// Prefix byte for nonce keys.
 pub const NONCE_KEY_PREFIX: u8 = 0x0a;
 
+/// Prefix byte for combined account keys (nonce + balance + code_hash).
+///
+/// Replaces the separate Nonce (0x0a) and CodeHash (0x08) sub-DBs for reth
+/// integration: reth's `basic_account` returns all three fields in one call,
+/// so merging them eliminates a read IO.  Value layout (72 bytes, fixed):
+///   [0..8]   nonce:     u64 big-endian
+///   [8..40]  balance:   U256 big-endian (32 bytes)
+///   [40..72] code_hash: B256 (32 bytes)
+pub const ACCOUNT_KEY_PREFIX: u8 = 0x0b;
+
 /// Identifies the family of an EVM key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EvmKeyKind {
@@ -39,6 +49,9 @@ pub enum EvmKeyKind {
     Storage = 4,
     /// Full original key preserved (address mappings, codesize, etc.).
     Legacy = 5,
+    /// Stripped key: 20-byte address.  Value: nonce(8) + balance(32) + code_hash(32).
+    /// Added for reth integration; supersedes Nonce and CodeHash sub-DBs.
+    Account = 6,
 }
 
 /// Parses an EVM key and returns its kind and the stripped key bytes.
@@ -76,6 +89,12 @@ pub fn parse_evm_key(key: &[u8]) -> (EvmKeyKind, &[u8]) {
             }
             (EvmKeyKind::Storage, &key[1..])
         }
+        ACCOUNT_KEY_PREFIX => {
+            if key.len() != 1 + ADDRESS_LEN {
+                return (EvmKeyKind::Legacy, key);
+            }
+            (EvmKeyKind::Account, &key[1..])
+        }
         // All other EVM keys go to legacy store (address mappings, codesize, etc.)
         _ => (EvmKeyKind::Legacy, key),
     }
@@ -85,9 +104,31 @@ pub fn parse_evm_key(key: &[u8]) -> (EvmKeyKind, &[u8]) {
 pub fn internal_key_len(kind: EvmKeyKind) -> usize {
     match kind {
         EvmKeyKind::Storage => ADDRESS_LEN + SLOT_LEN, // 52
-        EvmKeyKind::Nonce | EvmKeyKind::CodeHash | EvmKeyKind::Code => ADDRESS_LEN, // 20
+        EvmKeyKind::Nonce | EvmKeyKind::CodeHash | EvmKeyKind::Code | EvmKeyKind::Account => {
+            ADDRESS_LEN // 20
+        }
         _ => 0,
     }
+}
+
+/// Builds a raw Account key (with prefix) from a 20-byte address.
+pub fn make_account_key(address: &[u8; ADDRESS_LEN]) -> [u8; 1 + ADDRESS_LEN] {
+    let mut key = [0u8; 1 + ADDRESS_LEN];
+    key[0] = ACCOUNT_KEY_PREFIX;
+    key[1..].copy_from_slice(address);
+    key
+}
+
+/// Builds a raw Storage key (with prefix) from a 20-byte address and 32-byte slot.
+pub fn make_storage_key(
+    address: &[u8; ADDRESS_LEN],
+    slot: &[u8; SLOT_LEN],
+) -> [u8; 1 + ADDRESS_LEN + SLOT_LEN] {
+    let mut key = [0u8; 1 + ADDRESS_LEN + SLOT_LEN];
+    key[0] = STATE_KEY_PREFIX;
+    key[1..1 + ADDRESS_LEN].copy_from_slice(address);
+    key[1 + ADDRESS_LEN..].copy_from_slice(slot);
+    key
 }
 
 /// Returns the storage state key prefix (`&[0x03]`).

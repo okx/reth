@@ -1,0 +1,39 @@
+[package]
+name = "mptdb-provider"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mptdb-common = { workspace = true }
+mptdb-traits = { workspace = true }
+mptdb-sc = { workspace = true }
+mptdb-ss = { workspace = true }
+
+# reth traits
+reth-storage-api = { workspace = true }
+reth-primitives-traits = { workspace = true }
+reth-trie-common = { workspace = true }
+reth-execution-types = { workspace = true }
+reth-chainspec = { workspace = true }
+
+# alloy
+alloy-eips = { workspace = true }
+
+# alloy / revm
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+alloy-trie = { workspace = true, features = ["ethereum"] }
+revm-database = { workspace = true }
+
+rayon = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+alloy-primitives = { workspace = true }
+revm-database = { workspace = true }
+revm-state = { workspace = true }
+reth-storage-api = { workspace = true }
+reth-execution-types = { workspace = true }
+reth-primitives-traits = { workspace = true }

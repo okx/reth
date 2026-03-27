@@ -505,6 +505,78 @@ impl StateStore for EVMStateStore {
     }
 }
 
+impl EVMStateStore {
+    // ── Typed read interfaces for reth StateProvider integration ──────────
+
+    /// Encode `(nonce, balance, code_hash)` into the 72-byte Account value format.
+    ///
+    /// Layout (fixed-size, no length prefix):
+    ///   [0..8]   nonce:     u64 big-endian
+    ///   [8..40]  balance:   U256 big-endian (32 bytes)
+    ///   [40..72] code_hash: B256 (32 bytes)
+    pub fn encode_account_value(nonce: u64, balance: [u8; 32], code_hash: [u8; 32]) -> [u8; 72] {
+        let mut buf = [0u8; 72];
+        buf[..8].copy_from_slice(&nonce.to_be_bytes());
+        buf[8..40].copy_from_slice(&balance);
+        buf[40..72].copy_from_slice(&code_hash);
+        buf
+    }
+
+    /// Decode the 72-byte Account value into `(nonce, balance_bytes, code_hash_bytes)`.
+    pub fn decode_account_value(raw: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
+        if raw.len() != 72 {
+            return None;
+        }
+        let nonce = u64::from_be_bytes(raw[..8].try_into().ok()?);
+        let mut balance = [0u8; 32];
+        balance.copy_from_slice(&raw[8..40]);
+        let mut code_hash = [0u8; 32];
+        code_hash.copy_from_slice(&raw[40..72]);
+        Some((nonce, balance, code_hash))
+    }
+
+    /// Read the combined `(nonce, balance, code_hash)` for `address` at `version`.
+    ///
+    /// Returns `None` if the account does not exist or the version is out of range.
+    /// `address` is the raw 20-byte Ethereum address (not keccak-hashed).
+    pub fn get_account(
+        &self,
+        version: i64,
+        address: &[u8; 20],
+    ) -> Result<Option<(u64, [u8; 32], [u8; 32])>> {
+        use mptdb_common::evm_keys::{make_account_key, EvmKeyKind};
+        let raw_key = make_account_key(address);
+        let db = match self.sub_dbs.get(&EvmKeyKind::Account) {
+            Some(db) => db,
+            None => return Ok(None),
+        };
+        match db.get(version, &raw_key[1..])? {
+            None => Ok(None),
+            Some(raw) => Ok(Self::decode_account_value(&raw)),
+        }
+    }
+
+    /// Read the storage value for `(address, slot)` at `version`.
+    ///
+    /// Returns `None` if the slot is zero / not set.
+    /// Both `address` (20 bytes) and `slot` (32 bytes) are raw, not keccak-hashed.
+    pub fn get_storage(
+        &self,
+        version: i64,
+        address: &[u8; 20],
+        slot: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        use mptdb_common::evm_keys::{make_storage_key, EvmKeyKind};
+        let raw_key = make_storage_key(address, slot);
+        let db = match self.sub_dbs.get(&EvmKeyKind::Storage) {
+            Some(db) => db,
+            None => return Ok(None),
+        };
+        // Stripped key = raw_key without the 0x03 prefix
+        db.get(version, &raw_key[1..])
+    }
+}
+
 impl Drop for EVMStateStore {
     fn drop(&mut self) {
         let _ = self.close();
@@ -784,5 +856,128 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut store = open_evm_store(dir.path());
         store.close().unwrap();
+    }
+
+    // ── Account key (0x0b) acceptance tests ─────────────────────────────────
+
+    fn make_account_changeset(
+        addr: &[u8; 20],
+        nonce: u64,
+        balance: [u8; 32],
+        code_hash: [u8; 32],
+    ) -> mptdb_proto::ChangeSet {
+        use mptdb_common::evm_keys::{make_account_key, ACCOUNT_KEY_PREFIX as _};
+        let key = make_account_key(addr);
+        let value = EVMStateStore::encode_account_value(nonce, balance, code_hash);
+        mptdb_proto::ChangeSet {
+            pairs: vec![mptdb_proto::KvPair {
+                delete: false,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }],
+        }
+    }
+
+    fn delete_account_changeset(addr: &[u8; 20]) -> mptdb_proto::ChangeSet {
+        use mptdb_common::evm_keys::make_account_key;
+        let key = make_account_key(addr);
+        mptdb_proto::ChangeSet {
+            pairs: vec![mptdb_proto::KvPair { delete: true, key: key.to_vec(), value: vec![] }],
+        }
+    }
+
+    fn delete_storage_changeset(addr: &[u8; 20], slot: &[u8; 32]) -> mptdb_proto::ChangeSet {
+        use mptdb_common::evm_keys::make_storage_key;
+        let key = make_storage_key(addr, slot);
+        mptdb_proto::ChangeSet {
+            pairs: vec![mptdb_proto::KvPair { delete: true, key: key.to_vec(), value: vec![] }],
+        }
+    }
+
+    /// get_account returns correct (nonce, balance, code_hash) after write.
+    #[test]
+    fn account_key_write_read() {
+        let dir = tempdir().unwrap();
+        let mut store = open_evm_store(dir.path());
+        let addr = test_addr();
+        let balance = {
+            let mut b = [0u8; 32];
+            b[31] = 42;
+            b
+        };
+        let code_hash = [0xabu8; 32];
+
+        let cs = make_account_changeset(&addr, 7, balance, code_hash);
+        store.apply_changeset_sync(1, &cs).unwrap();
+
+        let result = store.get_account(1, &addr).unwrap();
+        let (nonce, bal, ch) = result.expect("account must exist");
+        assert_eq!(nonce, 7);
+        assert_eq!(bal, balance);
+        assert_eq!(ch, code_hash);
+    }
+
+    /// After selfdestruct (delete Account key), get_account returns None.
+    #[test]
+    fn account_key_selfdestruct_returns_none() {
+        let dir = tempdir().unwrap();
+        let mut store = open_evm_store(dir.path());
+        let addr = test_addr();
+        let cs = make_account_changeset(&addr, 1, [0u8; 32], [0u8; 32]);
+        store.apply_changeset_sync(1, &cs).unwrap();
+        assert!(store.get_account(1, &addr).unwrap().is_some());
+
+        let del = delete_account_changeset(&addr);
+        store.apply_changeset_sync(2, &del).unwrap();
+        assert!(store.get_account(2, &addr).unwrap().is_none(), "deleted account must return None");
+    }
+
+    /// After clearing a storage slot (delete Storage key), get_storage returns None.
+    #[test]
+    fn storage_key_clear_returns_none() {
+        let dir = tempdir().unwrap();
+        let mut store = open_evm_store(dir.path());
+        let addr = test_addr();
+        let slot = [0x01u8; 32];
+
+        // Write a non-zero storage value
+        let write_cs = mptdb_proto::ChangeSet {
+            pairs: vec![mptdb_proto::KvPair {
+                delete: false,
+                key: {
+                    use mptdb_common::evm_keys::make_storage_key;
+                    make_storage_key(&addr, &slot).to_vec()
+                },
+                value: vec![0u8; 31].into_iter().chain([99u8]).collect(),
+            }],
+        };
+        store.apply_changeset_sync(1, &write_cs).unwrap();
+        assert!(store.get_storage(1, &addr, &slot).unwrap().is_some());
+
+        // Clear (tombstone) the slot
+        let del = delete_storage_changeset(&addr, &slot);
+        store.apply_changeset_sync(2, &del).unwrap();
+        assert!(
+            store.get_storage(2, &addr, &slot).unwrap().is_none(),
+            "cleared storage slot must return None"
+        );
+    }
+
+    /// encode_account_value / decode_account_value round-trip.
+    #[test]
+    fn account_value_codec_roundtrip() {
+        let nonce = 0xDEAD_BEEF_u64;
+        let mut balance = [0u8; 32];
+        balance[0] = 0xFF;
+        balance[31] = 0x01;
+        let code_hash = [0x42u8; 32];
+
+        let encoded = EVMStateStore::encode_account_value(nonce, balance, code_hash);
+        assert_eq!(encoded.len(), 72);
+
+        let (n, b, c) = EVMStateStore::decode_account_value(&encoded).unwrap();
+        assert_eq!(n, nonce);
+        assert_eq!(b, balance);
+        assert_eq!(c, code_hash);
     }
 }

@@ -194,6 +194,7 @@ members = [
     "crates/xlayer/mpt-db/mptdb-sc",
     "crates/xlayer/mpt-db/mptdb-ledger",
     "crates/xlayer/mpt-db/mptdb",
+    "crates/xlayer/mpt-db/mptdb-provider",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]
@@ -782,6 +783,7 @@ mptdb-ss = { path = "crates/xlayer/mpt-db/mptdb-ss" }
 mptdb-sc = { path = "crates/xlayer/mpt-db/mptdb-sc" }
 mptdb-ledger = { path = "crates/xlayer/mpt-db/mptdb-ledger" }
 mptdb = { path = "crates/xlayer/mpt-db/mptdb" }
+mptdb-provider = { path = "crates/xlayer/mpt-db/mptdb-provider" }
 
 # mpt-db specific deps
 prost = "0.13"
