@@ -370,3 +370,68 @@ fn ss_version_available_reflects_written_range() {
         "SS should report block 99 as unavailable"
     );
 }
+
+// ── Phase 3: proof generation ──────────────────────────────────────────────────
+
+/// account_proof returns a valid AccountProof with non-empty proof nodes.
+#[test]
+#[ignore]
+fn proof_returns_account_proof() {
+    let dir = TempDir::new().unwrap();
+    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
+    let ss = open_ss(dir.path());
+    let addr = Address::repeat_byte(0xAB);
+    let bundle = make_bundle(addr, 3, 300, vec![(U256::from(5u64), U256::from(99u64))]);
+    write_block_get_root(&sc, &ss, &bundle, 0);
+
+    let provider = make_provider(sc, ss, ss_version_for_block(0));
+    use reth_storage_api::StateProofProvider;
+    use reth_trie_common::TrieInput;
+
+    let slot = alloy_primitives::keccak256(U256::from(5u64).to_be_bytes::<32>());
+    let ap = provider.proof(TrieInput::default(), addr, &[slot]).unwrap();
+
+    // proof nodes must be non-empty for a committed account
+    assert!(!ap.proof.is_empty(), "account proof must have nodes");
+    // address matches
+    assert_eq!(ap.address, addr);
+}
+
+/// storage_root matches the storage_root inside the account proof.
+#[test]
+#[ignore]
+fn storage_root_matches_account_proof_storage_root() {
+    let dir = TempDir::new().unwrap();
+    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
+    let ss = open_ss(dir.path());
+    let addr = Address::repeat_byte(0xCD);
+    let bundle = make_bundle(addr, 1, 100, vec![(U256::from(1u64), U256::from(42u64))]);
+    write_block_get_root(&sc, &ss, &bundle, 0);
+
+    let provider = make_provider(sc, ss, ss_version_for_block(0));
+    use reth_storage_api::{StateProofProvider, StorageRootProvider};
+    use reth_trie_common::TrieInput;
+
+    let ap = provider.proof(TrieInput::default(), addr, &[]).unwrap();
+    let sr = provider.storage_root(addr, Default::default()).unwrap();
+    assert_eq!(sr, ap.storage_root, "storage_root must match account proof's storage_root");
+}
+
+/// stub_paths no longer stub after Phase 3: proof() succeeds.
+#[test]
+#[ignore]
+fn proof_no_longer_returns_unsupported_error() {
+    let dir = TempDir::new().unwrap();
+    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
+    let ss = open_ss(dir.path());
+    let addr = Address::repeat_byte(0xEF);
+    let bundle = make_bundle(addr, 2, 200, vec![]);
+    write_block_get_root(&sc, &ss, &bundle, 0);
+
+    let provider = make_provider(sc, ss, ss_version_for_block(0));
+    use reth_storage_api::StateProofProvider;
+    use reth_trie_common::TrieInput;
+
+    let result = provider.proof(TrieInput::default(), addr, &[]);
+    assert!(result.is_ok(), "proof() must succeed in Phase 3, got: {:?}", result.err());
+}

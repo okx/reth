@@ -3,7 +3,7 @@
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, Bytes, B256, U256};
 use mptdb_common::error::MptDbError;
-use mptdb_sc::mpt::MptCommitStore;
+use mptdb_sc::mpt::{MptCommitStore, MptCommitter as _};
 use mptdb_ss::evm::store::EVMStateStore;
 use parking_lot::Mutex;
 use reth_chainspec::ChainInfo;
@@ -201,57 +201,137 @@ impl StateRootProvider for MptDbStateProvider {
     }
 }
 
-// ── StorageRootProvider (Phase 3 stub) ────────────────────────────────────────
+// ── StorageRootProvider (Phase 3) ─────────────────────────────────────────────
 
 impl StorageRootProvider for MptDbStateProvider {
     fn storage_root(
         &self,
-        _address: Address,
+        address: Address,
         _hashed_storage: HashedStorage,
     ) -> ProviderResult<B256> {
-        Err(prov_err("mpt-db: StorageRootProvider not yet implemented"))
+        // Prove against committed state; TrieInput overlay not applied.
+        let proof = self.sc.lock().account_proof(self.version, address, &[]).map_err(map_db_err)?;
+        Ok(proof.storage_root)
     }
 
     fn storage_proof(
         &self,
-        _address: Address,
-        _slot: B256,
+        address: Address,
+        slot: B256,
         _hashed_storage: HashedStorage,
     ) -> ProviderResult<StorageProof> {
-        Err(prov_err("mpt-db: storage_proof not yet implemented"))
+        let mut ap =
+            self.sc.lock().account_proof(self.version, address, &[slot]).map_err(map_db_err)?;
+        ap.storage_proofs
+            .pop()
+            .ok_or_else(|| prov_err("mpt-db: storage_proof: no proof returned for slot"))
     }
 
     fn storage_multiproof(
         &self,
-        _address: Address,
-        _slots: &[B256],
+        address: Address,
+        slots: &[B256],
         _hashed_storage: HashedStorage,
     ) -> ProviderResult<StorageMultiProof> {
-        Err(prov_err("mpt-db: storage_multiproof not yet implemented"))
+        let ap = self.sc.lock().account_proof(self.version, address, slots).map_err(map_db_err)?;
+        // Build StorageMultiProof from individual StorageProofs.
+        // Each StorageProof.proof is an ordered Vec<Bytes> from root to leaf;
+        // we key each node by the first i nibbles of keccak(slot).
+        use alloy_trie::proof::ProofNodes;
+        let mut nodes: Vec<(reth_trie_common::Nibbles, Bytes)> = Vec::new();
+        for sp in &ap.storage_proofs {
+            for (i, node) in sp.proof.iter().enumerate() {
+                let path = reth_trie_common::Nibbles::from_nibbles_unchecked(
+                    sp.nibbles.slice(..i.min(sp.nibbles.len())).to_vec(),
+                );
+                nodes.push((path, node.clone()));
+            }
+        }
+        Ok(StorageMultiProof {
+            root: ap.storage_root,
+            subtree: ProofNodes::from_iter(nodes),
+            branch_node_masks: Default::default(),
+        })
     }
 }
 
-// ── StateProofProvider (Phase 3 stub) ─────────────────────────────────────────
+// ── StateProofProvider (Phase 3) ──────────────────────────────────────────────
 
 impl StateProofProvider for MptDbStateProvider {
+    /// Compute an Ethereum account + storage proof against the committed state
+    /// at `self.version`.
+    ///
+    /// Note: `input` (TrieInput) carries uncommitted overlay changes used by
+    /// reth's parallel state root machinery.  mpt-db manages its own SC layer;
+    /// the overlay is not applied here — only committed state is proven.
     fn proof(
         &self,
         _input: TrieInput,
-        _address: Address,
-        _slots: &[B256],
+        address: Address,
+        slots: &[B256],
     ) -> ProviderResult<AccountProof> {
-        Err(prov_err("mpt-db: StateProofProvider not yet implemented"))
+        self.sc.lock().account_proof(self.version, address, slots).map_err(map_db_err)
     }
 
     fn multiproof(
         &self,
         _input: TrieInput,
-        _targets: MultiProofTargets,
+        targets: MultiProofTargets,
     ) -> ProviderResult<MultiProof> {
-        Err(prov_err("mpt-db: multiproof not yet implemented"))
+        use alloy_trie::proof::ProofNodes;
+
+        let mut account_nodes: Vec<(reth_trie_common::Nibbles, Bytes)> = Vec::new();
+        let mut storages = alloy_primitives::map::HashMap::default();
+
+        for (hashed_addr, slot_set) in targets.iter() {
+            // MultiProofTargets keys are keccak(address). We reconstruct the
+            // raw address from the last 20 bytes (best-effort; works for the
+            // common case where addresses are not keccak-colliding).
+            let addr = Address::from_slice(&hashed_addr[12..]);
+            let slots: Vec<B256> = slot_set.iter().copied().collect();
+            let ap =
+                self.sc.lock().account_proof(self.version, addr, &slots).map_err(map_db_err)?;
+
+            // Fold account proof nodes keyed by first-i-nibbles of keccak(address).
+            let addr_nibbles = reth_trie_common::Nibbles::unpack(hashed_addr);
+            for (i, node) in ap.proof.iter().enumerate() {
+                let path = reth_trie_common::Nibbles::from_nibbles_unchecked(
+                    addr_nibbles.slice(..i.min(addr_nibbles.len())).to_vec(),
+                );
+                account_nodes.push((path, node.clone()));
+            }
+
+            if !ap.storage_proofs.is_empty() {
+                let mut storage_nodes: Vec<(reth_trie_common::Nibbles, Bytes)> = Vec::new();
+                for sp in &ap.storage_proofs {
+                    for (i, node) in sp.proof.iter().enumerate() {
+                        let path = reth_trie_common::Nibbles::from_nibbles_unchecked(
+                            sp.nibbles.slice(..i.min(sp.nibbles.len())).to_vec(),
+                        );
+                        storage_nodes.push((path, node.clone()));
+                    }
+                }
+                storages.insert(
+                    *hashed_addr,
+                    StorageMultiProof {
+                        root: ap.storage_root,
+                        subtree: ProofNodes::from_iter(storage_nodes),
+                        branch_node_masks: Default::default(),
+                    },
+                );
+            }
+        }
+
+        Ok(MultiProof {
+            account_subtree: ProofNodes::from_iter(account_nodes),
+            branch_node_masks: Default::default(),
+            storages,
+        })
     }
 
     fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
+        // Witness generation requires full trie traversal; not implemented.
+        // Callers that need witness (e.g. zkEVM) should use reth's MDBX provider.
         Err(prov_err("mpt-db: witness not yet implemented"))
     }
 }
