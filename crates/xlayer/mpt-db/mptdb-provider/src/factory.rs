@@ -14,11 +14,19 @@ use reth_storage_api::{
 };
 use std::sync::Arc;
 
+// historical_fallback uses Arc<Mutex<StateProviderBox>> in provider.rs.
+// No unsafe Sync wrapper needed.
+
 pub struct MptDbStateProviderFactory {
     pub ss: Arc<EVMStateStore>,
     pub sc: Arc<Mutex<MptCommitStore>>,
+    /// Fallback for non-state data (bytecode, block hashes).
     pub fallback: Arc<dyn StateProvider + Send + Sync>,
     pub block_id_reader: Arc<dyn BlockIdReader + Send + Sync>,
+    /// Optional factory for creating MDBX-backed historical state providers.
+    /// Used when SS data at the requested version has been pruned (Phase 2).
+    /// If `None`, pruned-data queries return a `ProviderError` with a clear message.
+    pub historical_fallback_factory: Option<Arc<dyn StateProviderFactory + Send + Sync>>,
 }
 
 impl MptDbStateProviderFactory {
@@ -28,17 +36,39 @@ impl MptDbStateProviderFactory {
         fallback: Arc<dyn StateProvider + Send + Sync>,
         block_id_reader: Arc<dyn BlockIdReader + Send + Sync>,
     ) -> Self {
-        Self { ss, sc, fallback, block_id_reader }
+        Self { ss, sc, fallback, block_id_reader, historical_fallback_factory: None }
     }
 
+    /// Configure a MDBX-backed factory for historical fallback when SS data is pruned.
+    pub fn with_historical_fallback(
+        mut self,
+        factory: Arc<dyn StateProviderFactory + Send + Sync>,
+    ) -> Self {
+        self.historical_fallback_factory = Some(factory);
+        self
+    }
+
+    /// Create a `MptDbStateProvider` at `version`, optionally attaching a
+    /// historical MDBX provider when SS data at `version` may be pruned.
     fn make_provider(&self, version: i64) -> MptDbStateProvider {
-        MptDbStateProvider::new(
+        let mut provider = MptDbStateProvider::new(
             Arc::clone(&self.ss),
             Arc::clone(&self.sc),
             version,
             Arc::clone(&self.fallback),
             Arc::clone(&self.block_id_reader),
-        )
+        );
+        // If SS doesn't have this version and we have a MDBX fallback, attach it.
+        if !self.ss.is_version_available(version) {
+            if let Some(factory) = &self.historical_fallback_factory {
+                // block_number = version - 1 (SS version = block_number + 1)
+                let block = (version - 1).max(0) as u64;
+                if let Ok(hf) = factory.history_by_block_number(block) {
+                    provider = provider.with_historical_fallback(hf);
+                }
+            }
+        }
+        provider
     }
 
     fn latest_version(&self) -> i64 {
@@ -57,7 +87,8 @@ impl BlockNumReader for MptDbStateProviderFactory {
     }
 
     fn best_block_number(&self) -> ProviderResult<BlockNumber> {
-        Ok(self.latest_version().max(0) as u64)
+        // latest_version() = SC version = block_number + 1.
+        Ok(self.latest_version().saturating_sub(1).max(0) as u64)
     }
 
     fn last_block_number(&self) -> ProviderResult<BlockNumber> {

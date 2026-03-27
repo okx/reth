@@ -32,10 +32,18 @@ fn map_db_err(e: MptDbError) -> reth_storage_api::errors::provider::ProviderErro
 pub struct MptDbStateProvider {
     pub ss: Arc<EVMStateStore>,
     pub sc: Arc<Mutex<MptCommitStore>>,
-    /// version = block_number as i64
+    /// SS version for this provider = block_number + 1.
     pub version: i64,
+    /// Fallback for non-state data (bytecode, block hashes).
     pub fallback: Arc<dyn StateProvider + Send + Sync>,
+    /// For block_hash → block_number lookups.
     pub block_id_reader: Arc<dyn BlockIdReader + Send + Sync>,
+    /// Optional historical StateProvider backed by reth MDBX.
+    /// Used when SS data for `version` has been pruned (Phase 2).
+    /// Wrapped in Mutex to avoid requiring `Sync` on the inner provider
+    /// (StateProviderBox = Box<dyn StateProvider + Send>, not Sync).
+    /// If None, pruned-data queries return `ProviderError`.
+    pub historical_fallback: Option<Arc<Mutex<reth_storage_api::StateProviderBox>>>,
 }
 
 impl MptDbStateProvider {
@@ -46,7 +54,31 @@ impl MptDbStateProvider {
         fallback: Arc<dyn StateProvider + Send + Sync>,
         block_id_reader: Arc<dyn BlockIdReader + Send + Sync>,
     ) -> Self {
-        Self { ss, sc, version, fallback, block_id_reader }
+        Self { ss, sc, version, fallback, block_id_reader, historical_fallback: None }
+    }
+
+    pub fn with_historical_fallback(
+        mut self,
+        historical: reth_storage_api::StateProviderBox,
+    ) -> Self {
+        self.historical_fallback = Some(Arc::new(Mutex::new(historical)));
+        self
+    }
+
+    /// Check whether SS has data at `self.version`.
+    /// Returns `Err` with a clear pruning message if not available.
+    fn check_ss_version(&self) -> ProviderResult<()> {
+        if !self.ss.is_version_available(self.version) {
+            // Version is outside SS's retained range: either pruned or not yet written.
+            let block = (self.version - 1).max(0);
+            return Err(prov_err(format!(
+                "mpt-db: historical state for block {block} (SS version {}) is not \
+                 available — data may have been pruned (keep_recent) or SS was \
+                 initialized after this block",
+                self.version
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -54,6 +86,15 @@ impl MptDbStateProvider {
 
 impl AccountReader for MptDbStateProvider {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        // Phase 2: check if SS has data at this version before querying.
+        if let Err(prune_err) = self.check_ss_version() {
+            // Try historical_fallback first; if not configured, propagate the error.
+            return match &self.historical_fallback {
+                Some(hf) => hf.lock().basic_account(address),
+                None => Err(prune_err),
+            };
+        }
+
         let addr_bytes: [u8; 20] = address.into_array();
         match self.ss.get_account(self.version, &addr_bytes) {
             Ok(None) => Ok(None),
@@ -80,7 +121,8 @@ impl BlockNumReader for MptDbStateProvider {
     }
 
     fn best_block_number(&self) -> ProviderResult<BlockNumber> {
-        Ok(self.version.max(0) as u64)
+        // SS version = block_number + 1, so block_number = version - 1.
+        Ok(self.version.saturating_sub(1).max(0) as u64)
     }
 
     fn last_block_number(&self) -> ProviderResult<BlockNumber> {
@@ -243,13 +285,20 @@ impl StateProvider for MptDbStateProvider {
         account: Address,
         storage_key: alloy_primitives::StorageKey,
     ) -> ProviderResult<Option<alloy_primitives::StorageValue>> {
+        // Phase 2: check version availability before querying SS.
+        if let Err(prune_err) = self.check_ss_version() {
+            return match &self.historical_fallback {
+                Some(hf) => hf.lock().storage(account, storage_key),
+                None => Err(prune_err),
+            };
+        }
+
         let addr_bytes: [u8; 20] = account.into_array();
         let slot_bytes: [u8; 32] = storage_key.into();
         match self.ss.get_storage(self.version, &addr_bytes, &slot_bytes) {
             Ok(None) => Ok(None),
             Ok(Some(raw)) => {
-                // SS storage values are stored as raw 32-byte big-endian U256
-                // (from bundle_to_ss_changeset → to_be_bytes()).
+                // SS storage values are stored as raw 32-byte big-endian U256.
                 if raw.len() != 32 {
                     return Err(prov_err(format!("unexpected SS storage value len: {}", raw.len())));
                 }

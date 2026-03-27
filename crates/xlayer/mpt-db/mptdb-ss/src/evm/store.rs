@@ -506,6 +506,22 @@ impl StateStore for EVMStateStore {
 }
 
 impl EVMStateStore {
+    // ── Version availability ───────────────────────────────────────────────
+
+    /// Returns `true` if `version` is within SS's retained range
+    /// `[earliest_version, latest_version]`.
+    ///
+    /// A `false` result means data at that version has been pruned or SS has
+    /// not yet received any writes.  Callers should fall back to MDBX or
+    /// return a clear error when `false`.
+    pub fn is_version_available(&self, version: i64) -> bool {
+        use mptdb_traits::ss::StateStore as _;
+        let earliest = self.get_earliest_version();
+        let latest = self.get_latest_version();
+        // latest == 0 with no writes yet → treat as unavailable.
+        latest > 0 && version >= earliest && version <= latest
+    }
+
     // ── Typed read interfaces for reth StateProvider integration ──────────
 
     /// Encode `(nonce, balance, code_hash)` into the 72-byte Account value format.

@@ -34,6 +34,21 @@ fn open_ss(dir: &std::path::Path) -> Arc<EVMStateStore> {
     new_state_store(&config, &dir.to_string_lossy()).unwrap()
 }
 
+/// Open SS in fully synchronous mode for prune tests.
+///
+/// This avoids async writer/barrier interaction and keeps prune tests
+/// deterministic and fast.
+fn open_ss_sync_for_prune(dir: &std::path::Path) -> Arc<EVMStateStore> {
+    let config = StateStoreConfig {
+        db_directory: dir.join("ss").to_string_lossy().to_string(),
+        keep_last_version: true,
+        async_write_buffer: 0,
+        prune_interval_seconds: 0,
+        ..Default::default()
+    };
+    new_state_store(&config, &dir.to_string_lossy()).unwrap()
+}
+
 fn noop_fallback() -> Arc<dyn StateProvider + Send + Sync> {
     Arc::new(reth_storage_api::noop::NoopProvider::default())
 }
@@ -230,9 +245,8 @@ fn consecutive_blocks() {
     assert_eq!(p1.basic_account(&addr).unwrap().unwrap().nonce, 2);
 }
 
-/// Stub paths return Err, not panic.
+/// Stub paths return Err, not panic.  Lightweight — runs by default.
 #[test]
-#[ignore]
 fn stub_paths_return_err_not_panic() {
     let dir = TempDir::new().unwrap();
     let sc = Arc::new(Mutex::new(open_sc(dir.path())));
@@ -250,4 +264,109 @@ fn stub_paths_return_err_not_panic() {
     assert!(provider.proof(TrieInput::default(), Address::ZERO, &[]).is_err());
     assert!(provider.multiproof(TrieInput::default(), Default::default()).is_err());
     assert!(provider.witness(TrieInput::default(), Default::default()).is_err());
+}
+
+// ── Phase 2: historical query reliability ──────────────────────────────────────
+
+/// Queries within SS retained range succeed normally.
+#[test]
+fn historical_query_within_keep_recent_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
+    let ss = open_ss(dir.path());
+    let addr = Address::repeat_byte(0x11);
+
+    // Write 3 blocks
+    for block in 0..3u64 {
+        let bundle = make_bundle(addr, block + 1, (block + 1) * 100, vec![]);
+        write_block_get_root(&sc, &ss, &bundle, block);
+    }
+
+    // Read each block's state — all should be available (SS has all versions)
+    for block in 0..3u64 {
+        let provider = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(block));
+        let account = provider
+            .basic_account(&addr)
+            .expect("should not error for available version")
+            .expect("account must exist");
+        assert_eq!(account.nonce, block + 1, "block {block}: wrong nonce");
+    }
+}
+
+/// After pruning old versions, querying a pruned version returns a clear error.
+#[test]
+fn historical_query_pruned_version_returns_clear_error() {
+    let dir = TempDir::new().unwrap();
+    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
+    let ss = open_ss_sync_for_prune(dir.path());
+    let addr = Address::repeat_byte(0x22);
+
+    // Write 5 blocks
+    for block in 0..5u64 {
+        let bundle = make_bundle(addr, block + 1, (block + 1) * 100, vec![]);
+        write_block_get_root(&sc, &ss, &bundle, block);
+    }
+
+    // Block 1 (SS version 2) exists before pruning
+    {
+        let p = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(1));
+        assert!(p.basic_account(&addr).unwrap().is_some(), "block 1 data must exist before prune");
+    }
+
+    // Simulate prune by advancing earliest available SS version to 4
+    // (equivalent visibility effect to pruning versions 1..=3).
+    {
+        use mptdb_traits::ss::StateStore as _;
+        ss.set_earliest_version(4, false).unwrap();
+    }
+
+    // Block 1 (SS version 2) is now pruned → must return Err
+    let provider = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(1));
+    let result = provider.basic_account(&addr);
+    assert!(
+        result.is_err(),
+        "querying pruned SS version should return Err, not silently return None"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not available") || err_msg.contains("pruned"),
+        "error message should mention unavailability: {err_msg}"
+    );
+
+    // Block 4 (SS version 5) is after prune threshold — still available
+    let provider = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(4));
+    let account = provider.basic_account(&addr).unwrap().expect("block 4 must still exist");
+    assert_eq!(account.nonce, 5);
+}
+
+/// is_version_available correctly reflects SS retention state.  Lightweight — runs by default.
+#[test]
+fn ss_version_available_reflects_written_range() {
+    let dir = TempDir::new().unwrap();
+    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
+    let ss = open_ss(dir.path());
+    let addr = Address::repeat_byte(0x33);
+
+    // Before any writes, no version is available
+    assert!(
+        !ss.is_version_available(1),
+        "SS should report version 1 unavailable before any writes"
+    );
+
+    // Write block 0
+    let bundle = make_bundle(addr, 1, 100, vec![]);
+    write_block_get_root(&sc, &ss, &bundle, 0);
+
+    // After writing block 0 (SS version 1), version 1 should be available
+    assert!(
+        ss.is_version_available(ss_version_for_block(0)),
+        "SS should report block 0 (version {}) as available after write",
+        ss_version_for_block(0)
+    );
+
+    // A future version should not be available
+    assert!(
+        !ss.is_version_available(ss_version_for_block(99)),
+        "SS should report block 99 as unavailable"
+    );
 }
