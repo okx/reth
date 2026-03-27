@@ -2285,6 +2285,7 @@ impl MptCommitStore {
                             );
                             tracing::error!(?e, "background persist failed");
                         } else {
+                            let mut published_success = false;
                             if job.publish_baseline && !job.replay_from_wal {
                                 let mut publish_puts = job.published_puts.clone();
                                 let mut skip_publish = false;
@@ -2297,26 +2298,51 @@ impl MptCommitStore {
                                 // parallel via rayon using zero-copy frozen refs —
                                 // avoids the extra allocation of collect_all_nodes().
                                 if !job.committed_tries.is_empty() {
-                                    // Sequential freeze: O(overlay) per trie, cheap.
-                                    for (_, _, trie) in &mut job.committed_tries {
+                                    // Sequential materialize + freeze.
+                                    // Materialization resolves pending segment-lazy
+                                    // edges into arena refs so segment serialization
+                                    // does not silently emit hash embeds.
+                                    for (_, addr_root, trie) in &mut job.committed_tries {
+                                        if let Err(e) = trie.materialize_pending_segment_children() {
+                                            Self::warn_nonfatal_async_error(&MptDbError::Other(
+                                                format!(
+                                                    "wal_first materialize pending children for {}: {e}",
+                                                    addr_root
+                                                ),
+                                            ));
+                                            skip_publish = true;
+                                            break;
+                                        }
                                         trie.snapshot();
                                     }
-                                    // Parallel segment build via rayon.
-                                    let built: Vec<_> = job
-                                        .committed_tries
-                                        .par_iter()
-                                        .filter_map(|(addr, root, trie)| {
-                                            StorageTrieSegment::from_parts(
-                                                trie.frozen_arena_nodes_ref(),
-                                                trie.frozen_arena_hash_cache_ref(),
-                                                trie.root_index(),
-                                                *root,
-                                            )
-                                            .ok()
-                                            .map(|seg| (*addr, seg))
-                                        })
-                                        .collect();
-                                    publish_puts.extend(built);
+                                    if !skip_publish {
+                                        // Parallel segment build via rayon.
+                                        let built = job
+                                            .committed_tries
+                                            .par_iter()
+                                            .map(|(addr, root, trie)| {
+                                                StorageTrieSegment::from_parts(
+                                                    trie.frozen_arena_nodes_ref(),
+                                                    trie.frozen_arena_hash_cache_ref(),
+                                                    trie.root_index(),
+                                                    *root,
+                                                )
+                                                .map(|seg| (*addr, seg))
+                                                .map_err(|e| {
+                                                    MptDbError::Other(format!(
+                                                        "wal_first build segment for {addr} root {root}: {e}"
+                                                    ))
+                                                })
+                                            })
+                                            .collect::<Result<Vec<_>>>();
+                                        match built {
+                                            Ok(built) => publish_puts.extend(built),
+                                            Err(e) => {
+                                                Self::warn_nonfatal_async_error(&e);
+                                                skip_publish = true;
+                                            }
+                                        }
+                                    }
                                 }
 
                                 // Legacy path: build segments from RocksDB.
@@ -2367,6 +2393,7 @@ impl MptCommitStore {
                                     let publish_result = match publish_result {
                                         Ok(result) => {
                                             worker_published_meta = Some(result.meta.clone());
+                                            published_success = true;
                                             Some(result)
                                         }
                                         Err(e) => {
@@ -2502,7 +2529,7 @@ impl MptCommitStore {
                                         }
                                     }
                                 }
-                                if job.publish_baseline {
+                                if job.publish_baseline && published_success {
                                     published_version_clone.store(job.version, Ordering::Release);
                                 }
                             }
@@ -4392,7 +4419,11 @@ impl MptCommitStore {
                 }
                 let trie = match dirty_storage_accounts.get(&hashed_address) {
                     Some(dirty) => {
-                        Self::apply_storage_changes_to_working(trie, persisted_ref, dirty)?
+                        Self::apply_storage_changes_to_working(
+                            trie,
+                            persisted_ref,
+                            dirty,
+                        )?
                     }
                     None => trie,
                 };
@@ -7462,35 +7493,6 @@ mod tests {
         assert!(matches!(trie.root_ref(), CowRootRef::Lazy(CowLazyNodeRef::Segment(_))));
         assert!(trie.arena_nodes().is_empty());
         store.cache_storage_trie(hashed_addr, trie);
-    }
-
-    #[test]
-    fn storage_trie_cache_prefers_snapshot_cows_after_async_commit() {
-        let dir = TempDir::new().unwrap();
-        let mut config = MptConfig::default();
-        config.async_blob_threshold = usize::MAX;
-        let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
-
-        let addr = Address::repeat_byte(0xAC);
-        let info = default_info(1, 1000);
-        let bundle = make_bundle(vec![(
-            addr,
-            Some(info),
-            revm_database::AccountStatus::Changed,
-            vec![(U256::from(1), U256::ZERO, U256::from(10))],
-        )]);
-        store.apply_bundle_state(&bundle).unwrap();
-        store.commit().unwrap();
-
-        let hashed_addr = keccak256(addr);
-        let cached = store
-            .clone_cached_storage_trie(&hashed_addr)
-            .expect("expected cached entry after async commit");
-        let trie = cached;
-        assert!(matches!(trie.root_ref(), CowRootRef::Lazy(CowLazyNodeRef::Segment(_))));
-        assert!(trie.arena_nodes().is_empty());
-        store.cache_storage_trie(hashed_addr, trie);
-        store.flush_persist().unwrap();
     }
 
     #[test]

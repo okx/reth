@@ -1,7 +1,13 @@
 use alloy_primitives::B256;
 use alloy_trie::Nibbles;
 use mptdb_common::error::{MptDbError, Result};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use super::{
     arena::MutableTrieArena,
@@ -18,6 +24,15 @@ use super::{
     tree::MptTree,
     tree_algo,
 };
+
+static COW_DIAG_ENSURE_PATH_CALLS: AtomicU64 = AtomicU64::new(0);
+static COW_DIAG_MUTATE_SEGMENT_NODE_CALLS: AtomicU64 = AtomicU64::new(0);
+static COW_DIAG_APPLY_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn cow_diag_enabled() -> bool {
+    std::env::var_os("MPT_DEBUG_STORAGE_COW_DIAG").is_some()
+}
 
 #[derive(Clone)]
 pub enum CowLazyNodeRef {
@@ -185,13 +200,21 @@ impl StorageTrieCow {
             return Ok(Self::from_segment_page(segment.clone().into_page_lease()));
         }
 
-        // Build segment inline so the L2 cache stores a lightweight lazy
-        // reference instead of the full materialized arena.  For the async
-        // path the worker will independently build and persist its own segment;
-        // the inline segment here is for L2 cache only and is held alive by
-        // the Arc inside the StorageTrieCow.  In non-wal_first mode RocksDB
-        // provides the fallback if the trie is evicted before the worker
-        // publishes, so this is safe regardless of use_async.
+        // Async/wal_first hot path: keep the trie as-is in L2 cache and avoid
+        // front-end segment serialization/materialization work. Segment build
+        // is handled by the background publish worker.
+        if use_async {
+            self.clear_dirty();
+            return Ok(self);
+        }
+
+        // Sync inline-segment path: before serializing, materialize pending
+        // segment-lazy children into arena refs so segment encoding does not
+        // downgrade them into hash embeds that require persisted fallback.
+        self.materialize_pending_segment_children()?;
+
+        // Sync path only: build segment inline so L2 stores a lightweight
+        // lazy reference instead of the full materialized arena.
         if let Some(root_idx) = self.root_index() {
             let nodes = self.arena_nodes();
             let hashes = self.arena_hash_cache();
@@ -228,6 +251,43 @@ impl StorageTrieCow {
     /// materialized in the arena — stale lazy refs are no longer needed.
     pub fn clear_pending_lazy(&mut self) {
         self.pending_lazy_children.clear();
+    }
+
+    /// Materialize pending segment-lazy children into arena refs.
+    ///
+    /// This is required before segment serialization (`from_parts`) so edges
+    /// tracked only in `pending_lazy_children` are not silently emitted as
+    /// hash embeds.
+    pub fn materialize_pending_segment_children(&mut self) -> Result<()> {
+        if self.pending_lazy_children.is_empty() {
+            return Ok(());
+        }
+
+        let pending = std::mem::take(&mut self.pending_lazy_children);
+        for ((parent_idx, edge), child_ref) in pending {
+            let CowChildRef::Lazy(CowLazyNodeRef::Segment(node_ref)) = child_ref else {
+                self.pending_lazy_children.insert((parent_idx, edge), child_ref);
+                continue;
+            };
+
+            if (parent_idx as usize) >= self.arena.len() {
+                continue;
+            }
+
+            let child_idx = self.materialize_segment_lazy_subtree(node_ref)?;
+            match (self.arena.get_mut(parent_idx), edge) {
+                (MptNode::Extension(ext), PendingCowEdge::Extension) => {
+                    ext.child = ChildRef::Arena(child_idx);
+                }
+                (MptNode::Branch(branch), PendingCowEdge::Branch(slot)) => {
+                    branch.children[slot as usize] = Some(ChildRef::Arena(child_idx));
+                }
+                _ => {}
+            }
+        }
+
+        self.prune_pending_lazy_children();
+        Ok(())
     }
 
     /// Collect all arena nodes into a contiguous Vec.
@@ -356,6 +416,20 @@ impl StorageTrieCow {
         store: &PersistedTrieStore,
         changes: &[StorageChange],
     ) -> Result<()> {
+        self.apply_changes_batched_inner(store, changes)
+    }
+
+    fn apply_changes_batched_inner(
+        &mut self,
+        store: &PersistedTrieStore,
+        changes: &[StorageChange],
+    ) -> Result<()> {
+        let diag = cow_diag_enabled();
+        let diag_start = diag.then(std::time::Instant::now);
+        let ensure_before = diag.then(|| COW_DIAG_ENSURE_PATH_CALLS.load(Ordering::Relaxed));
+        let seg_before = diag.then(|| COW_DIAG_MUTATE_SEGMENT_NODE_CALLS.load(Ordering::Relaxed));
+        let pending_before = self.pending_lazy_children.len();
+
         if changes.is_empty() {
             return Ok(());
         }
@@ -422,6 +496,30 @@ impl StorageTrieCow {
             idx += 1;
         }
 
+        if let (true, Some(start), Some(ensure0), Some(seg0)) =
+            (diag, diag_start, ensure_before, seg_before)
+        {
+            let apply_call = COW_DIAG_APPLY_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+            let should_log = apply_call <= 20 || apply_call % 2000 == 0;
+            if !should_log {
+                return Ok(());
+            }
+            let ensure_delta = COW_DIAG_ENSURE_PATH_CALLS.load(Ordering::Relaxed) - ensure0;
+            let seg_delta = COW_DIAG_MUTATE_SEGMENT_NODE_CALLS.load(Ordering::Relaxed) - seg0;
+            eprintln!(
+                "[cowdiag] apply#{} changes={} touched={} deletes={} pending:{}->{} ensure_calls={} seg_materialize={} elapsed={:?}",
+                apply_call,
+                changes.len(),
+                touched_keys.len(),
+                has_deletes,
+                pending_before,
+                self.pending_lazy_children.len(),
+                ensure_delta,
+                seg_delta,
+                start.elapsed()
+            );
+        }
+
         Ok(())
     }
 
@@ -455,18 +553,54 @@ impl StorageTrieCow {
                     // materialize on-demand via pending_lazy_children.
                     let _ = root_ref;
                 } else {
-                    // Pure updates (no deletes): batch-preload touched paths
-                    // from the segment. This is much faster than per-slot
-                    // on-demand materialization (~3x for B4.6).
+                    // Pure updates (no deletes): batch-preload touched paths from
+                    // the segment. This is much faster than per-slot on-demand
+                    // materialization (~3x for B4.6).
+                    //
+                    // After trace_paths, untouched siblings remain as
+                    // ChildRef::Hash in the arena. We populate pending_lazy_children
+                    // with their SegmentNodeRef so that any structural access
+                    // (e.g. branch collapse) loads from segment mmap instead of
+                    // the persisted store. This is required for wal_first mode
+                    // where the persisted store has not been updated yet.
                     let reader = StorageTrieSegmentReader::open_shared_page(
                         root_ref.page_lease(),
                         root_ref.page_lease().root(),
                         root_ref.page_lease().root_record_off(),
                     )?;
                     let trace = reader.cursor().trace_paths(touched_keys)?;
-                    let (arena, root) = trace.into_parts();
+                    let (arena, root, lazy_siblings) = trace.into_parts();
                     self.arena = arena;
                     self.root = root.map(CowRootRef::Arena).unwrap_or(CowRootRef::Empty);
+
+                    // Filter: only add entries for children that are still
+                    // ChildRef::Hash. Touched children are already ChildRef::Arena
+                    // and must not be shadowed by a stale lazy entry.
+                    for (parent_arena_idx, slot_opt, node_ref) in lazy_siblings {
+                        let edge = match slot_opt {
+                            None => PendingCowEdge::Extension,
+                            Some(s) => PendingCowEdge::Branch(s),
+                        };
+                        let is_hash = match slot_opt {
+                            None => matches!(
+                                self.arena.get(parent_arena_idx),
+                                MptNode::Extension(ext) if matches!(ext.child, ChildRef::Hash(_))
+                            ),
+                            Some(s) => matches!(
+                                self.arena.get(parent_arena_idx),
+                                MptNode::Branch(branch) if matches!(
+                                    branch.children[s as usize],
+                                    Some(ChildRef::Hash(_))
+                                )
+                            ),
+                        };
+                        if is_hash {
+                            self.pending_lazy_children.insert(
+                                (parent_arena_idx, edge),
+                                CowChildRef::Lazy(CowLazyNodeRef::Segment(node_ref)),
+                            );
+                        }
+                    }
                 }
             }
             CowRootRef::Lazy(CowLazyNodeRef::Persisted(root))
@@ -905,6 +1039,9 @@ impl StorageTrieCow {
         key: &Nibbles,
         offset: usize,
     ) -> Result<()> {
+        if cow_diag_enabled() {
+            COW_DIAG_ENSURE_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         match self.arena.get(idx).clone() {
             MptNode::Leaf(_) => Ok(()),
             MptNode::Extension(ext) => {
@@ -1083,6 +1220,9 @@ impl StorageTrieCow {
     }
 
     fn mutate_segment_node(&mut self, node_ref: SegmentNodeRef) -> Result<u32> {
+        if cow_diag_enabled() {
+            COW_DIAG_MUTATE_SEGMENT_NODE_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         let reader = StorageTrieSegmentReader::open_shared_page(
             node_ref.page_lease(),
             node_ref.page_lease().root(),
@@ -1592,6 +1732,119 @@ mod tests {
         let overlay = cow.into_overlay_materialized(&store).unwrap();
         base.insert(&key1, vec![0xcc; 64]);
         assert_eq!(overlay.root_hash_and_dirty_blobs().0, base.root_hash());
+    }
+
+    #[test]
+    fn batched_apply_roundtrip_keeps_segment_paths_without_persisted_nodes() {
+        let mut base = MptTree::new();
+        let key1 = Nibbles::from_nibbles(&[1]);
+        let key2 = Nibbles::from_nibbles(&[2]);
+        base.insert(&key1, vec![0xaa; 64]);
+        base.insert(&key2, vec![0xbb; 64]);
+        let root = base.root_hash();
+        let segment = StorageTrieSegment::from_tree(&base, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        // Persisted store intentionally empty: wal_first must not depend on
+        // persisted-node fallback for untouched subtree reads.
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+        let mut cow = StorageTrieCow::from_segment_page(lease);
+
+        let change1 = StorageChange {
+            hashed_slot: B256::with_last_byte(1),
+            slot_key: key1.clone(),
+            value: alloy_primitives::U256::from(0xcc_u64),
+            encoded_value: Some(vec![0xcc; 64]),
+        };
+        cow.apply_changes_batched(&store, &[change1]).unwrap();
+
+        let (root1, mut cow) = cow.root_hash_only(&store).unwrap();
+        cow.clear_dirty();
+        let mut cached = cow.into_snapshot_cached(root1, None, true).unwrap();
+
+        // Next block touches a different key; this used to fail with
+        // "child node not found" when batched preload introduced hash-only
+        // siblings that required persisted fallback.
+        cached.apply_change(&store, &key2, Some(vec![0xdd; 64])).unwrap();
+    }
+
+    /// Extension child provenance is preserved across blocks in wal_first mode.
+    ///
+    /// Setup: base segment contains an extension node (requires at least two
+    /// keys sharing a long prefix so the trie produces an extension rather
+    /// than a branch at the root).
+    ///
+    /// Block 1: update key1 (path goes THROUGH the extension → child becomes
+    ///          Arena after trace_paths, extension child provenance not needed).
+    ///
+    /// Block 2: insert key_new (path DIVERGES from the extension at nibble 2).
+    ///          trace_paths materialises the extension with inserted=true but
+    ///          returns early, leaving ext.child as ChildRef::Hash.
+    ///          The lazy sibling fix must have recorded the SegmentNodeRef so
+    ///          that the extension split in apply_change can proceed without
+    ///          hitting the empty persisted store.
+    #[test]
+    fn batched_apply_extension_child_provenance_without_persisted_lookup() {
+        // Trie with two keys sharing a long prefix → produces an extension.
+        // key_a = [1,2,3,4,5], key_b = [1,2,3,4,7]:
+        //   extension [1,2,3,4] → branch { slot 5: leaf, slot 7: leaf }
+        let mut base = MptTree::new();
+        let key_a = Nibbles::from_nibbles(&[1, 2, 3, 4, 5]);
+        let key_b = Nibbles::from_nibbles(&[1, 2, 3, 4, 7]);
+        let key_new = Nibbles::from_nibbles(&[1, 2, 8, 9]); // diverges from ext at nibble-idx 2
+        base.insert(&key_a, vec![0xaa; 64]);
+        base.insert(&key_b, vec![0xbb; 64]);
+        let root = base.root_hash();
+        let segment = StorageTrieSegment::from_tree(&base, root).unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(segment.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let file = File::open(tmp.path()).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let mapped = Arc::new(MappedSegmentPage::new(Arc::new(mmap), 0, segment.as_bytes().len()));
+        let lease = Arc::new(SegmentPageLease::new(mapped, root, segment.root_record_off()));
+
+        // Persisted store intentionally empty: wal_first must not use it.
+        let dir = TempDir::new().unwrap();
+        let store = PersistedTrieStore::open(dir.path()).unwrap();
+
+        // Block 1: update key_a (matches extension fully → child Arena after trace).
+        let change_a = StorageChange {
+            hashed_slot: B256::with_last_byte(1),
+            slot_key: key_a.clone(),
+            value: alloy_primitives::U256::from(0xcc_u64),
+            encoded_value: Some(vec![0xcc; 64]),
+        };
+        let mut cow = StorageTrieCow::from_segment_page(lease);
+        cow.apply_changes_batched(&store, &[change_a]).unwrap();
+        let (root1, mut cow) = cow.root_hash_only(&store).unwrap();
+        cow.clear_dirty();
+        // Simulate wal_first async L2 snapshot (no published segment yet).
+        let mut cached = cow.into_snapshot_cached(root1, None, true).unwrap();
+
+        // Block 2: insert key_new which diverges from extension [1,2,3,4] at
+        // nibble index 2.  trace_paths materialises the extension node but
+        // returns early (nibble 8 != 3), leaving ext.child as ChildRef::Hash.
+        // The extension lazy-sibling fix must have captured the SegmentNodeRef
+        // so that this apply_change succeeds without touching the empty store.
+        cached.apply_change(&store, &key_new, Some(vec![0xdd; 64])).unwrap();
+        let (root2, _) = cached.root_hash_only(&store).unwrap();
+
+        // Verify against a reference trie built from scratch.
+        let mut reference = MptTree::new();
+        reference.insert(&key_a, vec![0xcc; 64]);
+        reference.insert(&key_b, vec![0xbb; 64]);
+        reference.insert(&key_new, vec![0xdd; 64]);
+        assert_eq!(root2, reference.root_hash());
     }
 
     #[test]

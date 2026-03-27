@@ -15,7 +15,7 @@ use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use mptdb_common::config::StateStoreConfig;
 use mptdb_provider::MptDbStateWriter;
-use mptdb_sc::mpt::MptCommitStore;
+use mptdb_sc::mpt::{MptCommitStore, MptConfig};
 use mptdb_ss::factory::new_state_store;
 use parking_lot::Mutex;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -43,6 +43,31 @@ const PRE_POP_ACCOUNTS: usize = 100_000;
 const NUM_BLOCKS: usize = 10;
 const TXS_PER_BLOCK: usize = 20_000;
 const INITIAL_BALANCE: u128 = 1_000_000_000_000_000_000; // 1 ETH
+const DEFAULT_SAMPLE_SIZE: usize = 10;
+const DEFAULT_WARMUP_SECS: u64 = 3;
+const DEFAULT_MEASUREMENT_SECS: u64 = 120;
+
+fn bench_sample_size() -> usize {
+    std::env::var("MPTDB_PROVIDER_BENCH_SAMPLE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(10))
+        .unwrap_or(DEFAULT_SAMPLE_SIZE)
+}
+
+fn bench_warmup_secs() -> u64 {
+    std::env::var("MPTDB_PROVIDER_BENCH_WARMUP_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WARMUP_SECS)
+}
+
+fn bench_measurement_secs() -> u64 {
+    std::env::var("MPTDB_PROVIDER_BENCH_MEASUREMENT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MEASUREMENT_SECS)
+}
 
 // ── InMemoryCache — EVM read backend (same for both mptdb and MDBX) ───────────
 
@@ -243,46 +268,64 @@ fn run_mptdb_bench(
     use reth_storage_api::StateWriter;
 
     b.iter_custom(|iters| {
-        let mut total = Duration::ZERO;
+        let mut exec_total = Duration::ZERO;
+        let mut wall_total = Duration::ZERO;
         for _ in 0..iters {
-            let iter_dir = TempDir::new().unwrap();
+            let iter_start = Instant::now();
+            {
+                let iter_dir = TempDir::new().unwrap();
 
-            // Open mptdb
-            let sc = Arc::new(Mutex::new(
-                MptCommitStore::open(iter_dir.path(), false).expect("open SC"),
-            ));
-            let ss_config = StateStoreConfig {
-                db_directory: iter_dir.path().join("ss").to_string_lossy().to_string(),
-                keep_last_version: true,
-                ..Default::default()
-            };
-            let ss =
-                new_state_store(&ss_config, &iter_dir.path().to_string_lossy()).expect("open SS");
-            let writer = MptDbStateWriter::<EthReceipt>::new(ss, sc);
+                // Open mptdb
+                let mut sc_config = MptConfig::default();
+                // Benchmark default: measure the wal_first commit path used by
+                // mpt-db high-performance mode. Set MPTDB_BENCH_LEGACY_SC=1 to
+                // force legacy (non-wal-first) commits for A/B comparison.
+                if std::env::var_os("MPTDB_BENCH_LEGACY_SC").is_none() {
+                    sc_config.wal_first_commit = true;
+                }
+                let sc = Arc::new(Mutex::new(
+                    MptCommitStore::open_with_config(iter_dir.path(), false, sc_config)
+                        .expect("open SC"),
+                ));
+                let ss_config = StateStoreConfig {
+                    db_directory: iter_dir.path().join("ss").to_string_lossy().to_string(),
+                    keep_last_version: true,
+                    ..Default::default()
+                };
+                let ss = new_state_store(&ss_config, &iter_dir.path().to_string_lossy())
+                    .expect("open SS");
+                let writer = MptDbStateWriter::<EthReceipt>::new(ss, Arc::clone(&sc));
 
-            // Pre-populate genesis
-            let genesis = cache_to_bundle(cache);
-            writer.pre_populate(&genesis, 0).expect("pre_populate");
+                // Pre-populate genesis
+                let genesis = cache_to_bundle(cache);
+                writer.pre_populate(&genesis, 0).expect("pre_populate");
 
-            let mut evm_cache = cache.clone();
+                let mut evm_cache = cache.clone();
 
-            let start = Instant::now();
-            for (blk_idx, txs) in block_txs.iter().enumerate() {
-                let bundle =
-                    execute_block_evm(&evm_cache, txs.clone().into_iter(), blk_idx as u64 + 1);
-                writer
-                    .write_state(
-                        &make_outcome(bundle.clone(), blk_idx as u64 + 1),
-                        OriginalValuesKnown::Yes,
-                        reth_storage_api::StateWriteConfig::default(),
-                    )
-                    .expect("write_state");
-                evm_cache.apply_bundle(&bundle);
+                let exec_start = Instant::now();
+                for (blk_idx, txs) in block_txs.iter().enumerate() {
+                    let bundle =
+                        execute_block_evm(&evm_cache, txs.clone().into_iter(), blk_idx as u64 + 1);
+                    writer
+                        .write_state(
+                            &make_outcome(bundle.clone(), blk_idx as u64 + 1),
+                            OriginalValuesKnown::Yes,
+                            reth_storage_api::StateWriteConfig::default(),
+                        )
+                        .expect("write_state");
+                    evm_cache.apply_bundle(&bundle);
+                }
+                exec_total += exec_start.elapsed();
             }
-            total += start.elapsed();
+            wall_total += iter_start.elapsed();
         }
-        eprintln!("[{}] avg/blk: {:.2?}", label, total / (iters * NUM_BLOCKS as u64) as u32);
-        total
+        eprintln!(
+            "[{}] avg/blk(exec-only): {:.2?}",
+            label,
+            exec_total / (iters * NUM_BLOCKS as u64) as u32
+        );
+        eprintln!("[{}] avg/iter(end-to-end): {:.2?}", label, wall_total / iters as u32);
+        wall_total
     });
 }
 
@@ -300,71 +343,81 @@ fn run_reth_mdbx_bench(
     use reth_trie_db::DatabaseStateRoot;
 
     b.iter_custom(|iters| {
-        let mut total = Duration::ZERO;
+        let mut exec_total = Duration::ZERO;
+        let mut wall_total = Duration::ZERO;
         for _ in 0..iters {
-            let factory = create_test_provider_factory();
-
-            // Pre-populate genesis state + compute genesis trie root
-            let genesis = cache_to_bundle(cache);
+            let iter_start = Instant::now();
             {
-                let provider = factory.provider_rw().expect("provider_rw");
-                provider
-                    .write_state(
-                        &make_outcome(genesis.clone(), 0),
-                        OriginalValuesKnown::Yes,
-                        reth_storage_api::StateWriteConfig::default(),
+                let factory = create_test_provider_factory();
+
+                // Pre-populate genesis state + compute genesis trie root
+                let genesis = cache_to_bundle(cache);
+                {
+                    let provider = factory.provider_rw().expect("provider_rw");
+                    provider
+                        .write_state(
+                            &make_outcome(genesis.clone(), 0),
+                            OriginalValuesKnown::Yes,
+                            reth_storage_api::StateWriteConfig::default(),
+                        )
+                        .expect("genesis write_state");
+                    // Engine mode: compute state root using DatabaseStateRoot on MDBX tx
+                    let hashed = HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(
+                        genesis.state.par_iter(),
+                    );
+                    let (_root, trie_updates) = reth_trie::StateRoot::overlay_root_with_updates(
+                        provider.tx_ref(),
+                        &hashed.into_sorted(),
                     )
-                    .expect("genesis write_state");
-                // Engine mode: compute state root using DatabaseStateRoot on MDBX tx
-                let hashed = HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(
-                    genesis.state.par_iter(),
-                );
-                let (_root, trie_updates) = reth_trie::StateRoot::overlay_root_with_updates(
-                    provider.tx_ref(),
-                    &hashed.into_sorted(),
-                )
-                .expect("genesis state_root");
-                provider.write_trie_updates(trie_updates).expect("trie_updates");
-                provider.commit().expect("genesis commit");
-            }
+                    .expect("genesis state_root");
+                    provider.write_trie_updates(trie_updates).expect("trie_updates");
+                    provider.commit().expect("genesis commit");
+                }
 
-            let mut evm_cache = cache.clone();
+                let mut evm_cache = cache.clone();
 
-            let start = Instant::now();
-            for (blk_idx, txs) in block_txs.iter().enumerate() {
-                let bundle =
-                    execute_block_evm(&evm_cache, txs.clone().into_iter(), blk_idx as u64 + 1);
-                let provider = factory.provider_rw().expect("provider_rw");
+                let exec_start = Instant::now();
+                for (blk_idx, txs) in block_txs.iter().enumerate() {
+                    let bundle =
+                        execute_block_evm(&evm_cache, txs.clone().into_iter(), blk_idx as u64 + 1);
+                    let provider = factory.provider_rw().expect("provider_rw");
 
-                // 1. Persist execution output (PlainState + HashedState)
-                provider
-                    .write_state(
-                        &make_outcome(bundle.clone(), blk_idx as u64 + 1),
-                        OriginalValuesKnown::Yes,
-                        reth_storage_api::StateWriteConfig::default(),
+                    // 1. Persist execution output (PlainState + HashedState)
+                    provider
+                        .write_state(
+                            &make_outcome(bundle.clone(), blk_idx as u64 + 1),
+                            OriginalValuesKnown::Yes,
+                            reth_storage_api::StateWriteConfig::default(),
+                        )
+                        .expect("write_state");
+
+                    // 2. Engine mode: compute state root per block (same as reth engine validation
+                    //    path)
+                    let hashed = HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(
+                        bundle.state.par_iter(),
+                    );
+                    let (_root, trie_updates) = reth_trie::StateRoot::overlay_root_with_updates(
+                        provider.tx_ref(),
+                        &hashed.into_sorted(),
                     )
-                    .expect("write_state");
+                    .expect("state_root_with_updates");
 
-                // 2. Engine mode: compute state root per block (same as reth engine validation
-                //    path)
-                let hashed = HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(
-                    bundle.state.par_iter(),
-                );
-                let (_root, trie_updates) = reth_trie::StateRoot::overlay_root_with_updates(
-                    provider.tx_ref(),
-                    &hashed.into_sorted(),
-                )
-                .expect("state_root_with_updates");
-
-                // 3. Write trie updates for next block's incremental root computation
-                provider.write_trie_updates(trie_updates).expect("write_trie_updates");
-                provider.commit().expect("commit");
-                evm_cache.apply_bundle(&bundle);
+                    // 3. Write trie updates for next block's incremental root computation
+                    provider.write_trie_updates(trie_updates).expect("write_trie_updates");
+                    provider.commit().expect("commit");
+                    evm_cache.apply_bundle(&bundle);
+                }
+                exec_total += exec_start.elapsed();
             }
-            total += start.elapsed();
+            wall_total += iter_start.elapsed();
         }
-        eprintln!("[{}] avg/blk: {:.2?}", label, total / (iters * NUM_BLOCKS as u64) as u32);
-        total
+        eprintln!(
+            "[{}] avg/blk(exec-only): {:.2?}",
+            label,
+            exec_total / (iters * NUM_BLOCKS as u64) as u32
+        );
+        eprintln!("[{}] avg/iter(end-to-end): {:.2?}", label, wall_total / iters as u32);
+        wall_total
     });
 }
 
@@ -376,10 +429,14 @@ fn bench_eth_transfer(c: &mut Criterion) {
     let addresses = setup_accounts(&mut cache, &mut rng);
     let block_txs = generate_eth_block_txs(&addresses, &cache, &mut rng);
     let id = format!("{PRE_POP_ACCOUNTS}acc_{TXS_PER_BLOCK}tx_{NUM_BLOCKS}blk");
+    let sample_size = bench_sample_size();
+    let warmup_secs = bench_warmup_secs();
+    let measurement_secs = bench_measurement_secs();
 
     let mut group = c.benchmark_group("eth_transfer");
-    group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(600));
+    group.sample_size(sample_size);
+    group.warm_up_time(std::time::Duration::from_secs(warmup_secs));
+    group.measurement_time(std::time::Duration::from_secs(measurement_secs));
 
     group.bench_with_input(BenchmarkId::new("mptdb", &id), &(), |b, _| {
         run_mptdb_bench(b, &cache, &block_txs, "mptdb");
@@ -485,10 +542,14 @@ fn bench_erc20_transfer(c: &mut Criterion) {
     setup_erc20(&mut cache, &addresses);
     let block_txs = generate_erc20_block_txs(&addresses, &cache, &mut rng);
     let id = format!("{PRE_POP_ACCOUNTS}acc_{TXS_PER_BLOCK}tx_{NUM_BLOCKS}blk");
+    let sample_size = bench_sample_size();
+    let warmup_secs = bench_warmup_secs();
+    let measurement_secs = bench_measurement_secs();
 
     let mut group = c.benchmark_group("erc20_transfer");
-    group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(600));
+    group.sample_size(sample_size);
+    group.warm_up_time(std::time::Duration::from_secs(warmup_secs));
+    group.measurement_time(std::time::Duration::from_secs(measurement_secs));
 
     group.bench_with_input(BenchmarkId::new("mptdb", &id), &(), |b, _| {
         run_mptdb_bench(b, &cache, &block_txs, "mptdb/erc20");

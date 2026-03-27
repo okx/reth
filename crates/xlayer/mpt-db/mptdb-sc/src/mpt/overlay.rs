@@ -16,7 +16,7 @@ impl StorageOverlay {
     }
 
     pub fn from_trace(trace: StoragePathTrace) -> Self {
-        let (arena, root) = trace.into_parts();
+        let (arena, root, _lazy_siblings) = trace.into_parts();
         Self { arena, root }
     }
 

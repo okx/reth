@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::{
     arena::MutableTrieArena,
     encoding::{encode_branch, encode_extension, encode_leaf},
-    flat_layout::{encode_page, read_page_header, FlatPageHeader, FLAT_PAGE_HEADER_LEN},
+    flat_layout::{encode_page, read_page_header_light, FlatPageHeader, FLAT_PAGE_HEADER_LEN},
     hash,
     node::{BranchNode, ChildRef, ExtensionNode, LeafNode, MptNode},
     tree::MptTree,
@@ -139,6 +139,13 @@ pub struct StoragePathTrace {
     arena: MutableTrieArena,
     root: Option<u32>,
     touched_keys: usize,
+    /// Segment lazy refs for hash-only siblings produced by trace_touched_paths.
+    /// Each entry is (parent_arena_idx, branch_slot: Option<u8>, SegmentNodeRef).
+    /// `None` slot = extension child; `Some(s)` = branch child at nibble s.
+    /// Consumers should populate `pending_lazy_children` with these so that
+    /// hash-only siblings are resolved via segment (not persisted store) when
+    /// a structural modification (e.g. branch collapse) needs to access them.
+    lazy_siblings: Vec<(u32, Option<u8>, SegmentNodeRef)>,
 }
 
 #[derive(Clone)]
@@ -288,8 +295,10 @@ pub struct SegmentNodeView<'a> {
 }
 
 impl StoragePathTrace {
-    pub fn into_parts(self) -> (MutableTrieArena, Option<u32>) {
-        (self.arena, self.root)
+    pub fn into_parts(
+        self,
+    ) -> (MutableTrieArena, Option<u32>, Vec<(u32, Option<u8>, SegmentNodeRef)>) {
+        (self.arena, self.root, self.lazy_siblings)
     }
 
     #[cfg(test)]
@@ -318,7 +327,9 @@ impl<'a> StorageTrieSegmentReader<'a> {
         expected_root: B256,
         expected_record_off: u32,
     ) -> Result<Self> {
-        let page = read_page_header(bytes)?;
+        // Hot read path: keep structural checks, skip payload CRC scan.
+        // Full checksum validation is preserved in publish-time paths.
+        let page = read_page_header_light(bytes)?;
         if page.root != expected_root {
             return Err(MptDbError::Other("flat page root mismatch".to_string()));
         }
@@ -333,7 +344,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
     }
 
     pub fn open(bytes: &'a [u8], expected_root: B256) -> Result<Self> {
-        let page = read_page_header(bytes)?;
+        let page = read_page_header_light(bytes)?;
         Self::open_page(bytes, expected_root, page.root_record_off)
     }
 
@@ -469,21 +480,35 @@ impl<'a> StorageTrieSegmentReader<'a> {
                 arena: MutableTrieArena::new(),
                 root: None,
                 touched_keys: keys.len(),
+                lazy_siblings: Vec::new(),
             });
         }
 
         let mut arena = MutableTrieArena::new();
         let mut materialized = vec![None; self.node_count as usize];
+        let mut lazy_siblings: Vec<(u32, Option<u8>, SegmentNodeRef)> = Vec::new();
 
         for key in keys {
-            self.materialize_for_key(self.root_idx, key, 0, &mut arena, &mut materialized)?;
+            self.materialize_for_key(
+                self.root_idx,
+                key,
+                0,
+                &mut arena,
+                &mut materialized,
+                &mut lazy_siblings,
+            )?;
         }
 
         let root_idx =
             materialized.get(self.root_idx as usize).copied().flatten().ok_or_else(|| {
                 MptDbError::Other("segment root was not materialized".to_string())
             })?;
-        Ok(StoragePathTrace { arena, root: Some(root_idx), touched_keys: keys.len() })
+        Ok(StoragePathTrace {
+            arena,
+            root: Some(root_idx),
+            touched_keys: keys.len(),
+            lazy_siblings,
+        })
     }
 
     #[cfg(test)]
@@ -498,6 +523,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
         offset: usize,
         arena: &mut MutableTrieArena,
         materialized: &mut [Option<u32>],
+        lazy_siblings: &mut Vec<(u32, Option<u8>, SegmentNodeRef)>,
     ) -> Result<u32> {
         let mut inserted = false;
         let arena_idx = if let Some(idx) = materialized.get(seg_idx as usize).copied().flatten() {
@@ -517,6 +543,26 @@ impl<'a> StorageTrieSegmentReader<'a> {
         match node.body {
             SegmentNodeBody::Leaf { .. } => Ok(arena_idx),
             SegmentNodeBody::Extension { nibbles, child } => {
+                // On first materialization, record the extension child's
+                // SegmentNodeRef as a lazy sibling so that any subsequent
+                // access (e.g. branch collapse after a delete, or extension
+                // split that exposes the child) can resolve it via segment
+                // mmap rather than the persisted store.
+                // If the key matches and we recurse, the child will become
+                // ChildRef::Arena and the entry will be filtered out by the
+                // is_hash check in preload_batched_paths.
+                if inserted {
+                    if let (Some(lease), Some(target_idx)) = (self.lease.as_ref(), child.target_idx)
+                    {
+                        let hash = self.view_node(target_idx).ok().and_then(|v| v.hash);
+                        lazy_siblings.push((
+                            arena_idx,
+                            None, // Extension child edge
+                            SegmentNodeRef::new(Arc::clone(lease), target_idx, hash),
+                        ));
+                    }
+                }
+
                 let remaining = key.slice(offset..);
                 if remaining.len() < nibbles.len() || remaining.slice(..nibbles.len()) != nibbles {
                     return Ok(arena_idx);
@@ -528,6 +574,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
                         offset + nibbles.len(),
                         arena,
                         materialized,
+                        lazy_siblings,
                     )?;
                     if inserted ||
                         !matches!(
@@ -550,6 +597,28 @@ impl<'a> StorageTrieSegmentReader<'a> {
                 if (child_bitmap & (1u16 << nibble)) == 0 {
                     return Ok(arena_idx);
                 }
+
+                // On first materialization, record SegmentNodeRefs for ALL children
+                // that have a known segment index.  These become pending_lazy_children
+                // in StorageTrieCow so that hash-only siblings can be resolved via
+                // segment mmap instead of the persisted store (required for wal_first).
+                // Touched children (which become ChildRef::Arena) are filtered out
+                // later by the caller before inserting into pending_lazy_children.
+                if inserted {
+                    if let Some(lease) = self.lease.as_ref() {
+                        for child in &children {
+                            if let Some(target_idx) = child.target_idx {
+                                let hash = self.view_node(target_idx).ok().and_then(|v| v.hash);
+                                lazy_siblings.push((
+                                    arena_idx,
+                                    Some(child.slot),
+                                    SegmentNodeRef::new(Arc::clone(lease), target_idx, hash),
+                                ));
+                            }
+                        }
+                    }
+                }
+
                 if let Some(child) = children.iter().find(|child| child.slot == nibble as u8) {
                     if let Some(target_idx) = child.target_idx {
                         let child_arena = self.materialize_for_key(
@@ -558,6 +627,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
                             offset + 1,
                             arena,
                             materialized,
+                            lazy_siblings,
                         )?;
                         let current = self.current_branch_child(arena, arena_idx, nibble as usize);
                         if inserted || !matches!(current, Some(ChildRef::Arena(_))) {
