@@ -111,8 +111,8 @@ impl StateProviderFactory for MptDbStateProviderFactory {
                 self.latest()
             }
             BlockNumberOrTag::Pending => self.pending(),
-            BlockNumberOrTag::Number(n) => Ok(Box::new(self.make_provider(n as i64))),
-            BlockNumberOrTag::Earliest => Ok(Box::new(self.make_provider(0))),
+            BlockNumberOrTag::Number(n) => Ok(Box::new(self.make_provider(n as i64 + 1))),
+            BlockNumberOrTag::Earliest => Ok(Box::new(self.make_provider(1))), /* block 0 → version 1 */
         }
     }
 
@@ -126,7 +126,7 @@ impl StateProviderFactory for MptDbStateProviderFactory {
             .block_id_reader
             .block_number(block)?
             .ok_or_else(|| ProviderError::BlockHashNotFound(block))?;
-        Ok(Box::new(self.make_provider(number as i64)))
+        Ok(Box::new(self.make_provider(number as i64 + 1)))
     }
 
     fn history_by_block_hash(&self, block: BlockHash) -> ProviderResult<StateProviderBox> {
@@ -139,7 +139,7 @@ impl StateProviderFactory for MptDbStateProviderFactory {
 
     fn pending_state_by_hash(&self, block_hash: B256) -> ProviderResult<Option<StateProviderBox>> {
         match self.block_id_reader.block_number(block_hash)? {
-            Some(n) => Ok(Some(Box::new(self.make_provider(n as i64)))),
+            Some(n) => Ok(Some(Box::new(self.make_provider(n as i64 + 1)))),
             None => Ok(None),
         }
     }
