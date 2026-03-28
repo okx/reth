@@ -8,7 +8,7 @@ use crate::{
 use alloy_consensus::BlockHeader;
 use alloy_eips::{eip1898::BlockWithParent, merge::EPOCH_SLOTS, BlockNumHash, NumHash};
 use alloy_evm::block::StateChangeSource;
-use alloy_primitives::B256;
+use alloy_primitives::{BlockHash, BlockNumber, B256};
 use alloy_rpc_types_engine::{
     ForkchoiceState, PayloadStatus, PayloadStatusEnum, PayloadValidationError,
 };
@@ -276,9 +276,9 @@ where
     /// Changeset cache for in-memory trie changesets
     changeset_cache: ChangesetCache,
     /// Optional callback invoked synchronously for each new canonical block.
-    /// Receives the block's BundleState. Runs on the engine's dedicated thread
-    /// before notifications are sent.
-    on_canonical_commit: Option<Box<dyn Fn(&BundleState) + Send>>,
+    /// Receives `(block_number, block_hash, bundle_state)`. Runs on the
+    /// engine's dedicated thread before notifications are sent.
+    on_canonical_commit: Option<Box<dyn Fn(BlockNumber, BlockHash, &BundleState) + Send>>,
 }
 
 impl<N, P: Debug, T: PayloadTypes + Debug, V: Debug, C> std::fmt::Debug
@@ -342,7 +342,7 @@ where
         engine_kind: EngineApiKind,
         evm_config: C,
         changeset_cache: ChangesetCache,
-        on_canonical_commit: Option<Box<dyn Fn(&BundleState) + Send>>,
+        on_canonical_commit: Option<Box<dyn Fn(BlockNumber, BlockHash, &BundleState) + Send>>,
     ) -> Self {
         let (incoming_tx, incoming) = crossbeam_channel::unbounded();
 
@@ -385,7 +385,7 @@ where
         kind: EngineApiKind,
         evm_config: C,
         changeset_cache: ChangesetCache,
-        on_canonical_commit: Option<Box<dyn Fn(&BundleState) + Send>>,
+        on_canonical_commit: Option<Box<dyn Fn(BlockNumber, BlockHash, &BundleState) + Send>>,
     ) -> (Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>, UnboundedReceiver<EngineApiEvent<N>>)
     {
         let best_block_number = provider.best_block_number().unwrap_or(0);
@@ -2385,7 +2385,11 @@ where
                 NewCanonicalChain::Commit { new } | NewCanonicalChain::Reorg { new, .. } => new,
             };
             for block in new_blocks {
-                on_commit(&block.execution_output.state);
+                on_commit(
+                    block.recovered_block().number(),
+                    block.recovered_block().hash(),
+                    &block.execution_output.state,
+                );
             }
         }
 

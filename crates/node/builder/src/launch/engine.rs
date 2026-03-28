@@ -9,6 +9,7 @@ use crate::{
     NodeBuilderWithComponents, NodeComponents, NodeComponentsBuilder, NodeHandle, NodeTypesAdapter,
 };
 use alloy_consensus::BlockHeader;
+use alloy_primitives::{BlockHash, BlockNumber};
 use futures::{stream_select, FutureExt, StreamExt};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_engine_service::service::{ChainEvent, EngineService};
@@ -54,7 +55,8 @@ pub struct EngineNodeLauncher {
 
     /// Optional callback invoked synchronously for each new canonical block.
     /// Used by QMDB integration to commit state before the next block is processed.
-    pub on_canonical_commit: Option<Box<dyn Fn(&revm_database::BundleState) + Send>>,
+    pub on_canonical_commit:
+        Option<Box<dyn Fn(BlockNumber, BlockHash, &revm_database::BundleState) + Send>>,
 
     /// Optional state provider override factory. When set, state reads go through
     /// this factory instead of the default database/in-memory providers.
@@ -101,7 +103,7 @@ impl EngineNodeLauncher {
     /// Set the canonical commit callback.
     pub fn with_on_canonical_commit(
         mut self,
-        cb: Box<dyn Fn(&revm_database::BundleState) + Send>,
+        cb: Box<dyn Fn(BlockNumber, BlockHash, &revm_database::BundleState) + Send>,
     ) -> Self {
         self.on_canonical_commit = Some(cb);
         self

@@ -42,7 +42,8 @@ use tracing::trace;
 ///
 /// Receives the default `StateProviderBox` (from MDBX/in-memory) so the override can delegate
 /// certain queries (e.g., bytecodes) back to it while handling others (accounts, storage) itself.
-pub type StateProviderOverride = Arc<dyn Fn(StateProviderBox) -> StateProviderBox + Send + Sync>;
+pub type StateProviderOverride =
+    Arc<dyn Fn(BlockHash, StateProviderBox) -> StateProviderBox + Send + Sync>;
 
 /// The main type for interacting with the blockchain.
 ///
@@ -611,7 +612,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
 
         if let Some(ref override_fn) = self.state_provider_override {
             trace!(target: "providers::blockchain", "Using state provider override for block hash");
-            return Ok(override_fn(default_provider));
+            return Ok(override_fn(hash, default_provider));
         }
         Ok(default_provider)
     }

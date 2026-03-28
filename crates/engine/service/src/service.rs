@@ -1,3 +1,4 @@
+use alloy_primitives::{BlockHash, BlockNumber};
 use futures::{Stream, StreamExt};
 use pin_project::pin_project;
 use reth_chainspec::EthChainSpec;
@@ -86,7 +87,9 @@ where
         sync_metrics_tx: MetricEventsSender,
         evm_config: C,
         changeset_cache: ChangesetCache,
-        on_canonical_commit: Option<Box<dyn Fn(&revm_database::BundleState) + Send>>,
+        on_canonical_commit: Option<
+            Box<dyn Fn(BlockNumber, BlockHash, &revm_database::BundleState) + Send>,
+        >,
     ) -> Self
     where
         V: EngineValidator<N::Payload>,

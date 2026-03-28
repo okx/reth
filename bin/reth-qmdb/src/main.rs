@@ -256,7 +256,7 @@ fn main() {
             // If the parallel payload builder already submitted this block, skip the duplicate.
             // Otherwise, send to flusher thread for async processing.
             let store_for_commit = qmdb_store.clone();
-            let on_canonical_commit = Box::new(move |bundle: &revm_database::BundleState| {
+            let on_canonical_commit = Box::new(move |_block_number, _block_hash, bundle: &revm_database::BundleState| {
                 if !store_for_commit.skip_if_already_committed() {
                     store_for_commit.commit_bundle_async(bundle.clone());
                 }
@@ -265,7 +265,7 @@ fn main() {
             // State provider override: account/storage reads go through QMDB.
             let store_for_override = qmdb_store.clone();
             let state_override: reth_provider::providers::StateProviderOverride =
-                Arc::new(move |default_provider| {
+                Arc::new(move |_requested_hash, default_provider| {
                     Box::new(xlayer_qmdb_provider::QmdbStateProvider::with_fallback(
                         store_for_override.clone(),
                         default_provider,
