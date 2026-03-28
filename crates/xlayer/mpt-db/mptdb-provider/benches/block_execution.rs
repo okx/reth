@@ -1,8 +1,27 @@
-//! Block execution benchmark: mptdb-provider vs reth native MDBX.
+//! Block execution benchmark: mptdb SC (state root) vs reth native MDBX.
 //!
-//! Same EVM workload (revm + real StateProvider read path), comparing:
-//! - **mptdb**: MptDbStateWriter (SC MPT + SS flat-KV)
-//! - **reth-mdbx**: reth DatabaseProvider (MDBX B-tree)
+//! ## What this benchmark measures
+//!
+//! For each block:
+//! - **mptdb lane**: EVM reads from MDBX directly (not via MptDbStateProvider), SC commit (apply +
+//!   WAL + state root), and MDBX PlainState write in parallel.
+//! - **reth-mdbx lane**: EVM reads from MDBX, MDBX write + overlay_root_with_updates
+//!   + write_trie_updates + commit (full reth persistence path).
+//!
+//! ## Known benchmark design choices
+//!
+//! 1. **MptDbStateProvider is NOT in the mptdb EVM read path here.** EVM reads use
+//!    `mdbx_factory.latest()` directly (no Mutex, no provider wrapper). In production, reads go
+//!    through `SyncProvider(Mutex<StateProviderBox>)` injected by StateProviderOverride, adding a
+//!    per-read lock overhead not measured here. This benchmark therefore **understates** the real
+//!    mptdb EVM read overhead. It measures SC write (state root computation) vs reth MDBX
+//!    write+root, not the full provider-layer read cost.
+//!
+//! 2. **mptdb lane skips trie updates, but still writes MDBX state tables.** `write_state` writes
+//!    PlainState and related change/history tables; we intentionally skip
+//!    `overlay_root_with_updates + write_trie_updates`, so MDBX trie tables
+//!    (AccountsTrie/StoragesTrie) are left empty. This matches the Plan C target where SC owns
+//!    state root computation while MDBX serves EVM reads.
 //!
 //! Run:
 //!   cargo bench --bench block_execution -p mptdb-provider
@@ -13,28 +32,14 @@
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use mptdb_common::config::StateStoreConfig;
-use mptdb_provider::{MptDbStateProviderFactory, MptDbStateWriter};
+use mptdb_provider::MptDbStateWriter;
 use mptdb_sc::mpt::{MptCommitStore, MptConfig};
-use mptdb_ss::factory::new_state_store;
 use parking_lot::Mutex;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use reth_ethereum_primitives::Receipt as EthReceipt;
-use reth_storage_api::{
-    errors::{
-        db::DatabaseError,
-        provider::{ProviderError, ProviderResult},
-    },
-    noop::NoopProvider,
-    AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BytecodeReader,
-    HashedPostStateProvider, StateProofProvider, StateProvider, StateProviderFactory,
-    StateRootProvider, StorageRootProvider,
-};
-use reth_trie_common::{
-    updates::TrieUpdates, AccountProof, HashedPostState, MultiProof, MultiProofTargets,
-    StorageMultiProof, StorageProof, TrieInput,
-};
+use reth_storage_api::{errors::provider::ProviderError, StateProvider, StateWriteConfig};
+use reth_trie_common::HashedPostState;
 use revm::{
     context::{BlockEnv, Context, TxEnv},
     database::states::bundle_state::BundleRetention,
@@ -238,190 +243,6 @@ impl<P: StateProvider> revm::DatabaseRef for BenchStateProviderDb<P> {
     }
 }
 
-#[derive(Clone)]
-struct BytecodeFallbackProvider {
-    noop: NoopProvider,
-    code_by_hash: HashMap<B256, reth_primitives_traits::Bytecode>,
-}
-
-impl BytecodeFallbackProvider {
-    fn from_cache(cache: &InMemoryCache) -> Self {
-        let code_by_hash = cache
-            .code_by_hash
-            .iter()
-            .map(|(hash, code)| (*hash, reth_primitives_traits::Bytecode(code.clone())))
-            .collect();
-        Self { noop: NoopProvider::default(), code_by_hash }
-    }
-}
-
-impl AccountReader for BytecodeFallbackProvider {
-    fn basic_account(
-        &self,
-        address: &Address,
-    ) -> ProviderResult<Option<reth_primitives_traits::Account>> {
-        self.noop.basic_account(address)
-    }
-}
-
-impl BlockHashReader for BytecodeFallbackProvider {
-    fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
-        self.noop.block_hash(number)
-    }
-
-    fn canonical_hashes_range(&self, start: u64, end: u64) -> ProviderResult<Vec<B256>> {
-        self.noop.canonical_hashes_range(start, end)
-    }
-}
-
-impl BlockNumReader for BytecodeFallbackProvider {
-    fn chain_info(&self) -> ProviderResult<reth_chainspec::ChainInfo> {
-        self.noop.chain_info()
-    }
-
-    fn best_block_number(&self) -> ProviderResult<u64> {
-        self.noop.best_block_number()
-    }
-
-    fn last_block_number(&self) -> ProviderResult<u64> {
-        self.noop.last_block_number()
-    }
-
-    fn block_number(&self, hash: B256) -> ProviderResult<Option<u64>> {
-        self.noop.block_number(hash)
-    }
-}
-
-impl BlockIdReader for BytecodeFallbackProvider {
-    fn pending_block_num_hash(&self) -> ProviderResult<Option<alloy_eips::BlockNumHash>> {
-        self.noop.pending_block_num_hash()
-    }
-
-    fn safe_block_num_hash(&self) -> ProviderResult<Option<alloy_eips::BlockNumHash>> {
-        self.noop.safe_block_num_hash()
-    }
-
-    fn finalized_block_num_hash(&self) -> ProviderResult<Option<alloy_eips::BlockNumHash>> {
-        self.noop.finalized_block_num_hash()
-    }
-}
-
-impl BytecodeReader for BytecodeFallbackProvider {
-    fn bytecode_by_hash(
-        &self,
-        code_hash: &B256,
-    ) -> ProviderResult<Option<reth_primitives_traits::Bytecode>> {
-        Ok(self.code_by_hash.get(code_hash).cloned())
-    }
-}
-
-impl StateRootProvider for BytecodeFallbackProvider {
-    fn state_root(&self, _hashed_state: HashedPostState) -> ProviderResult<B256> {
-        Err(ProviderError::Database(DatabaseError::Other(
-            "bytecode fallback does not support state_root".to_string(),
-        )))
-    }
-
-    fn state_root_from_nodes(&self, _input: TrieInput) -> ProviderResult<B256> {
-        Err(ProviderError::Database(DatabaseError::Other(
-            "bytecode fallback does not support state_root_from_nodes".to_string(),
-        )))
-    }
-
-    fn state_root_with_updates(
-        &self,
-        _hashed_state: HashedPostState,
-    ) -> ProviderResult<(B256, TrieUpdates)> {
-        Err(ProviderError::Database(DatabaseError::Other(
-            "bytecode fallback does not support state_root_with_updates".to_string(),
-        )))
-    }
-
-    fn state_root_from_nodes_with_updates(
-        &self,
-        _input: TrieInput,
-    ) -> ProviderResult<(B256, TrieUpdates)> {
-        Err(ProviderError::Database(DatabaseError::Other(
-            "bytecode fallback does not support state_root_from_nodes_with_updates".to_string(),
-        )))
-    }
-}
-
-impl StorageRootProvider for BytecodeFallbackProvider {
-    fn storage_root(
-        &self,
-        _address: Address,
-        _hashed_storage: reth_trie_common::HashedStorage,
-    ) -> ProviderResult<B256> {
-        Err(ProviderError::Database(DatabaseError::Other(
-            "bytecode fallback does not support storage_root".to_string(),
-        )))
-    }
-
-    fn storage_proof(
-        &self,
-        _address: Address,
-        _slot: B256,
-        _hashed_storage: reth_trie_common::HashedStorage,
-    ) -> ProviderResult<StorageProof> {
-        Err(ProviderError::Database(DatabaseError::Other(
-            "bytecode fallback does not support storage_proof".to_string(),
-        )))
-    }
-
-    fn storage_multiproof(
-        &self,
-        _address: Address,
-        _slots: &[B256],
-        _hashed_storage: reth_trie_common::HashedStorage,
-    ) -> ProviderResult<StorageMultiProof> {
-        Err(ProviderError::Database(DatabaseError::Other(
-            "bytecode fallback does not support storage_multiproof".to_string(),
-        )))
-    }
-}
-
-impl StateProofProvider for BytecodeFallbackProvider {
-    fn proof(
-        &self,
-        _input: TrieInput,
-        _address: Address,
-        _slots: &[B256],
-    ) -> ProviderResult<AccountProof> {
-        Err(ProviderError::Database(DatabaseError::Other(
-            "bytecode fallback does not support proof".to_string(),
-        )))
-    }
-
-    fn multiproof(
-        &self,
-        _input: TrieInput,
-        _targets: MultiProofTargets,
-    ) -> ProviderResult<MultiProof> {
-        Err(ProviderError::Database(DatabaseError::Other(
-            "bytecode fallback does not support multiproof".to_string(),
-        )))
-    }
-
-    fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
-        Err(ProviderError::Database(DatabaseError::Other(
-            "bytecode fallback does not support witness".to_string(),
-        )))
-    }
-}
-
-impl HashedPostStateProvider for BytecodeFallbackProvider {
-    fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState {
-        HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(bundle_state.state())
-    }
-}
-
-impl StateProvider for BytecodeFallbackProvider {
-    fn storage(&self, _account: Address, _storage_key: B256) -> ProviderResult<Option<U256>> {
-        Ok(None)
-    }
-}
-
 // ── InMemoryCache → BundleState ───────────────────────────────────────────────
 
 fn cache_to_bundle(cache: &InMemoryCache) -> BundleState {
@@ -448,13 +269,12 @@ fn cache_to_bundle(cache: &InMemoryCache) -> BundleState {
             },
         );
     }
-    BundleState {
-        state,
-        contracts: Default::default(),
-        reverts: Default::default(),
-        state_size: 0,
-        reverts_size: 0,
-    }
+    // Include contract bytecodes so write_state populates the MDBX Bytecodes
+    // table.  Without this, ERC20 calls land on accounts with no code and the
+    // benchmark measures "call to empty account" rather than real storage updates.
+    let contracts: PrimitivesHashMap<B256, revm::bytecode::Bytecode> =
+        cache.code_by_hash.iter().map(|(&h, c)| (h, c.clone())).collect();
+    BundleState { state, contracts, reverts: Default::default(), state_size: 0, reverts_size: 0 }
 }
 
 // ── EVM execution ─────────────────────────────────────────────────────────────
@@ -545,7 +365,10 @@ fn generate_eth_block_txs(
     rng: &mut StdRng,
 ) -> Vec<Vec<TxEnv>> {
     let blocks_n = num_blocks();
-    let txs_n = txs_per_block();
+    // Cap to available senders: each block requires unique senders.
+    // Without this cap the while-loop below would spin forever when
+    // TXS_PER_BLOCK > eoa_addresses.len().
+    let txs_n = txs_per_block().min(eoa_addresses.len());
     let mut nonces: HashMap<Address, u64> = eoa_addresses
         .iter()
         .map(|&addr| (addr, cache.accounts.get(&addr).map(|i| i.nonce).unwrap_or(0)))
@@ -584,7 +407,13 @@ fn generate_eth_block_txs(
 type Outcome = reth_execution_types::ExecutionOutcome<EthReceipt>;
 
 fn make_outcome(bundle: BundleState, block_number: u64) -> Outcome {
-    Outcome::new(bundle, Default::default(), block_number, Default::default())
+    // One-block outcome with empty receipts; benchmark disables receipt writes.
+    Outcome::new(bundle, vec![Vec::new()], block_number, vec![])
+}
+
+fn bench_state_write_config() -> StateWriteConfig {
+    // Bench focuses on state DB cost. Receipts are not part of this benchmark.
+    StateWriteConfig { write_receipts: false, write_account_changesets: false }
 }
 
 // ── mptdb backend ─────────────────────────────────────────────────────────────
@@ -595,7 +424,8 @@ fn run_mptdb_bench(
     block_txs: &[Vec<TxEnv>],
     label: &str,
 ) {
-    use reth_storage_api::StateWriter;
+    use reth_storage_api::{StateWriter, TrieWriter};
+    use reth_trie_db::DatabaseStateRoot as _;
 
     b.iter_custom(|iters| {
         let measure_mode = bench_measure_mode();
@@ -606,16 +436,17 @@ fn run_mptdb_bench(
         let mut setup_total = Duration::ZERO;
         let mut teardown_total = Duration::ZERO;
         let mut evm_total = Duration::ZERO;
-        let mut write_total = Duration::ZERO;
+        let mut sc_write_total = Duration::ZERO;
+        let mut write_total = Duration::ZERO; // wall of parallel SC+MDBX
         let mut prepop_total = Duration::ZERO;
 
         for iter_idx in 0..iters {
             let iter_start = Instant::now();
             let mut open_sc = Duration::ZERO;
-            let mut open_ss = Duration::ZERO;
             let mut pre_pop = Duration::ZERO;
             let mut evm_phase = Duration::ZERO;
-            let mut write_phase = Duration::ZERO;
+            let mut sc_write_phase = Duration::ZERO;
+            let mut write_phase = Duration::ZERO; // wall of parallel SC+MDBX
             let mut drop_phase = Duration::ZERO;
             let mut tmp_drop = Duration::ZERO;
 
@@ -635,65 +466,143 @@ fn run_mptdb_bench(
             ));
             open_sc += t.elapsed();
 
-            let writer = MptDbStateWriter::<EthReceipt>::new(Arc::clone(&sc));
-            let fallback = Arc::new(BytecodeFallbackProvider::from_cache(cache));
-            let block_id_reader = fallback.clone() as Arc<dyn BlockIdReader + Send + Sync>;
-            let mpt_factory = MptDbStateProviderFactory::new(
-                Arc::clone(&writer.sc),
-                fallback as Arc<dyn StateProvider + Send + Sync>,
-                block_id_reader,
-            );
+            let sc_writer = MptDbStateWriter::<EthReceipt>::new(Arc::clone(&sc));
 
-            // Pre-populate genesis
+            // Create MDBX ProviderFactory — same as the reth_mdbx path.
+            // EVM reads go directly from MDBX (no Mutex wrapper) to match the
+            // production path where reth writes PlainState and SC reads MDBX
+            // via the StateProviderOverride default_provider.
+            use reth_provider::test_utils::create_test_provider_factory;
+            let mdbx_factory = create_test_provider_factory();
+
             let genesis = cache_to_bundle(cache);
             let t = Instant::now();
-            writer.pre_populate(&genesis, 0).expect("pre_populate");
+            // Genesis → MDBX (PlainState + trie for initial root)
+            {
+                let provider = mdbx_factory.provider_rw().expect("genesis rw");
+                provider
+                    .write_state(
+                        &make_outcome(genesis.clone(), 0),
+                        OriginalValuesKnown::Yes,
+                        bench_state_write_config(),
+                    )
+                    .expect("genesis mdbx write_state");
+                let hashed = HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(
+                    genesis.state(),
+                );
+                let (_, trie_updates) = reth_trie::StateRoot::overlay_root_with_updates(
+                    provider.tx_ref(),
+                    &hashed.into_sorted(),
+                )
+                .expect("genesis trie root");
+                provider.write_trie_updates(trie_updates).expect("genesis trie updates");
+                provider.commit().expect("genesis mdbx commit");
+            }
+            // Genesis → SC
+            sc_writer.pre_populate(&genesis, 0).expect("pre_populate SC");
             pre_pop += t.elapsed();
+
+            // Pre-spawn one MDBX worker thread per iteration.
+            // This avoids per-block thread-create overhead and removes the
+            // worker from rayon's thread pool so SC's internal rayon tasks
+            // don't contend with MDBX writes.
+            //
+            // Protocol per block:
+            //   main → job_tx.send(Arc<Outcome>)   (non-blocking: bounded(1))
+            //   main → SC commit (rayon, main thread)
+            //   main → done_rx.recv()              (sync: MDBX done before next EVM)
+            type JobOutcome = Arc<Outcome>;
+            let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<JobOutcome>(1);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(0);
+            let mdbx_worker = {
+                let factory = mdbx_factory.clone();
+                std::thread::spawn(move || {
+                    while let Ok(outcome) = job_rx.recv() {
+                        let rw = factory.provider_rw().expect("mdbx rw");
+                        // write_state writes PlainAccountState, PlainStorageState,
+                        // HashedAccountState, AccountChangeSets, StorageChangeSets, etc.
+                        // (see DatabaseProvider::write_state for the full set).
+                        // Intentionally omit overlay_root_with_updates + write_trie_updates:
+                        // SC owns state root; MDBX AccountsTrie/StoragesTrie are not needed
+                        // since EVM reads use PlainState, not the trie tables.
+                        rw.write_state(
+                            outcome.as_ref(),
+                            OriginalValuesKnown::Yes,
+                            bench_state_write_config(),
+                        )
+                            .expect("mdbx write_state");
+                        rw.commit().expect("mdbx commit");
+                        done_tx.send(()).expect("done signal");
+                    }
+                })
+            };
 
             let exec_start = Instant::now();
             for (blk_idx, txs) in block_txs.iter().enumerate() {
+                // EVM reads directly from MDBX via DatabaseProvider (no Mutex wrapper).
+                // This mirrors the production path where reth's StateProviderOverride
+                // receives `default_provider` (the MDBX state) directly.
+                // MptDbStateProvider is not used for EVM reads here — its role in
+                // production is only for state_root / proof, which the benchmark
+                // measures via sc_writer.write_state below.
                 let t_evm = Instant::now();
-                let state_provider = mpt_factory.latest().expect("mpt latest state provider");
+                let db_provider = mdbx_factory.latest().expect("mdbx latest");
                 let bundle =
-                    execute_block_evm(state_provider, txs.clone().into_iter(), blk_idx as u64 + 1);
+                    execute_block_evm(db_provider, txs.clone().into_iter(), blk_idx as u64 + 1);
                 evm_phase += t_evm.elapsed();
 
+                // Wrap outcome in Arc — MDBX worker and SC commit share it
+                // without any large-object clone.
                 let t_wr = Instant::now();
-                writer
+                let outcome = Arc::new(make_outcome(bundle, blk_idx as u64 + 1));
+                job_tx.send(Arc::clone(&outcome)).expect("send to mdbx worker");
+
+                // SC commit on main thread (uses rayon internally).
+                let t_sc = Instant::now();
+                sc_writer
                     .write_state(
-                        &make_outcome(bundle.clone(), blk_idx as u64 + 1),
+                        outcome.as_ref(),
                         OriginalValuesKnown::Yes,
-                        reth_storage_api::StateWriteConfig::default(),
+                        bench_state_write_config(),
                     )
-                    .expect("write_state");
+                    .expect("sc write_state");
+                sc_write_phase += t_sc.elapsed();
+
+                // Wait for MDBX worker to finish before next block's EVM reads.
+                done_rx.recv().expect("mdbx done");
                 write_phase += t_wr.elapsed();
             }
             exec_total += exec_start.elapsed();
 
+            drop(job_tx); // signal worker to exit
+            mdbx_worker.join().expect("mdbx worker");
+
             let t = Instant::now();
-            drop(writer);
+            drop(sc_writer);
             drop(sc);
+            drop(mdbx_factory);
             drop_phase += t.elapsed();
             let t = Instant::now();
             drop(iter_dir);
             tmp_drop += t.elapsed();
 
-            setup_total += open_sc + open_ss + pre_pop;
+            setup_total += open_sc + pre_pop;
             prepop_total += pre_pop;
             evm_total += evm_phase;
+            sc_write_total += sc_write_phase;
             write_total += write_phase;
             teardown_total += drop_phase + tmp_drop;
             wall_total += iter_start.elapsed();
 
             if trace && (iter_idx as usize) < trace_iters {
                 eprintln!(
-                    "[trace][{}][iter {}] setup(open_sc={:.2?}, open_ss={:.2?}, pre_pop={:.2?}) exec(evm={:.2?}, write={:.2?}, total={:.2?}) teardown(drop={:.2?}, tmp_drop={:.2?}) wall={:.2?}",
+                    "[trace][{}][iter {}] setup(open_sc={:.2?}, pre_pop={:.2?}) exec(evm={:.2?}, sc_write={:.2?}, write_wall={:.2?}, total={:.2?}) teardown(drop={:.2?}, tmp_drop={:.2?}) wall={:.2?}",
                     label,
                     iter_idx + 1,
                     open_sc,
-                    open_ss,
                     pre_pop,
                     evm_phase,
+                    sc_write_phase,
                     write_phase,
                     evm_phase + write_phase,
                     drop_phase,
@@ -708,11 +617,12 @@ fn run_mptdb_bench(
             exec_total / (iters * block_txs.len() as u64) as u32
         );
         eprintln!(
-            "[{}] avg/iter breakdown: setup={:.2?} (pre_pop={:.2?}) evm={:.2?} write={:.2?} teardown={:.2?}",
+            "[{}] avg/iter breakdown: setup={:.2?} (pre_pop={:.2?}) evm={:.2?} sc_write={:.2?} write_wall={:.2?} teardown={:.2?}",
             label,
             setup_total / iters as u32,
             prepop_total / iters as u32,
             evm_total / iters as u32,
+            sc_write_total / iters as u32,
             write_total / iters as u32,
             teardown_total / iters as u32,
         );
@@ -774,7 +684,7 @@ fn run_reth_mdbx_bench(
                     .write_state(
                         &make_outcome(genesis_bundle.clone(), 0),
                         OriginalValuesKnown::Yes,
-                        reth_storage_api::StateWriteConfig::default(),
+                        bench_state_write_config(),
                     )
                     .expect("genesis write_state");
                 // Engine mode: compute state root using DatabaseStateRoot on MDBX tx
@@ -800,13 +710,16 @@ fn run_reth_mdbx_bench(
                 evm_phase += t_evm.elapsed();
                 let provider = factory.provider_rw().expect("provider_rw");
 
+                // Wrap in Arc so write_state and hashing share the same allocation.
+                let outcome = Arc::new(make_outcome(bundle, blk_idx as u64 + 1));
+
                 // 1. Persist execution output (PlainState + HashedState)
                 let t_wr = Instant::now();
                 provider
                     .write_state(
-                        &make_outcome(bundle.clone(), blk_idx as u64 + 1),
+                        outcome.as_ref(),
                         OriginalValuesKnown::Yes,
-                        reth_storage_api::StateWriteConfig::default(),
+                        bench_state_write_config(),
                     )
                     .expect("write_state");
                 write_phase += t_wr.elapsed();
@@ -815,7 +728,7 @@ fn run_reth_mdbx_bench(
                 let t_root = Instant::now();
                 let hashed =
                     HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(
-                        bundle.state.par_iter(),
+                        outcome.state().state.par_iter(),
                     );
                 let (_root, trie_updates) = reth_trie::StateRoot::overlay_root_with_updates(
                     provider.tx_ref(),
@@ -978,7 +891,8 @@ fn generate_erc20_block_txs(
     rng: &mut StdRng,
 ) -> Vec<Vec<TxEnv>> {
     let blocks_n = num_blocks();
-    let txs_n = txs_per_block();
+    // Cap to available senders to prevent infinite loop (see generate_eth_block_txs).
+    let txs_n = txs_per_block().min(eoa_addresses.len());
     let mut nonces: HashMap<Address, u64> = eoa_addresses
         .iter()
         .map(|&addr| (addr, cache.accounts.get(&addr).map(|i| i.nonce).unwrap_or(0)))

@@ -6,7 +6,7 @@
 //! state root computation and proof generation.
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, Bytes, B256};
+use alloy_primitives::{keccak256, Address, BlockNumber, Bytes, B256};
 use mptdb_common::error::MptDbError;
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter as _};
 use parking_lot::Mutex;
@@ -137,26 +137,74 @@ impl BytecodeReader for MptDbStateProvider {
 
 impl StateRootProvider for MptDbStateProvider {
     fn state_root(&self, hashed_state: HashedPostState) -> ProviderResult<B256> {
-        self.sc.lock().apply_hashed_state_overlay(&hashed_state).map_err(map_db_err)
+        // SC maintains only the latest committed state; state_root always runs
+        // against the current SC base regardless of self.version.
+        //
+        // The check below guards against providers created via
+        // `history_by_block_number` / `make_provider(N)` where version N ≠
+        // sc.version().  In production, `reth-mptdb` gates StateProviderOverride
+        // so SC is used only for the latest canonical hash; historical hash
+        // requests are delegated to reth's default provider.
+        // Full historical state_root correctness in SC would still require
+        // per-version snapshots (not yet implemented).
+        // Hold a single lock for version check + root computation to avoid
+        // TOCTOU races where SC advances between two separate lock acquisitions.
+        let mut sc = self.sc.lock();
+        let sc_version = sc.version();
+        if self.version != sc_version {
+            return Err(prov_err(format!(
+                "mpt-db: state_root requires version == latest SC version ({sc_version}); \
+                 self.version={} — SC has no per-version MPT snapshots",
+                self.version
+            )));
+        }
+        // Known correctness risk for cold accounts: `apply_hashed_state_overlay`
+        // treats any storage trie not present in SC's handle map as an empty trie
+        // (`StorageTrieCow::empty()`).  Accounts that exist in MDBX but were
+        // never written to SC will get an incorrect storage root.  Fix requires SC
+        // to load historical storage tries on demand when the handle is absent.
+        sc.apply_hashed_state_overlay(&hashed_state).map_err(map_db_err)
     }
 
     fn state_root_with_updates(
         &self,
         hashed_state: HashedPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
+        // Returns empty TrieUpdates: SC manages its own MPT representation and
+        // does not produce MDBX trie-table updates (HashedAccountState,
+        // AccountsTrie, StoragesTrie, etc.).
+        //
+        // Known limitation: reth's execution pipeline uses TrieUpdates to write
+        // trie nodes back to MDBX (provider.rs write_trie_updates).  Returning
+        // empty updates means MDBX trie tables remain unpopulated.  This is
+        // acceptable in the Plan C architecture because:
+        //   - EVM reads come from PlainState (not trie tables)
+        //   - SC provides state root computation independently
+        //   - Code paths that require MDBX trie nodes (e.g. reth's own proof generation, historical
+        //     sync) will need to use reth's native path
         let root = self.state_root(hashed_state)?;
         Ok((root, TrieUpdates::default()))
     }
 
     fn state_root_from_nodes(&self, _input: TrieInput) -> ProviderResult<B256> {
-        Err(prov_err("mpt-db: state_root_from_nodes not supported (Phase 1)"))
+        // Used by reth's parallel state root path (e.g. engine tree speculative
+        // execution).  SC does not accept pre-hashed trie node overlays; it
+        // computes state root via apply_hashed_state_overlay instead.
+        // Callers that need this path must use reth's native MDBX provider.
+        Err(prov_err(
+            "mpt-db: state_root_from_nodes not supported — \
+             use state_root(HashedPostState) instead",
+        ))
     }
 
     fn state_root_from_nodes_with_updates(
         &self,
         _input: TrieInput,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        Err(prov_err("mpt-db: state_root_from_nodes_with_updates not supported (Phase 1)"))
+        Err(prov_err(
+            "mpt-db: state_root_from_nodes_with_updates not supported — \
+             use state_root_with_updates(HashedPostState) instead",
+        ))
     }
 }
 
@@ -235,57 +283,16 @@ impl StateProofProvider for MptDbStateProvider {
     fn multiproof(
         &self,
         _input: TrieInput,
-        targets: MultiProofTargets,
+        _targets: MultiProofTargets,
     ) -> ProviderResult<MultiProof> {
-        use alloy_trie::proof::ProofNodes;
-
-        let mut account_nodes: Vec<(reth_trie_common::Nibbles, Bytes)> = Vec::new();
-        let mut storages = alloy_primitives::map::HashMap::default();
-
-        for (hashed_addr, slot_set) in targets.iter() {
-            // MultiProofTargets keys are keccak(address). We reconstruct the
-            // raw address from the last 20 bytes (best-effort; works for the
-            // common case where addresses are not keccak-colliding).
-            let addr = Address::from_slice(&hashed_addr[12..]);
-            let slots: Vec<B256> = slot_set.iter().copied().collect();
-            let ap =
-                self.sc.lock().account_proof(self.version, addr, &slots).map_err(map_db_err)?;
-
-            // Fold account proof nodes keyed by first-i-nibbles of keccak(address).
-            let addr_nibbles = reth_trie_common::Nibbles::unpack(hashed_addr);
-            for (i, node) in ap.proof.iter().enumerate() {
-                let path = reth_trie_common::Nibbles::from_nibbles_unchecked(
-                    addr_nibbles.slice(..i.min(addr_nibbles.len())).to_vec(),
-                );
-                account_nodes.push((path, node.clone()));
-            }
-
-            if !ap.storage_proofs.is_empty() {
-                let mut storage_nodes: Vec<(reth_trie_common::Nibbles, Bytes)> = Vec::new();
-                for sp in &ap.storage_proofs {
-                    for (i, node) in sp.proof.iter().enumerate() {
-                        let path = reth_trie_common::Nibbles::from_nibbles_unchecked(
-                            sp.nibbles.slice(..i.min(sp.nibbles.len())).to_vec(),
-                        );
-                        storage_nodes.push((path, node.clone()));
-                    }
-                }
-                storages.insert(
-                    *hashed_addr,
-                    StorageMultiProof {
-                        root: ap.storage_root,
-                        subtree: ProofNodes::from_iter(storage_nodes),
-                        branch_node_masks: Default::default(),
-                    },
-                );
-            }
-        }
-
-        Ok(MultiProof {
-            account_subtree: ProofNodes::from_iter(account_nodes),
-            branch_node_masks: Default::default(),
-            storages,
-        })
+        // MultiProofTargets keys are keccak256(address).  SC's account_proof API
+        // requires the original Address, and keccak256 is not reversible.
+        // Implementing multiproof correctly requires SC to expose a hashed-address
+        // proof API.  Return an explicit error until that is available.
+        Err(prov_err(
+            "mpt-db: multiproof not yet supported (MultiProofTargets keys are \
+             keccak256(address) but SC proof API requires raw Address)",
+        ))
     }
 
     fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
@@ -325,5 +332,109 @@ impl StateProvider for MptDbStateProvider {
         storage_key: alloy_primitives::StorageKey,
     ) -> ProviderResult<Option<alloy_primitives::StorageValue>> {
         self.fallback.storage(account, storage_key)
+    }
+}
+
+// ── SyncProvider ──────────────────────────────────────────────────────────────
+//
+// Wraps `StateProviderBox` (`Box<dyn StateProvider + Send>`) in a `Mutex` to
+// satisfy `Arc<dyn StateProvider + Send + Sync>`.  Used by
+// `MptDbStateProviderFactory::make_provider` to build version-specific
+// historical fallbacks from `historical_fallback_factory`.
+//
+// All calls lock the Mutex then delegate; since historical providers are
+// accessed sequentially (one RPC request at a time), the Mutex is
+// uncontended in practice.
+
+pub struct SyncProvider(pub Mutex<reth_storage_api::StateProviderBox>);
+
+impl SyncProvider {
+    pub fn new(p: reth_storage_api::StateProviderBox) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(p)))
+    }
+}
+
+impl AccountReader for SyncProvider {
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        self.0.lock().basic_account(address)
+    }
+}
+impl BlockHashReader for SyncProvider {
+    fn block_hash(&self, n: BlockNumber) -> ProviderResult<Option<B256>> {
+        self.0.lock().block_hash(n)
+    }
+    fn canonical_hashes_range(&self, s: BlockNumber, e: BlockNumber) -> ProviderResult<Vec<B256>> {
+        self.0.lock().canonical_hashes_range(s, e)
+    }
+}
+impl reth_storage_api::BytecodeReader for SyncProvider {
+    fn bytecode_by_hash(&self, h: &B256) -> ProviderResult<Option<Bytecode>> {
+        self.0.lock().bytecode_by_hash(h)
+    }
+}
+impl StateRootProvider for SyncProvider {
+    fn state_root(&self, h: HashedPostState) -> ProviderResult<B256> {
+        self.0.lock().state_root(h)
+    }
+    fn state_root_from_nodes(&self, i: TrieInput) -> ProviderResult<B256> {
+        self.0.lock().state_root_from_nodes(i)
+    }
+    fn state_root_with_updates(
+        &self,
+        h: HashedPostState,
+    ) -> ProviderResult<(B256, reth_trie_common::updates::TrieUpdates)> {
+        self.0.lock().state_root_with_updates(h)
+    }
+    fn state_root_from_nodes_with_updates(
+        &self,
+        i: TrieInput,
+    ) -> ProviderResult<(B256, reth_trie_common::updates::TrieUpdates)> {
+        self.0.lock().state_root_from_nodes_with_updates(i)
+    }
+}
+impl StorageRootProvider for SyncProvider {
+    fn storage_root(&self, a: Address, h: reth_trie_common::HashedStorage) -> ProviderResult<B256> {
+        self.0.lock().storage_root(a, h)
+    }
+    fn storage_proof(
+        &self,
+        a: Address,
+        s: B256,
+        h: reth_trie_common::HashedStorage,
+    ) -> ProviderResult<StorageProof> {
+        self.0.lock().storage_proof(a, s, h)
+    }
+    fn storage_multiproof(
+        &self,
+        a: Address,
+        slots: &[B256],
+        h: reth_trie_common::HashedStorage,
+    ) -> ProviderResult<StorageMultiProof> {
+        self.0.lock().storage_multiproof(a, slots, h)
+    }
+}
+impl StateProofProvider for SyncProvider {
+    fn proof(&self, i: TrieInput, a: Address, s: &[B256]) -> ProviderResult<AccountProof> {
+        self.0.lock().proof(i, a, s)
+    }
+    fn multiproof(&self, i: TrieInput, t: MultiProofTargets) -> ProviderResult<MultiProof> {
+        self.0.lock().multiproof(i, t)
+    }
+    fn witness(&self, i: TrieInput, t: HashedPostState) -> ProviderResult<Vec<Bytes>> {
+        self.0.lock().witness(i, t)
+    }
+}
+impl HashedPostStateProvider for SyncProvider {
+    fn hashed_post_state(&self, b: &revm_database::BundleState) -> HashedPostState {
+        self.0.lock().hashed_post_state(b)
+    }
+}
+impl StateProvider for SyncProvider {
+    fn storage(
+        &self,
+        account: Address,
+        storage_key: alloy_primitives::StorageKey,
+    ) -> ProviderResult<Option<alloy_primitives::StorageValue>> {
+        self.0.lock().storage(account, storage_key)
     }
 }

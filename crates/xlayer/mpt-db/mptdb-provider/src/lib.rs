@@ -1,23 +1,27 @@
-//! reth `StateProvider` adapter for mpt-db.
+//! reth `StateProvider` adapter for mpt-db (Plan C architecture).
 //!
-//! This crate bridges mptdb-sc (SC layer) and mptdb-ss (SS layer) to reth's
-//! `StateProvider` / `StateWriter` / `StateProviderFactory` traits.
-//!
-//! ## Architecture
+//! ## Architecture (Plan C)
 //!
 //! ```text
 //! reth engine
-//!   ├─ StateProvider reads  → SS (flat KV, O(1))
-//!   ├─ StateRootProvider    → SC (MPT dry-run via apply_hashed_state_overlay)
-//!   └─ StateWriter          → SC commit (sync) then SS async write
+//!   ├─ EVM reads (basic_account/storage)
+//!   │    └─ MptDbStateProvider.fallback → reth PlainState (MDBX)
+//!   │         via StateProviderOverride default_provider
+//!   ├─ StateRootProvider / proof
+//!   │    └─ SC (MptCommitStore, always-resident MPT)
+//!   └─ StateWriter
+//!        └─ SC commit only (apply_bundle_state + commit)
+//!             reth writes PlainState to MDBX as part of its own flow
 //! ```
+//!
+//! SS (mptdb-ss) is no longer in the read/write hot path.
 
 mod factory;
-mod provider;
+pub mod provider;
 mod writer;
 
 pub use factory::MptDbStateProviderFactory;
-pub use provider::MptDbStateProvider;
+pub use provider::{MptDbStateProvider, SyncProvider};
 pub use writer::MptDbStateWriter;
 
 #[cfg(test)]

@@ -43,13 +43,39 @@ impl MptDbStateProviderFactory {
     }
 
     /// Create a `MptDbStateProvider` at `version`.
-    fn make_provider(&self, version: i64) -> MptDbStateProvider {
-        MptDbStateProvider::new(
+    ///
+    /// For `latest()` (version == latest SC version): uses `self.fallback`
+    /// directly (the `StateProviderOverride` default_provider in production).
+    ///
+    /// For historical versions (version < latest SC version):
+    /// - If `historical_fallback_factory` is set: calls `history_by_block_number` to obtain a
+    ///   version-specific fallback.  Errors are propagated.
+    /// - If `historical_fallback_factory` is NOT set: returns an error rather than silently using
+    ///   `self.fallback` (current-state data), which would produce wrong reads for historical
+    ///   queries without any indication.
+    fn make_provider(&self, version: i64) -> ProviderResult<MptDbStateProvider> {
+        use crate::provider::SyncProvider;
+
+        let latest = self.sc.lock().version().max(0);
+        let fallback: Arc<dyn StateProvider + Send + Sync> = if version == latest {
+            // Latest version: self.fallback is correct (current-state provider).
+            Arc::clone(&self.fallback)
+        } else if let Some(factory) = &self.historical_fallback_factory {
+            let block = (version - 1).max(0) as u64;
+            SyncProvider::new(factory.history_by_block_number(block)?)
+        } else {
+            // No historical factory configured: cannot provide version-specific
+            // reads.  Return an error instead of silently using self.fallback
+            // (current-state), which would return wrong data for historical queries.
+            return Err(ProviderError::UnsupportedProvider);
+        };
+
+        Ok(MptDbStateProvider::new(
             Arc::clone(&self.sc),
             version,
-            Arc::clone(&self.fallback),
+            fallback,
             Arc::clone(&self.block_id_reader),
-        )
+        ))
     }
 
     fn latest_version(&self) -> i64 {
@@ -107,7 +133,17 @@ impl BlockIdReader for MptDbStateProviderFactory {
 
 impl StateProviderFactory for MptDbStateProviderFactory {
     fn latest(&self) -> ProviderResult<StateProviderBox> {
-        Ok(Box::new(self.make_provider(self.latest_version())))
+        // Build latest provider in one shot to avoid TOCTOU races:
+        // if SC version advances between `latest_version()` and `make_provider`,
+        // `make_provider` can misclassify "latest" as historical and return
+        // UnsupportedProvider when no historical factory is configured.
+        let version = self.latest_version();
+        Ok(Box::new(MptDbStateProvider::new(
+            Arc::clone(&self.sc),
+            version,
+            Arc::clone(&self.fallback),
+            Arc::clone(&self.block_id_reader),
+        )))
     }
 
     fn state_by_block_number_or_tag(
@@ -115,18 +151,35 @@ impl StateProviderFactory for MptDbStateProviderFactory {
         number_or_tag: BlockNumberOrTag,
     ) -> ProviderResult<StateProviderBox> {
         match number_or_tag {
-            BlockNumberOrTag::Latest | BlockNumberOrTag::Safe | BlockNumberOrTag::Finalized => {
-                self.latest()
+            BlockNumberOrTag::Latest => self.latest(),
+            BlockNumberOrTag::Safe => {
+                let nh = self
+                    .block_id_reader
+                    .safe_block_num_hash()?
+                    .ok_or(ProviderError::SafeBlockNotFound)?;
+                self.history_by_block_number(nh.number)
+            }
+            BlockNumberOrTag::Finalized => {
+                let nh = self
+                    .block_id_reader
+                    .finalized_block_num_hash()?
+                    .ok_or(ProviderError::FinalizedBlockNotFound)?;
+                self.history_by_block_number(nh.number)
             }
             BlockNumberOrTag::Pending => self.pending(),
-            BlockNumberOrTag::Number(n) => Ok(Box::new(self.make_provider(n as i64 + 1))),
-            BlockNumberOrTag::Earliest => Ok(Box::new(self.make_provider(1))), /* block 0 → version 1 */
+            BlockNumberOrTag::Number(n) => Ok(Box::new(self.make_provider(n as i64 + 1)?)),
+            BlockNumberOrTag::Earliest => {
+                // Version 1 = block 0 (genesis).  If SC was initialised from
+                // a non-genesis checkpoint or has pruned early versions, this
+                // may not correspond to the true earliest available state.
+                // TODO: expose SC earliest_version to derive a correct mapping.
+                Ok(Box::new(self.make_provider(1)?))
+            }
         }
     }
 
     fn history_by_block_number(&self, block: BlockNumber) -> ProviderResult<StateProviderBox> {
-        // SS version = block_number + 1 (see §5.4 of plan).
-        Ok(Box::new(self.make_provider(block as i64 + 1)))
+        Ok(Box::new(self.make_provider(block as i64 + 1)?))
     }
 
     fn state_by_block_hash(&self, block: BlockHash) -> ProviderResult<StateProviderBox> {
@@ -134,7 +187,7 @@ impl StateProviderFactory for MptDbStateProviderFactory {
             .block_id_reader
             .block_number(block)?
             .ok_or_else(|| ProviderError::BlockHashNotFound(block))?;
-        Ok(Box::new(self.make_provider(number as i64 + 1)))
+        Ok(Box::new(self.make_provider(number as i64 + 1)?))
     }
 
     fn history_by_block_hash(&self, block: BlockHash) -> ProviderResult<StateProviderBox> {
@@ -147,7 +200,7 @@ impl StateProviderFactory for MptDbStateProviderFactory {
 
     fn pending_state_by_hash(&self, block_hash: B256) -> ProviderResult<Option<StateProviderBox>> {
         match self.block_id_reader.block_number(block_hash)? {
-            Some(n) => Ok(Some(Box::new(self.make_provider(n as i64 + 1)))),
+            Some(n) => Ok(Some(Box::new(self.make_provider(n as i64 + 1)?))),
             None => Ok(None),
         }
     }

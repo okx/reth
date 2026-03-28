@@ -96,8 +96,15 @@ impl<R: reth_primitives_traits::Receipt + 'static> StateWriter for MptDbStateWri
         &self,
         _block: alloy_primitives::BlockNumber,
     ) -> ProviderResult<ExecutionOutcome<Self::Receipt>> {
+        // Called by the execution stage unwind path
+        // (stages/stages/src/stages/execution.rs).  SC does not store
+        // execution outcomes per block; returning the outcome for replay
+        // is not supported.  Use remove_state_above for the rollback side;
+        // the execution outcome must be obtained from reth's MDBX change sets.
         Err(ProviderError::Database(reth_storage_api::errors::db::DatabaseError::Other(
-            "mpt-db: take_state_above (reorg) not yet implemented".into(),
+            "mpt-db: take_state_above not supported — SC stores no per-block execution \
+             outcomes; retrieve from reth MDBX change sets instead"
+                .into(),
         )))
     }
 }

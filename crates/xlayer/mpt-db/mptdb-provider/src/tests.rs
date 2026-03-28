@@ -1,10 +1,13 @@
-//! Phase 1b acceptance tests for MptDbStateProvider / MptDbStateWriter.
+//! Plan C acceptance tests for MptDbStateProvider / MptDbStateWriter.
+//!
+//! All tests use a typed in-memory `MapStateProvider` as the fallback,
+//! mirroring the Plan C architecture where basic_account / storage reads come
+//! from reth's PlainState (MDBX) and SC handles state_root / proof only.
+//! No SS (mptdb-ss) references appear here.
 
 use crate::{MptDbStateProvider, MptDbStateWriter};
 use alloy_primitives::{Address, U256};
-use mptdb_common::config::StateStoreConfig;
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter as _};
-use mptdb_ss::{evm::store::EVMStateStore, factory::new_state_store};
 use parking_lot::Mutex;
 use reth_execution_types::ExecutionOutcome;
 use reth_storage_api::{
@@ -16,41 +19,13 @@ use revm_database::{
     states::StorageSlot, AccountStatus, BundleAccount, BundleState, OriginalValuesKnown,
 };
 use revm_state::AccountInfo;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tempfile::TempDir;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn open_sc(dir: &std::path::Path) -> MptCommitStore {
     MptCommitStore::open(dir, false).unwrap()
-}
-
-fn open_ss(dir: &std::path::Path) -> Arc<EVMStateStore> {
-    let config = StateStoreConfig {
-        db_directory: dir.join("ss").to_string_lossy().to_string(),
-        keep_last_version: true,
-        ..Default::default()
-    };
-    new_state_store(&config, &dir.to_string_lossy()).unwrap()
-}
-
-/// Open SS in fully synchronous mode for prune tests.
-///
-/// This avoids async writer/barrier interaction and keeps prune tests
-/// deterministic and fast.
-fn open_ss_sync_for_prune(dir: &std::path::Path) -> Arc<EVMStateStore> {
-    let config = StateStoreConfig {
-        db_directory: dir.join("ss").to_string_lossy().to_string(),
-        keep_last_version: true,
-        async_write_buffer: 0,
-        prune_interval_seconds: 0,
-        ..Default::default()
-    };
-    new_state_store(&config, &dir.to_string_lossy()).unwrap()
-}
-
-fn noop_fallback() -> Arc<dyn StateProvider + Send + Sync> {
-    Arc::new(reth_storage_api::noop::NoopProvider::default())
 }
 
 fn noop_block_id() -> Arc<dyn reth_storage_api::BlockIdReader + Send + Sync> {
@@ -86,78 +61,281 @@ fn make_bundle(
     }
 }
 
-/// Write a block and return the committed state root.
-/// Uses apply_changeset_sync so SS data is readable immediately after return.
-fn write_block_get_root(
-    sc: &Arc<Mutex<MptCommitStore>>,
-    ss: &Arc<EVMStateStore>,
-    bundle: &BundleState,
-    block_number: u64,
-) -> alloy_primitives::B256 {
-    let root = {
-        let mut guard = sc.lock();
-        guard.apply_bundle_state(bundle).unwrap();
-        let (_, r) = guard.commit().unwrap();
-        r
-    };
-    use mptdb_sc::mpt::ss_changeset::bundle_to_ss_changeset;
-    use mptdb_traits::ss::StateStore as _;
-    let cs = bundle_to_ss_changeset(bundle);
-    // SS version = block_number + 1 (avoids MVCC version-0 fixup).
-    ss.apply_changeset_sync(block_number as i64 + 1, &cs).unwrap();
-    root
+// ── MapStateProvider — typed in-memory fallback (replaces MDBX in tests) ────
+
+struct MapStateProvider {
+    accounts: HashMap<Address, AccountInfo>,
+    storage: HashMap<Address, HashMap<U256, U256>>,
 }
 
-fn make_provider(
-    sc: Arc<Mutex<MptCommitStore>>,
-    _ss: Arc<EVMStateStore>,
-    version: i64,
-) -> MptDbStateProvider {
-    MptDbStateProvider::new(sc, version, noop_fallback(), noop_block_id())
+impl MapStateProvider {
+    fn empty() -> Arc<Self> {
+        Arc::new(Self { accounts: HashMap::new(), storage: HashMap::new() })
+    }
+
+    fn with_account(addr: Address, nonce: u64, balance: u64) -> Arc<Self> {
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            addr,
+            AccountInfo {
+                nonce,
+                balance: U256::from(balance),
+                code_hash: alloy_trie::KECCAK_EMPTY,
+                code: None,
+                account_id: None,
+            },
+        );
+        Arc::new(Self { accounts, storage: HashMap::new() })
+    }
+
+    fn with_account_and_storage(
+        addr: Address,
+        nonce: u64,
+        balance: u64,
+        slots: Vec<(U256, U256)>,
+    ) -> Arc<Self> {
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            addr,
+            AccountInfo {
+                nonce,
+                balance: U256::from(balance),
+                code_hash: alloy_trie::KECCAK_EMPTY,
+                code: None,
+                account_id: None,
+            },
+        );
+        let mut storage = HashMap::new();
+        storage.insert(addr, slots.into_iter().collect());
+        Arc::new(Self { accounts, storage })
+    }
 }
 
-// Not needed — write_block_get_root uses apply_changeset_sync.
+// Sync is auto-derived: HashMap<Address, AccountInfo> is Sync,
+// HashMap<Address, HashMap<U256, U256>> is Sync.
+
+impl AccountReader for MapStateProvider {
+    fn basic_account(
+        &self,
+        address: &Address,
+    ) -> reth_storage_api::errors::provider::ProviderResult<Option<reth_primitives_traits::Account>>
+    {
+        Ok(self.accounts.get(address).map(|i| reth_primitives_traits::Account {
+            nonce: i.nonce,
+            balance: i.balance,
+            bytecode_hash: if i.code_hash == alloy_trie::KECCAK_EMPTY {
+                None
+            } else {
+                Some(i.code_hash)
+            },
+        }))
+    }
+}
+
+impl reth_storage_api::BlockHashReader for MapStateProvider {
+    fn block_hash(
+        &self,
+        _: u64,
+    ) -> reth_storage_api::errors::provider::ProviderResult<Option<alloy_primitives::B256>> {
+        Ok(None)
+    }
+    fn canonical_hashes_range(
+        &self,
+        _: u64,
+        _: u64,
+    ) -> reth_storage_api::errors::provider::ProviderResult<Vec<alloy_primitives::B256>> {
+        Ok(vec![])
+    }
+}
+impl reth_storage_api::BytecodeReader for MapStateProvider {
+    fn bytecode_by_hash(
+        &self,
+        _: &alloy_primitives::B256,
+    ) -> reth_storage_api::errors::provider::ProviderResult<Option<reth_primitives_traits::Bytecode>>
+    {
+        Ok(None)
+    }
+}
+impl StateRootProvider for MapStateProvider {
+    fn state_root(
+        &self,
+        _: HashedPostState,
+    ) -> reth_storage_api::errors::provider::ProviderResult<alloy_primitives::B256> {
+        Err(reth_storage_api::errors::provider::ProviderError::Database(
+            reth_storage_api::errors::db::DatabaseError::Other("not supported".into()),
+        ))
+    }
+    fn state_root_from_nodes(
+        &self,
+        _: reth_trie_common::TrieInput,
+    ) -> reth_storage_api::errors::provider::ProviderResult<alloy_primitives::B256> {
+        Err(reth_storage_api::errors::provider::ProviderError::Database(
+            reth_storage_api::errors::db::DatabaseError::Other("not supported".into()),
+        ))
+    }
+    fn state_root_with_updates(
+        &self,
+        _: HashedPostState,
+    ) -> reth_storage_api::errors::provider::ProviderResult<(
+        alloy_primitives::B256,
+        reth_trie_common::updates::TrieUpdates,
+    )> {
+        Err(reth_storage_api::errors::provider::ProviderError::Database(
+            reth_storage_api::errors::db::DatabaseError::Other("not supported".into()),
+        ))
+    }
+    fn state_root_from_nodes_with_updates(
+        &self,
+        _: reth_trie_common::TrieInput,
+    ) -> reth_storage_api::errors::provider::ProviderResult<(
+        alloy_primitives::B256,
+        reth_trie_common::updates::TrieUpdates,
+    )> {
+        Err(reth_storage_api::errors::provider::ProviderError::Database(
+            reth_storage_api::errors::db::DatabaseError::Other("not supported".into()),
+        ))
+    }
+}
+impl reth_storage_api::StorageRootProvider for MapStateProvider {
+    fn storage_root(
+        &self,
+        _: Address,
+        _: reth_trie_common::HashedStorage,
+    ) -> reth_storage_api::errors::provider::ProviderResult<alloy_primitives::B256> {
+        Err(reth_storage_api::errors::provider::ProviderError::Database(
+            reth_storage_api::errors::db::DatabaseError::Other("not supported".into()),
+        ))
+    }
+    fn storage_proof(
+        &self,
+        _: Address,
+        _: alloy_primitives::B256,
+        _: reth_trie_common::HashedStorage,
+    ) -> reth_storage_api::errors::provider::ProviderResult<reth_trie_common::StorageProof> {
+        Err(reth_storage_api::errors::provider::ProviderError::Database(
+            reth_storage_api::errors::db::DatabaseError::Other("not supported".into()),
+        ))
+    }
+    fn storage_multiproof(
+        &self,
+        _: Address,
+        _: &[alloy_primitives::B256],
+        _: reth_trie_common::HashedStorage,
+    ) -> reth_storage_api::errors::provider::ProviderResult<reth_trie_common::StorageMultiProof>
+    {
+        Err(reth_storage_api::errors::provider::ProviderError::Database(
+            reth_storage_api::errors::db::DatabaseError::Other("not supported".into()),
+        ))
+    }
+}
+impl reth_storage_api::StateProofProvider for MapStateProvider {
+    fn proof(
+        &self,
+        _: reth_trie_common::TrieInput,
+        _: Address,
+        _: &[alloy_primitives::B256],
+    ) -> reth_storage_api::errors::provider::ProviderResult<reth_trie_common::AccountProof> {
+        Err(reth_storage_api::errors::provider::ProviderError::Database(
+            reth_storage_api::errors::db::DatabaseError::Other("not supported".into()),
+        ))
+    }
+    fn multiproof(
+        &self,
+        _: reth_trie_common::TrieInput,
+        _: reth_trie_common::MultiProofTargets,
+    ) -> reth_storage_api::errors::provider::ProviderResult<reth_trie_common::MultiProof> {
+        Err(reth_storage_api::errors::provider::ProviderError::Database(
+            reth_storage_api::errors::db::DatabaseError::Other("not supported".into()),
+        ))
+    }
+    fn witness(
+        &self,
+        _: reth_trie_common::TrieInput,
+        _: HashedPostState,
+    ) -> reth_storage_api::errors::provider::ProviderResult<Vec<alloy_primitives::Bytes>> {
+        Err(reth_storage_api::errors::provider::ProviderError::Database(
+            reth_storage_api::errors::db::DatabaseError::Other("not supported".into()),
+        ))
+    }
+}
+impl HashedPostStateProvider for MapStateProvider {
+    fn hashed_post_state(&self, _: &BundleState) -> HashedPostState {
+        HashedPostState::default()
+    }
+}
+impl StateProvider for MapStateProvider {
+    fn storage(
+        &self,
+        addr: Address,
+        key: alloy_primitives::StorageKey,
+    ) -> reth_storage_api::errors::provider::ProviderResult<Option<alloy_primitives::StorageValue>>
+    {
+        let slot = U256::from_be_bytes(*key);
+        Ok(self.storage.get(&addr).and_then(|m| m.get(&slot)).copied())
+    }
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// Version mapping discovery: SS MVCC treats version=0 as version=1 internally
-/// (see mptdb-engine/src/mvcc/write.rs:17). So:
-///   block 0 written at SS version 0 → internally stored at version 1
-///   block 1 written at SS version 1 → stored at version 1 (same slot!)
-/// This means the plan's "version = block_number as i64" needs adjustment:
-///   SS read/write version should be (block_number + 1) to avoid the version-0 fixup.
-///
-/// After block 0, SC version == 1 (§5.4 mapping).
+/// Plan C: basic_account is served by the fallback provider, not SC.
 #[test]
-#[ignore]
-fn write_state_sc_version_mapping() {
+fn plan_c_basic_account_reads_from_fallback() {
     let dir = TempDir::new().unwrap();
     let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
-    let bundle = make_bundle(Address::repeat_byte(0x01), 7, 1000, vec![]);
+    let addr = Address::repeat_byte(0xAA);
 
-    assert_eq!(sc.lock().version(), 0);
-    write_block_get_root(&sc, &ss, &bundle, 0);
-    assert_eq!(sc.lock().version(), 1, "SC version 1 = block 0");
+    // Commit a block to SC (advances SC version).
+    let bundle = make_bundle(addr, 7, 1000, vec![]);
+    {
+        let mut guard = sc.lock();
+        guard.apply_bundle_state(&bundle).unwrap();
+        guard.commit().unwrap();
+    }
+
+    // Fallback has different data — Plan C: basic_account must return fallback data.
+    let fallback = MapStateProvider::with_account(addr, 99, 42);
+    let version = sc.lock().version();
+    let provider = MptDbStateProvider::new(Arc::clone(&sc), version, fallback, noop_block_id());
+
+    let account = provider.basic_account(&addr).unwrap().expect("account must exist");
+    assert_eq!(account.nonce, 99, "nonce must come from fallback, not SC");
+    assert_eq!(account.balance, U256::from(42u64), "balance must come from fallback");
 }
 
-/// Helper: correct SS version for reading block N's state.
-/// SS MVCC skips version 0 (treats it as 1), so use block_number + 1 for SS.
-fn ss_version_for_block(block_number: u64) -> i64 {
-    (block_number + 1) as i64
-}
-
-/// state_root(HashedPostState) dry-run == SC commit root for same block.
+/// Plan C: storage() is served by the fallback provider.
 #[test]
-#[ignore]
-fn state_root_dry_run_matches_commit_root() {
+fn plan_c_storage_reads_from_fallback() {
     let dir = TempDir::new().unwrap();
     let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
-    let addr = Address::repeat_byte(0x02);
+    let addr = Address::repeat_byte(0xBB);
+    let slot = U256::from(7u64);
+    let value = U256::from(123u64);
+
+    let bundle = make_bundle(addr, 1, 0, vec![(slot, value)]);
+    {
+        let mut guard = sc.lock();
+        guard.apply_bundle_state(&bundle).unwrap();
+        guard.commit().unwrap();
+    }
+
+    // Fallback has the storage data.
+    let fallback = MapStateProvider::with_account_and_storage(addr, 1, 0, vec![(slot, value)]);
+    let version = sc.lock().version();
+    let provider = MptDbStateProvider::new(Arc::clone(&sc), version, fallback, noop_block_id());
+
+    let slot_key = alloy_primitives::StorageKey::from(slot.to_be_bytes::<32>());
+    let stored = provider.storage(addr, slot_key).unwrap().expect("slot must exist");
+    assert_eq!(stored, value);
+}
+
+/// Plan C: state_root is computed by SC (dry-run overlay), not fallback.
+#[test]
+fn plan_c_state_root_uses_sc() {
+    let dir = TempDir::new().unwrap();
+    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
+    let addr = Address::repeat_byte(0xCC);
     let bundle = make_bundle(addr, 3, 500, vec![(U256::from(1u64), U256::from(42u64))]);
 
-    // Compute HashedPostState from bundle (same as reth does before state_root call)
     let hps: HashedPostState = {
         use alloy_primitives::keccak256;
         use reth_trie_common::HashedStorage;
@@ -176,262 +354,143 @@ fn state_root_dry_run_matches_commit_root() {
         h
     };
 
-    // Dry-run root (SC not yet committed)
-    let provider = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(0));
+    // Dry-run root before commit.
+    let version = sc.lock().version();
+    let provider = MptDbStateProvider::new(
+        Arc::clone(&sc),
+        version,
+        MapStateProvider::empty(),
+        noop_block_id(),
+    );
     let root_dry = provider.state_root(hps).unwrap();
 
-    // Commit root
-    let root_commit = write_block_get_root(&sc, &ss, &bundle, 0);
+    // Commit.
+    let mut guard = sc.lock();
+    guard.apply_bundle_state(&bundle).unwrap();
+    let (_, root_commit) = guard.commit().unwrap();
 
-    assert_eq!(root_dry, root_commit, "dry-run root must match commit root");
+    assert_eq!(root_dry, root_commit, "Plan C state_root dry-run must match committed root");
 }
 
-/// basic_account reads back correct values after write.
+/// Plan C: write_state only writes to SC; reads come from fallback.
 #[test]
-#[ignore]
-fn basic_account_reads_back() {
+fn plan_c_write_state_sc_only_read_from_fallback() {
     let dir = TempDir::new().unwrap();
     let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
-    let addr = Address::repeat_byte(0x03);
+    let addr = Address::repeat_byte(0xDD);
+
+    let writer = MptDbStateWriter::<reth_ethereum_primitives::Receipt>::new(Arc::clone(&sc));
     let bundle = make_bundle(addr, 5, 999, vec![]);
+    writer
+        .write_state(
+            &ExecutionOutcome::new(bundle.clone(), Default::default(), 1, Default::default()),
+            OriginalValuesKnown::Yes,
+            StateWriteConfig::default(),
+        )
+        .unwrap();
 
-    write_block_get_root(&sc, &ss, &bundle, 0);
+    assert_eq!(sc.lock().version(), 1, "SC must advance after write_state");
 
-    let provider = make_provider(sc, ss, ss_version_for_block(0));
+    // Fallback has different data — reads must come from fallback, not SC.
+    let fallback = MapStateProvider::with_account(addr, 77, 888);
+    let version = sc.lock().version();
+    let provider = MptDbStateProvider::new(Arc::clone(&sc), version, fallback, noop_block_id());
     let account = provider.basic_account(&addr).unwrap().expect("account must exist");
-    assert_eq!(account.nonce, 5);
-    assert_eq!(account.balance, U256::from(999u64));
+    assert_eq!(account.nonce, 77, "Plan C: reads come from fallback, not SC");
 }
 
-/// storage() reads back correct value after write.
+/// SC version advances correctly: block 0 → version 1.
 #[test]
-#[ignore]
-fn storage_reads_back() {
+fn sc_version_mapping_after_write_state() {
     let dir = TempDir::new().unwrap();
     let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
-    let addr = Address::repeat_byte(0x04);
-    let slot = U256::from(7u64);
-    let value = U256::from(123u64);
-    let bundle = make_bundle(addr, 1, 0, vec![(slot, value)]);
+    assert_eq!(sc.lock().version(), 0, "fresh SC starts at version 0");
 
-    write_block_get_root(&sc, &ss, &bundle, 0);
+    let writer = MptDbStateWriter::<reth_ethereum_primitives::Receipt>::new(Arc::clone(&sc));
+    let bundle = make_bundle(Address::repeat_byte(0x01), 7, 1000, vec![]);
+    writer
+        .write_state(
+            &ExecutionOutcome::new(bundle, Default::default(), 1, Default::default()),
+            OriginalValuesKnown::Yes,
+            StateWriteConfig::default(),
+        )
+        .unwrap();
 
-    let provider = make_provider(sc, ss, ss_version_for_block(0));
-    let slot_key = alloy_primitives::StorageKey::from(slot.to_be_bytes::<32>());
-    let stored = provider.storage(addr, slot_key).unwrap().expect("slot must exist");
-    assert_eq!(stored, value);
+    assert_eq!(sc.lock().version(), 1, "SC version 1 = block 0 committed");
 }
 
-/// Consecutive blocks accumulate correctly; version 0 sees block 0 state.
+/// remove_state_above (reorg rollback) rolls SC back to the target version.
 #[test]
-#[ignore]
-fn consecutive_blocks() {
+fn remove_state_above_rolls_back_sc() {
     let dir = TempDir::new().unwrap();
     let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
-    let addr = Address::repeat_byte(0x05);
+    let writer = MptDbStateWriter::<reth_ethereum_primitives::Receipt>::new(Arc::clone(&sc));
 
-    write_block_get_root(&sc, &ss, &make_bundle(addr, 1, 100, vec![]), 0);
-    write_block_get_root(&sc, &ss, &make_bundle(addr, 2, 200, vec![]), 1);
+    // Commit 3 blocks.
+    for blk in 0..3u64 {
+        let bundle = make_bundle(Address::repeat_byte(0x10 + blk as u8), blk + 1, 100, vec![]);
+        writer
+            .write_state(
+                &ExecutionOutcome::new(bundle, Default::default(), blk + 1, Default::default()),
+                OriginalValuesKnown::Yes,
+                StateWriteConfig::default(),
+            )
+            .unwrap();
+    }
+    assert_eq!(sc.lock().version(), 3);
 
-    assert_eq!(sc.lock().version(), 2);
-
-    let p0 = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(0));
-    assert_eq!(p0.basic_account(&addr).unwrap().unwrap().nonce, 1);
-
-    let p1 = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(1));
-    assert_eq!(p1.basic_account(&addr).unwrap().unwrap().nonce, 2);
+    // Roll back to block 1 (SC version 2 = after block 1).
+    use reth_storage_api::StateWriter as _;
+    writer.remove_state_above(1).unwrap();
+    assert_eq!(sc.lock().version(), 2, "SC must be at version 2 (= block 1 + 1) after rollback");
 }
 
-/// Stub paths return Err, not panic.  Lightweight — runs by default.
+/// Stub paths return Err, not panic.
 #[test]
 fn stub_paths_return_err_not_panic() {
     let dir = TempDir::new().unwrap();
     let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
-    let provider = make_provider(sc, ss, ss_version_for_block(0));
+    let provider =
+        MptDbStateProvider::new(Arc::clone(&sc), 0, MapStateProvider::empty(), noop_block_id());
 
-    use reth_storage_api::{StateRootProvider, StorageRootProvider};
+    use reth_storage_api::{StateProofProvider, StateRootProvider};
     use reth_trie_common::TrieInput;
 
+    // These are truly unimplemented stubs — must return Err.
     assert!(provider.state_root_from_nodes(TrieInput::default()).is_err());
     assert!(provider.state_root_from_nodes_with_updates(TrieInput::default()).is_err());
-    assert!(provider.storage_root(Address::ZERO, Default::default()).is_err());
-
-    use reth_storage_api::StateProofProvider;
-    assert!(provider.proof(TrieInput::default(), Address::ZERO, &[]).is_err());
     assert!(provider.multiproof(TrieInput::default(), Default::default()).is_err());
     assert!(provider.witness(TrieInput::default(), Default::default()).is_err());
+    // proof / storage_root delegate to SC and return Ok for a fresh (empty) SC.
 }
 
-// ── Phase 2: historical query reliability ──────────────────────────────────────
-
-/// Queries within SS retained range succeed normally.
+/// proof() succeeds for a committed account.
 #[test]
-fn historical_query_within_keep_recent_succeeds() {
+fn proof_succeeds_for_committed_account() {
     let dir = TempDir::new().unwrap();
     let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
-    let addr = Address::repeat_byte(0x11);
-
-    // Write 3 blocks
-    for block in 0..3u64 {
-        let bundle = make_bundle(addr, block + 1, (block + 1) * 100, vec![]);
-        write_block_get_root(&sc, &ss, &bundle, block);
-    }
-
-    // Read each block's state — all should be available (SS has all versions)
-    for block in 0..3u64 {
-        let provider = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(block));
-        let account = provider
-            .basic_account(&addr)
-            .expect("should not error for available version")
-            .expect("account must exist");
-        assert_eq!(account.nonce, block + 1, "block {block}: wrong nonce");
-    }
-}
-
-/// After pruning old versions, querying a pruned version returns a clear error.
-#[test]
-fn historical_query_pruned_version_returns_clear_error() {
-    let dir = TempDir::new().unwrap();
-    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss_sync_for_prune(dir.path());
-    let addr = Address::repeat_byte(0x22);
-
-    // Write 5 blocks
-    for block in 0..5u64 {
-        let bundle = make_bundle(addr, block + 1, (block + 1) * 100, vec![]);
-        write_block_get_root(&sc, &ss, &bundle, block);
-    }
-
-    // Block 1 (SS version 2) exists before pruning
-    {
-        let p = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(1));
-        assert!(p.basic_account(&addr).unwrap().is_some(), "block 1 data must exist before prune");
-    }
-
-    // Simulate prune by advancing earliest available SS version to 4
-    // (equivalent visibility effect to pruning versions 1..=3).
-    {
-        use mptdb_traits::ss::StateStore as _;
-        ss.set_earliest_version(4, false).unwrap();
-    }
-
-    // Block 1 (SS version 2) is now pruned → must return Err
-    let provider = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(1));
-    let result = provider.basic_account(&addr);
-    assert!(
-        result.is_err(),
-        "querying pruned SS version should return Err, not silently return None"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("not available") || err_msg.contains("pruned"),
-        "error message should mention unavailability: {err_msg}"
-    );
-
-    // Block 4 (SS version 5) is after prune threshold — still available
-    let provider = make_provider(Arc::clone(&sc), Arc::clone(&ss), ss_version_for_block(4));
-    let account = provider.basic_account(&addr).unwrap().expect("block 4 must still exist");
-    assert_eq!(account.nonce, 5);
-}
-
-/// is_version_available correctly reflects SS retention state.  Lightweight — runs by default.
-#[test]
-fn ss_version_available_reflects_written_range() {
-    let dir = TempDir::new().unwrap();
-    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
-    let addr = Address::repeat_byte(0x33);
-
-    // Before any writes, no version is available
-    assert!(
-        !ss.is_version_available(1),
-        "SS should report version 1 unavailable before any writes"
-    );
-
-    // Write block 0
-    let bundle = make_bundle(addr, 1, 100, vec![]);
-    write_block_get_root(&sc, &ss, &bundle, 0);
-
-    // After writing block 0 (SS version 1), version 1 should be available
-    assert!(
-        ss.is_version_available(ss_version_for_block(0)),
-        "SS should report block 0 (version {}) as available after write",
-        ss_version_for_block(0)
-    );
-
-    // A future version should not be available
-    assert!(
-        !ss.is_version_available(ss_version_for_block(99)),
-        "SS should report block 99 as unavailable"
-    );
-}
-
-// ── Phase 3: proof generation ──────────────────────────────────────────────────
-
-/// account_proof returns a valid AccountProof with non-empty proof nodes.
-#[test]
-#[ignore]
-fn proof_returns_account_proof() {
-    let dir = TempDir::new().unwrap();
-    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
-    let addr = Address::repeat_byte(0xAB);
-    let bundle = make_bundle(addr, 3, 300, vec![(U256::from(5u64), U256::from(99u64))]);
-    write_block_get_root(&sc, &ss, &bundle, 0);
-
-    let provider = make_provider(sc, ss, ss_version_for_block(0));
-    use reth_storage_api::StateProofProvider;
-    use reth_trie_common::TrieInput;
-
-    let slot = alloy_primitives::keccak256(U256::from(5u64).to_be_bytes::<32>());
-    let ap = provider.proof(TrieInput::default(), addr, &[slot]).unwrap();
-
-    // proof nodes must be non-empty for a committed account
-    assert!(!ap.proof.is_empty(), "account proof must have nodes");
-    // address matches
-    assert_eq!(ap.address, addr);
-}
-
-/// storage_root matches the storage_root inside the account proof.
-#[test]
-#[ignore]
-fn storage_root_matches_account_proof_storage_root() {
-    let dir = TempDir::new().unwrap();
-    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
-    let addr = Address::repeat_byte(0xCD);
-    let bundle = make_bundle(addr, 1, 100, vec![(U256::from(1u64), U256::from(42u64))]);
-    write_block_get_root(&sc, &ss, &bundle, 0);
-
-    let provider = make_provider(sc, ss, ss_version_for_block(0));
-    use reth_storage_api::{StateProofProvider, StorageRootProvider};
-    use reth_trie_common::TrieInput;
-
-    let ap = provider.proof(TrieInput::default(), addr, &[]).unwrap();
-    let sr = provider.storage_root(addr, Default::default()).unwrap();
-    assert_eq!(sr, ap.storage_root, "storage_root must match account proof's storage_root");
-}
-
-/// stub_paths no longer stub after Phase 3: proof() succeeds.
-#[test]
-#[ignore]
-fn proof_no_longer_returns_unsupported_error() {
-    let dir = TempDir::new().unwrap();
-    let sc = Arc::new(Mutex::new(open_sc(dir.path())));
-    let ss = open_ss(dir.path());
     let addr = Address::repeat_byte(0xEF);
     let bundle = make_bundle(addr, 2, 200, vec![]);
-    write_block_get_root(&sc, &ss, &bundle, 0);
 
-    let provider = make_provider(sc, ss, ss_version_for_block(0));
+    let writer = MptDbStateWriter::<reth_ethereum_primitives::Receipt>::new(Arc::clone(&sc));
+    writer
+        .write_state(
+            &ExecutionOutcome::new(bundle, Default::default(), 1, Default::default()),
+            OriginalValuesKnown::Yes,
+            StateWriteConfig::default(),
+        )
+        .unwrap();
+
+    let version = sc.lock().version();
+    let provider = MptDbStateProvider::new(
+        Arc::clone(&sc),
+        version,
+        MapStateProvider::empty(),
+        noop_block_id(),
+    );
+
     use reth_storage_api::StateProofProvider;
     use reth_trie_common::TrieInput;
-
     let result = provider.proof(TrieInput::default(), addr, &[]);
-    assert!(result.is_ok(), "proof() must succeed in Phase 3, got: {:?}", result.err());
+    assert!(result.is_ok(), "proof() must succeed for committed account, got: {:?}", result.err());
 }

@@ -24,7 +24,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::map::HashMap;
 use clap::{Args, Parser};
-use mptdb_provider::{MptDbStateProvider, MptDbStateWriter};
+use mptdb_provider::{MptDbStateProvider, MptDbStateWriter, SyncProvider};
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter as _};
 use parking_lot::Mutex;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
@@ -41,112 +41,9 @@ use tracing::info;
 #[derive(Debug, Clone, Args, PartialEq, Eq, Default)]
 pub struct MptdbArgs {}
 
-// ── DefaultProviderWrapper ────────────────────────────────────────────────────
-// Wraps `StateProviderBox` (Box<dyn StateProvider + Send>) so it can be stored
-// as `Arc<dyn StateProvider + Send + Sync>` in MptDbStateProvider.
-//
-// SAFETY: reth's DatabaseProvider (the source of default_provider in
-// StateProviderOverride callbacks) is Send + Sync.  We re-assert Sync here to
-// satisfy Arc's constraint.
-
-use alloy_primitives::{Address, BlockNumber, Bytes, B256};
-use reth_primitives_traits::{Account, Bytecode};
-use reth_storage_api::{
-    errors::provider::ProviderResult, AccountReader, BlockHashReader, BytecodeReader,
-    HashedPostStateProvider, StateProofProvider, StateProvider, StateProviderBox,
-    StateRootProvider, StorageRootProvider,
-};
-use reth_trie_common::{
-    updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
-    MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
-};
-
-struct DefaultProviderWrapper(StateProviderBox);
-unsafe impl Sync for DefaultProviderWrapper {}
-
-// Only implement the traits actually required by StateProvider (its supertrait chain).
-// BlockNumReader and BlockIdReader are NOT in StateProvider's supertrait chain.
-
-impl AccountReader for DefaultProviderWrapper {
-    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        self.0.basic_account(address)
-    }
-}
-impl BlockHashReader for DefaultProviderWrapper {
-    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
-        self.0.block_hash(number)
-    }
-    fn canonical_hashes_range(
-        &self,
-        start: BlockNumber,
-        end: BlockNumber,
-    ) -> ProviderResult<Vec<B256>> {
-        self.0.canonical_hashes_range(start, end)
-    }
-}
-impl BytecodeReader for DefaultProviderWrapper {
-    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
-        self.0.bytecode_by_hash(code_hash)
-    }
-}
-impl StateRootProvider for DefaultProviderWrapper {
-    fn state_root(&self, h: HashedPostState) -> ProviderResult<B256> {
-        self.0.state_root(h)
-    }
-    fn state_root_with_updates(&self, h: HashedPostState) -> ProviderResult<(B256, TrieUpdates)> {
-        self.0.state_root_with_updates(h)
-    }
-    fn state_root_from_nodes(&self, i: TrieInput) -> ProviderResult<B256> {
-        self.0.state_root_from_nodes(i)
-    }
-    fn state_root_from_nodes_with_updates(
-        &self,
-        i: TrieInput,
-    ) -> ProviderResult<(B256, TrieUpdates)> {
-        self.0.state_root_from_nodes_with_updates(i)
-    }
-}
-impl StorageRootProvider for DefaultProviderWrapper {
-    fn storage_root(&self, a: Address, h: HashedStorage) -> ProviderResult<B256> {
-        self.0.storage_root(a, h)
-    }
-    fn storage_proof(&self, a: Address, s: B256, h: HashedStorage) -> ProviderResult<StorageProof> {
-        self.0.storage_proof(a, s, h)
-    }
-    fn storage_multiproof(
-        &self,
-        a: Address,
-        slots: &[B256],
-        h: HashedStorage,
-    ) -> ProviderResult<StorageMultiProof> {
-        self.0.storage_multiproof(a, slots, h)
-    }
-}
-impl StateProofProvider for DefaultProviderWrapper {
-    fn proof(&self, i: TrieInput, a: Address, slots: &[B256]) -> ProviderResult<AccountProof> {
-        self.0.proof(i, a, slots)
-    }
-    fn multiproof(&self, i: TrieInput, t: MultiProofTargets) -> ProviderResult<MultiProof> {
-        self.0.multiproof(i, t)
-    }
-    fn witness(&self, i: TrieInput, t: HashedPostState) -> ProviderResult<Vec<Bytes>> {
-        self.0.witness(i, t)
-    }
-}
-impl HashedPostStateProvider for DefaultProviderWrapper {
-    fn hashed_post_state(&self, b: &revm_database::BundleState) -> HashedPostState {
-        self.0.hashed_post_state(b)
-    }
-}
-impl StateProvider for DefaultProviderWrapper {
-    fn storage(
-        &self,
-        account: Address,
-        key: alloy_primitives::StorageKey,
-    ) -> ProviderResult<Option<alloy_primitives::StorageValue>> {
-        self.0.storage(account, key)
-    }
-}
+// StateProviderOverride wraps default_provider in SyncProvider (Mutex-based)
+// to satisfy Arc<dyn StateProvider + Send + Sync>.
+use reth_storage_api::StateProvider;
 
 fn main() {
     reth_cli_util::sigsegv_handler::install();
@@ -177,16 +74,45 @@ fn main() {
 
             // ── Genesis pre-population ─────────────────────────────────────
             // Only populate if SC is at version 0 (fresh DB).
+            //
+            // Known limitation — MDBX-exists-but-SC-lost scenario:
+            // This check only guards against re-populating an existing SC.
+            // If the MDBX datadir already contains a non-genesis chain state
+            // (e.g. a synced node) but the SC directory was deleted or
+            // re-created, SC will be seeded from genesis and diverge from the
+            // actual chain state.  The node will produce wrong state roots
+            // from block 1 onwards without any error.
+            // Mitigation: if MDBX has non-genesis state, SC should be rebuilt
+            // by replaying canonical blocks before starting the node.
+            // TODO: detect this condition by comparing best_block_number() from
+            // reth's provider against sc.version() == 0 and fail-fast if
+            // MDBX is ahead.
             if sc.lock().version() == 0 {
                 let chain_spec = builder.config().chain.clone();
                 let genesis = chain_spec.genesis();
                 let mut state: HashMap<_, _> = HashMap::default();
+                let mut contracts: HashMap<alloy_primitives::B256, revm_state::Bytecode> =
+                    HashMap::default();
                 for (addr, account) in &genesis.alloc {
+                    // Compute real code_hash for accounts that have code.
+                    // Using KECCAK_EMPTY for all accounts (including contracts) would
+                    // produce wrong state roots for chains with genesis contracts
+                    // (commit_store uses code_hash in account RLP encoding).
+                    let (code_hash, code) = match &account.code {
+                        Some(code_bytes) => {
+                            let hash = alloy_primitives::keccak256(code_bytes);
+                            let bytecode =
+                                revm_state::Bytecode::new_raw(code_bytes.clone().0.into());
+                            contracts.insert(hash, bytecode);
+                            (hash, None)
+                        }
+                        None => (KECCAK_EMPTY, None),
+                    };
                     let info = AccountInfo {
                         nonce: account.nonce.unwrap_or_default(),
                         balance: account.balance,
-                        code_hash: KECCAK_EMPTY,
-                        code: None,
+                        code_hash,
+                        code,
                         account_id: None,
                     };
                     let storage: revm_database::StorageWithOriginalValues = account
@@ -215,7 +141,7 @@ fn main() {
                 }
                 let genesis_bundle = BundleState {
                     state,
-                    contracts: Default::default(),
+                    contracts,
                     reverts: Default::default(),
                     state_size: 0,
                     reverts_size: 0,
@@ -239,42 +165,129 @@ fn main() {
             }
 
             // ── on_canonical_commit: commit each canonical block's state to SC ─
+            //
+            // Reorg handling:
+            // The callback now receives (block_number, block_hash, bundle).
+            // If a new canonical block number is <= last committed SC block,
+            // we rollback SC to (block_number - 1) before applying the new
+            // block state. This keeps SC aligned with canonical chain on reorgs.
+            //
+            // Performance note — SC commit is synchronous and blocks the engine:
+            // The callback is invoked inside `on_canonical_chain_update` which runs
+            // on the engine's main task (tree/mod.rs:2371).  SC apply+WAL+root runs
+            // synchronously here, adding its latency directly to canonical chain
+            // processing.  reth-qmdb uses an async flush model (reth-qmdb/main.rs)
+            // to avoid this.  mptdb's wal_first_commit mode reduces the critical-path
+            // cost (WAL write is fast; segment build is deferred to a background
+            // worker), but the apply+root phase still blocks inline.
             let sc_for_commit = sc.clone();
+            // Tracks latest block committed into SC; used to detect reorgs and
+            // execute rollback before applying replacement canonical blocks.
+            let last_sc_committed_block = Arc::new(Mutex::new({
+                let v = sc_for_commit.lock().version();
+                if v > 0 { Some((v - 1) as u64) } else { None }
+            }));
+            // Tracks latest canonical block hash that SC is aligned with.
+            // StateProviderOverride uses this to gate SC usage to latest-only.
+            let latest_sc_hash = Arc::new(Mutex::new(None::<alloy_primitives::B256>));
+            let latest_sc_hash_for_commit = latest_sc_hash.clone();
+            let last_sc_committed_block_for_commit = last_sc_committed_block.clone();
 
-            let on_canonical_commit = Box::new(move |bundle: &revm_database::BundleState| {
+            let on_canonical_commit = Box::new(
+                move |
+                      block_number: alloy_primitives::BlockNumber,
+                      block_hash: alloy_primitives::BlockHash,
+                      bundle: &revm_database::BundleState| {
                 let writer = MptDbStateWriter::<EthReceipt>::new(sc_for_commit.clone());
+
+                // Reorg handling: if new canonical block number is <= last committed
+                // SC block, rollback SC to (new_first - 1) before applying.
+                if let Some(last_committed) = *last_sc_committed_block_for_commit.lock() {
+                    if block_number <= last_committed {
+                        let rollback_to = block_number.saturating_sub(1);
+                        writer.remove_state_above(rollback_to).unwrap_or_else(|e| {
+                            panic!(
+                                "mptdb: SC rollback failed at reorg (target block {rollback_to}): {e}"
+                            )
+                        });
+                    } else {
+                        let expected_next = last_committed.saturating_add(1);
+                        if block_number != expected_next {
+                            panic!(
+                                "mptdb: non-contiguous canonical callback: expected block {expected_next}, got {block_number}"
+                            );
+                        }
+                    }
+                }
+
                 let outcome = reth_execution_types::ExecutionOutcome::<EthReceipt>::new(
                     bundle.clone(),
                     Default::default(),
                     0, // first_block placeholder (unused by SC writer)
                     Default::default(),
                 );
-                if let Err(e) = writer.write_state(
-                    &outcome,
-                    revm_database::OriginalValuesKnown::Yes,
-                    reth_storage_api::StateWriteConfig::default(),
-                ) {
-                    tracing::error!(
-                        target: "reth::cli",
-                        error = %e,
-                        "mptdb on_canonical_commit failed"
-                    );
-                }
+                // SC commit failure is unrecoverable: all subsequent
+                // state_root / proof calls will be based on a diverged SC
+                // state, silently producing wrong roots.  Panic to abort the
+                // node rather than allowing it to continue with corrupted state.
+                writer
+                    .write_state(
+                        &outcome,
+                        revm_database::OriginalValuesKnown::Yes,
+                        reth_storage_api::StateWriteConfig::default(),
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "mptdb: SC commit failed — aborting to prevent state divergence: {e}"
+                        )
+                    });
+                *last_sc_committed_block_for_commit.lock() = Some(block_number);
+                *latest_sc_hash_for_commit.lock() = Some(block_hash);
             });
 
             // ── StateProviderOverride: SC provides state_root/proof; EVM reads
             //   delegate to reth's default_provider (PlainState via MDBX). ──
             let sc_for_override = sc.clone();
+            let latest_sc_hash_for_override = latest_sc_hash.clone();
+            // NoopProvider is used here because the StateProviderOverride is only
+            // invoked via BlockchainProvider::state_by_block_hash (engine execution
+            // path), which does not call block_id_reader methods (chain_info,
+            // block_number, etc.) on MptDbStateProvider.  If this provider is used
+            // in a context where those methods ARE called (e.g. direct RPC via
+            // MptDbStateProviderFactory), the NoopProvider will return empty/zero
+            // values.  Fix: wire in BlockchainProvider or a real block reader.
             let noop_block_id: Arc<dyn reth_storage_api::BlockIdReader + Send + Sync> =
                 Arc::new(reth_storage_api::noop::NoopProvider::default());
 
             let state_override: reth_provider::providers::StateProviderOverride =
-                Arc::new(move |default_provider| {
+                Arc::new(move |requested_hash, default_provider| {
+                    // Historical hash requests must not use SC (SC has no
+                    // per-version snapshots yet).  Delegate them to reth's
+                    // default provider for correctness.
+                    let use_sc = latest_sc_hash_for_override
+                        .lock()
+                        .as_ref()
+                        .is_some_and(|h| *h == requested_hash);
+                    if !use_sc {
+                        return default_provider
+                    }
+                    // SC version = latest committed block + 1.
+                    // This callback is invoked via BlockchainProvider::state_by_block_hash()
+                    // for the block currently being executed.  For the normal execution path
+                    // (EVM executing block N+1, parent = block N), SC is at version N which
+                    // is the correct base for state_root / proof.
+                    //
+                    // Historical hash queries are delegated to default_provider.
+                    // SC is used only when requested_hash == latest_sc_hash.
+                    // This avoids serving incorrect historical roots/proofs from
+                    // SC, which currently has no per-version snapshots.
                     let version = sc_for_override.lock().version().max(0);
-                    // Wrap Box<dyn StateProvider + Send> in DefaultProviderWrapper
-                    // to satisfy Arc<dyn StateProvider + Send + Sync>.
+                    // SyncProvider wraps StateProviderBox in Mutex<> to satisfy
+                    // Arc<dyn StateProvider + Send + Sync> without unsafe.
+                    // EVM reads are single-threaded per block so the Mutex is
+                    // uncontended in the engine execution path.
                     let fallback: Arc<dyn StateProvider + Send + Sync> =
-                        Arc::new(DefaultProviderWrapper(default_provider));
+                        SyncProvider::new(default_provider);
                     Box::new(MptDbStateProvider::new(
                         Arc::clone(&sc_for_override),
                         version,
