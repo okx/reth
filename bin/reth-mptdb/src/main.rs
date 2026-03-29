@@ -24,7 +24,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::map::HashMap;
 use clap::{Args, Parser};
-use mptdb_provider::{MptDbStateProvider, MptDbStateWriter, SyncProvider};
+use mptdb_provider::{MptDbStateProvider, MptDbStateWriter, ScPrewarmDispatcher, SyncProvider};
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter as _};
 use parking_lot::Mutex;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
@@ -190,6 +190,21 @@ fn main() {
             // Tracks latest canonical block hash that SC is aligned with.
             // StateProviderOverride uses this to gate SC usage to latest-only.
             let latest_sc_hash = Arc::new(Mutex::new(None::<alloy_primitives::B256>));
+            // ── SC prewarm (optional) ───────────────────────────────────────
+            // When MPTDB_SC_PREWARM=1, a background thread warms SC's L2
+            // storage-trie cache for accounts that touched storage in the
+            // just-committed block.  Prewarm is enqueued from on_canonical_commit
+            // so it runs after SC commit and doesn't touch the hot path.
+            let sc_prewarm = if std::env::var_os("MPTDB_SC_PREWARM").is_some() {
+                Some(
+                    ScPrewarmDispatcher::spawn(Arc::clone(&sc), 16_384, 256)
+                        .map_err(|e| eyre::eyre!("failed to spawn SC prewarm worker: {e}"))?,
+                )
+            } else {
+                None
+            };
+            let sc_prewarm_for_commit = sc_prewarm.as_ref().map(Arc::clone);
+
             let latest_sc_hash_for_commit = latest_sc_hash.clone();
             let last_sc_committed_block_for_commit = last_sc_committed_block.clone();
 
@@ -243,6 +258,17 @@ fn main() {
                     });
                 *last_sc_committed_block_for_commit.lock() = Some(block_number);
                 *latest_sc_hash_for_commit.lock() = Some(block_hash);
+
+                // Enqueue accounts with storage changes for background SC prewarm.
+                // Only accounts with storage.is_empty() == false are enqueued to
+                // avoid triggering account-MPT traversals for EOA senders.
+                if let Some(ref prewarm) = sc_prewarm_for_commit {
+                    for (addr, account) in bundle.state.iter() {
+                        if !account.storage.is_empty() {
+                            prewarm.enqueue_address(*addr);
+                        }
+                    }
+                }
             });
 
             // ── StateProviderOverride: SC provides state_root/proof; EVM reads

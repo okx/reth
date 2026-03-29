@@ -22,7 +22,13 @@ use reth_trie_common::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::{
+        mpsc::{sync_channel, SyncSender, TryRecvError},
+        Arc, Mutex as StdMutex,
+    },
+};
 
 fn prov_err(e: impl std::fmt::Display) -> reth_storage_api::errors::provider::ProviderError {
     reth_storage_api::errors::provider::ProviderError::Database(DatabaseError::Other(e.to_string()))
@@ -30,6 +36,121 @@ fn prov_err(e: impl std::fmt::Display) -> reth_storage_api::errors::provider::Pr
 
 fn map_db_err(e: MptDbError) -> reth_storage_api::errors::provider::ProviderError {
     prov_err(e)
+}
+
+/// Background dispatcher: receives touched accounts and prewarms SC storage tries.
+///
+/// Dropping the dispatcher closes the channel (`tx` is dropped), which causes
+/// the worker's `rx.recv()` to return `Err` and the thread to exit.  The
+/// `JoinHandle` is stored so `Drop` can join the thread and guarantee the
+/// worker has fully stopped before the next iteration starts.
+pub struct ScPrewarmDispatcher {
+    tx: Option<SyncSender<B256>>,
+    pending: Arc<StdMutex<HashSet<B256>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ScPrewarmDispatcher {
+    fn drop(&mut self) {
+        // Close the channel first: this signals the worker to exit.
+        drop(self.tx.take());
+        // Join the worker so no cross-iteration backlog remains.
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl ScPrewarmDispatcher {
+    /// Spawn the background prewarm worker.
+    ///
+    /// The worker exits automatically when the `ScPrewarmDispatcher` is dropped:
+    /// dropping the dispatcher drops the only `SyncSender`, which causes `rx.recv()`
+    /// to return `Err(_)` and breaks the worker loop.
+    /// NOTE: the worker must NOT hold a cloned sender — doing so prevents shutdown.
+    pub fn spawn(
+        sc: Arc<Mutex<MptCommitStore>>,
+        queue_capacity: usize,
+        batch_size: usize,
+    ) -> std::io::Result<Arc<Self>> {
+        let capacity = queue_capacity.max(64);
+        let batch = batch_size.max(16);
+        let (tx, rx) = sync_channel::<B256>(capacity);
+        let pending = Arc::new(StdMutex::new(HashSet::with_capacity(capacity)));
+        let pending_for_worker = Arc::clone(&pending);
+        // No tx clone in the worker — the dispatcher is the sole sender.
+        // Dropping the dispatcher drops tx, closing the channel → worker exits.
+
+        let handle =
+            std::thread::Builder::new().name("mptdb-sc-prewarm".to_string()).spawn(move || {
+                loop {
+                    let first = match rx.recv() {
+                        Ok(v) => v,
+                        Err(_) => break, // dispatcher dropped → all senders gone → exit
+                    };
+
+                    let mut batch_keys = Vec::with_capacity(batch);
+                    batch_keys.push(first);
+                    while batch_keys.len() < batch {
+                        match rx.try_recv() {
+                            Ok(v) => batch_keys.push(v),
+                            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                        }
+                    }
+
+                    // Two-phase processing to avoid holding the SC lock for the
+                    // entire batch:
+                    //
+                    // Phase 1 (brief lock): refresh the published view once for
+                    // the whole batch.  This is a fast atomic-read check; the
+                    // lock is released immediately after.
+                    // Phase 1: check-only view refresh (no I/O, no reload).
+                    // Skips reload intentionally — see maybe_refresh_published_view_for_prewarm.
+                    if let Some(mut guard) = sc.try_lock() {
+                        guard.maybe_refresh_published_view_for_prewarm();
+                    }
+
+                    // Phase 2 (one lock per item): each per-key call is fast —
+                    // O(1) index check + optional short MPT walk.  Releasing the
+                    // lock between items lets SC commit interleave freely.
+                    for hashed in &batch_keys {
+                        if let Some(mut guard) = sc.try_lock() {
+                            let _ = guard.prewarm_storage_trie_by_hashed_address(*hashed);
+                            // Guard drops here, lock released before next item.
+                        }
+                        // If SC is busy, skip this item (best-effort).
+                    }
+
+                    let mut pending =
+                        pending_for_worker.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for hashed in batch_keys {
+                        pending.remove(&hashed);
+                    }
+                }
+            })?;
+
+        Ok(Arc::new(Self { tx: Some(tx), pending, handle: Some(handle) }))
+    }
+
+    pub fn enqueue_address(&self, address: Address) {
+        self.enqueue_hashed(keccak256(address.as_slice()));
+    }
+
+    pub fn enqueue_hashed(&self, hashed_address: B256) {
+        let Some(ref tx) = self.tx else { return };
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !pending.insert(hashed_address) {
+                return;
+            }
+        }
+        if tx.try_send(hashed_address).is_err() {
+            // Channel full or disconnected: remove from pending so future
+            // enqueue attempts are not silently dropped.
+            let mut pending = self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.remove(&hashed_address);
+        }
+    }
 }
 
 /// reth `StateProvider` backed by mpt-db SC.

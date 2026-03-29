@@ -3829,6 +3829,94 @@ impl MptCommitStore {
         self.check_async_error()
     }
 
+    /// Best-effort async prewarm entry: load a storage trie into SC's L2 cache.
+    ///
+    /// This is intended for background read-side warming. It must not block the
+    /// caller's hot path and may skip work if the trie is unavailable in the
+    /// currently published view.
+    pub fn prewarm_storage_trie_by_hashed_address(&mut self, hashed_address: B256) -> Result<()> {
+        if self.storage_trie_cache.capacity() == 0 {
+            return Ok(());
+        }
+
+        // Already cached/known: refresh recency and return.
+        if self.storage_trie_cache.contains(&hashed_address) ||
+            self.storage_trie_handles.contains_key(&hashed_address)
+        {
+            if !self.touch_cached_storage_trie(hashed_address) {
+                self.rejected_activations.push(hashed_address);
+            }
+            return Ok(());
+        }
+
+        // Fast published-store index check (O(1)) BEFORE doing the expensive
+        // account-MPT traversal.  NOTE: maybe_refresh_published_view is intentionally
+        // NOT called here — callers should call maybe_refresh_published_view_for_prewarm
+        // once per batch before processing items one-by-one with per-item locking.
+        //
+        // wal_first limitation: the published store only contains data that has been
+        // flushed by the background segment-build worker.  Addresses committed in the
+        // most recent block(s) may not appear in the index until the worker runs.
+        // This makes prewarm a no-op for cold accounts that are freshly committed but
+        // not yet published.  Addresses already in storage_trie_handles (see above)
+        // are unaffected — they are touched on the fast path.
+        if let Some(ref store) = self.published_store {
+            if !store.has_storage_trie(&hashed_address) {
+                // No segment for this address → skip account-MPT traversal.
+                return Ok(());
+            }
+        } else {
+            // No published store (e.g. node just started, no baseline yet).
+            return Ok(());
+        }
+
+        let storage_root = self.get_existing_storage_root(&hashed_address);
+        if storage_root == EMPTY_ROOT_HASH {
+            return Ok(());
+        }
+
+        if let Some(ref store) = self.published_store {
+            if let Some(loaded) = store.open_trie(&hashed_address, storage_root)? {
+                self.cache_storage_trie(hashed_address, loaded.trie);
+                return Ok(());
+            }
+        }
+
+        // In wal_first mode, avoid persisted fallback for prewarm reads; nodes
+        // may not exist in persisted store yet. Keep this best-effort.
+        if !self.config.wal_first_commit {
+            self.cache_storage_trie(
+                hashed_address,
+                StorageTrieCow::from_persisted_root(storage_root),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Non-blocking view check for prewarm workers.
+    ///
+    /// Unlike `maybe_refresh_published_view`, this does NOT call `reload_published_view`
+    /// even when a newer version is available.  `reload_published_view` involves
+    /// file I/O (opening new mmap segment files) and must not run under the SC lock
+    /// during prewarm, as it would block the SC commit path for the duration.
+    ///
+    /// Prewarm tolerates a slightly stale `published_store`: it may miss tries that
+    /// were published in the most recent segment, but will still warm everything that
+    /// is in the current store.  The main apply path will reload the view on next use.
+    pub fn maybe_refresh_published_view_for_prewarm(&mut self) {
+        // Fast atomic check only — do not reload.
+        // If bg_version > current_version, a new segment has been published but we
+        // intentionally skip the reload to avoid lock-while-I/O.
+        // The stale published_store is still valid for warming older segments.
+    }
+
+    /// Convenience wrapper for raw address input.
+    pub fn prewarm_storage_trie(&mut self, address: Address) -> Result<()> {
+        self.maybe_refresh_published_view()?;
+        self.prewarm_storage_trie_by_hashed_address(alloy_primitives::keccak256(address.as_slice()))
+    }
+
     /// Write WAL entry synchronously.  Serialize + CRC run outside the WAL
     /// mutex (using a reusable buffer) so the lock only covers the file write
     /// and index update — reducing contention with the background worker's

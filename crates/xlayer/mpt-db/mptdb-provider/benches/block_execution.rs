@@ -3,8 +3,9 @@
 //! ## What this benchmark measures
 //!
 //! For each block:
-//! - **mptdb lane**: EVM reads from MDBX directly (not via MptDbStateProvider), SC commit (apply +
-//!   WAL + state root), and MDBX PlainState write in parallel.
+//! - **mptdb lane**: default EVM reads from MDBX directly; set
+//!   `MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS=1` to route reads through `MptDbStateProvider`. SC
+//!   commit (apply + WAL + state root) and MDBX PlainState write run in parallel.
 //! - **reth-mdbx lane**: EVM reads from MDBX, MDBX write + overlay_root_with_updates
 //!   + write_trie_updates + commit (full reth persistence path).
 //!
@@ -32,13 +33,15 @@
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use mptdb_provider::MptDbStateWriter;
-use mptdb_sc::mpt::{MptCommitStore, MptConfig};
+use mptdb_provider::{MptDbStateProvider, MptDbStateWriter, ScPrewarmDispatcher, SyncProvider};
+use mptdb_sc::mpt::{MptCommitStore, MptCommitter, MptConfig};
 use parking_lot::Mutex;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use reth_ethereum_primitives::Receipt as EthReceipt;
-use reth_storage_api::{errors::provider::ProviderError, StateProvider, StateWriteConfig};
+use reth_storage_api::{
+    errors::provider::ProviderError, BlockIdReader, StateProvider, StateWriteConfig,
+};
 use reth_trie_common::HashedPostState;
 use revm::{
     context::{BlockEnv, Context, TxEnv},
@@ -154,6 +157,14 @@ fn bench_trace_iters() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(2)
+}
+
+fn bench_use_provider_reads() -> bool {
+    std::env::var_os("MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS").is_some()
+}
+
+fn bench_enable_sc_prewarm() -> bool {
+    std::env::var_os("MPTDB_PROVIDER_BENCH_ENABLE_SC_PREWARM").is_some()
 }
 
 // ── InMemoryCache — synthetic dataset builder (genesis + tx generation) ───────
@@ -431,6 +442,8 @@ fn run_mptdb_bench(
         let measure_mode = bench_measure_mode();
         let trace = bench_trace_enabled();
         let trace_iters = bench_trace_iters();
+        let use_provider_reads = bench_use_provider_reads();
+        let enable_sc_prewarm = bench_enable_sc_prewarm();
         let mut exec_total = Duration::ZERO;
         let mut wall_total = Duration::ZERO;
         let mut setup_total = Duration::ZERO;
@@ -467,6 +480,23 @@ fn run_mptdb_bench(
             open_sc += t.elapsed();
 
             let sc_writer = MptDbStateWriter::<EthReceipt>::new(Arc::clone(&sc));
+            let noop_block_id: Arc<dyn BlockIdReader + Send + Sync> =
+                Arc::new(reth_storage_api::noop::NoopProvider::default());
+            // SC prewarm dispatcher: triggered AFTER each SC commit (block boundary),
+            // not from the EVM read hot path.  Prewarms storage tries for accounts
+            // touched in the committed block, so the NEXT block's SC operations find
+            // warm L2 cache entries.
+            // SC prewarm is independent of use_provider_reads: it warms SC's
+            // L2 trie cache after each commit, which benefits SC writes regardless
+            // of whether EVM reads go through MptDbStateProvider or raw MDBX.
+            let sc_prewarm = if enable_sc_prewarm {
+                Some(
+                    ScPrewarmDispatcher::spawn(Arc::clone(&sc), 16_384, 256)
+                        .expect("spawn sc prewarm worker"),
+                )
+            } else {
+                None
+            };
 
             // Create MDBX ProviderFactory — same as the reth_mdbx path.
             // EVM reads go directly from MDBX (no Mutex wrapper) to match the
@@ -539,16 +569,25 @@ fn run_mptdb_bench(
 
             let exec_start = Instant::now();
             for (blk_idx, txs) in block_txs.iter().enumerate() {
-                // EVM reads directly from MDBX via DatabaseProvider (no Mutex wrapper).
-                // This mirrors the production path where reth's StateProviderOverride
-                // receives `default_provider` (the MDBX state) directly.
-                // MptDbStateProvider is not used for EVM reads here — its role in
-                // production is only for state_root / proof, which the benchmark
-                // measures via sc_writer.write_state below.
                 let t_evm = Instant::now();
-                let db_provider = mdbx_factory.latest().expect("mdbx latest");
-                let bundle =
-                    execute_block_evm(db_provider, txs.clone().into_iter(), blk_idx as u64 + 1);
+                let bundle = if use_provider_reads {
+                    let version = sc.lock().version().max(0);
+                    let fallback: Arc<dyn StateProvider + Send + Sync> =
+                        SyncProvider::new(mdbx_factory.latest().expect("mdbx latest"));
+                    let provider = MptDbStateProvider::new(
+                        Arc::clone(&sc),
+                        version,
+                        fallback,
+                        Arc::clone(&noop_block_id),
+                    );
+                    // No prewarm in the EVM read hot path — prewarm is triggered
+                    // after SC commit (see below) so it operates at block granularity.
+                    execute_block_evm(Box::new(provider), txs.clone().into_iter(), blk_idx as u64 + 1)
+                } else {
+                    // Default benchmark mode: direct MDBX reads (no provider wrapper).
+                    let db_provider = mdbx_factory.latest().expect("mdbx latest");
+                    execute_block_evm(db_provider, txs.clone().into_iter(), blk_idx as u64 + 1)
+                };
                 evm_phase += t_evm.elapsed();
 
                 // Wrap outcome in Arc — MDBX worker and SC commit share it
@@ -571,11 +610,29 @@ fn run_mptdb_bench(
                 // Wait for MDBX worker to finish before next block's EVM reads.
                 done_rx.recv().expect("mdbx done");
                 write_phase += t_wr.elapsed();
+
+                // Enqueue storage-touching accounts for background SC prewarm AFTER
+                // write_phase has been measured.  This avoids polluting the block
+                // lifecycle timing with enqueue overhead.
+                // Filter to accounts with storage changes only: EOA senders have
+                // empty storage and would trigger expensive account-MPT traversals
+                // in prewarm_storage_trie_by_hashed_address.
+                if let Some(ref prewarm) = sc_prewarm {
+                    for (addr, account) in outcome.state().state.iter() {
+                        if !account.storage.is_empty() {
+                            prewarm.enqueue_address(*addr);
+                        }
+                    }
+                }
             }
             exec_total += exec_start.elapsed();
 
-            drop(job_tx); // signal worker to exit
+            drop(job_tx); // signal MDBX worker to exit
             mdbx_worker.join().expect("mdbx worker");
+            // Drop prewarm dispatcher BEFORE dropping SC.  ScPrewarmDispatcher::Drop
+            // closes tx (signals worker exit) then joins the thread, guaranteeing
+            // the worker has stopped and there is no cross-iteration backlog.
+            drop(sc_prewarm);
 
             let t = Instant::now();
             drop(sc_writer);
@@ -627,6 +684,10 @@ fn run_mptdb_bench(
             teardown_total / iters as u32,
         );
         eprintln!("[{}] avg/iter(end-to-end): {:.2?}", label, wall_total / iters as u32);
+        eprintln!(
+            "[{}] read_mode: provider_reads={} sc_prewarm={}",
+            label, use_provider_reads, enable_sc_prewarm
+        );
         eprintln!("[{}] criterion measure mode: {:?}", label, measure_mode);
         if matches!(measure_mode, BenchMeasureMode::EndToEnd) {
             wall_total

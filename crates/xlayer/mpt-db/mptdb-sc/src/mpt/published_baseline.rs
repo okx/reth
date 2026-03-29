@@ -199,6 +199,13 @@ impl PublishedBaselineReader {
         &self.meta
     }
 
+    /// O(1) check: does this hashed address have a storage trie segment in the
+    /// published store?  Used by prewarm to skip the expensive account-MPT
+    /// traversal (`get_existing_storage_root`) for addresses with no segment.
+    pub fn has_storage_trie(&self, hashed_address: &B256) -> bool {
+        self.merged_puts.contains_key(hashed_address)
+    }
+
     pub fn materialize_touched_paths(
         &self,
         hashed_address: &B256,
