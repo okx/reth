@@ -360,7 +360,6 @@ impl StorageTrieHandle {
             self.clone_base_with_steal(overlay_reuse, watermark)
         }
     }
-
 }
 
 #[derive(Clone)]
@@ -3219,13 +3218,7 @@ impl MptCommitStore {
         if is_sparse_storage_forced() {
             config.use_sparse_storage = true;
         }
-        Self::open_with_config_at_version(
-            dir,
-            read_only,
-            config,
-            target_version,
-            overwrite,
-        )
+        Self::open_with_config_at_version(dir, read_only, config, target_version, overwrite)
     }
 
     /// Open an MptCommitStore at the given directory with custom configuration.
@@ -4226,11 +4219,25 @@ impl MptCommitter for MptCommitStore {
     ) -> Result<AccountProof> {
         // Sparse path: if the requested version is the latest committed version
         // and the sparse trie is available, use it for proof generation.
-        if self.config.use_sparse_storage &&
-            version == self.version &&
-            let Some(ref sparse_trie) = self.last_committed_sparse_trie
-        {
-            return super::sparse_storage::build_account_proof_from_sparse(sparse_trie, address, slots);
+        // In per-block mode the trie is in `last_committed_sparse_trie`;
+        // in cross-block mode it is in `cross_block_sparse.trie`.
+        if self.config.use_sparse_storage && version == self.version {
+            if let Some(ref sparse_trie) = self.last_committed_sparse_trie {
+                return super::sparse_storage::build_account_proof_from_sparse(
+                    sparse_trie,
+                    address,
+                    slots,
+                );
+            }
+            if let Some(ref cross) = self.cross_block_sparse {
+                if !cross.trie.state_trie_ref().is_none() {
+                    return super::sparse_storage::build_account_proof_from_sparse(
+                        &cross.trie,
+                        address,
+                        slots,
+                    );
+                }
+            }
         }
 
         // Sparse trie is only available for the latest committed version.
@@ -4466,11 +4473,11 @@ impl MptCommitStore {
     /// incorrect results for accounts with complex prior storage, but is better
     /// than failing outright.
     /// Build a pre-built storage proof from the best available source:
-    /// 1. Previous block's sparse trie (`last_committed_sparse_trie`) — always
-    ///    correct because computed by `root_with_updates`.
+    /// 1. Previous block's sparse trie (`last_committed_sparse_trie`) — always correct because
+    ///    computed by `root_with_updates`.
     /// 2. L2 cache (`storage_trie_handles`) — correct for recently-committed accounts.
-    /// 3. Persisted store (RocksDB) — available after non-wal_first commits and
-    ///    WAL replay.  Loads from `persisted.load_trie_at_root` + preloads dirty paths.
+    /// 3. Persisted store (RocksDB) — available after non-wal_first commits and WAL replay.  Loads
+    ///    from `persisted.load_trie_at_root` + preloads dirty paths.
     /// 4. Fall back to `known_empty` as last resort.
     fn try_build_l2_proof(
         &self,
@@ -4481,13 +4488,17 @@ impl MptCommitStore {
     ) {
         // 1. Prefer previous sparse trie (always correct hashes).
         if let Some(ref prev_sparse) = self.last_committed_sparse_trie {
-            if let Ok(Some(proof)) = extract_storage_proof_from_sparse_trie(prev_sparse, hashed_addr, root) {
+            if let Ok(Some(proof)) =
+                extract_storage_proof_from_sparse_trie(prev_sparse, hashed_addr, root)
+            {
                 factory.pre_built_storage_proofs.insert(*hashed_addr, proof);
                 return;
             }
         }
         if let Some(ref cross) = self.cross_block_sparse {
-            if let Ok(Some(proof)) = extract_storage_proof_from_sparse_trie(&cross.trie, hashed_addr, root) {
+            if let Ok(Some(proof)) =
+                extract_storage_proof_from_sparse_trie(&cross.trie, hashed_addr, root)
+            {
                 factory.pre_built_storage_proofs.insert(*hashed_addr, proof);
                 return;
             }
@@ -4507,9 +4518,9 @@ impl MptCommitStore {
                 Err(_) => {}
             }
         }
-        // 3. Persisted store (RocksDB) fallback — available after non-wal_first commits
-        //    and WAL replay.  Materialises only the dirty slot paths from the persisted
-        //    trie so we don't load the whole storage trie.
+        // 3. Persisted store (RocksDB) fallback — available after non-wal_first commits and WAL
+        //    replay.  Materialises only the dirty slot paths from the persisted trie so we don't
+        //    load the whole storage trie.
         if !dirty_keys.is_empty() {
             let mut cow = StorageTrieCow::from_persisted_root(root);
             if cow.preload_paths(&self.persisted, dirty_keys).is_ok() {
@@ -4532,8 +4543,13 @@ impl MptCommitStore {
 
     /// Build a `SegmentTrieNodeProviderFactory` for the given dirty accounts.
     ///
-    /// Shared by both per-block (Phase 2) and cross-block (Phase 4) apply paths.
-    fn build_sparse_factory(&self, dirty_accounts: &[DirtyAccount]) -> SegmentTrieNodeProviderFactory {
+    /// Used for per-block apply (Phase 2, first cross-block block).  Calls
+    /// `try_build_l2_proof` for accounts whose published segment is missing or
+    /// stale, potentially executing a full-arena DFS (tier 1/2).
+    fn build_sparse_factory(
+        &self,
+        dirty_accounts: &[DirtyAccount],
+    ) -> SegmentTrieNodeProviderFactory {
         let mut factory = SegmentTrieNodeProviderFactory::new();
         for dirty in dirty_accounts {
             if dirty.storage_known_empty || dirty.storage_wiped {
@@ -4551,18 +4567,134 @@ impl MptCommitStore {
                             // Segment missing or stale root mismatch.
                             // Account HAS prior storage — do NOT mark as known_empty.
                             // Fall back to sparse trie / L2 cache / persisted store.
-                            let dirty_keys: Vec<Nibbles> = dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
-                            self.try_build_l2_proof(&dirty.hashed_address, root, &dirty_keys, &mut factory);
+                            let dirty_keys: Vec<Nibbles> =
+                                dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
+                            self.try_build_l2_proof(
+                                &dirty.hashed_address,
+                                root,
+                                &dirty_keys,
+                                &mut factory,
+                            );
                         }
                     }
                 } else {
                     // No published store at all: fall back to sparse trie / L2 / persisted.
-                    let dirty_keys: Vec<Nibbles> = dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
+                    let dirty_keys: Vec<Nibbles> =
+                        dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
                     self.try_build_l2_proof(&dirty.hashed_address, root, &dirty_keys, &mut factory);
                 }
             }
         }
         factory
+    }
+
+    /// Build a `SegmentTrieNodeProviderFactory` optimised for **cross-block reuse**.
+    ///
+    /// For accounts whose storage trie is **already present** in `cross_trie`
+    /// (i.e. revealed in a previous block), this function skips the expensive
+    /// tier-1 (`extract_storage_proof_from_sparse_trie`) and tier-2
+    /// (`convert_arena_to_decoded_storage_multiproof`) full-arena DFS.  Instead:
+    ///
+    /// - If a published segment is available (root matches): use it directly.
+    /// - Otherwise: tier-3 dirty-key-only persisted preload — O(dirty_keys × path_depth) instead of
+    ///   O(all_trie_nodes).  The resulting small proof is stored as `pre_built_proof` in
+    ///   `SegmentStorageNodeProvider` and is consulted **only** if a Hash-blinded node is
+    ///   encountered during Step-2 `update_storage_leaf` (rare for fully-revealed paths).
+    ///
+    /// For accounts NOT in `cross_trie` (first appearance), falls back to the
+    /// full `build_sparse_factory` logic (tier 1/2/3).
+    fn build_sparse_factory_cross_block_reuse(
+        &self,
+        dirty_accounts: &[DirtyAccount],
+        cross_trie: &SparseStateTrie,
+    ) -> SegmentTrieNodeProviderFactory {
+        let mut factory = SegmentTrieNodeProviderFactory::new();
+        for dirty in dirty_accounts {
+            if dirty.storage_known_empty || dirty.storage_wiped {
+                factory.known_empty_accounts.insert(dirty.hashed_address);
+                continue;
+            }
+            if dirty.storage_changes.is_empty() {
+                // Balance/nonce-only change: no storage reveal needed.
+                continue;
+            }
+
+            let root = self.get_existing_storage_root(&dirty.hashed_address);
+            if root == EMPTY_ROOT_HASH {
+                factory.known_empty_accounts.insert(dirty.hashed_address);
+                continue;
+            }
+
+            // Try published segment first (O(1)).
+            let segment_ok = if let Some(store) = &self.published_store {
+                match store.open_trie_page(&dirty.hashed_address, root) {
+                    Ok(Some(loaded)) => {
+                        factory.storage_segments.insert(dirty.hashed_address, loaded.lease);
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if segment_ok {
+                continue;
+            }
+
+            // No valid segment.
+            let dirty_keys: Vec<Nibbles> =
+                dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
+
+            if cross_trie.storage_trie_ref(&dirty.hashed_address).is_some() {
+                // Account is already revealed in the cross-block trie.
+                // Skip tier-1/2 full-arena DFS; use tier-3 dirty-key preload only.
+                // The provider's `pre_built_proof` will serve any Hash-blinded nodes
+                // encountered for genuinely new dirty slots.
+                self.try_build_l2_proof_tier3_only(
+                    &dirty.hashed_address,
+                    root,
+                    &dirty_keys,
+                    &mut factory,
+                );
+            } else {
+                // Account not yet in cross-block trie: full tier-1/2/3 fallback.
+                self.try_build_l2_proof(&dirty.hashed_address, root, &dirty_keys, &mut factory);
+            }
+        }
+        factory
+    }
+
+    /// Tier-3-only variant of `try_build_l2_proof`: loads ONLY the dirty-key
+    /// paths from the persisted store.  Does NOT attempt tier-1 (sparse trie
+    /// DFS) or tier-2 (L2 cache arena DFS).
+    ///
+    /// The resulting proof contains only the nodes along `dirty_keys` paths,
+    /// making it O(dirty_keys × path_depth) instead of O(all_trie_nodes).
+    fn try_build_l2_proof_tier3_only(
+        &self,
+        hashed_addr: &B256,
+        root: B256,
+        dirty_keys: &[Nibbles],
+        factory: &mut SegmentTrieNodeProviderFactory,
+    ) {
+        if dirty_keys.is_empty() {
+            return;
+        }
+        let mut cow = StorageTrieCow::from_persisted_root(root);
+        if cow.preload_paths(&self.persisted, dirty_keys).is_ok() {
+            match convert_arena_to_decoded_storage_multiproof(cow.arena(), cow.root_index(), root) {
+                Ok(proof) => {
+                    factory.pre_built_storage_proofs.insert(*hashed_addr, proof);
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        // Tier-3 failed (account not in persisted store, e.g. brand-new in wal_first
+        // mode with no published segment).  Leave the account without a pre-built
+        // proof — the provider will return Err if a Hash-blinded node is encountered,
+        // which surfaces as an apply error.  This is safe when the cross-block trie
+        // already has the account fully revealed (no Hash nodes on dirty paths).
     }
 
     /// Extract the account trie proof for sparse reveal.
@@ -4610,10 +4742,7 @@ impl MptCommitStore {
     /// Returns immediately (without setting `pending_sparse_state`) when
     /// `dirty_accounts` is empty — the normal Phase 2b path handles empty
     /// blocks correctly and produces the unchanged previous state root.
-    fn apply_dirty_accounts_inner_sparse(
-        &mut self,
-        dirty_accounts: &[DirtyAccount],
-    ) -> Result<()> {
+    fn apply_dirty_accounts_inner_sparse(&mut self, dirty_accounts: &[DirtyAccount]) -> Result<()> {
         // Always set working_version so account_trie_handle_versions() is correct.
         let working_version = self.current_working_version();
         self.account_trie.checkout_for_write(working_version);
@@ -4639,12 +4768,11 @@ impl MptCommitStore {
             account_proof,
             &factory,
             dirty_accounts,
+            false, // fresh trie: full reveal required
         )?;
 
-        self.pending_sparse_state = Some(Box::new(PendingSparseState {
-            trie: sparse_trie,
-            factory,
-        }));
+        self.pending_sparse_state =
+            Some(Box::new(PendingSparseState { trie: sparse_trie, factory }));
         // Store dirty_accounts — the normal apply no longer runs in sparse mode.
         self.dirty_accounts = dirty_accounts.to_vec();
         Ok(())
@@ -4654,36 +4782,80 @@ impl MptCommitStore {
     /// blocks for incremental witness reveals and root computation.
     ///
     /// Flow:
-    /// 1. If no cross-block trie: initialise fresh (same as Phase 2).
-    /// 2. If cross-block trie exists: reset updates, update factory, reveal
-    ///    only new dirty paths (already-revealed are skipped automatically).
-    /// 3. Evict storage tries not accessed for `cross_block_sparse_max_lag` blocks.
+    /// 1. If no cross-block trie: initialise fresh (same as Phase 2, full reveal).
+    /// 2. If cross-block trie exists:
+    ///    - Build factory via `build_sparse_factory_cross_block_reuse`: skips tier-1/2 full-arena
+    ///      DFS for accounts already in the trie; uses segment (O(1)) or tier-3 dirty-key preload
+    ///      (O(k·depth)) instead.
+    ///    - Call `apply_all_storage_changes_sparse` with `skip_already_revealed_storage=true`: for
+    ///      already-revealed accounts, skip `reveal_decoded_storage_multiproof` entirely — provider
+    ///      handles Hash-blinded boundaries lazily.
+    ///    - Evict storage tries idle for `cross_block_sparse_max_lag` blocks.
     fn apply_dirty_accounts_inner_cross_block(
         &mut self,
         dirty_accounts: &[DirtyAccount],
     ) -> Result<()> {
-        let factory = self.build_sparse_factory(dirty_accounts);
-        let account_proof = self.extract_account_proof_from_base(dirty_accounts)?;
         let next_version = self.version + 1;
 
+        // ── Phase A: build factory and account proof (immutable/exclusive borrows
+        //    completed before the mutable Phase B begins) ──────────────────────
+        let in_reuse_mode = self.cross_block_sparse.is_some();
+
+        // Factory build: for the reuse path, borrow cross.trie immutably to
+        // check which accounts are already revealed.  This borrow is released
+        // before the mutable Phase B begins.
+        let factory = if in_reuse_mode {
+            // SAFETY: both borrows are immutable.  &cross.trie is a sub-borrow of
+            // &self; &self is the receiver of build_sparse_factory_cross_block_reuse.
+            // Rust allows multiple shared references simultaneously.
+            let cross_trie = &self.cross_block_sparse.as_ref().unwrap().trie;
+            self.build_sparse_factory_cross_block_reuse(dirty_accounts, cross_trie)
+        } else {
+            self.build_sparse_factory(dirty_accounts)
+        };
+
+        // Account proof: check if ALL dirty accounts are already in the cross-block
+        // account trie.  If yes, the entire DFS + reveal is skipped (empty proof is
+        // a no-op for `reveal_decoded_account_multiproof` when the trie is already
+        // fully populated).  This eliminates the O(all_account_nodes) DFS for the
+        // common case where only previously-touched accounts are dirty.
+        //
+        // If ANY new account appears (not yet in cross.trie), fall back to the full
+        // proof extraction so that `is_account_revealed` is set for it, enabling the
+        // correct `update_account` path in Step 3.
+        let all_account_trie_revealed = if in_reuse_mode {
+            let cross_trie = &self.cross_block_sparse.as_ref().unwrap().trie;
+            dirty_accounts.iter().all(|d| cross_trie.is_account_revealed(d.hashed_address))
+        } else {
+            false
+        };
+
+        let account_proof = if in_reuse_mode && all_account_trie_revealed {
+            // All accounts already in account trie: pass empty proof (no-op reveal).
+            (
+                alloy_trie::proof::DecodedProofNodes::default(),
+                reth_trie_common::BranchNodeMasksMap::default(),
+            )
+        } else {
+            // First block, or some new accounts: build full proof.
+            self.extract_account_proof_from_base(dirty_accounts)?
+        };
+
+        // ── Phase B: apply changes (mutable borrow of cross.trie) ────────────
         if let Some(ref mut cross) = self.cross_block_sparse {
-            // ── Cross-block reuse path ────────────────────────────────────────
-            //
             // Reset update tracking so root_with_updates captures only the
             // current block's changes.
             cross.trie.reinit_updates();
             cross.factory = factory;
 
-            // Reveal new dirty paths incrementally.
-            // `reveal_decoded_account_multiproof` and
-            // `reveal_decoded_storage_multiproof` both skip already-revealed
-            // paths via the `!revealed_nodes.insert(path)` guard — no extra
-            // logic needed here.
+            // Apply changes with skip_already_revealed_storage=true:
+            // storage tries already in cross.trie skip the reveal step entirely.
             apply_all_storage_changes_sparse(
                 &mut cross.trie,
                 account_proof,
                 &cross.factory,
                 dirty_accounts,
+                true, // skip_already_revealed_storage
             )?;
 
             // Update access version for dirty storage accounts.
@@ -4712,26 +4884,28 @@ impl MptCommitStore {
             // Build pending from the reused trie (factory already updated above).
             // We take the trie out of cross_block_sparse temporarily;
             // commit_inner_with_mode will put it back.
-            let trie_for_pending = std::mem::replace(
-                &mut cross.trie,
-                SparseStateTrie::default().with_updates(true),
-            );
+            let trie_for_pending =
+                std::mem::replace(&mut cross.trie, SparseStateTrie::default().with_updates(true));
             let factory_clone = SegmentTrieNodeProviderFactory {
                 account_segment: cross.factory.account_segment.clone(),
                 storage_segments: cross.factory.storage_segments.clone(),
                 pre_built_storage_proofs: cross.factory.pre_built_storage_proofs.clone(),
                 known_empty_accounts: cross.factory.known_empty_accounts.clone(),
             };
-            self.pending_sparse_state =
-                Some(Box::new(PendingSparseState { trie: trie_for_pending, factory: factory_clone }));
+            self.pending_sparse_state = Some(Box::new(PendingSparseState {
+                trie: trie_for_pending,
+                factory: factory_clone,
+            }));
         } else {
             // ── First block: initialise cross-block state ─────────────────────
+            // factory and account_proof were built in Phase A above.
             let mut sparse_trie = SparseStateTrie::default().with_updates(true);
             apply_all_storage_changes_sparse(
                 &mut sparse_trie,
                 account_proof,
                 &factory,
                 dirty_accounts,
+                false, // first block: all storage tries need full reveal
             )?;
 
             // Initialise access tracking for dirty storage accounts.
@@ -5237,9 +5411,8 @@ impl MptCommitStore {
                 } else if !dirty.storage_changes.is_empty() {
                     // Always override — the REUSE-inserted EMPTY_ROOT_HASH is wrong
                     // for newly-created accounts that have storage in this block.
-                    let root = pending.trie
-                        .storage_root(dirty.hashed_address)
-                        .unwrap_or(EMPTY_ROOT_HASH);
+                    let root =
+                        pending.trie.storage_root(dirty.hashed_address).unwrap_or(EMPTY_ROOT_HASH);
                     storage_roots.insert(dirty.hashed_address, root);
                 }
                 // Accounts with no storage changes: keep existing root (REUSE or
@@ -6059,7 +6232,8 @@ mod tests {
         // SP-* integration tests.
         let mut legacy_config = MptConfig::default();
         legacy_config.use_sparse_storage = false;
-        let mut legacy = MptCommitStore::open_with_config(legacy_dir.path(), false, legacy_config).unwrap();
+        let mut legacy =
+            MptCommitStore::open_with_config(legacy_dir.path(), false, legacy_config).unwrap();
         let wal_dir = TempDir::new().unwrap();
         let mut wal_config = MptConfig::default();
         wal_config.wal_first_commit = true;
@@ -7725,8 +7899,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-
-
     /// T6.15: account_proof(version) for specified committed root is correct
     #[test]
     fn t6_15_account_proof_version() {
@@ -7776,7 +7948,6 @@ mod tests {
         assert!(store.account_proof(1, addr, &[]).is_err());
         let _ = root1;
     }
-
 
     // ── Storage trie cache tests ──
 
@@ -8122,7 +8293,6 @@ mod tests {
         assert_eq!(reopened.manifest.latest_version, 1);
     }
 
-
     #[test]
     fn t6_5e_publish_failure_is_nonfatal() {
         let dir = TempDir::new().unwrap();
@@ -8143,10 +8313,6 @@ mod tests {
         store.flush_persist().unwrap();
         store.load_version().unwrap();
     }
-
-
-
-
 
     /// Cache correctness across 3 blocks: account touched in block 1 and 3 (not 2)
     /// should still produce correct roots.

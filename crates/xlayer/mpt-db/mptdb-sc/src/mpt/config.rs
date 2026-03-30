@@ -58,12 +58,12 @@ pub struct MptConfig {
     /// Keep the `SparseStateTrie` alive across blocks (Phase 4 optimisation).
     ///
     /// When `true`, the sparse trie built in one block is reused in the next:
-    /// already-revealed paths are skipped, and only new dirty paths are
-    /// revealed.  This eliminates per-block arena COW overhead and allows
-    /// incremental `root_with_updates` computation (only changed subtrees
-    /// recomputed).
+    /// already-revealed storage tries are skipped (no re-reveal DFS), and the
+    /// factory skips tier-1/tier-2 full-arena DFS for those accounts.  Only new
+    /// dirty paths require reveal.  This eliminates the per-block
+    /// `convert_arena_to_decoded_storage_multiproof` overhead.
     ///
-    /// Requires `use_sparse_storage=true`.  Default: `false`.
+    /// Requires `use_sparse_storage=true`.  Default: `true`.
     pub cross_block_sparse: bool,
 
     /// Maximum number of blocks a storage account's trie can remain in the
@@ -96,7 +96,7 @@ impl Default for MptConfig {
             max_wal_bytes: 0,
             overlay_reuse_enabled: true,
             use_sparse_storage: true,
-            cross_block_sparse: false,
+            cross_block_sparse: true,
             cross_block_sparse_max_lag: 8,
         }
     }

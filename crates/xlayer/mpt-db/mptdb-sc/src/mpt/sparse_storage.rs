@@ -7,11 +7,13 @@
 
 use alloy_primitives::{keccak256, Address, Bytes, B256};
 use alloy_rlp::{Decodable as _, Encodable as _};
-use alloy_trie::nodes::{
-    BranchNode as TrieBranchNode, ExtensionNode as TrieExtensionNode, LeafNode as TrieLeafNode,
-    RlpNode, TrieNode,
+use alloy_trie::{
+    nodes::{
+        BranchNode as TrieBranchNode, ExtensionNode as TrieExtensionNode, LeafNode as TrieLeafNode,
+        RlpNode, TrieNode,
+    },
+    proof::DecodedProofNodes,
 };
-use alloy_trie::proof::DecodedProofNodes;
 use mptdb_common::error::{MptDbError, Result as MptResult};
 use reth_execution_errors::{SparseTrieError, SparseTrieErrorKind};
 use reth_primitives_traits::Account as RethAccount;
@@ -24,14 +26,18 @@ use reth_trie_sparse::{
     provider::{RevealedNode, TrieNodeProvider, TrieNodeProviderFactory},
     SerialSparseTrie, SparseNode, SparseStateTrie,
 };
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use super::arena::MutableTrieArena;
-use super::encoding::{encode_branch, encode_extension, encode_leaf};
-use super::node::{ChildRef, MptNode};
-use super::segment::{SegmentPageLease, StorageTrieSegmentReader};
-use super::state::DirtyAccount;
+use super::{
+    arena::MutableTrieArena,
+    encoding::{encode_branch, encode_extension, encode_leaf},
+    node::{ChildRef, MptNode},
+    segment::{SegmentPageLease, StorageTrieSegmentReader},
+    state::DirtyAccount,
+};
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
@@ -46,20 +52,27 @@ fn sparse_err(msg: impl Into<String>) -> SparseTrieError {
 ///
 /// `is_known_empty` controls behaviour when `lease` is `None`:
 ///
-/// - `true` (new account or `storage_wiped`): `trie_node` returns `Ok(None)`,
-///   which the sparse trie treats as `EmptyRoot` — correct for new accounts
-///   that never had storage.
+/// - `true` (new account or `storage_wiped`): `trie_node` returns `Ok(None)`, which the sparse trie
+///   treats as `EmptyRoot` — correct for new accounts that never had storage.
 ///
-/// - `false` (existing account): `trie_node` returns `Err`, because a missing
-///   lease for an existing account indicates data loss, not an empty trie.
-///   Returning `Ok(None)` would silently set the storage root to
-///   `EMPTY_ROOT_HASH`, producing a wrong state root.
+/// - `false` (existing account): `trie_node` returns `Err`, because a missing lease for an existing
+///   account indicates data loss, not an empty trie. Returning `Ok(None)` would silently set the
+///   storage root to `EMPTY_ROOT_HASH`, producing a wrong state root.
+///
+/// `pre_built_proof` is an optional fallback used in **cross-block** mode when no segment is
+/// available.  It holds a `DecodedStorageMultiProof` built from a dirty-key-only persisted preload
+/// (tier-3) or a similar small sub-trie.  The provider only consults this fallback when a
+/// Hash-blinded node is encountered during `update_storage_leaf` — for fully-revealed paths the
+/// provider is never called, so the clone cost is zero in the common case.
 pub struct SegmentStorageNodeProvider {
     /// Segment page for this account's storage trie, or `None` if absent.
     pub lease: Option<Arc<SegmentPageLease>>,
     /// When `true`, `Ok(None)` is returned on a missing lease (new/empty account).
     /// When `false`, a missing lease is `Err` (fail-fast: data-loss, not empty).
     pub is_known_empty: bool,
+    /// Cross-block fallback proof (subset of nodes for dirty paths only).
+    /// Consulted only when `lease` is `None` and the provider is actually called.
+    pub pre_built_proof: Option<DecodedStorageMultiProof>,
 }
 
 /// Account trie node provider backed by a single mmap segment page.
@@ -135,26 +148,48 @@ impl Default for SegmentTrieNodeProviderFactory {
 // ── TrieNodeProvider implementations ─────────────────────────────────────────
 
 impl TrieNodeProvider for SegmentStorageNodeProvider {
-    fn trie_node(&self, path: &Nibbles) -> std::result::Result<Option<RevealedNode>, SparseTrieError> {
-        let Some(ref lease) = self.lease else {
-            if self.is_known_empty {
-                // New account or storage_wiped: empty trie is the correct answer.
-                return Ok(None);
-            }
-            // Existing account with a missing segment is a data-loss condition,
-            // not an empty trie.  Fail loudly.
-            return Err(sparse_err(
-                "storage segment unavailable for existing account: cannot reveal \
-                 storage trie node; this is a data-loss condition, not an empty trie",
-            ));
-        };
+    fn trie_node(
+        &self,
+        path: &Nibbles,
+    ) -> std::result::Result<Option<RevealedNode>, SparseTrieError> {
+        if let Some(ref lease) = self.lease {
+            return open_reader_and_get(lease, path);
+        }
 
-        open_reader_and_get(lease, path)
+        if self.is_known_empty {
+            // New account or storage_wiped: empty trie is the correct answer.
+            return Ok(None);
+        }
+
+        // Cross-block fallback: pre-built proof from dirty-key-only tier-3 preload.
+        // Only consulted when a Hash-blinded node is encountered during
+        // `update_storage_leaf` for a path NOT fully revealed in the reused
+        // cross-block sparse trie.
+        if let Some(ref proof) = self.pre_built_proof {
+            if let Some(node) = proof.subtree.get(path) {
+                let masks = proof.branch_node_masks.get(path);
+                let (tree_mask, hash_mask) =
+                    masks.map(|m| (Some(m.tree_mask), Some(m.hash_mask))).unwrap_or((None, None));
+                let rlp = Bytes::from(alloy_rlp::encode(node));
+                return Ok(Some(RevealedNode { node: rlp, tree_mask, hash_mask }));
+            }
+            // Path not in pre-built proof: genuinely absent in this sub-trie.
+            return Ok(None);
+        }
+
+        // Existing account with a missing segment and no fallback is a data-loss condition.
+        Err(sparse_err(
+            "storage segment unavailable for existing account: cannot reveal \
+             storage trie node; this is a data-loss condition, not an empty trie",
+        ))
     }
 }
 
 impl TrieNodeProvider for SegmentAccountNodeProvider {
-    fn trie_node(&self, path: &Nibbles) -> std::result::Result<Option<RevealedNode>, SparseTrieError> {
+    fn trie_node(
+        &self,
+        path: &Nibbles,
+    ) -> std::result::Result<Option<RevealedNode>, SparseTrieError> {
         let Some(ref lease) = self.lease else {
             // A missing account segment is ALWAYS a data-loss condition.
             // `Ok(None)` would silently set the account root to EMPTY_ROOT_HASH
@@ -183,6 +218,10 @@ impl TrieNodeProviderFactory for SegmentTrieNodeProviderFactory {
         SegmentStorageNodeProvider {
             lease: self.storage_segments.get(&account).cloned(),
             is_known_empty: self.known_empty_accounts.contains(&account),
+            // Cross-block fallback: cloned only when the provider is actually called
+            // (i.e. when a Hash-blinded node is encountered), which is rare for
+            // fully-revealed accounts.
+            pre_built_proof: self.pre_built_storage_proofs.get(&account).cloned(),
         }
     }
 }
@@ -202,8 +241,7 @@ pub(crate) fn extract_account_proof_from_sparse_trie(
     sparse_trie: &SparseStateTrie,
 ) -> MptResult<(DecodedProofNodes, BranchNodeMasksMap)> {
     let Some(account_trie) = sparse_trie.state_trie_ref() else {
-        let subtree =
-            DecodedProofNodes::from_iter([(Nibbles::default(), TrieNode::EmptyRoot)]);
+        let subtree = DecodedProofNodes::from_iter([(Nibbles::default(), TrieNode::EmptyRoot)]);
         return Ok((subtree, BranchNodeMasksMap::default()));
     };
     sparse_nodes_to_account_proof_nodes(account_trie)
@@ -255,12 +293,21 @@ fn sparse_nodes_to_account_proof_nodes(
             SparseNode::Leaf { key, .. } => {
                 let full_path = nibbles_extend(&path, key);
                 let value = values.get(&full_path).cloned().unwrap_or_default();
-                pairs.push((path, TrieNode::Leaf(alloy_trie::nodes::LeafNode::new(key.clone(), value))));
+                pairs.push((
+                    path,
+                    TrieNode::Leaf(alloy_trie::nodes::LeafNode::new(key.clone(), value)),
+                ));
             }
             SparseNode::Extension { key, .. } => {
                 let child_path = nibbles_extend(&path, key);
                 let child_hash = sparse_node_rlp(nodes, &child_path);
-                pairs.push((path, TrieNode::Extension(alloy_trie::nodes::ExtensionNode::new(key.clone(), child_hash))));
+                pairs.push((
+                    path,
+                    TrieNode::Extension(alloy_trie::nodes::ExtensionNode::new(
+                        key.clone(),
+                        child_hash,
+                    )),
+                ));
                 stack.push(child_path);
             }
             SparseNode::Branch { state_mask, .. } => {
@@ -269,12 +316,19 @@ fn sparse_nodes_to_account_proof_nodes(
                 let mut hash_mask = reth_trie_common::TrieMask::default();
 
                 for i in 0u8..16 {
-                    if !state_mask.is_bit_set(i) { continue; }
+                    if !state_mask.is_bit_set(i) {
+                        continue;
+                    }
                     let child_path = nibbles_push(&path, i);
                     let child_rlp = sparse_node_rlp(nodes, &child_path);
-                    if child_rlp.is_hash() { hash_mask.set_bit(i); }
+                    if child_rlp.is_hash() {
+                        hash_mask.set_bit(i);
+                    }
                     // Only recurse into revealed (non-Hash) children.
-                    let is_revealed = nodes.get(&child_path).map(|n| !matches!(n, SparseNode::Hash(_))).unwrap_or(false);
+                    let is_revealed = nodes
+                        .get(&child_path)
+                        .map(|n| !matches!(n, SparseNode::Hash(_)))
+                        .unwrap_or(false);
                     if is_revealed {
                         tree_mask.set_bit(i);
                         stack.push(child_path);
@@ -282,7 +336,10 @@ fn sparse_nodes_to_account_proof_nodes(
                     rlp_stack.push(child_rlp);
                 }
 
-                pairs.push((path.clone(), TrieNode::Branch(alloy_trie::nodes::BranchNode::new(rlp_stack, *state_mask))));
+                pairs.push((
+                    path.clone(),
+                    TrieNode::Branch(alloy_trie::nodes::BranchNode::new(rlp_stack, *state_mask)),
+                ));
                 if tree_mask.get() != 0 || hash_mask.get() != 0 {
                     branch_masks.insert(path, BranchNodeMasks { tree_mask, hash_mask });
                 }
@@ -310,17 +367,28 @@ fn sparse_nodes_to_decoded_storage_multiproof(
             None => continue,
         };
         match node {
-            SparseNode::Empty => { pairs.push((path, TrieNode::EmptyRoot)); }
+            SparseNode::Empty => {
+                pairs.push((path, TrieNode::EmptyRoot));
+            }
             SparseNode::Hash(_) => {} // blinded
             SparseNode::Leaf { key, .. } => {
                 let full_path = nibbles_extend(&path, key);
                 let value = values.get(&full_path).cloned().unwrap_or_default();
-                pairs.push((path, TrieNode::Leaf(alloy_trie::nodes::LeafNode::new(key.clone(), value))));
+                pairs.push((
+                    path,
+                    TrieNode::Leaf(alloy_trie::nodes::LeafNode::new(key.clone(), value)),
+                ));
             }
             SparseNode::Extension { key, .. } => {
                 let child_path = nibbles_extend(&path, key);
                 let child_hash = sparse_node_rlp(nodes, &child_path);
-                pairs.push((path, TrieNode::Extension(alloy_trie::nodes::ExtensionNode::new(key.clone(), child_hash))));
+                pairs.push((
+                    path,
+                    TrieNode::Extension(alloy_trie::nodes::ExtensionNode::new(
+                        key.clone(),
+                        child_hash,
+                    )),
+                ));
                 stack.push(child_path);
             }
             SparseNode::Branch { state_mask, .. } => {
@@ -328,15 +396,28 @@ fn sparse_nodes_to_decoded_storage_multiproof(
                 let mut tree_mask = reth_trie_common::TrieMask::default();
                 let mut hash_mask = reth_trie_common::TrieMask::default();
                 for i in 0u8..16 {
-                    if !state_mask.is_bit_set(i) { continue; }
+                    if !state_mask.is_bit_set(i) {
+                        continue;
+                    }
                     let child_path = nibbles_push(&path, i);
                     let child_rlp = sparse_node_rlp(nodes, &child_path);
-                    if child_rlp.is_hash() { hash_mask.set_bit(i); }
-                    let is_revealed = nodes.get(&child_path).map(|n| !matches!(n, SparseNode::Hash(_))).unwrap_or(false);
-                    if is_revealed { tree_mask.set_bit(i); stack.push(child_path); }
+                    if child_rlp.is_hash() {
+                        hash_mask.set_bit(i);
+                    }
+                    let is_revealed = nodes
+                        .get(&child_path)
+                        .map(|n| !matches!(n, SparseNode::Hash(_)))
+                        .unwrap_or(false);
+                    if is_revealed {
+                        tree_mask.set_bit(i);
+                        stack.push(child_path);
+                    }
                     rlp_stack.push(child_rlp);
                 }
-                pairs.push((path.clone(), TrieNode::Branch(alloy_trie::nodes::BranchNode::new(rlp_stack, *state_mask))));
+                pairs.push((
+                    path.clone(),
+                    TrieNode::Branch(alloy_trie::nodes::BranchNode::new(rlp_stack, *state_mask)),
+                ));
                 if tree_mask.get() != 0 || hash_mask.get() != 0 {
                     branch_masks.insert(path, BranchNodeMasks { tree_mask, hash_mask });
                 }
@@ -416,8 +497,8 @@ pub(crate) fn convert_arena_to_account_proof_nodes(
 /// from the trie root (not including the node's own key/nibbles).
 ///
 /// # Branch `ChildRef` semantics → masks
-/// - `Arena(idx)` (materialized child): `tree_mask` bit SET;
-///   `hash_mask` bit SET when child is hash-sized (≥ 32 bytes), NOT SET when inline.
+/// - `Arena(idx)` (materialized child): `tree_mask` bit SET; `hash_mask` bit SET when child is
+///   hash-sized (≥ 32 bytes), NOT SET when inline.
 /// - `Hash(h)` (blinded cross-segment ref): `tree_mask` NOT SET; `hash_mask` SET.
 /// - `Inline(rlp)` (small embedded node): both masks NOT SET.
 fn arena_to_proof_nodes(
@@ -579,18 +660,14 @@ fn nibbles_extend(base: &Nibbles, extra: &Nibbles) -> Nibbles {
 /// `SparseStateTrie` in one pass.
 ///
 /// # Preconditions
-/// - `trie` MUST have been constructed with `.with_updates(true)`.
-///   `SparseStateTrie::default()` sets `retain_updates=false`; call
-///   `SparseStateTrie::default().with_updates(true)` before passing.
-/// - `account_proof` must have been produced from the committed account trie
-///   (e.g. via `convert_arena_to_account_proof_nodes` on the committed arena).
-/// - `provider_factory.known_empty_accounts` must be pre-populated:
-///   ```ignore
-///   factory.known_empty_accounts = dirty_accounts.iter()
-///       .filter(|d| d.storage_known_empty || d.storage_wiped)
-///       .map(|d| d.hashed_address)
-///       .collect();
-///   ```
+/// - `trie` MUST have been constructed with `.with_updates(true)`. `SparseStateTrie::default()`
+///   sets `retain_updates=false`; call `SparseStateTrie::default().with_updates(true)` before
+///   passing.
+/// - `account_proof` must have been produced from the committed account trie (e.g. via
+///   `convert_arena_to_account_proof_nodes` on the committed arena).
+/// - `provider_factory.known_empty_accounts` must be pre-populated: ```ignore
+///   factory.known_empty_accounts = dirty_accounts.iter() .filter(|d| d.storage_known_empty ||
+///   d.storage_wiped) .map(|d| d.hashed_address) .collect(); ```
 ///
 /// # Step 0 — Batch account trie reveal (⚠ must run BEFORE the per-account loop)
 /// All dirty account paths are revealed at once.  Do NOT call
@@ -610,11 +687,20 @@ fn nibbles_extend(base: &Nibbles, extra: &Nibbles) -> Nibbles {
 /// Updates or removes the account leaf.  `update_account` reads the storage
 /// root from the storage trie entry (revealed in Step 1) or from the existing
 /// leaf value (when no storage changes exist).
+/// Apply all storage and account changes from `dirty_accounts` to `trie`.
+///
+/// When `skip_already_revealed_storage` is `true` (cross-block reuse path), the
+/// Step-1 storage-trie reveal is skipped for accounts whose storage trie is
+/// **already present** in `trie` (i.e. `trie.storage_trie_ref(addr).is_some()`).
+/// The trie was reused from the previous block, so re-revealing is redundant.
+/// The factory's `pre_built_proof` fallback in `SegmentStorageNodeProvider`
+/// handles any Hash-blinded nodes encountered during Step-2 `update_storage_leaf`.
 pub(crate) fn apply_all_storage_changes_sparse(
     trie: &mut SparseStateTrie,
     account_proof: (DecodedProofNodes, BranchNodeMasksMap),
     provider_factory: &SegmentTrieNodeProviderFactory,
     dirty_accounts: &[DirtyAccount],
+    skip_already_revealed_storage: bool,
 ) -> MptResult<()> {
     if dirty_accounts.is_empty() {
         return Ok(());
@@ -625,9 +711,15 @@ pub(crate) fn apply_all_storage_changes_sparse(
     // ⚠ Implementation trap: do NOT call reveal_decoded_account_multiproof
     // inside the per-account loop.  A second call for the same path silently
     // overwrites already-applied account node updates, producing a wrong root.
+    //
+    // Cross-block fast path: when `account_proof` is empty (all accounts already
+    // revealed in the reused trie), this step is skipped entirely — avoiding the
+    // O(all_account_nodes) HashMap construction and reveal.
     let (account_nodes, account_masks) = account_proof;
-    trie.reveal_decoded_account_multiproof(account_nodes, account_masks)
-        .map_err(|e| MptDbError::Other(format!("reveal account multiproof: {e}")))?;
+    if !account_nodes.is_empty() {
+        trie.reveal_decoded_account_multiproof(account_nodes, account_masks)
+            .map_err(|e| MptDbError::Other(format!("reveal account multiproof: {e}")))?;
+    }
 
     // ── Per-account loop ──────────────────────────────────────────────────────
     for dirty in dirty_accounts {
@@ -637,15 +729,18 @@ pub(crate) fn apply_all_storage_changes_sparse(
 
         // ── Step 1: storage trie reveal ───────────────────────────────────────
         //
-        // storage_wiped handling MUST come before the segment-reveal branch.
-        // When storage_wiped=true (SELFDESTRUCT), all prior storage is discarded.
-        // Falling through to segment-reveal would load the OLD base and produce
-        // a wrong storage root.
+        // Cross-block fast path: if the storage trie for this account is already
+        // present in the reused sparse trie, skip the reveal.  Previously-revealed
+        // paths are still accessible; Hash-blinded node boundaries (new slots) are
+        // handled lazily by the provider (segment or `pre_built_proof` fallback).
+        //
+        // storage_wiped handling MUST come before the cross-block skip: a wiped
+        // account must always re-reveal as empty to record the wipe marker.
         //
         // Correct two-step fix (from plan Decision 4):
-        //   1. reveal_decoded_storage_multiproof with EmptyRoot — so that
-        //      `wipe()` sees updates.is_some() and records the wipe marker.
-        //      (If we used Box::default(), updates=None and wipe() is a no-op.)
+        //   1. reveal_decoded_storage_multiproof with EmptyRoot — so that `wipe()` sees
+        //      updates.is_some() and records the wipe marker. (If we used Box::default(),
+        //      updates=None and wipe() is a no-op.)
         //   2. wipe_storage — sets updates=Some(wiped) for TrieUpdates.
         if dirty.storage_wiped {
             trie.reveal_decoded_storage_multiproof(hashed_addr, DecodedStorageMultiProof::empty())
@@ -655,6 +750,10 @@ pub(crate) fn apply_all_storage_changes_sparse(
             trie.wipe_storage(hashed_addr)
                 .map_err(|e| MptDbError::Other(format!("wipe_storage {hashed_addr}: {e}")))?;
             // Fall through: new storage slots (if any) are written in Step 2.
+        } else if skip_already_revealed_storage && trie.storage_trie_ref(&hashed_addr).is_some() {
+            // Cross-block reuse: storage trie already revealed — skip reveal.
+            // Step 2 applies changes directly; the provider handles Hash-blinded
+            // boundaries via segment or `pre_built_proof` fallback.
         } else if let Some(reader) = provider_factory.get_storage_reader(hashed_addr) {
             // Existing account with a published segment: eager-reveal dirty paths.
             //
@@ -664,20 +763,23 @@ pub(crate) fn apply_all_storage_changes_sparse(
             // (balance/nonce only change) — `update_account` will read the
             // storage root directly from the existing account leaf.
             if !dirty_keys.is_empty() {
-                let proof = reader
-                    .extract_decoded_multiproof(&dirty_keys)
-                    .map_err(|e| MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}")))?;
+                let proof = reader.extract_decoded_multiproof(&dirty_keys).map_err(|e| {
+                    MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
+                })?;
                 trie.reveal_decoded_storage_multiproof(hashed_addr, proof)
                     .map_err(|e| MptDbError::Other(format!("reveal storage {hashed_addr}: {e}")))?;
             }
             // else: no storage changes → no storage trie reveal needed.
-        } else if let Some(proof) = provider_factory.pre_built_storage_proofs.get(&hashed_addr).cloned() {
+        } else if let Some(proof) =
+            provider_factory.pre_built_storage_proofs.get(&hashed_addr).cloned()
+        {
             // L2 cache fallback: published segment was stale (root mismatch) but
             // the committed StorageTrieCow is available in the L2 cache.  Use the
             // pre-built proof from `build_sparse_factory`.
             if !dirty_keys.is_empty() {
-                trie.reveal_decoded_storage_multiproof(hashed_addr, proof)
-                    .map_err(|e| MptDbError::Other(format!("reveal storage (L2 fallback) {hashed_addr}: {e}")))?;
+                trie.reveal_decoded_storage_multiproof(hashed_addr, proof).map_err(|e| {
+                    MptDbError::Other(format!("reveal storage (L2 fallback) {hashed_addr}: {e}"))
+                })?;
             }
         } else {
             // No published segment and NOT storage_wiped.
@@ -687,8 +789,8 @@ pub(crate) fn apply_all_storage_changes_sparse(
             // from the existing account leaf (or use EMPTY_ROOT_HASH for new
             // accounts).  Only error when there are actual storage changes that
             // require a base trie but no valid witness source can be found.
-            let is_known_empty = dirty.storage_known_empty
-                || provider_factory.known_empty_accounts.contains(&hashed_addr);
+            let is_known_empty = dirty.storage_known_empty ||
+                provider_factory.known_empty_accounts.contains(&hashed_addr);
             if !is_known_empty && !dirty_keys.is_empty() {
                 return Err(MptDbError::Other(format!(
                     "no storage segment for existing account {hashed_addr}; \
@@ -717,13 +819,14 @@ pub(crate) fn apply_all_storage_changes_sparse(
         // ── Step 2: apply storage changes ────────────────────────────────────
         for change in &dirty.storage_changes {
             if change.value.is_zero() {
-                trie.remove_storage_leaf(hashed_addr, &change.slot_key, provider_factory)
-                    .map_err(|e| {
+                trie.remove_storage_leaf(hashed_addr, &change.slot_key, provider_factory).map_err(
+                    |e| {
                         MptDbError::Other(format!(
                             "remove_storage_leaf {hashed_addr}/{:?}: {e}",
                             change.slot_key
                         ))
-                    })?;
+                    },
+                )?;
             } else {
                 let encoded = change.encoded_value.clone().unwrap_or_default();
                 trie.update_storage_leaf(
@@ -811,10 +914,9 @@ pub(crate) fn apply_all_storage_changes_sparse(
                 }
             }
             None => {
-                trie.remove_account_leaf(&dirty.account_key, provider_factory)
-                    .map_err(|e| {
-                        MptDbError::Other(format!("remove_account_leaf {hashed_addr}: {e}"))
-                    })?;
+                trie.remove_account_leaf(&dirty.account_key, provider_factory).map_err(|e| {
+                    MptDbError::Other(format!("remove_account_leaf {hashed_addr}: {e}"))
+                })?;
             }
         }
     }
@@ -830,10 +932,7 @@ impl SegmentTrieNodeProviderFactory {
     ///
     /// Used in `apply_all_storage_changes_sparse` (Phase 2) to extract eager
     /// witnesses before the per-account apply loop.
-    pub fn get_storage_reader(
-        &self,
-        hashed_addr: B256,
-    ) -> Option<StorageTrieSegmentReader<'_>> {
+    pub fn get_storage_reader(&self, hashed_addr: B256) -> Option<StorageTrieSegmentReader<'_>> {
         let lease = self.storage_segments.get(&hashed_addr)?;
         StorageTrieSegmentReader::open_shared_page(lease, lease.root(), lease.root_record_off())
             .ok()
@@ -853,15 +952,15 @@ impl SegmentTrieNodeProviderFactory {
     ) -> MptResult<(DecodedProofNodes, BranchNodeMasksMap)> {
         let Some(ref lease) = self.account_segment else {
             // No account segment yet (genesis / pre-population phase).
-            let subtree =
-                DecodedProofNodes::from_iter([(Nibbles::default(), TrieNode::EmptyRoot)]);
+            let subtree = DecodedProofNodes::from_iter([(Nibbles::default(), TrieNode::EmptyRoot)]);
             return Ok((subtree, BranchNodeMasksMap::default()));
         };
-        let reader =
-            StorageTrieSegmentReader::open_shared_page(lease, lease.root(), lease.root_record_off())
-                .map_err(|e| {
-                    MptDbError::Other(format!("failed to open account segment: {e}"))
-                })?;
+        let reader = StorageTrieSegmentReader::open_shared_page(
+            lease,
+            lease.root(),
+            lease.root_record_off(),
+        )
+        .map_err(|e| MptDbError::Other(format!("failed to open account segment: {e}")))?;
         reader.extract_decoded_account_multiproof(keys)
     }
 }
@@ -930,20 +1029,19 @@ pub(crate) fn build_account_proof_from_sparse(
     let proof_nodes = collect_proof_nodes_sparse(account_trie, &account_path)?;
 
     // Decode account info from the leaf value (if present).
-    let (info, storage_root) =
-        match account_trie.values_ref().get(&account_path) {
-            Some(rlp) => {
-                let ta = TrieAccount::decode(&mut rlp.as_slice())
-                    .map_err(|e| MptDbError::Other(format!("decode account leaf: {e}")))?;
-                // Normalise code_hash: None means KECCAK_EMPTY (empty bytecode),
-                // matching the convention used by the persisted proof path.
-                let bytecode_hash =
-                    if ta.code_hash == alloy_trie::KECCAK_EMPTY { None } else { Some(ta.code_hash) };
-                let account = RethAccount { nonce: ta.nonce, balance: ta.balance, bytecode_hash };
-                (Some(account), ta.storage_root)
-            }
-            None => (None, EMPTY_ROOT_HASH),
-        };
+    let (info, storage_root) = match account_trie.values_ref().get(&account_path) {
+        Some(rlp) => {
+            let ta = TrieAccount::decode(&mut rlp.as_slice())
+                .map_err(|e| MptDbError::Other(format!("decode account leaf: {e}")))?;
+            // Normalise code_hash: None means KECCAK_EMPTY (empty bytecode),
+            // matching the convention used by the persisted proof path.
+            let bytecode_hash =
+                if ta.code_hash == alloy_trie::KECCAK_EMPTY { None } else { Some(ta.code_hash) };
+            let account = RethAccount { nonce: ta.nonce, balance: ta.balance, bytecode_hash };
+            (Some(account), ta.storage_root)
+        }
+        None => (None, EMPTY_ROOT_HASH),
+    };
 
     // Build storage proofs for requested slots.
     let storage_proofs = if info.is_some() && storage_root != EMPTY_ROOT_HASH {
@@ -963,10 +1061,7 @@ pub(crate) fn build_account_proof_from_sparse(
 /// Walks from root to the target leaf, collecting each node's RLP encoding.
 /// Blinded (`Hash`) nodes at non-leaf positions are included as their 33-byte
 /// hash-reference RLP (0xa0 + 32 bytes).
-fn collect_proof_nodes_sparse(
-    trie: &SerialSparseTrie,
-    path: &Nibbles,
-) -> MptResult<Vec<Bytes>> {
+fn collect_proof_nodes_sparse(trie: &SerialSparseTrie, path: &Nibbles) -> MptResult<Vec<Bytes>> {
     let nodes = trie.nodes_ref();
     let values = trie.values_ref();
     let mut result = Vec::new();
@@ -1001,7 +1096,7 @@ fn collect_proof_nodes_sparse(
                 }
                 break;
             }
-            SparseNode::Extension { key, hash: _ , .. } => {
+            SparseNode::Extension { key, hash: _, .. } => {
                 // Encode extension then advance past the key.
                 let child_path = nibbles_extend(&current, key);
                 let child_hash = get_node_hash(nodes, &child_path);
@@ -1012,7 +1107,7 @@ fn collect_proof_nodes_sparse(
                 result.push(rlp.into());
                 current = child_path;
             }
-            SparseNode::Branch { state_mask, hash: _ , .. } => {
+            SparseNode::Branch { state_mask, hash: _, .. } => {
                 // Encode branch node with hashes for each present child.
                 let rlp = encode_branch_node_from_sparse(nodes, &current, *state_mask)?;
                 result.push(rlp.into());
@@ -1061,7 +1156,10 @@ fn build_storage_proof_sparse(
 }
 
 /// Returns the hash of the node at `path` (if computed).
-fn get_node_hash(nodes: &alloy_primitives::map::HashMap<Nibbles, SparseNode>, path: &Nibbles) -> Option<B256> {
+fn get_node_hash(
+    nodes: &alloy_primitives::map::HashMap<Nibbles, SparseNode>,
+    path: &Nibbles,
+) -> Option<B256> {
     match nodes.get(path)? {
         SparseNode::Hash(h) => Some(*h),
         SparseNode::Leaf { hash, .. } => *hash,
@@ -1235,10 +1333,7 @@ fn get_child_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mpt::{
-        segment::StorageTrieSegment,
-        tree::MptTree,
-    };
+    use crate::mpt::{segment::StorageTrieSegment, tree::MptTree};
     use alloy_primitives::keccak256;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1269,28 +1364,34 @@ mod tests {
 
     #[test]
     fn t_storage_provider_known_empty_no_lease_returns_none() {
-        let provider = SegmentStorageNodeProvider { lease: None, is_known_empty: true };
+        let provider =
+            SegmentStorageNodeProvider { lease: None, is_known_empty: true, pre_built_proof: None };
         let result = provider.trie_node(&Nibbles::default());
         assert!(result.unwrap().is_none(), "known-empty + no lease must return Ok(None)");
     }
 
     #[test]
     fn t_storage_provider_not_known_empty_no_lease_returns_err() {
-        let provider = SegmentStorageNodeProvider { lease: None, is_known_empty: false };
+        let provider = SegmentStorageNodeProvider {
+            lease: None,
+            is_known_empty: false,
+            pre_built_proof: None,
+        };
         let result = provider.trie_node(&Nibbles::default());
         assert!(result.is_err(), "existing account + no lease must return Err");
         let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("data-loss"),
-            "error must mention data-loss, got: {err_str}"
-        );
+        assert!(err_str.contains("data-loss"), "error must mention data-loss, got: {err_str}");
     }
 
     #[test]
     fn t_storage_provider_with_lease_root_path_returns_node() {
         let tree = single_key_tree();
         let lease = build_lease(&mut tree.clone());
-        let provider = SegmentStorageNodeProvider { lease: Some(lease), is_known_empty: false };
+        let provider = SegmentStorageNodeProvider {
+            lease: Some(lease),
+            is_known_empty: false,
+            pre_built_proof: None,
+        };
 
         let result = provider.trie_node(&Nibbles::default()).unwrap();
         assert!(result.is_some(), "root path must return a node when lease is present");
@@ -1302,7 +1403,11 @@ mod tests {
     fn t_storage_provider_with_lease_missing_path_returns_none() {
         let tree = single_key_tree();
         let lease = build_lease(&mut tree.clone());
-        let provider = SegmentStorageNodeProvider { lease: Some(lease), is_known_empty: false };
+        let provider = SegmentStorageNodeProvider {
+            lease: Some(lease),
+            is_known_empty: false,
+            pre_built_proof: None,
+        };
 
         // A 5-nibble path [0,0,0,0,0] almost certainly does not exist.
         let absent = Nibbles::from_nibbles(&[0, 0, 0, 0, 0]);
@@ -1320,10 +1425,7 @@ mod tests {
         let result = provider.trie_node(&Nibbles::default());
         assert!(result.is_err(), "account provider with no lease must always Err");
         let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("data-loss"),
-            "error must mention data-loss, got: {err_str}"
-        );
+        assert!(err_str.contains("data-loss"), "error must mention data-loss, got: {err_str}");
     }
 
     #[test]
@@ -1418,14 +1520,8 @@ mod tests {
 
         let result = provider.trie_node(&Nibbles::default()).unwrap().unwrap();
         // tree_mask and hash_mask are both Some for branch nodes.
-        assert!(
-            result.tree_mask.is_some(),
-            "branch node must have tree_mask"
-        );
-        assert!(
-            result.hash_mask.is_some(),
-            "branch node must have hash_mask"
-        );
+        assert!(result.tree_mask.is_some(), "branch node must have tree_mask");
+        assert!(result.hash_mask.is_some(), "branch node must have hash_mask");
     }
 
     #[test]
@@ -1484,10 +1580,7 @@ mod tests {
         let root_node = proof.subtree.get(&Nibbles::default());
         assert!(root_node.is_some(), "DecodedProofNodes must contain root path");
         // No branch masks for a single-key trie (root is a leaf).
-        assert!(
-            proof.branch_node_masks.is_empty(),
-            "single-leaf trie must have no branch masks"
-        );
+        assert!(proof.branch_node_masks.is_empty(), "single-leaf trie must have no branch masks");
     }
 
     #[test]
