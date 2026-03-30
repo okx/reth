@@ -1,7 +1,7 @@
 use alloy_trie::Nibbles;
 
 use super::{
-    arena::MutableTrieArena, segment::StoragePathTrace, storage_recompute, tree::MptTree, tree_algo,
+    arena::MutableTrieArena, segment::StoragePathTrace, tree::MptTree, tree_algo,
 };
 
 #[derive(Clone)]
@@ -54,11 +54,14 @@ impl StorageOverlay {
         MptTree { arena: self.arena, root: self.root }
     }
 
+    /// Compute the overlay root hash and collect dirty node blobs.
     pub fn root_hash_and_dirty_blobs(
-        mut self,
+        self,
     ) -> (alloy_primitives::B256, Vec<(alloy_primitives::B256, Vec<u8>)>, StorageOverlay) {
-        let result = storage_recompute::recompute(&mut self.arena, self.root);
-        (result.root, result.dirty_blobs, self)
+        let mut tree = self.into_tree();
+        let (root, blobs) = tree.root_hash_and_dirty_blobs();
+        let overlay = StorageOverlay::from_tree(tree);
+        (root, blobs, overlay)
     }
 
     pub fn clear_dirty(&mut self) {

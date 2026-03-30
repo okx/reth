@@ -290,34 +290,6 @@ fn insert_at_extension(
     }
 }
 
-fn insert_at_branch(
-    arena: &mut MutableTrieArena,
-    idx: u32,
-    branch: &BranchNode,
-    key: &Nibbles,
-    offset: usize,
-    value: Vec<u8>,
-) -> u32 {
-    if offset >= key.len() {
-        // Key consumed: set branch value
-        if let MptNode::Branch(b) = arena.get_mut(idx) {
-            b.value = Some(value);
-        }
-        idx
-    } else {
-        let nibble = key.get_unchecked(offset) as usize;
-        let child_idx = branch.children[nibble].as_ref().map(|c| match c {
-            ChildRef::Arena(i) => *i,
-            _ => panic!("Phase 1: only Arena child refs"),
-        });
-        let new_child = insert_recursive(arena, child_idx, key, offset + 1, value);
-        if let MptNode::Branch(b) = arena.get_mut(idx) {
-            b.children[nibble] = Some(ChildRef::Arena(new_child));
-        }
-        idx
-    }
-}
-
 /// Delete a key from the trie rooted at `node_idx`.
 /// Returns (was_deleted, new_root_for_subtree).
 pub(crate) fn delete_recursive(

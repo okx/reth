@@ -45,6 +45,35 @@ pub struct MptConfig {
     /// Set to false to disable and fall back to fresh allocations — useful for
     /// bisecting regressions or diagnosing allocator issues in production.
     pub overlay_reuse_enabled: bool,
+    /// Replace `StorageTrieCow`-based storage apply with reth `SparseStateTrie`.
+    ///
+    /// When true, `apply_dirty_accounts_inner` creates a `SparseStateTrie`, reveals
+    /// dirty paths from published L3 segments, and applies all storage + account
+    /// changes via the sparse engine.  `commit_inner_with_mode` then calls
+    /// `root_with_updates` instead of the custom per-account root aggregation.
+    ///
+    /// Default: `false`.  The feature flag allows toggling without data migration.
+    pub use_sparse_storage: bool,
+
+    /// Keep the `SparseStateTrie` alive across blocks (Phase 4 optimisation).
+    ///
+    /// When `true`, the sparse trie built in one block is reused in the next:
+    /// already-revealed paths are skipped, and only new dirty paths are
+    /// revealed.  This eliminates per-block arena COW overhead and allows
+    /// incremental `root_with_updates` computation (only changed subtrees
+    /// recomputed).
+    ///
+    /// Requires `use_sparse_storage=true`.  Default: `false`.
+    pub cross_block_sparse: bool,
+
+    /// Maximum number of blocks a storage account's trie can remain in the
+    /// cross-block `SparseStateTrie` without being accessed before it is
+    /// evicted.
+    ///
+    /// Eviction bounds memory growth for workloads with many distinct accounts.
+    /// `0` disables eviction (unbounded; only use for testing).
+    /// Default: `8`.
+    pub cross_block_sparse_max_lag: i64,
 }
 
 impl Default for MptConfig {
@@ -66,6 +95,9 @@ impl Default for MptConfig {
             checkpoint_max_account_trie_nodes: 200_000,
             max_wal_bytes: 0,
             overlay_reuse_enabled: true,
+            use_sparse_storage: true,
+            cross_block_sparse: false,
+            cross_block_sparse_max_lag: 8,
         }
     }
 }

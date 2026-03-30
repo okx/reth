@@ -946,6 +946,12 @@ impl SparseTrieInterface for SerialSparseTrie {
         self.updates.take().unwrap_or_default()
     }
 
+    fn reinit_updates(&mut self) {
+        if self.updates.is_none() {
+            self.updates = Some(SparseTrieUpdates::default());
+        }
+    }
+
     fn wipe(&mut self) {
         self.nodes = HashMap::from_iter([(Nibbles::default(), SparseNode::Empty)]);
         self.values = HashMap::default();
@@ -1125,6 +1131,33 @@ impl SerialSparseTrie {
     /// Returns an immutable reference to all nodes in the sparse trie.
     pub const fn nodes_ref(&self) -> &HashMap<Nibbles, SparseNode> {
         &self.nodes
+    }
+
+    /// Re-initialises the update tracker for a new block.
+    ///
+    /// Called at the start of each block's apply phase when the
+    /// `SparseStateTrie` is reused across blocks (cross-block optimisation).
+    /// After `take_updates()` the tracker is `None`; this call brings it back
+    /// to `Some(default)` so that the next `root_with_updates` collects the
+    /// current block's changes correctly.
+    ///
+    /// No-op if `self.updates` is already `Some(...)`.
+    pub fn reinit_updates(&mut self) {
+        if self.updates.is_none() {
+            self.updates = Some(SparseTrieUpdates::default());
+        }
+    }
+
+    /// Returns an immutable reference to all leaf values in the sparse trie.
+    ///
+    /// Keys are full leaf paths (64 nibbles for keccak-hashed keys).
+    /// Values are RLP-encoded leaf payloads (e.g. encoded account or storage value).
+    ///
+    /// Required by mpt-db for proof generation and background segment building:
+    /// `SparseNode::Leaf` stores only the remaining key suffix and an optional hash;
+    /// the actual leaf value is kept separately in this map.
+    pub fn values_ref(&self) -> &HashMap<Nibbles, Vec<u8>> {
+        &self.values
     }
 
     /// Reveals either a node or its hash placeholder based on the provided child data.

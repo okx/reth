@@ -17,7 +17,7 @@ use super::{
     flat_layout::{
         append_page as append_flat_page, data_path as pages_data_path,
         index_path as pages_index_path, open_data_file as open_pages_data_file,
-        open_index_file as open_pages_index_file_handle, read_page_header, read_page_header_light,
+        open_index_file as open_pages_index_file_handle, read_page_header,
         write_full_page_index, FlatPageIndexEntry, PAGE_INDEX_RECORD_LEN,
     },
     manifest::VersionManifest,

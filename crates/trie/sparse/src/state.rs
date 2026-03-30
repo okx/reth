@@ -130,6 +130,31 @@ impl<A, S> SparseStateTrie<A, S> {
         self
     }
 
+    /// Re-initialises update tracking on the account trie and all revealed
+    /// storage tries for use in the next block.
+    ///
+    /// After `root_with_updates` calls `take_updates()` the internal trackers
+    /// become `None`.  Call this at the beginning of each block's apply phase
+    /// when reusing the `SparseStateTrie` across blocks (cross-block
+    /// optimisation, Phase 4).  No-op when `retain_updates=false`.
+    pub fn reinit_updates(&mut self)
+    where
+        A: SparseTrieInterface,
+        S: SparseTrieInterface,
+    {
+        if !self.retain_updates {
+            return;
+        }
+        if let Some(trie) = self.state.as_revealed_mut() {
+            trie.reinit_updates();
+        }
+        for trie in self.storage.tries.values_mut() {
+            if let Some(t) = trie.as_revealed_mut() {
+                t.reinit_updates();
+            }
+        }
+    }
+
     /// Set the accounts trie to the given `SparseTrie`.
     pub fn with_accounts_trie(mut self, trie: SparseTrie<A>) -> Self {
         self.state = trie;

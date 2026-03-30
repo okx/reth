@@ -20,6 +20,8 @@ alloy-trie = { workspace = true, features = ["ethereum"] }
 revm-database = { workspace = true }
 revm-state = { workspace = true }
 reth-trie-common = { workspace = true }
+reth-trie-sparse = { workspace = true }
+reth-execution-errors = { workspace = true }
 reth-primitives-traits = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

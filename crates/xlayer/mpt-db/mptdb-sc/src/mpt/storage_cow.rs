@@ -20,7 +20,6 @@ use super::{
         StorageTrieSegment, StorageTrieSegmentReader,
     },
     state::StorageChange,
-    storage_recompute,
     tree::MptTree,
     tree_algo,
 };
@@ -618,81 +617,63 @@ impl StorageTrieCow {
         Ok(())
     }
 
+    /// Compute the storage root hash, returning the updated trie.
+    ///
+    /// Materialises the trie into a fully arena-backed `MptTree`, computes the
+    /// root hash via `MptTree::root_hash`, and converts back to `StorageTrieCow`.
+    /// Compute root hash from the arena WITHOUT materialising lazy/segment/persisted nodes.
+    ///
+    /// For arena-rooted tries: hashes are computed recursively from the arena.
+    ///   - `ChildRef::Hash(h)` children contribute `h` directly — no store access.
+    ///   - This preserves `pending_lazy_children` so subsequent `apply_change` calls
+    ///     can still resolve segment-backed hash nodes.
+    /// For lazy roots (segment or persisted): the cached root hash is returned directly.
+    pub fn root_hash_only(mut self, _store: &PersistedTrieStore) -> Result<(B256, StorageTrieCow)> {
+        let root = match self.root {
+            CowRootRef::Empty => alloy_trie::EMPTY_ROOT_HASH,
+            CowRootRef::Arena(idx) => {
+                // Build an MptTree view (borrows the arena) and compute hash.
+                // MptTree::root_hash handles ChildRef::Hash without store access.
+                let mut tree = MptTree { arena: self.arena.clone(), root: Some(idx) };
+                let h = tree.root_hash();
+                // Propagate computed hashes back so the next block's proof
+                // extraction can read arena.get_hash(idx).
+                self.arena = tree.arena;
+                h
+            }
+            CowRootRef::Lazy(CowLazyNodeRef::Persisted(h)) => h,
+            CowRootRef::Lazy(CowLazyNodeRef::Segment(ref node_ref)) => {
+                node_ref.hash().unwrap_or(alloy_trie::EMPTY_ROOT_HASH)
+            }
+            CowRootRef::Lazy(CowLazyNodeRef::Inline(ref rlp)) => {
+                super::hash::hash_rlp(rlp)
+            }
+        };
+        self.arena.snapshot();
+        Ok((root, self))
+    }
+
+    /// Parallel variant — delegates to serial (no parallel optimisation needed).
+    pub fn root_hash_only_parallel(self, store: &PersistedTrieStore) -> Result<(B256, StorageTrieCow)> {
+        self.root_hash_only(store)
+    }
+
+    /// Compute root hash and collect dirty node blobs for RocksDB persistence.
     pub fn root_hash_and_dirty_blobs(
         self,
         store: &PersistedTrieStore,
-    ) -> Result<(B256, Vec<(B256, Vec<u8>)>, StorageTrieCow)> {
-        self.root_hash_and_dirty_blobs_inner(store, false)
+    ) -> Result<(B256, Vec<(alloy_primitives::B256, Vec<u8>)>, StorageTrieCow)> {
+        let mut tree = self.into_materialized_tree(store)?;
+        let (root, blobs) = tree.root_hash_and_dirty_blobs();
+        Ok((root, blobs, StorageTrieCow::from_tree(tree)))
     }
 
-    /// Parallel variant: hash the root's 16 children in parallel.
-    /// Use for the account trie where the root is a large Branch node.
+    /// Parallel variant — delegates to serial.
     pub fn root_hash_and_dirty_blobs_parallel(
         self,
         store: &PersistedTrieStore,
-    ) -> Result<(B256, Vec<(B256, Vec<u8>)>, StorageTrieCow)> {
-        self.root_hash_and_dirty_blobs_inner(store, true)
-    }
-
-    /// Compute root hash without collecting dirty blobs.
-    /// Used in wal_first mode where blobs are never persisted to RocksDB —
-    /// matching sei-db's model where commit is pure in-memory work.
-    pub fn root_hash_only(mut self, store: &PersistedTrieStore) -> Result<(B256, StorageTrieCow)> {
-        let root = match self.root.clone() {
-            CowRootRef::Empty => None,
-            CowRootRef::Arena(idx) => Some(idx),
-            CowRootRef::Lazy(_) => self.materialize_root_subtree(store, self.root.clone())?,
-        };
-        self.root = match root {
-            Some(idx) => CowRootRef::Arena(idx),
-            None => CowRootRef::Empty,
-        };
-        self.prune_pending_lazy_children();
-        let hash = storage_recompute::recompute_hash_only(&mut self.arena, root);
-        Ok((hash, self))
-    }
-
-    /// Parallel hash-only variant for the account trie.
-    pub fn root_hash_only_parallel(
-        mut self,
-        store: &PersistedTrieStore,
-    ) -> Result<(B256, StorageTrieCow)> {
-        let root = match self.root.clone() {
-            CowRootRef::Empty => None,
-            CowRootRef::Arena(idx) => Some(idx),
-            CowRootRef::Lazy(_) => self.materialize_root_subtree(store, self.root.clone())?,
-        };
-        self.root = match root {
-            Some(idx) => CowRootRef::Arena(idx),
-            None => CowRootRef::Empty,
-        };
-        self.prune_pending_lazy_children();
-        let hash = storage_recompute::recompute_hash_only_parallel(&mut self.arena, root);
-        Ok((hash, self))
-    }
-
-    fn root_hash_and_dirty_blobs_inner(
-        mut self,
-        store: &PersistedTrieStore,
-        parallel: bool,
-    ) -> Result<(B256, Vec<(B256, Vec<u8>)>, StorageTrieCow)> {
-        let root = match self.root.clone() {
-            CowRootRef::Empty => None,
-            CowRootRef::Arena(idx) => Some(idx),
-            CowRootRef::Lazy(_) => self.materialize_root_subtree(store, self.root.clone())?,
-        };
-        self.root = match root {
-            Some(idx) => CowRootRef::Arena(idx),
-            None => CowRootRef::Empty,
-        };
-        self.prune_pending_lazy_children();
-
-        let result = if parallel {
-            storage_recompute::recompute_parallel(&mut self.arena, root)
-        } else {
-            storage_recompute::recompute(&mut self.arena, root)
-        };
-        Ok((result.root, result.dirty_blobs, self))
+    ) -> Result<(B256, Vec<(alloy_primitives::B256, Vec<u8>)>, StorageTrieCow)> {
+        self.root_hash_and_dirty_blobs(store)
     }
 
     pub fn into_overlay_materialized(

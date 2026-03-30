@@ -208,6 +208,13 @@ pub trait SparseTrieInterface: Sized + Debug + Send + Sync {
     /// The accumulated updates, or an empty set if updates weren't being tracked.
     fn take_updates(&mut self) -> SparseTrieUpdates;
 
+    /// Re-initialises the update tracker for a new block.
+    ///
+    /// After `take_updates()` the tracker is `None`; this call restores it to
+    /// `Some(default)` so that the next `root_with_updates` collects the
+    /// current block's changes.  No-op when updates are already initialised.
+    fn reinit_updates(&mut self);
+
     /// Removes all nodes and values from the trie, resetting it to a blank state
     /// with only an empty root node. This is used when a storage root is deleted.
     ///
