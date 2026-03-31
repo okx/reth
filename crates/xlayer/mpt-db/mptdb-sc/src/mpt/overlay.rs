@@ -1,8 +1,6 @@
 use alloy_trie::Nibbles;
 
-use super::{
-    arena::MutableTrieArena, segment::StoragePathTrace, tree::MptTree, tree_algo,
-};
+use super::{arena::MutableTrieArena, segment::StoragePathTrace, tree::MptTree, tree_algo};
 
 #[derive(Clone)]
 pub struct StorageOverlay {

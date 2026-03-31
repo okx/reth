@@ -1,8 +1,8 @@
 use alloy_primitives::{Bytes, B256};
 use alloy_trie::{proof::DecodedProofNodes, Nibbles, TrieMask};
-use reth_trie_common::{BranchNodeMasksMap, DecodedStorageMultiProof};
 use memmap2::Mmap;
 use mptdb_common::error::{MptDbError, Result};
+use reth_trie_common::{BranchNodeMasksMap, DecodedStorageMultiProof};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -614,8 +614,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
             SegmentNodeKind::Branch { value, children, .. } => {
                 let mut tree_mask = TrieMask::default();
                 let mut hash_mask = TrieMask::default();
-                let mut children_bytes: [Option<Vec<u8>>; 16] =
-                    std::array::from_fn(|_| None);
+                let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
 
                 for child_result in children.iter() {
                     let child = child_result?;
@@ -625,12 +624,10 @@ impl<'a> StorageTrieSegmentReader<'a> {
                     if matches!(child.embed, SegmentChildEmbedRef::Hash(_)) {
                         hash_mask.set_bit(child.slot);
                     }
-                    children_bytes[child.slot as usize] =
-                        Some(self.child_embed_bytes(&child)?);
+                    children_bytes[child.slot as usize] = Some(self.child_embed_bytes(&child)?);
                 }
 
-                let rlp =
-                    super::encoding::encode_branch(&children_bytes, value);
+                let rlp = super::encoding::encode_branch(&children_bytes, value);
                 Ok((rlp.into(), Some(tree_mask), Some(hash_mask)))
             }
         }
@@ -1593,10 +1590,7 @@ mod tests {
                 // hash_mask must be a subset of (tree_mask | hash-only children).
                 // The key invariant: (tree_mask & hash_mask) == in-segment-hash-children,
                 // which is ≥0.  We just verify neither mask is nonsensically large.
-                assert!(
-                    hm.get() < 0xFFFF || tm.get() < 0xFFFF,
-                    "masks must fit in 16 bits"
-                );
+                assert!(hm.get() < 0xFFFF || tm.get() < 0xFFFF, "masks must fit in 16 bits");
             }
             (None, None) => {
                 // Root is not a branch (single-key trie, not expected here).
@@ -1618,8 +1612,7 @@ mod tests {
         let (seg, root) = make_reader_from_tree(&mut tree);
         let reader = StorageTrieSegmentReader::open(seg.as_bytes(), root).unwrap();
 
-        let (rlp, _, _) =
-            reader.get_segment_node_by_path(&Nibbles::default()).unwrap().unwrap();
+        let (rlp, _, _) = reader.get_segment_node_by_path(&Nibbles::default()).unwrap().unwrap();
 
         // Re-hash the returned RLP and compare with the segment root hash.
         // For nodes >= 32 bytes, hash(rlp) == root.

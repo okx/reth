@@ -178,7 +178,6 @@ where
         Self::default()
     }
 
-    /// Returns `true` if account was already revealed.
     pub fn is_account_revealed(&self, account: B256) -> bool {
         self.revealed_account_paths.contains(&Nibbles::unpack(account))
     }

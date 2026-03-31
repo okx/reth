@@ -41,7 +41,11 @@ fn default_info(nonce: u64, balance: u64) -> AccountInfo {
 #[test]
 fn i8_1_export_import_roundtrip() {
     let src_dir = TempDir::new().unwrap();
-    let mut src_store = { let mut cfg = mptdb_sc::mpt::MptConfig::default(); cfg.use_sparse_storage = false; mptdb_sc::mpt::MptCommitStore::open_with_config(src_dir.path(), false, cfg).unwrap() };
+    let mut src_store = {
+        let mut cfg = mptdb_sc::mpt::MptConfig::default();
+        cfg.use_sparse_storage = false;
+        mptdb_sc::mpt::MptCommitStore::open_with_config(src_dir.path(), false, cfg).unwrap()
+    };
 
     // Commit several blocks with data
     let addr1 = Address::repeat_byte(0x01);
@@ -76,7 +80,11 @@ fn i8_1_export_import_roundtrip() {
 
     // Import into fresh store
     let dst_dir = TempDir::new().unwrap();
-    let mut dst_store = { let mut cfg = mptdb_sc::mpt::MptConfig::default(); cfg.use_sparse_storage = false; mptdb_sc::mpt::MptCommitStore::open_with_config(dst_dir.path(), false, cfg).unwrap() };
+    let mut dst_store = {
+        let mut cfg = mptdb_sc::mpt::MptConfig::default();
+        cfg.use_sparse_storage = false;
+        mptdb_sc::mpt::MptCommitStore::open_with_config(dst_dir.path(), false, cfg).unwrap()
+    };
 
     {
         let mut imp = dst_store.importer(1, root).unwrap();
@@ -96,7 +104,11 @@ fn i8_1_export_import_roundtrip() {
 #[test]
 fn i8_2_imported_store_reopen_proof() {
     let src_dir = TempDir::new().unwrap();
-    let mut src_store = { let mut cfg = mptdb_sc::mpt::MptConfig::default(); cfg.use_sparse_storage = false; mptdb_sc::mpt::MptCommitStore::open_with_config(src_dir.path(), false, cfg).unwrap() };
+    let mut src_store = {
+        let mut cfg = mptdb_sc::mpt::MptConfig::default();
+        cfg.use_sparse_storage = false;
+        mptdb_sc::mpt::MptCommitStore::open_with_config(src_dir.path(), false, cfg).unwrap()
+    };
 
     let addr = Address::repeat_byte(0x03);
     let info = default_info(1, 999);
@@ -115,7 +127,11 @@ fn i8_2_imported_store_reopen_proof() {
     // Import
     let dst_dir = TempDir::new().unwrap();
     {
-        let mut dst_store = { let mut cfg = mptdb_sc::mpt::MptConfig::default(); cfg.use_sparse_storage = false; mptdb_sc::mpt::MptCommitStore::open_with_config(dst_dir.path(), false, cfg).unwrap() };
+        let mut dst_store = {
+            let mut cfg = mptdb_sc::mpt::MptConfig::default();
+            cfg.use_sparse_storage = false;
+            mptdb_sc::mpt::MptCommitStore::open_with_config(dst_dir.path(), false, cfg).unwrap()
+        };
         {
             let mut imp = dst_store.importer(1, root).unwrap();
             for n in &nodes {
@@ -138,7 +154,11 @@ fn i8_2_imported_store_reopen_proof() {
 #[test]
 fn i8_3_exporter_prune_gc() {
     let dir = TempDir::new().unwrap();
-    let mut store = { let mut cfg = mptdb_sc::mpt::MptConfig::default(); cfg.use_sparse_storage = false; mptdb_sc::mpt::MptCommitStore::open_with_config(dir.path(), false, cfg).unwrap() };
+    let mut store = {
+        let mut cfg = mptdb_sc::mpt::MptConfig::default();
+        cfg.use_sparse_storage = false;
+        mptdb_sc::mpt::MptCommitStore::open_with_config(dir.path(), false, cfg).unwrap()
+    };
 
     // v1
     let addr1 = Address::repeat_byte(0x01);

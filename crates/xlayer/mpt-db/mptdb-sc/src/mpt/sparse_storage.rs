@@ -1,3 +1,4 @@
+
 //! Segment-backed `TrieNodeProviderFactory` for `SparseStateTrie` integration.
 //!
 //! Implements the single custom interface that connects mpt-db's mmap-backed
@@ -815,7 +816,6 @@ pub(crate) fn apply_all_storage_changes_sparse(
                 })?;
             }
         }
-
         // ── Step 2: apply storage changes ────────────────────────────────────
         for change in &dirty.storage_changes {
             if change.value.is_zero() {
@@ -843,7 +843,6 @@ pub(crate) fn apply_all_storage_changes_sparse(
                 })?;
             }
         }
-
         // ── Step 3: apply account change ─────────────────────────────────────
         //
         // Safety note — info=None + storage_wiped=false:

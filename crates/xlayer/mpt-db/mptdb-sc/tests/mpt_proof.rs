@@ -89,8 +89,10 @@ fn i7_2_reopen_read_only_proof() {
         // Historical proof generation requires re-applying the latest block.
         let store = MptCommitStore::open(dir.path(), true).unwrap();
         assert_eq!(store.frontier().committed_root, root);
-        assert!(store.account_proof(1, addr, &[]).is_err(),
-            "proof must fail after restart without sparse trie");
+        assert!(
+            store.account_proof(1, addr, &[]).is_err(),
+            "proof must fail after restart without sparse trie"
+        );
     }
 }
 
@@ -148,11 +150,13 @@ fn i7_4_historical_version_proof() {
     assert_ne!(root1, root2);
 
     // Historical version proof (v1 != current v2) is not supported → error.
-    assert!(store.account_proof(1, addr, &[]).is_err(),
-        "historical proof for version < current must return error");
+    assert!(
+        store.account_proof(1, addr, &[]).is_err(),
+        "historical proof for version < current must return error"
+    );
 
     // Current version proof (v2) works via sparse trie.
     let proof2 = store.account_proof(2, addr, &[]).unwrap();
     assert_eq!(proof2.info.as_ref().unwrap().nonce, 2);
-    let _ = root1;  // verified via state root chain
+    let _ = root1; // verified via state root chain
 }

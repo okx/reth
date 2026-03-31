@@ -376,10 +376,7 @@ fn sp1_sparse_single_account_single_slot() {
         root
     };
 
-    assert_eq!(
-        reference, sparse_root,
-        "sparse path must produce identical root to normal path"
-    );
+    assert_eq!(reference, sparse_root, "sparse path must produce identical root to normal path");
 }
 
 /// SP-2: multiple accounts + multiple storage slots via sparse path.
@@ -402,8 +399,12 @@ fn sp2_sparse_multi_account_multi_slot() {
                     let slots: Vec<(U256, U256, U256)> = (0u64..5)
                         .map(|s| (U256::from(s), U256::ZERO, U256::from(i as u64 * 100 + s)))
                         .collect();
-                    (addr, Some(default_info(i as u64 + 1, (i + 1) as u64 * 1000)),
-                     revm_database::AccountStatus::Changed, slots)
+                    (
+                        addr,
+                        Some(default_info(i as u64 + 1, (i + 1) as u64 * 1000)),
+                        revm_database::AccountStatus::Changed,
+                        slots,
+                    )
                 })
                 .collect(),
         );
@@ -517,12 +518,7 @@ fn sp5_sparse_selfdestruct() {
         store.flush_persist().unwrap();
 
         // Block 2: SELFDESTRUCT (storage_wiped + info=None via DestroyedAgain status)
-        let b2 = make_bundle(vec![(
-            addr,
-            None,
-            AccountStatus::DestroyedAgain,
-            vec![],
-        )]);
+        let b2 = make_bundle(vec![(addr, None, AccountStatus::DestroyedAgain, vec![])]);
         store.apply_bundle_state(&b2).unwrap();
         let (_, root) = store.commit().unwrap();
         (dir, root)
@@ -560,13 +556,21 @@ fn sp6_sparse_dual_run_10_blocks() {
                     let addr = Address::repeat_byte(addr_base.wrapping_add(i));
                     let slots: Vec<(U256, U256, U256)> = (0u64..2)
                         .map(|s| {
-                            let orig = if blk == 0 { U256::ZERO } else { U256::from(blk as u64 - 1) * U256::from(s + 1) };
-                            let new  = U256::from(blk as u64) * U256::from(s + 1) + U256::from(i);
+                            let orig = if blk == 0 {
+                                U256::ZERO
+                            } else {
+                                U256::from(blk as u64 - 1) * U256::from(s + 1)
+                            };
+                            let new = U256::from(blk as u64) * U256::from(s + 1) + U256::from(i);
                             (U256::from(s), orig, new)
                         })
                         .collect();
-                    (addr, Some(default_info(blk as u64 + 1, (i as u64 + 1) * 1000 + blk as u64)),
-                     revm_database::AccountStatus::Changed, slots)
+                    (
+                        addr,
+                        Some(default_info(blk as u64 + 1, (i as u64 + 1) * 1000 + blk as u64)),
+                        revm_database::AccountStatus::Changed,
+                        slots,
+                    )
                 })
                 .collect();
             let bundle = make_bundle(accounts);
@@ -609,7 +613,8 @@ fn sp7_sparse_account_proof_matches_normal() {
         store.apply_bundle_state(&bundle).unwrap();
         let (ver, _root) = store.commit().unwrap();
         store.flush_persist().unwrap();
-        let proof = store.account_proof(ver, addr, &[B256::from(slot.to_be_bytes::<32>())]).unwrap();
+        let proof =
+            store.account_proof(ver, addr, &[B256::from(slot.to_be_bytes::<32>())]).unwrap();
         (dir, proof)
     };
 
@@ -751,12 +756,17 @@ fn sp10_phase3b_extension_nodes_persisted() {
     let block1_root = {
         let mut store = open_sparse(dir.path());
         let bundle = make_bundle(
-            addrs.iter().map(|&a| (
-                a,
-                Some(default_info(1, 500)),
-                revm_database::AccountStatus::Changed,
-                vec![(U256::from(1u64), U256::ZERO, U256::from(42u64))],
-            )).collect(),
+            addrs
+                .iter()
+                .map(|&a| {
+                    (
+                        a,
+                        Some(default_info(1, 500)),
+                        revm_database::AccountStatus::Changed,
+                        vec![(U256::from(1u64), U256::ZERO, U256::from(42u64))],
+                    )
+                })
+                .collect(),
         );
         store.apply_bundle_state(&bundle).unwrap();
         let (_, root) = store.commit().unwrap();
@@ -768,12 +778,18 @@ fn sp10_phase3b_extension_nodes_persisted() {
     let block2_root_sparse = {
         let mut store = open_sparse(dir.path());
         let bundle = make_bundle(
-            addrs.iter().enumerate().map(|(i, &a)| (
-                a,
-                Some(default_info(2, 400 + i as u64 * 10)),
-                revm_database::AccountStatus::Changed,
-                vec![(U256::from(1u64), U256::from(42u64), U256::from(99u64 + i as u64))],
-            )).collect(),
+            addrs
+                .iter()
+                .enumerate()
+                .map(|(i, &a)| {
+                    (
+                        a,
+                        Some(default_info(2, 400 + i as u64 * 10)),
+                        revm_database::AccountStatus::Changed,
+                        vec![(U256::from(1u64), U256::from(42u64), U256::from(99u64 + i as u64))],
+                    )
+                })
+                .collect(),
         );
         store.apply_bundle_state(&bundle).unwrap();
         let (_, root) = store.commit().unwrap();
@@ -786,22 +802,33 @@ fn sp10_phase3b_extension_nodes_persisted() {
         let dir2 = TempDir::new().unwrap();
         let mut store = MptCommitStore::open(dir2.path(), false).unwrap();
         let b1 = make_bundle(
-            addrs.iter().map(|&a| (
-                a,
-                Some(default_info(1, 500)),
-                revm_database::AccountStatus::Changed,
-                vec![(U256::from(1u64), U256::ZERO, U256::from(42u64))],
-            )).collect(),
+            addrs
+                .iter()
+                .map(|&a| {
+                    (
+                        a,
+                        Some(default_info(1, 500)),
+                        revm_database::AccountStatus::Changed,
+                        vec![(U256::from(1u64), U256::ZERO, U256::from(42u64))],
+                    )
+                })
+                .collect(),
         );
         store.apply_bundle_state(&b1).unwrap();
         store.commit().unwrap();
         let b2 = make_bundle(
-            addrs.iter().enumerate().map(|(i, &a)| (
-                a,
-                Some(default_info(2, 400 + i as u64 * 10)),
-                revm_database::AccountStatus::Changed,
-                vec![(U256::from(1u64), U256::from(42u64), U256::from(99u64 + i as u64))],
-            )).collect(),
+            addrs
+                .iter()
+                .enumerate()
+                .map(|(i, &a)| {
+                    (
+                        a,
+                        Some(default_info(2, 400 + i as u64 * 10)),
+                        revm_database::AccountStatus::Changed,
+                        vec![(U256::from(1u64), U256::from(42u64), U256::from(99u64 + i as u64))],
+                    )
+                })
+                .collect(),
         );
         store.apply_bundle_state(&b2).unwrap();
         let (_, root) = store.commit().unwrap();
@@ -850,13 +877,13 @@ fn sp11_phase3b_account_proof_after_restart() {
     // The store is otherwise healthy (correct version and root).
     let store = open_sparse(dir.path());
     assert_eq!(store.version(), ver1, "version must be restored");
-    assert_eq!(
-        store.frontier().committed_root, root1,
-        "committed root must match"
-    );
+    assert_eq!(store.frontier().committed_root, root1, "committed root must match");
     // proof returns error since sparse trie is not available after restart
     let proof_result = store.account_proof(ver1, addr, &[B256::from(slot.to_be_bytes::<32>())]);
-    assert!(proof_result.is_err(), "account_proof must return error after restart without sparse trie");
+    assert!(
+        proof_result.is_err(),
+        "account_proof must return error after restart without sparse trie"
+    );
 }
 
 // ── Phase 4: cross-block SparseStateTrie optimization ─────────────────────────
@@ -884,16 +911,29 @@ fn sp12_cross_block_dual_run_10_blocks() {
         };
         let mut roots = Vec::new();
         for blk in 0..num_blocks {
-            let accounts: Vec<_> = (0u8..4).map(|i| {
-                let addr = Address::repeat_byte(addr_base.wrapping_add(i));
-                // Same slots modified every block (HOT PATH — cross-block optimization)
-                let slots: Vec<(U256, U256, U256)> = (0u64..3).map(|s| {
-                    let orig = if blk == 0 { U256::ZERO } else { U256::from((blk as u64 - 1) * 10 + s) };
-                    let new  = U256::from(blk as u64 * 10 + s);
-                    (U256::from(s), orig, new)
-                }).collect();
-                (addr, Some(default_info(blk as u64 + 1, 1000)), revm_database::AccountStatus::Changed, slots)
-            }).collect();
+            let accounts: Vec<_> = (0u8..4)
+                .map(|i| {
+                    let addr = Address::repeat_byte(addr_base.wrapping_add(i));
+                    // Same slots modified every block (HOT PATH — cross-block optimization)
+                    let slots: Vec<(U256, U256, U256)> = (0u64..3)
+                        .map(|s| {
+                            let orig = if blk == 0 {
+                                U256::ZERO
+                            } else {
+                                U256::from((blk as u64 - 1) * 10 + s)
+                            };
+                            let new = U256::from(blk as u64 * 10 + s);
+                            (U256::from(s), orig, new)
+                        })
+                        .collect();
+                    (
+                        addr,
+                        Some(default_info(blk as u64 + 1, 1000)),
+                        revm_database::AccountStatus::Changed,
+                        slots,
+                    )
+                })
+                .collect();
             store.apply_bundle_state(&make_bundle(accounts)).unwrap();
             let (_, root) = store.commit().unwrap();
             store.flush_persist().unwrap();
@@ -921,7 +961,9 @@ fn sp13_cross_block_restart_recovery() {
     let root1 = {
         let mut store = open_cross_block(dir.path());
         let b = make_bundle(vec![(
-            addr, Some(default_info(1, 100)), revm_database::AccountStatus::Changed,
+            addr,
+            Some(default_info(1, 100)),
+            revm_database::AccountStatus::Changed,
             vec![(slot, U256::ZERO, U256::from(10))],
         )]);
         store.apply_bundle_state(&b).unwrap();
@@ -934,7 +976,9 @@ fn sp13_cross_block_restart_recovery() {
     let root2_cross = {
         let mut store = open_cross_block(dir.path());
         let b = make_bundle(vec![(
-            addr, Some(default_info(2, 90)), revm_database::AccountStatus::Changed,
+            addr,
+            Some(default_info(2, 90)),
+            revm_database::AccountStatus::Changed,
             vec![(slot, U256::from(10), U256::from(20))],
         )]);
         store.apply_bundle_state(&b).unwrap();
@@ -948,13 +992,17 @@ fn sp13_cross_block_restart_recovery() {
         let dir2 = TempDir::new().unwrap();
         let mut store = MptCommitStore::open(dir2.path(), false).unwrap();
         let b1 = make_bundle(vec![(
-            addr, Some(default_info(1, 100)), revm_database::AccountStatus::Changed,
+            addr,
+            Some(default_info(1, 100)),
+            revm_database::AccountStatus::Changed,
             vec![(slot, U256::ZERO, U256::from(10))],
         )]);
         store.apply_bundle_state(&b1).unwrap();
         store.commit().unwrap();
         let b2 = make_bundle(vec![(
-            addr, Some(default_info(2, 90)), revm_database::AccountStatus::Changed,
+            addr,
+            Some(default_info(2, 90)),
+            revm_database::AccountStatus::Changed,
             vec![(slot, U256::from(10), U256::from(20))],
         )]);
         store.apply_bundle_state(&b2).unwrap();
@@ -971,31 +1019,48 @@ fn sp13_cross_block_restart_recovery() {
 fn sp14_cross_block_lru_eviction() {
     // max_lag=2: accounts not accessed for 2 blocks are evicted from the trie.
     let dir = TempDir::new().unwrap();
-    let hot_addr  = Address::repeat_byte(0xE0);
+    let hot_addr = Address::repeat_byte(0xE0);
     let cold_addr = Address::repeat_byte(0xE1);
 
     let mut config = mptdb_sc::mpt::MptConfig::default();
     config.use_sparse_storage = true;
     config.cross_block_sparse = true;
     config.cross_block_sparse_max_lag = 2;
-    let mut store = mptdb_sc::mpt::MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+    let mut store =
+        mptdb_sc::mpt::MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
     let slot = U256::from(1);
 
     // Block 1: both hot + cold
-    store.apply_bundle_state(&make_bundle(vec![
-        (hot_addr,  Some(default_info(1, 100)), revm_database::AccountStatus::Changed, vec![(slot, U256::ZERO, U256::from(1))]),
-        (cold_addr, Some(default_info(1, 100)), revm_database::AccountStatus::Changed, vec![(slot, U256::ZERO, U256::from(1))]),
-    ])).unwrap();
+    store
+        .apply_bundle_state(&make_bundle(vec![
+            (
+                hot_addr,
+                Some(default_info(1, 100)),
+                revm_database::AccountStatus::Changed,
+                vec![(slot, U256::ZERO, U256::from(1))],
+            ),
+            (
+                cold_addr,
+                Some(default_info(1, 100)),
+                revm_database::AccountStatus::Changed,
+                vec![(slot, U256::ZERO, U256::from(1))],
+            ),
+        ]))
+        .unwrap();
     store.commit().unwrap();
     store.flush_persist().unwrap();
 
     // Blocks 2+3: only hot account touched (cold_addr not accessed)
     for blk in 2u64..=3 {
-        store.apply_bundle_state(&make_bundle(vec![
-            (hot_addr, Some(default_info(blk, 100 - blk as u64 * 5)), revm_database::AccountStatus::Changed,
-             vec![(slot, U256::from(blk - 1), U256::from(blk))]),
-        ])).unwrap();
+        store
+            .apply_bundle_state(&make_bundle(vec![(
+                hot_addr,
+                Some(default_info(blk, 100 - blk as u64 * 5)),
+                revm_database::AccountStatus::Changed,
+                vec![(slot, U256::from(blk - 1), U256::from(blk))],
+            )]))
+            .unwrap();
         store.commit().unwrap();
         store.flush_persist().unwrap();
     }
@@ -1003,10 +1068,14 @@ fn sp14_cross_block_lru_eviction() {
     // Block 4: cold_addr accessed again — it was evicted after max_lag=2
     // This must still produce the correct root (evicted trie re-revealed from segment).
     let (_, root_cross) = {
-        store.apply_bundle_state(&make_bundle(vec![
-            (cold_addr, Some(default_info(4, 50)), revm_database::AccountStatus::Changed,
-             vec![(slot, U256::from(1), U256::from(99))]),
-        ])).unwrap();
+        store
+            .apply_bundle_state(&make_bundle(vec![(
+                cold_addr,
+                Some(default_info(4, 50)),
+                revm_database::AccountStatus::Changed,
+                vec![(slot, U256::from(1), U256::from(99))],
+            )]))
+            .unwrap();
         let r = store.commit().unwrap();
         r
     };
@@ -1016,15 +1085,37 @@ fn sp14_cross_block_lru_eviction() {
         let dir2 = TempDir::new().unwrap();
         let mut s = MptCommitStore::open(dir2.path(), false).unwrap();
         let b1 = make_bundle(vec![
-            (hot_addr,  Some(default_info(1, 100)), revm_database::AccountStatus::Changed, vec![(slot, U256::ZERO, U256::from(1))]),
-            (cold_addr, Some(default_info(1, 100)), revm_database::AccountStatus::Changed, vec![(slot, U256::ZERO, U256::from(1))]),
+            (
+                hot_addr,
+                Some(default_info(1, 100)),
+                revm_database::AccountStatus::Changed,
+                vec![(slot, U256::ZERO, U256::from(1))],
+            ),
+            (
+                cold_addr,
+                Some(default_info(1, 100)),
+                revm_database::AccountStatus::Changed,
+                vec![(slot, U256::ZERO, U256::from(1))],
+            ),
         ]);
-        s.apply_bundle_state(&b1).unwrap(); s.commit().unwrap();
+        s.apply_bundle_state(&b1).unwrap();
+        s.commit().unwrap();
         for blk in 2u64..=3 {
-            let b = make_bundle(vec![(hot_addr, Some(default_info(blk, 100 - blk * 5)), revm_database::AccountStatus::Changed, vec![(slot, U256::from(blk - 1), U256::from(blk))])]);
-            s.apply_bundle_state(&b).unwrap(); s.commit().unwrap();
+            let b = make_bundle(vec![(
+                hot_addr,
+                Some(default_info(blk, 100 - blk * 5)),
+                revm_database::AccountStatus::Changed,
+                vec![(slot, U256::from(blk - 1), U256::from(blk))],
+            )]);
+            s.apply_bundle_state(&b).unwrap();
+            s.commit().unwrap();
         }
-        let b4 = make_bundle(vec![(cold_addr, Some(default_info(4, 50)), revm_database::AccountStatus::Changed, vec![(slot, U256::from(1), U256::from(99))])]);
+        let b4 = make_bundle(vec![(
+            cold_addr,
+            Some(default_info(4, 50)),
+            revm_database::AccountStatus::Changed,
+            vec![(slot, U256::from(1), U256::from(99))],
+        )]);
         s.apply_bundle_state(&b4).unwrap();
         let (_, r) = s.commit().unwrap();
         r
@@ -1061,7 +1152,7 @@ fn sp15_sparse_dual_run_100_blocks() {
             for i in 0u8..3 {
                 let addr = Address::repeat_byte(hot_addr_base.wrapping_add(i));
                 let orig = if blk == 0 { U256::ZERO } else { U256::from(blk as u64 - 1) };
-                let new  = U256::from(blk as u64 + 1);
+                let new = U256::from(blk as u64 + 1);
                 accounts.push((
                     addr,
                     Some(default_info(blk as u64 + 1, 1000 + i as u64)),
@@ -1125,17 +1216,27 @@ fn sp15_regression_block41_hash_cache() {
                 let addr = Address::repeat_byte(hot_addr_base.wrapping_add(i));
                 let orig = if blk == 0 { U256::ZERO } else { U256::from(blk as u64 - 1) };
                 let new = U256::from(blk as u64 + 1);
-                accounts.push((addr, Some(default_info(blk as u64 + 1, 1000 + i as u64)),
-                    revm_database::AccountStatus::Changed, vec![(hot_slot, orig, new)]));
+                accounts.push((
+                    addr,
+                    Some(default_info(blk as u64 + 1, 1000 + i as u64)),
+                    revm_database::AccountStatus::Changed,
+                    vec![(hot_slot, orig, new)],
+                ));
             }
             if blk % 10 == 0 {
                 let addr = Address::repeat_byte(cold_addr_base.wrapping_add((blk / 10) as u8));
-                accounts.push((addr, Some(default_info(1, 500)), revm_database::AccountStatus::Changed,
-                    vec![(U256::from(blk as u64), U256::ZERO, U256::from(blk as u64 * 7 + 1))]));
+                accounts.push((
+                    addr,
+                    Some(default_info(1, 500)),
+                    revm_database::AccountStatus::Changed,
+                    vec![(U256::from(blk as u64), U256::ZERO, U256::from(blk as u64 * 7 + 1))],
+                ));
             }
             store.apply_bundle_state(&make_bundle(accounts)).unwrap();
             let (_, root) = store.commit().unwrap();
-            if blk % flush_every == flush_every - 1 { store.flush_persist().unwrap(); }
+            if blk % flush_every == flush_every - 1 {
+                store.flush_persist().unwrap();
+            }
             roots.push(root);
         }
         (dir, roots)

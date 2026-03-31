@@ -625,8 +625,8 @@ impl StorageTrieCow {
     ///
     /// For arena-rooted tries: hashes are computed recursively from the arena.
     ///   - `ChildRef::Hash(h)` children contribute `h` directly — no store access.
-    ///   - This preserves `pending_lazy_children` so subsequent `apply_change` calls
-    ///     can still resolve segment-backed hash nodes.
+    ///   - This preserves `pending_lazy_children` so subsequent `apply_change` calls can still
+    ///     resolve segment-backed hash nodes.
     /// For lazy roots (segment or persisted): the cached root hash is returned directly.
     pub fn root_hash_only(mut self, _store: &PersistedTrieStore) -> Result<(B256, StorageTrieCow)> {
         let root = match self.root {
@@ -645,16 +645,17 @@ impl StorageTrieCow {
             CowRootRef::Lazy(CowLazyNodeRef::Segment(ref node_ref)) => {
                 node_ref.hash().unwrap_or(alloy_trie::EMPTY_ROOT_HASH)
             }
-            CowRootRef::Lazy(CowLazyNodeRef::Inline(ref rlp)) => {
-                super::hash::hash_rlp(rlp)
-            }
+            CowRootRef::Lazy(CowLazyNodeRef::Inline(ref rlp)) => super::hash::hash_rlp(rlp),
         };
         self.arena.snapshot();
         Ok((root, self))
     }
 
     /// Parallel variant — delegates to serial (no parallel optimisation needed).
-    pub fn root_hash_only_parallel(self, store: &PersistedTrieStore) -> Result<(B256, StorageTrieCow)> {
+    pub fn root_hash_only_parallel(
+        self,
+        store: &PersistedTrieStore,
+    ) -> Result<(B256, StorageTrieCow)> {
         self.root_hash_only(store)
     }
 
