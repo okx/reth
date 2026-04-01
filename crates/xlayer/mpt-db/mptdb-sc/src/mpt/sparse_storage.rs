@@ -47,10 +47,10 @@ static SPARSE_PROVIDER_ACCOUNT_CALLS: std::sync::atomic::AtomicU64 =
 
 const SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES: usize = 16;
 const SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES: usize = 64;
-const SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS: usize = 2000;
+const SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS: usize = 20_000;
 // Keep a bounded per-call storage map size for reveal_decoded_multiproof to
 // avoid very large transient allocations under 10K-account blocks.
-const SPARSE_STORAGE_REVEAL_BATCH_CHUNK: usize = 8192;
+const SPARSE_STORAGE_REVEAL_BATCH_CHUNK: usize = 16_384;
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 

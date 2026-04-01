@@ -920,12 +920,12 @@ impl<'a> StorageTrieSegmentReader<'a> {
         lazy_siblings: &mut Vec<(u32, Option<u8>, SegmentNodeRef)>,
         collect_lazy_siblings: bool,
     ) -> Result<u32> {
+        let node = self.decode_node(seg_idx)?;
         let mut inserted = false;
         let arena_idx = if let Some(idx) = materialized.get(seg_idx as usize).copied().flatten() {
             idx
         } else {
-            let node = self.decode_node(seg_idx)?;
-            let idx = arena.alloc_clean(node.node);
+            let idx = arena.alloc_clean(node.node.clone());
             if let Some(hash) = node.hash {
                 arena.set_hash(idx, hash);
             }
@@ -934,7 +934,6 @@ impl<'a> StorageTrieSegmentReader<'a> {
             idx
         };
 
-        let node = self.decode_node(seg_idx)?;
         match node.body {
             SegmentNodeBody::Leaf { .. } => Ok(arena_idx),
             SegmentNodeBody::Extension { nibbles, child } => {
