@@ -741,6 +741,9 @@ impl SparseTrieInterface for SerialSparseTrie {
             };
         }
 
+        // A new leaf was structurally inserted: clear hash_mask bits along its
+        // path so its ancestors cannot be pruned back to stale hashes.
+        self.clear_hash_mask_for_path(&full_path);
         Ok(())
     }
 
@@ -763,6 +766,9 @@ impl SparseTrieInterface for SerialSparseTrie {
             return Ok(())
         }
         self.prefix_set.insert(*full_path);
+        // Mark ancestors of the removed path as modified so they cannot be
+        // pruned back to stale hash boundaries.
+        self.clear_hash_mask_for_path(full_path);
 
         // If the path wasn't present in `values`, we still need to walk the trie and ensure that
         // there is no node at the path. When a leaf node is a blinded `Hash`, it will have an entry
@@ -1115,6 +1121,10 @@ impl SparseTrieInterface for SerialSparseTrie {
     fn shrink_values_to(&mut self, size: usize) {
         self.values.shrink_to(size);
     }
+
+    fn prune_hash_boundaries(&mut self, dirty_paths: &[Nibbles]) {
+        SerialSparseTrie::prune_hash_boundaries(self, dirty_paths);
+    }
 }
 
 impl SerialSparseTrie {
@@ -1394,6 +1404,162 @@ impl SerialSparseTrie {
         }
 
         Ok(remaining_child_node)
+    }
+
+    /// Clears `hash_mask` bits along the path from root to `leaf_path` in all
+    /// branch nodes encountered.  Called after a structural change (new leaf
+    /// inserted or existing leaf removed) so that ancestors of modified paths
+    /// are no longer considered eligible for safe de-materialization.
+    fn clear_hash_mask_for_path(&mut self, leaf_path: &Nibbles) {
+        let mut current = Nibbles::default();
+        loop {
+            if current.len() >= leaf_path.len() {
+                break;
+            }
+            // Read node info without holding a borrow across the mask mutation.
+            enum Step {
+                Branch(u8),
+                Extension(Nibbles),
+                Stop,
+            }
+            let step = match self.nodes.get(&current) {
+                Some(SparseNode::Branch { .. }) => {
+                    Step::Branch(leaf_path.get_unchecked(current.len()))
+                }
+                Some(SparseNode::Extension { key, .. }) => Step::Extension(*key),
+                _ => Step::Stop,
+            };
+            match step {
+                Step::Branch(nibble) => {
+                    // This branch is on the path to the modified leaf.
+                    // Clear its hash_mask bit so the modified child can't be
+                    // pruned back to a stale hash boundary.
+                    if let Some(masks) = self.branch_node_masks.get_mut(&current) {
+                        masks.hash_mask.unset_bit(nibble);
+                    }
+                    current.push_unchecked(nibble);
+                }
+                Step::Extension(key) => {
+                    current.extend(&key);
+                }
+                Step::Stop => break,
+            }
+        }
+    }
+
+    /// Prunes revealed subtries back to `Hash` nodes at hash-mask boundaries.
+    ///
+    /// Must be called *after* [`SerialSparseTrie::root`] so that all `hash`
+    /// fields in nodes are up-to-date.
+    ///
+    /// A node at path `P` is eligible for pruning when **all** of the following
+    /// hold:
+    /// 1. `P` is a revealed, non-`Hash` node with a computed hash.
+    /// 2. `P`'s parent branch has `hash_mask` bit set for `P`'s nibble position — meaning `P` was
+    ///    originally a hash reference before any reveal. ([`Self::clear_hash_mask_for_path`]
+    ///    ensures this bit is cleared whenever `P` is on the path of a structural modification.)
+    /// 3. `P` is not an ancestor of any path in `dirty_paths` (i.e. no dirty leaf is a descendant
+    ///    of `P`).
+    ///
+    /// `dirty_paths`: the full 64-nibble leaf paths modified in this block.
+    pub fn prune_hash_boundaries(&mut self, dirty_paths: &[Nibbles]) {
+        if dirty_paths.is_empty() || self.branch_node_masks.is_empty() {
+            return;
+        }
+
+        // Build a prefix set so that `dirty_prefix.contains(P)` ⟺
+        // `P` is an ancestor (prefix) of at least one dirty leaf path.
+        let mut dirty_prefix = PrefixSetMut::default();
+        for dp in dirty_paths {
+            dirty_prefix.insert(*dp);
+        }
+        let mut dirty_prefix = dirty_prefix.freeze();
+
+        // Collect candidates: non-Hash nodes with a computed hash whose parent
+        // branch holds a hash_mask bit for their position, and which are not
+        // ancestors of dirty leaves.
+        let mut prunable: Vec<(Nibbles, B256)> = Vec::new();
+        for (path, node) in &self.nodes {
+            if path.is_empty() {
+                continue; // root has no parent — never eligible
+            }
+            let hash = match node {
+                SparseNode::Branch { hash: Some(h), .. } => *h,
+                SparseNode::Extension { hash: Some(h), .. } => *h,
+                SparseNode::Leaf { hash: Some(h), .. } => *h,
+                _ => continue,
+            };
+            // Skip ancestors of dirty leaves.
+            if dirty_prefix.contains(path) {
+                continue;
+            }
+            // Parent must be a branch whose hash_mask flags this child.
+            let parent_len = path.len().saturating_sub(1);
+            let parent_path = path.slice(..parent_len);
+            let nibble = path.get_unchecked(path.len() - 1);
+            if self
+                .branch_node_masks
+                .get(&parent_path)
+                .is_some_and(|m| m.hash_mask.is_bit_set(nibble))
+            {
+                prunable.push((*path, hash));
+            }
+        }
+
+        if prunable.is_empty() {
+            return;
+        }
+
+        // Prune each candidate: replace with Hash + remove entire subtree.
+        for (path, hash) in prunable {
+            // The node may already have been pruned by an ancestor in this
+            // iteration (ancestor pruning removes all its descendants first).
+            match self.nodes.get(&path) {
+                Some(SparseNode::Hash(_)) | None => continue,
+                _ => {}
+            }
+
+            // Collect all descendant paths before modifying `nodes`.
+            let mut descendants: Vec<Nibbles> = Vec::new();
+            self.collect_subtree_paths(&path, &mut descendants);
+
+            // Replace the node with a blinded hash.
+            self.nodes.insert(path, SparseNode::Hash(hash));
+
+            // Remove all descendant nodes + their mask / value entries.
+            for desc in descendants {
+                self.nodes.remove(&desc);
+                self.branch_node_masks.remove(&desc);
+                self.values.remove(&desc);
+            }
+            // Remove mask entry for the pruned node itself (it's now a Hash).
+            self.branch_node_masks.remove(&path);
+        }
+    }
+
+    /// Depth-first collection of all paths reachable from `root_path`
+    /// (excluding `root_path` itself).
+    fn collect_subtree_paths(&self, root_path: &Nibbles, out: &mut Vec<Nibbles>) {
+        match self.nodes.get(root_path) {
+            Some(SparseNode::Branch { state_mask, .. }) => {
+                for nibble in 0u8..16 {
+                    if state_mask.is_bit_set(nibble) {
+                        let mut child = *root_path;
+                        child.push_unchecked(nibble);
+                        out.push(child);
+                        self.collect_subtree_paths(&child, out);
+                    }
+                }
+            }
+            Some(SparseNode::Extension { key, .. }) => {
+                let mut child = *root_path;
+                child.extend(key);
+                out.push(child);
+                self.collect_subtree_paths(&child, out);
+            }
+            // Leaf / Hash / Empty / None — no children to collect
+            _ => {}
+        }
     }
 
     /// Recalculates and updates the RLP hashes of nodes deeper than or equal to the specified
