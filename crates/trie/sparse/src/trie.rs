@@ -31,9 +31,16 @@ use tracing::{debug, instrument, trace};
 const SPARSE_TRIE_SUBTRIE_HASHES_LEVEL: usize = 2;
 /// Minimum number of changed prefixes before enabling parallel pre-hash in
 /// [`SerialSparseTrie::root`] (only when trie updates are disabled).
-const SPARSE_TRIE_PARALLEL_ROOT_MIN_PREFIX_KEYS: usize = 2_048;
+const SPARSE_TRIE_PARALLEL_ROOT_MIN_PREFIX_KEYS: usize = 128;
 /// Minimum number of independent subtries to process in parallel.
 const SPARSE_TRIE_PARALLEL_ROOT_MIN_TARGETS: usize = 64;
+/// For smaller changed-prefix batches, use a coarser split (depth=1) to reduce
+/// per-target overhead in parallel pre-hash.
+const SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_DEPTH: usize = 1;
+/// Upper bound of changed prefixes to enable the shallow split strategy.
+const SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_MAX_PREFIX_KEYS: usize = 1_024;
+/// Minimum targets required for shallow split parallel pre-hash.
+const SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_MIN_TARGETS: usize = 8;
 
 /// A sparse trie that is either in a "blind" state (no nodes are revealed, root node hash is
 /// unknown) or in a "revealed" state (root node has been revealed and the trie can be updated).
@@ -1435,9 +1442,18 @@ impl SerialSparseTrie {
             return;
         }
 
-        let (targets, new_prefix_set) =
-            self.get_changed_nodes_at_depth(prefix_set, SPARSE_TRIE_SUBTRIE_HASHES_LEVEL);
-        if targets.len() < SPARSE_TRIE_PARALLEL_ROOT_MIN_TARGETS {
+        let depth = if prefix_set.len() <= SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_MAX_PREFIX_KEYS {
+            SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_DEPTH
+        } else {
+            SPARSE_TRIE_SUBTRIE_HASHES_LEVEL
+        };
+        let min_targets = if depth == SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_DEPTH {
+            SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_MIN_TARGETS
+        } else {
+            SPARSE_TRIE_PARALLEL_ROOT_MIN_TARGETS
+        };
+        let (targets, new_prefix_set) = self.get_changed_nodes_at_depth(prefix_set, depth);
+        if targets.len() < min_targets {
             return;
         }
 
