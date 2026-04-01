@@ -20,8 +20,8 @@ use reth_execution_errors::{SparseTrieError, SparseTrieErrorKind};
 use reth_primitives_traits::Account as RethAccount;
 use reth_trie_common::{
     updates::{StorageTrieUpdates, TrieUpdates},
-    AccountProof, BranchNodeMasks, BranchNodeMasksMap, DecodedStorageMultiProof, Nibbles,
-    StorageProof, TrieAccount, EMPTY_ROOT_HASH,
+    AccountProof, BranchNodeMasks, BranchNodeMasksMap, DecodedMultiProof, DecodedStorageMultiProof,
+    Nibbles, StorageProof, TrieAccount, EMPTY_ROOT_HASH,
 };
 use reth_trie_sparse::{
     provider::{RevealedNode, TrieNodeProvider, TrieNodeProviderFactory},
@@ -1131,10 +1131,15 @@ pub(crate) fn apply_all_storage_changes_sparse(
         t_extract_storage_proof += start.elapsed();
     }
 
-    // ── Per-account loop ──────────────────────────────────────────────────────
+    // ── Step 1: plan and batch-reveal storage tries ───────────────────────────
+    //
+    // We keep all source-selection logic (segment / prebuilt / known-empty /
+    // wiped) identical to the serial path, but reveal in one batched call so
+    // SparseStateTrie can parallelize per-account reveal internally.
+    let mut storage_reveal_batch = alloy_primitives::map::B256Map::default();
+    let mut storage_wipe_after_reveal: Vec<B256> = Vec::new();
     for dirty in dirty_accounts {
         let hashed_addr = dirty.hashed_address;
-        storage_change_total += dirty.storage_changes.len();
         let mut dirty_keys_vec: Option<Vec<Nibbles>> = None;
         let dirty_keys: &[Nibbles] = if dirty.storage_changes.len() == 1 {
             std::slice::from_ref(&dirty.storage_changes[0].slot_key)
@@ -1146,56 +1151,23 @@ pub(crate) fn apply_all_storage_changes_sparse(
             &[]
         };
 
-        // ── Step 1: storage trie reveal ───────────────────────────────────────
-        //
-        // Cross-block fast path: if the storage trie for this account is already
-        // present in the reused sparse trie, skip the reveal.  Previously-revealed
-        // paths are still accessible; Hash-blinded node boundaries (new slots) are
-        // handled lazily by the provider (segment or `pre_built_proof` fallback).
-        //
-        // storage_wiped handling MUST come before the cross-block skip: a wiped
-        // account must always re-reveal as empty to record the wipe marker.
-        //
-        // Correct two-step fix (from plan Decision 4):
-        //   1. reveal_decoded_storage_multiproof with EmptyRoot — so that `wipe()` sees
-        //      updates.is_some() and records the wipe marker. (If we used Box::default(),
-        //      updates=None and wipe() is a no-op.)
-        //   2. wipe_storage — sets updates=Some(wiped) for TrieUpdates.
         if dirty.storage_wiped {
             accounts_wiped += 1;
-            let step_start = trace_enabled.then(std::time::Instant::now);
-            trie.reveal_decoded_storage_multiproof(hashed_addr, DecodedStorageMultiProof::empty())
-                .map_err(|e| {
-                    MptDbError::Other(format!("reveal empty storage (wiped) {hashed_addr}: {e}"))
-                })?;
-            trie.wipe_storage(hashed_addr)
-                .map_err(|e| MptDbError::Other(format!("wipe_storage {hashed_addr}: {e}")))?;
-            if let Some(start) = step_start {
-                t_reveal_storage += start.elapsed();
-            }
-            // Fall through: new storage slots (if any) are written in Step 2.
-        } else if skip_already_revealed_storage && trie.storage_trie_ref(&hashed_addr).is_some() {
-            // Cross-block reuse: storage trie already revealed — skip reveal.
-            // Step 2 applies changes directly; the provider handles Hash-blinded
-            // boundaries via segment or `pre_built_proof` fallback.
-        } else if let Some(proof) = pre_extracted_segment_proofs.remove(&hashed_addr) {
+            storage_reveal_batch.insert(hashed_addr, DecodedStorageMultiProof::empty());
+            storage_wipe_after_reveal.push(hashed_addr);
+            continue;
+        }
+        if skip_already_revealed_storage && trie.storage_trie_ref(&hashed_addr).is_some() {
+            continue;
+        }
+        if let Some(proof) = pre_extracted_segment_proofs.remove(&hashed_addr) {
             if !dirty_keys.is_empty() {
                 accounts_segment_reveal += 1;
-                let reveal_start = trace_enabled.then(std::time::Instant::now);
-                trie.reveal_decoded_storage_multiproof(hashed_addr, proof)
-                    .map_err(|e| MptDbError::Other(format!("reveal storage {hashed_addr}: {e}")))?;
-                if let Some(start) = reveal_start {
-                    t_reveal_storage += start.elapsed();
-                }
+                storage_reveal_batch.insert(hashed_addr, proof);
             }
-        } else if let Some(reader) = provider_factory.get_storage_reader(hashed_addr) {
-            // Existing account with a published segment: eager-reveal dirty paths.
-            //
-            // Guard: trace_touched_paths([]) panics with root-not-materialized
-            // when dirty_keys is empty (segment.rs requires ≥1 key to materialise
-            // root).  Skip reveal when the account has no storage changes
-            // (balance/nonce only change) — `update_account` will read the
-            // storage root directly from the existing account leaf.
+            continue;
+        }
+        if let Some(reader) = provider_factory.get_storage_reader(hashed_addr) {
             if !dirty_keys.is_empty() {
                 accounts_segment_reveal += 1;
                 let extract_start = trace_enabled.then(std::time::Instant::now);
@@ -1205,69 +1177,58 @@ pub(crate) fn apply_all_storage_changes_sparse(
                 if let Some(start) = extract_start {
                     t_extract_storage_proof += start.elapsed();
                 }
-                let reveal_start = trace_enabled.then(std::time::Instant::now);
-                trie.reveal_decoded_storage_multiproof(hashed_addr, proof)
-                    .map_err(|e| MptDbError::Other(format!("reveal storage {hashed_addr}: {e}")))?;
-                if let Some(start) = reveal_start {
-                    t_reveal_storage += start.elapsed();
-                }
+                storage_reveal_batch.insert(hashed_addr, proof);
             }
-            // else: no storage changes → no storage trie reveal needed.
-        } else if let Some(proof) =
-            provider_factory.pre_built_storage_proofs.get(&hashed_addr).cloned()
-        {
-            // L2 cache fallback: published segment was stale (root mismatch) but
-            // the committed StorageTrieCow is available in the L2 cache.  Use the
-            // pre-built proof from `build_sparse_factory`.
+            continue;
+        }
+        if let Some(proof) = provider_factory.pre_built_storage_proofs.get(&hashed_addr).cloned() {
             if !dirty_keys.is_empty() {
                 accounts_prebuilt_reveal += 1;
-                let reveal_start = trace_enabled.then(std::time::Instant::now);
-                trie.reveal_decoded_storage_multiproof(hashed_addr, proof).map_err(|e| {
-                    MptDbError::Other(format!("reveal storage (L2 fallback) {hashed_addr}: {e}"))
-                })?;
-                if let Some(start) = reveal_start {
-                    t_reveal_storage += start.elapsed();
-                }
+                storage_reveal_batch.insert(hashed_addr, proof);
             }
-        } else {
-            // No published segment and NOT storage_wiped.
-            //
-            // If the account has NO storage changes (balance/nonce-only change),
-            // no reveal is needed: `update_account` will read the storage root
-            // from the existing account leaf (or use EMPTY_ROOT_HASH for new
-            // accounts).  Only error when there are actual storage changes that
-            // require a base trie but no valid witness source can be found.
-            let is_known_empty = dirty.storage_known_empty ||
-                provider_factory.known_empty_accounts.contains(&hashed_addr);
-            if !is_known_empty && !dirty_keys.is_empty() {
-                return Err(MptDbError::Other(format!(
-                    "no storage segment for existing account {hashed_addr}; \
-                     check that dirty.storage_known_empty is set for new accounts"
-                )));
-            }
-            // New account:
-            //   dirty_keys empty   → nothing to reveal (update_account reads EMPTY_ROOT from leaf)
-            //   dirty_keys non-empty → reveal empty base so that:
-            //     (a) update_storage_leaf does not hit Blind, AND
-            //     (b) root_with_updates sees the new slots (updates=None on
-            //         Box::default() means the slots would not appear in TrieUpdates)
-            if !dirty_keys.is_empty() {
-                accounts_empty_reveal += 1;
-                let reveal_start = trace_enabled.then(std::time::Instant::now);
-                trie.reveal_decoded_storage_multiproof(
-                    hashed_addr,
-                    DecodedStorageMultiProof::empty(),
-                )
-                .map_err(|e| {
-                    MptDbError::Other(format!(
-                        "reveal empty storage (new account) {hashed_addr}: {e}"
-                    ))
-                })?;
-                if let Some(start) = reveal_start {
-                    t_reveal_storage += start.elapsed();
-                }
-            }
+            continue;
         }
+
+        let is_known_empty = dirty.storage_known_empty ||
+            provider_factory.known_empty_accounts.contains(&hashed_addr);
+        if !is_known_empty && !dirty_keys.is_empty() {
+            return Err(MptDbError::Other(format!(
+                "no storage segment for existing account {hashed_addr}; \
+                 check that dirty.storage_known_empty is set for new accounts"
+            )));
+        }
+        if !dirty_keys.is_empty() {
+            accounts_empty_reveal += 1;
+            storage_reveal_batch.insert(hashed_addr, DecodedStorageMultiProof::empty());
+        }
+    }
+    if !storage_reveal_batch.is_empty() {
+        let reveal_start = trace_enabled.then(std::time::Instant::now);
+        trie.reveal_decoded_multiproof(DecodedMultiProof {
+            account_subtree: DecodedProofNodes::default(),
+            branch_node_masks: BranchNodeMasksMap::default(),
+            storages: storage_reveal_batch,
+        })
+        .map_err(|e| MptDbError::Other(format!("batch reveal storage multiproof: {e}")))?;
+        if let Some(start) = reveal_start {
+            t_reveal_storage += start.elapsed();
+        }
+    }
+    if !storage_wipe_after_reveal.is_empty() {
+        let wipe_start = trace_enabled.then(std::time::Instant::now);
+        for hashed_addr in storage_wipe_after_reveal {
+            trie.wipe_storage(hashed_addr)
+                .map_err(|e| MptDbError::Other(format!("wipe_storage {hashed_addr}: {e}")))?;
+        }
+        if let Some(start) = wipe_start {
+            t_reveal_storage += start.elapsed();
+        }
+    }
+
+    // ── Per-account loop ──────────────────────────────────────────────────────
+    for dirty in dirty_accounts {
+        let hashed_addr = dirty.hashed_address;
+        storage_change_total += dirty.storage_changes.len();
         // ── Step 2: apply storage changes ────────────────────────────────────
         let storage_apply_start = trace_enabled.then(std::time::Instant::now);
         for change in &dirty.storage_changes {

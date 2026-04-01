@@ -29,6 +29,11 @@ use tracing::{debug, instrument, trace};
 /// The level below which the sparse trie hashes are calculated in
 /// [`SerialSparseTrie::update_subtrie_hashes`].
 const SPARSE_TRIE_SUBTRIE_HASHES_LEVEL: usize = 2;
+/// Minimum number of changed prefixes before enabling parallel pre-hash in
+/// [`SerialSparseTrie::root`] (only when trie updates are disabled).
+const SPARSE_TRIE_PARALLEL_ROOT_MIN_PREFIX_KEYS: usize = 2_048;
+/// Minimum number of independent subtries to process in parallel.
+const SPARSE_TRIE_PARALLEL_ROOT_MIN_TARGETS: usize = 64;
 
 /// A sparse trie that is either in a "blind" state (no nodes are revealed, root node hash is
 /// unknown) or in a "revealed" state (root node has been revealed and the trie can be updated).
@@ -922,6 +927,13 @@ impl SparseTrieInterface for SerialSparseTrie {
     fn root(&mut self) -> B256 {
         // Take the current prefix set
         let mut prefix_set = core::mem::take(&mut self.prefix_set).freeze();
+        // Fast path for wal_first-like callers (updates disabled): pre-hash
+        // independent subtries in parallel, then let `rlp_node_allocate` merge
+        // the shallow frontier serially.
+        #[cfg(feature = "std")]
+        if self.updates.is_none() {
+            self.parallel_prehash_subtries_no_updates(&mut prefix_set);
+        }
         let rlp_node = self.rlp_node_allocate(&mut prefix_set);
         if let Some(root_hash) = rlp_node.as_hash() {
             root_hash
@@ -1408,6 +1420,175 @@ impl SerialSparseTrie {
             self.rlp_node(&mut prefix_set, &mut buffers, &mut temp_rlp_buf);
         }
         self.rlp_buf = temp_rlp_buf;
+    }
+
+    /// Pre-hash changed subtries in parallel when updates are disabled.
+    ///
+    /// This computes hashes below [`SPARSE_TRIE_SUBTRIE_HASHES_LEVEL`] in
+    /// parallel and shrinks `prefix_set` to only shallow nodes, so the final
+    /// `root()` merge stays cheap on large account batches.
+    #[cfg(feature = "std")]
+    fn parallel_prehash_subtries_no_updates(&mut self, prefix_set: &mut PrefixSet) {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+        if prefix_set.len() < SPARSE_TRIE_PARALLEL_ROOT_MIN_PREFIX_KEYS {
+            return;
+        }
+
+        let (targets, new_prefix_set) =
+            self.get_changed_nodes_at_depth(prefix_set, SPARSE_TRIE_SUBTRIE_HASHES_LEVEL);
+        if targets.len() < SPARSE_TRIE_PARALLEL_ROOT_MIN_TARGETS {
+            return;
+        }
+
+        let updates = {
+            let trie_ref: &SerialSparseTrie = self;
+            let prefix_seed = prefix_set.clone();
+            targets
+                .into_par_iter()
+                .map(move |(_, path)| {
+                    let mut local_updates = Vec::new();
+                    let mut rlp_buf = Vec::new();
+                    let mut local_prefix_set = prefix_seed.clone();
+                    let _ = trie_ref.compute_rlp_node_no_updates(
+                        path,
+                        &mut local_prefix_set,
+                        &mut local_updates,
+                        &mut rlp_buf,
+                    );
+                    local_updates
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for local_updates in updates {
+            for update in local_updates {
+                self.apply_hash_cache_update_no_updates(update);
+            }
+        }
+
+        *prefix_set = new_prefix_set.freeze();
+    }
+
+    /// Read-only recursive RLP/hash computation for no-updates mode.
+    ///
+    /// Returns both encoded node and node type so extension/branch
+    /// `store_in_db_trie` flags can be propagated exactly like `rlp_node`.
+    fn compute_rlp_node_no_updates(
+        &self,
+        path: Nibbles,
+        prefix_set: &mut PrefixSet,
+        updates: &mut Vec<SparseHashCacheUpdate>,
+        rlp_buf: &mut Vec<u8>,
+    ) -> (RlpNode, SparseNodeType) {
+        match self.nodes.get(&path).unwrap() {
+            SparseNode::Empty => (RlpNode::word_rlp(&EMPTY_ROOT_HASH), SparseNodeType::Empty),
+            SparseNode::Hash(hash) => (RlpNode::word_rlp(hash), SparseNodeType::Hash),
+            SparseNode::Leaf { key, hash } => {
+                let mut full_path = path;
+                full_path.extend(key);
+                if let Some(hash) = hash.filter(|_| !prefix_set.contains(&full_path)) {
+                    (RlpNode::word_rlp(&hash), SparseNodeType::Leaf)
+                } else {
+                    let value = self.values.get(&full_path).unwrap();
+                    rlp_buf.clear();
+                    let rlp_node = LeafNodeRef { key, value }.rlp(rlp_buf);
+                    let new_hash = rlp_node.as_hash();
+                    updates.push(SparseHashCacheUpdate::Leaf { path, hash: new_hash });
+                    (rlp_node, SparseNodeType::Leaf)
+                }
+            }
+            SparseNode::Extension { key, hash, store_in_db_trie } => {
+                if let Some((hash, store_in_db_trie)) =
+                    hash.zip(*store_in_db_trie).filter(|_| !prefix_set.contains(&path))
+                {
+                    (
+                        RlpNode::word_rlp(&hash),
+                        SparseNodeType::Extension { store_in_db_trie: Some(store_in_db_trie) },
+                    )
+                } else {
+                    let mut child_path = path;
+                    child_path.extend(key);
+                    let (child_rlp, child_node_type) =
+                        self.compute_rlp_node_no_updates(child_path, prefix_set, updates, rlp_buf);
+                    rlp_buf.clear();
+                    let rlp_node = ExtensionNodeRef::new(key, &child_rlp).rlp(rlp_buf);
+                    let new_hash = rlp_node.as_hash();
+                    let new_store_in_db_trie = child_node_type.store_in_db_trie();
+                    updates.push(SparseHashCacheUpdate::Extension {
+                        path,
+                        hash: new_hash,
+                        store_in_db_trie: new_store_in_db_trie,
+                    });
+                    (rlp_node, SparseNodeType::Extension { store_in_db_trie: new_store_in_db_trie })
+                }
+            }
+            SparseNode::Branch { state_mask, hash, store_in_db_trie } => {
+                if let Some((hash, store_in_db_trie)) =
+                    hash.zip(*store_in_db_trie).filter(|_| !prefix_set.contains(&path))
+                {
+                    (
+                        RlpNode::word_rlp(&hash),
+                        SparseNodeType::Branch { store_in_db_trie: Some(store_in_db_trie) },
+                    )
+                } else {
+                    let mut children = Vec::new();
+                    for bit in CHILD_INDEX_RANGE {
+                        if state_mask.is_bit_set(bit) {
+                            let mut child_path = path;
+                            child_path.push_unchecked(bit);
+                            let (child_rlp, _child_node_type) = self.compute_rlp_node_no_updates(
+                                child_path, prefix_set, updates, rlp_buf,
+                            );
+                            children.push(child_rlp);
+                        }
+                    }
+                    rlp_buf.clear();
+                    let rlp_node = BranchNodeRef::new(&children, *state_mask).rlp(rlp_buf);
+                    let new_hash = rlp_node.as_hash();
+                    let new_store_in_db_trie = Some(false);
+                    updates.push(SparseHashCacheUpdate::Branch {
+                        path,
+                        hash: new_hash,
+                        store_in_db_trie: new_store_in_db_trie,
+                    });
+                    (rlp_node, SparseNodeType::Branch { store_in_db_trie: new_store_in_db_trie })
+                }
+            }
+        }
+    }
+
+    /// Apply hash/store cache updates produced by [`compute_rlp_node_no_updates`].
+    fn apply_hash_cache_update_no_updates(&mut self, update: SparseHashCacheUpdate) {
+        match update {
+            SparseHashCacheUpdate::Leaf { path, hash } => {
+                if let Some(SparseNode::Leaf { hash: node_hash, .. }) = self.nodes.get_mut(&path) {
+                    *node_hash = hash;
+                }
+            }
+            SparseHashCacheUpdate::Extension { path, hash, store_in_db_trie } => {
+                if let Some(SparseNode::Extension {
+                    hash: node_hash,
+                    store_in_db_trie: node_store_in_db_trie,
+                    ..
+                }) = self.nodes.get_mut(&path)
+                {
+                    *node_hash = hash;
+                    *node_store_in_db_trie = store_in_db_trie;
+                }
+            }
+            SparseHashCacheUpdate::Branch { path, hash, store_in_db_trie } => {
+                if let Some(SparseNode::Branch {
+                    hash: node_hash,
+                    store_in_db_trie: node_store_in_db_trie,
+                    ..
+                }) = self.nodes.get_mut(&path)
+                {
+                    *node_hash = hash;
+                    *node_store_in_db_trie = store_in_db_trie;
+                }
+            }
+        }
     }
 
     /// Returns a list of (level, path) tuples identifying the nodes that have changed at the
@@ -1978,6 +2159,14 @@ struct RemovedSparseNode {
     ///
     /// This is only set for branch nodes that have a direct path to the leaf being deleted.
     unset_branch_nibble: Option<u8>,
+}
+
+/// Hash/store cache update for a sparse node path.
+#[derive(Debug)]
+enum SparseHashCacheUpdate {
+    Leaf { path: Nibbles, hash: Option<B256> },
+    Extension { path: Nibbles, hash: Option<B256>, store_in_db_trie: Option<bool> },
+    Branch { path: Nibbles, hash: Option<B256>, store_in_db_trie: Option<bool> },
 }
 
 /// Collection of reusable buffers for [`SerialSparseTrie::rlp_node`] calculations.
