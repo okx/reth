@@ -1020,6 +1020,11 @@ pub(crate) fn apply_all_storage_changes_sparse(
     dirty_accounts: &[DirtyAccount],
     skip_already_revealed_storage: bool,
 ) -> MptResult<()> {
+    const SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES: usize = 16;
+    const SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES: usize = 64;
+    const SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS: usize = 2000;
+    const SPARSE_STORAGE_REVEAL_BATCH_CHUNK: usize = 8192;
+
     if dirty_accounts.is_empty() {
         return Ok(());
     }
@@ -1036,13 +1041,14 @@ pub(crate) fn apply_all_storage_changes_sparse(
     let mut accounts_prebuilt_reveal = 0usize;
     let mut accounts_empty_reveal = 0usize;
     let mut storage_change_total = 0usize;
+    let enable_full_scan = dirty_accounts.len() <= SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS;
     let mut pre_extracted_segment_proofs: HashMap<B256, DecodedStorageMultiProof> =
-        HashMap::default();
+        HashMap::with_capacity(dirty_accounts.len());
     let provider_storage_before =
         SPARSE_PROVIDER_STORAGE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
     let provider_account_before =
         SPARSE_PROVIDER_ACCOUNT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
-    let mut storage_root_accounts: Vec<B256> = Vec::new();
+    let mut storage_root_accounts: Vec<B256> = Vec::with_capacity(dirty_accounts.len());
 
     // ── Step 0: reveal account trie for ALL dirty addresses in one batch ──────
     //
@@ -1066,9 +1072,9 @@ pub(crate) fn apply_all_storage_changes_sparse(
     // Pre-extract segment proofs in parallel before the per-account mutation loop.
     // This turns the dominant per-account serial extract cost into a batched step.
     let pre_extract_start = trace_enabled.then(std::time::Instant::now);
-    let mut segment_extract_candidates: Vec<(B256, Arc<SegmentPageLease>, Vec<Nibbles>)> =
+    let mut segment_extract_candidates: Vec<(B256, Arc<SegmentPageLease>, usize)> =
         Vec::with_capacity(dirty_accounts.len());
-    for dirty in dirty_accounts {
+    for (dirty_idx, dirty) in dirty_accounts.iter().enumerate() {
         if dirty.storage_wiped || dirty.storage_changes.is_empty() {
             continue;
         }
@@ -1081,17 +1087,14 @@ pub(crate) fn apply_all_storage_changes_sparse(
         let Some(lease) = provider_factory.storage_segments.get(&dirty.hashed_address) else {
             continue;
         };
-        segment_extract_candidates.push((
-            dirty.hashed_address,
-            Arc::clone(lease),
-            dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect(),
-        ));
+        segment_extract_candidates.push((dirty.hashed_address, Arc::clone(lease), dirty_idx));
     }
     if !segment_extract_candidates.is_empty() {
         let extracted = if segment_extract_candidates.len() >= 64 {
             segment_extract_candidates
                 .into_par_iter()
-                .map(|(hashed_addr, lease, keys)| -> MptResult<(B256, DecodedStorageMultiProof)> {
+                .map(
+                    |(hashed_addr, lease, dirty_idx)| -> MptResult<(B256, DecodedStorageMultiProof)> {
                     let reader = StorageTrieSegmentReader::open_shared_page(
                         &lease,
                         lease.root(),
@@ -1100,16 +1103,39 @@ pub(crate) fn apply_all_storage_changes_sparse(
                     .map_err(|e| {
                         MptDbError::Other(format!("open storage segment reader {hashed_addr}: {e}"))
                     })?;
-                    let proof = reader.extract_decoded_multiproof(&keys).map_err(|e| {
+                    let dirty = &dirty_accounts[dirty_idx];
+                    let storage_change_len = dirty.storage_changes.len();
+                    let proof = if enable_full_scan &&
+                        (SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES..=
+                            SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES)
+                            .contains(&storage_change_len)
+                    {
+                        reader.extract_full_decoded_multiproof()
+                    } else if storage_change_len == 1 {
+                        reader.extract_decoded_multiproof(std::slice::from_ref(
+                            &dirty.storage_changes[0].slot_key,
+                        ))
+                    } else {
+                        let mut dirty_keys: Vec<Nibbles> = Vec::with_capacity(storage_change_len);
+                        dirty_keys.extend(dirty.storage_changes.iter().map(|c| c.slot_key.clone()));
+                        if enable_full_scan {
+                            reader.extract_decoded_multiproof(&dirty_keys)
+                        } else {
+                            reader.extract_decoded_multiproof_no_full_scan(&dirty_keys)
+                        }
+                    }
+                    .map_err(|e| {
                         MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
                     })?;
                     Ok((hashed_addr, proof))
-                })
+                },
+                )
                 .collect::<MptResult<Vec<_>>>()?
         } else {
             segment_extract_candidates
                 .into_iter()
-                .map(|(hashed_addr, lease, keys)| -> MptResult<(B256, DecodedStorageMultiProof)> {
+                .map(
+                    |(hashed_addr, lease, dirty_idx)| -> MptResult<(B256, DecodedStorageMultiProof)> {
                     let reader = StorageTrieSegmentReader::open_shared_page(
                         &lease,
                         lease.root(),
@@ -1118,11 +1144,33 @@ pub(crate) fn apply_all_storage_changes_sparse(
                     .map_err(|e| {
                         MptDbError::Other(format!("open storage segment reader {hashed_addr}: {e}"))
                     })?;
-                    let proof = reader.extract_decoded_multiproof(&keys).map_err(|e| {
+                    let dirty = &dirty_accounts[dirty_idx];
+                    let storage_change_len = dirty.storage_changes.len();
+                    let proof = if enable_full_scan &&
+                        (SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES..=
+                            SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES)
+                            .contains(&storage_change_len)
+                    {
+                        reader.extract_full_decoded_multiproof()
+                    } else if storage_change_len == 1 {
+                        reader.extract_decoded_multiproof(std::slice::from_ref(
+                            &dirty.storage_changes[0].slot_key,
+                        ))
+                    } else {
+                        let mut dirty_keys: Vec<Nibbles> = Vec::with_capacity(storage_change_len);
+                        dirty_keys.extend(dirty.storage_changes.iter().map(|c| c.slot_key.clone()));
+                        if enable_full_scan {
+                            reader.extract_decoded_multiproof(&dirty_keys)
+                        } else {
+                            reader.extract_decoded_multiproof_no_full_scan(&dirty_keys)
+                        }
+                    }
+                    .map_err(|e| {
                         MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
                     })?;
                     Ok((hashed_addr, proof))
-                })
+                },
+                )
                 .collect::<MptResult<Vec<_>>>()?
         };
         pre_extracted_segment_proofs.extend(extracted);
@@ -1136,80 +1184,119 @@ pub(crate) fn apply_all_storage_changes_sparse(
     // We keep all source-selection logic (segment / prebuilt / known-empty /
     // wiped) identical to the serial path, but reveal in one batched call so
     // SparseStateTrie can parallelize per-account reveal internally.
-    let mut storage_reveal_batch = alloy_primitives::map::B256Map::default();
-    let mut storage_wipe_after_reveal: Vec<B256> = Vec::new();
+    let mut storage_reveal_entries: Vec<(B256, DecodedStorageMultiProof)> =
+        Vec::with_capacity(dirty_accounts.len());
+    let mut storage_reveal_non_empty = 0usize;
+    let mut storage_wipe_after_reveal: Vec<B256> = Vec::with_capacity(dirty_accounts.len() / 8);
     for dirty in dirty_accounts {
         let hashed_addr = dirty.hashed_address;
-        let mut dirty_keys_vec: Option<Vec<Nibbles>> = None;
-        let dirty_keys: &[Nibbles] = if dirty.storage_changes.len() == 1 {
-            std::slice::from_ref(&dirty.storage_changes[0].slot_key)
-        } else if dirty.storage_changes.len() > 1 {
-            dirty_keys_vec =
-                Some(dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect());
-            dirty_keys_vec.as_ref().unwrap()
-        } else {
-            &[]
-        };
+        let storage_change_len = dirty.storage_changes.len();
 
         if dirty.storage_wiped {
             accounts_wiped += 1;
-            storage_reveal_batch.insert(hashed_addr, DecodedStorageMultiProof::empty());
+            storage_reveal_entries.push((hashed_addr, DecodedStorageMultiProof::empty()));
             storage_wipe_after_reveal.push(hashed_addr);
+            continue;
+        }
+        if storage_change_len == 0 {
             continue;
         }
         if skip_already_revealed_storage && trie.storage_trie_ref(&hashed_addr).is_some() {
             continue;
         }
         if let Some(proof) = pre_extracted_segment_proofs.remove(&hashed_addr) {
-            if !dirty_keys.is_empty() {
-                accounts_segment_reveal += 1;
-                storage_reveal_batch.insert(hashed_addr, proof);
-            }
+            accounts_segment_reveal += 1;
+            storage_reveal_entries.push((hashed_addr, proof));
+            storage_reveal_non_empty += 1;
             continue;
         }
         if let Some(reader) = provider_factory.get_storage_reader(hashed_addr) {
-            if !dirty_keys.is_empty() {
-                accounts_segment_reveal += 1;
-                let extract_start = trace_enabled.then(std::time::Instant::now);
-                let proof = reader.extract_decoded_multiproof(&dirty_keys).map_err(|e| {
-                    MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
-                })?;
-                if let Some(start) = extract_start {
-                    t_extract_storage_proof += start.elapsed();
+            accounts_segment_reveal += 1;
+            let extract_start = trace_enabled.then(std::time::Instant::now);
+            let proof = if enable_full_scan &&
+                (SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES..=SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES)
+                    .contains(&storage_change_len)
+            {
+                reader.extract_full_decoded_multiproof()
+            } else if storage_change_len == 1 {
+                reader.extract_decoded_multiproof(std::slice::from_ref(
+                    &dirty.storage_changes[0].slot_key,
+                ))
+            } else {
+                let dirty_keys: Vec<Nibbles> =
+                    dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
+                if enable_full_scan {
+                    reader.extract_decoded_multiproof(&dirty_keys)
+                } else {
+                    reader.extract_decoded_multiproof_no_full_scan(&dirty_keys)
                 }
-                storage_reveal_batch.insert(hashed_addr, proof);
             }
+            .map_err(|e| {
+                MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
+            })?;
+            if let Some(start) = extract_start {
+                t_extract_storage_proof += start.elapsed();
+            }
+            storage_reveal_entries.push((hashed_addr, proof));
+            storage_reveal_non_empty += 1;
             continue;
         }
         if let Some(proof) = provider_factory.pre_built_storage_proofs.get(&hashed_addr).cloned() {
-            if !dirty_keys.is_empty() {
-                accounts_prebuilt_reveal += 1;
-                storage_reveal_batch.insert(hashed_addr, proof);
-            }
+            accounts_prebuilt_reveal += 1;
+            storage_reveal_entries.push((hashed_addr, proof));
+            storage_reveal_non_empty += 1;
             continue;
         }
 
         let is_known_empty = dirty.storage_known_empty ||
             provider_factory.known_empty_accounts.contains(&hashed_addr);
-        if !is_known_empty && !dirty_keys.is_empty() {
+        if !is_known_empty {
             return Err(MptDbError::Other(format!(
                 "no storage segment for existing account {hashed_addr}; \
                  check that dirty.storage_known_empty is set for new accounts"
             )));
         }
-        if !dirty_keys.is_empty() {
-            accounts_empty_reveal += 1;
-            storage_reveal_batch.insert(hashed_addr, DecodedStorageMultiProof::empty());
-        }
+        accounts_empty_reveal += 1;
+        storage_reveal_entries.push((hashed_addr, DecodedStorageMultiProof::empty()));
     }
-    if !storage_reveal_batch.is_empty() {
+    if !storage_reveal_entries.is_empty() {
         let reveal_start = trace_enabled.then(std::time::Instant::now);
-        trie.reveal_decoded_multiproof(DecodedMultiProof {
-            account_subtree: DecodedProofNodes::default(),
-            branch_node_masks: BranchNodeMasksMap::default(),
-            storages: storage_reveal_batch,
-        })
-        .map_err(|e| MptDbError::Other(format!("batch reveal storage multiproof: {e}")))?;
+        if storage_reveal_non_empty == 0 ||
+            storage_reveal_entries.len() <= SPARSE_STORAGE_REVEAL_BATCH_CHUNK
+        {
+            let mut storages = alloy_primitives::map::B256Map::default();
+            storages.reserve(storage_reveal_entries.len());
+            for (hashed_addr, proof) in storage_reveal_entries {
+                storages.insert(hashed_addr, proof);
+            }
+            trie.reveal_decoded_multiproof(DecodedMultiProof {
+                account_subtree: DecodedProofNodes::default(),
+                branch_node_masks: BranchNodeMasksMap::default(),
+                storages,
+            })
+            .map_err(|e| MptDbError::Other(format!("batch reveal storage multiproof: {e}")))?;
+        } else {
+            let mut reveal_iter = storage_reveal_entries.into_iter();
+            loop {
+                let mut storages = alloy_primitives::map::B256Map::default();
+                storages.reserve(SPARSE_STORAGE_REVEAL_BATCH_CHUNK);
+                for _ in 0..SPARSE_STORAGE_REVEAL_BATCH_CHUNK {
+                    let Some((hashed_addr, proof)) = reveal_iter.next() else {
+                        break;
+                    };
+                    storages.insert(hashed_addr, proof);
+                }
+                if storages.is_empty() {
+                    break;
+                }
+                trie.reveal_decoded_multiproof(DecodedMultiProof {
+                    account_subtree: DecodedProofNodes::default(),
+                    branch_node_masks: BranchNodeMasksMap::default(),
+                    storages,
+                })
+                .map_err(|e| MptDbError::Other(format!("batch reveal storage multiproof: {e}")))?;
+            }
+        }
         if let Some(start) = reveal_start {
             t_reveal_storage += start.elapsed();
         }
@@ -2069,7 +2156,7 @@ mod tests {
         // Reveal ALL keys → full trie in the proof.  Root hash must match.
         let mut tree = MptTree::new();
         let mut keys = Vec::new();
-        for i in 0u8..8 {
+        for i in 0u8..20 {
             let key = Nibbles::unpack(keccak256(&[i, i]));
             keys.push(key.clone());
             tree.insert(&key, vec![i; 16]);

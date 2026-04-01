@@ -667,10 +667,50 @@ impl<'a> StorageTrieSegmentReader<'a> {
     /// }
     /// ```
     pub fn extract_decoded_multiproof(&self, keys: &[Nibbles]) -> Result<DecodedStorageMultiProof> {
+        self.extract_decoded_multiproof_with_full_scan(keys, true)
+    }
+
+    /// Extracts a `DecodedStorageMultiProof` while forcing path-only materialization.
+    ///
+    /// Unlike `extract_decoded_multiproof`, this path never upgrades to full-trie
+    /// materialization based on key-count/node-count heuristics.
+    pub fn extract_decoded_multiproof_no_full_scan(
+        &self,
+        keys: &[Nibbles],
+    ) -> Result<DecodedStorageMultiProof> {
+        self.extract_decoded_multiproof_with_full_scan(keys, false)
+    }
+
+    fn extract_decoded_multiproof_with_full_scan(
+        &self,
+        keys: &[Nibbles],
+        allow_full_scan: bool,
+    ) -> Result<DecodedStorageMultiProof> {
+        const STORAGE_PROOF_FULL_SCAN_MIN_KEYS: usize = 16;
+        const STORAGE_PROOF_FULL_SCAN_MAX_NODES: usize = 4096;
+
         if keys.len() == 1 {
             return self.extract_single_key_decoded_multiproof(&keys[0]);
         }
-        let (arena, root_idx, _lazy_siblings) = self.trace_touched_paths(keys)?.into_parts();
+        let use_full_scan = allow_full_scan &&
+            keys.len() >= STORAGE_PROOF_FULL_SCAN_MIN_KEYS &&
+            self.node_count() <= STORAGE_PROOF_FULL_SCAN_MAX_NODES;
+        let (arena, root_idx, _lazy_siblings) = if use_full_scan {
+            self.trace_full_trie_for_proof()?.into_parts()
+        } else {
+            self.trace_touched_paths_inner(keys, false)?.into_parts()
+        };
+        super::sparse_storage::convert_arena_to_decoded_storage_multiproof(
+            &arena, root_idx, self.root,
+        )
+    }
+
+    /// Extracts a full decoded storage multiproof by materializing the whole trie.
+    ///
+    /// This path avoids per-key path tracing overhead for dense updates where many
+    /// slots of the same account are touched in one block.
+    pub fn extract_full_decoded_multiproof(&self) -> Result<DecodedStorageMultiProof> {
+        let (arena, root_idx, _lazy_siblings) = self.trace_full_trie_for_proof()?.into_parts();
         super::sparse_storage::convert_arena_to_decoded_storage_multiproof(
             &arena, root_idx, self.root,
         )
@@ -687,11 +727,20 @@ impl<'a> StorageTrieSegmentReader<'a> {
         &self,
         keys: &[Nibbles],
     ) -> Result<(DecodedProofNodes, BranchNodeMasksMap)> {
-        let (arena, root_idx, _lazy_siblings) = self.trace_touched_paths(keys)?.into_parts();
+        let (arena, root_idx, _lazy_siblings) =
+            self.trace_touched_paths_inner(keys, false)?.into_parts();
         super::sparse_storage::convert_arena_to_account_proof_nodes(&arena, root_idx)
     }
 
     pub fn trace_touched_paths(&self, keys: &[Nibbles]) -> Result<StoragePathTrace> {
+        self.trace_touched_paths_inner(keys, true)
+    }
+
+    fn trace_touched_paths_inner(
+        &self,
+        keys: &[Nibbles],
+        collect_lazy_siblings: bool,
+    ) -> Result<StoragePathTrace> {
         if self.root_idx == u32::MAX {
             return Ok(StoragePathTrace {
                 arena: MutableTrieArena::new(),
@@ -713,6 +762,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
                 &mut arena,
                 &mut materialized,
                 &mut lazy_siblings,
+                collect_lazy_siblings,
             )?;
         }
 
@@ -725,6 +775,28 @@ impl<'a> StorageTrieSegmentReader<'a> {
             root: Some(root_idx),
             touched_keys: keys.len(),
             lazy_siblings,
+        })
+    }
+
+    fn trace_full_trie_for_proof(&self) -> Result<StoragePathTrace> {
+        if self.root_idx == u32::MAX {
+            return Ok(StoragePathTrace {
+                arena: MutableTrieArena::new(),
+                root: None,
+                touched_keys: 0,
+                lazy_siblings: Vec::new(),
+            });
+        }
+
+        let mut arena = MutableTrieArena::new();
+        let mut materialized = vec![None; self.node_count as usize];
+        let root_idx =
+            self.materialize_full_subtree(self.root_idx, &mut arena, &mut materialized)?;
+        Ok(StoragePathTrace {
+            arena,
+            root: Some(root_idx),
+            touched_keys: 0,
+            lazy_siblings: Vec::new(),
         })
     }
 
@@ -844,6 +916,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
         arena: &mut MutableTrieArena,
         materialized: &mut [Option<u32>],
         lazy_siblings: &mut Vec<(u32, Option<u8>, SegmentNodeRef)>,
+        collect_lazy_siblings: bool,
     ) -> Result<u32> {
         let mut inserted = false;
         let arena_idx = if let Some(idx) = materialized.get(seg_idx as usize).copied().flatten() {
@@ -871,7 +944,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
                 // If the key matches and we recurse, the child will become
                 // ChildRef::Arena and the entry will be filtered out by the
                 // is_hash check in preload_batched_paths.
-                if inserted {
+                if collect_lazy_siblings && inserted {
                     if let (Some(lease), Some(target_idx)) = (self.lease.as_ref(), child.target_idx)
                     {
                         let hash = self.view_node(target_idx).ok().and_then(|v| v.hash);
@@ -895,6 +968,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
                         arena,
                         materialized,
                         lazy_siblings,
+                        collect_lazy_siblings,
                     )?;
                     if inserted ||
                         !matches!(
@@ -924,7 +998,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
                 // segment mmap instead of the persisted store (required for wal_first).
                 // Touched children (which become ChildRef::Arena) are filtered out
                 // later by the caller before inserting into pending_lazy_children.
-                if inserted {
+                if collect_lazy_siblings && inserted {
                     if let Some(lease) = self.lease.as_ref() {
                         for child in &children {
                             if let Some(target_idx) = child.target_idx {
@@ -948,6 +1022,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
                             arena,
                             materialized,
                             lazy_siblings,
+                            collect_lazy_siblings,
                         )?;
                         let current = self.current_branch_child(arena, arena_idx, nibble as usize);
                         if inserted || !matches!(current, Some(ChildRef::Arena(_))) {
@@ -961,6 +1036,51 @@ impl<'a> StorageTrieSegmentReader<'a> {
                 Ok(arena_idx)
             }
         }
+    }
+
+    fn materialize_full_subtree(
+        &self,
+        seg_idx: u32,
+        arena: &mut MutableTrieArena,
+        materialized: &mut [Option<u32>],
+    ) -> Result<u32> {
+        if let Some(idx) = materialized.get(seg_idx as usize).copied().flatten() {
+            return Ok(idx);
+        }
+
+        let node = self.decode_node(seg_idx)?;
+        let arena_idx = arena.alloc_clean(node.node);
+        if let Some(hash) = node.hash {
+            arena.set_hash(arena_idx, hash);
+        }
+        materialized[seg_idx as usize] = Some(arena_idx);
+
+        match node.body {
+            SegmentNodeBody::Leaf { .. } => {}
+            SegmentNodeBody::Extension { child, .. } => {
+                if let Some(target_idx) = child.target_idx {
+                    let child_arena =
+                        self.materialize_full_subtree(target_idx, arena, materialized)?;
+                    if let MptNode::Extension(ext) = arena.get_mut(arena_idx) {
+                        ext.child = ChildRef::Arena(child_arena);
+                    }
+                }
+            }
+            SegmentNodeBody::Branch { children, .. } => {
+                for child in children {
+                    if let Some(target_idx) = child.target_idx {
+                        let child_arena =
+                            self.materialize_full_subtree(target_idx, arena, materialized)?;
+                        if let MptNode::Branch(branch) = arena.get_mut(arena_idx) {
+                            branch.children[child.slot as usize] =
+                                Some(ChildRef::Arena(child_arena));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(arena_idx)
     }
 
     fn current_extension_child(&self, arena: &MutableTrieArena, arena_idx: u32) -> ChildRef {
