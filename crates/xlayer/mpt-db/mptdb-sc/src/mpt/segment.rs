@@ -741,6 +741,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
         keys: &[Nibbles],
         collect_lazy_siblings: bool,
     ) -> Result<StoragePathTrace> {
+        // `u32::MAX` is the segment sentinel for an empty trie root.
         if self.root_idx == u32::MAX {
             return Ok(StoragePathTrace {
                 arena: MutableTrieArena::new(),
@@ -779,6 +780,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
     }
 
     fn trace_full_trie_for_proof(&self) -> Result<StoragePathTrace> {
+        // `u32::MAX` is the segment sentinel for an empty trie root.
         if self.root_idx == u32::MAX {
             return Ok(StoragePathTrace {
                 arena: MutableTrieArena::new(),
@@ -1067,13 +1069,18 @@ impl<'a> StorageTrieSegmentReader<'a> {
                 }
             }
             SegmentNodeBody::Branch { children, .. } => {
+                let mut resolved_children: Vec<(usize, u32)> = Vec::new();
                 for child in children {
                     if let Some(target_idx) = child.target_idx {
                         let child_arena =
                             self.materialize_full_subtree(target_idx, arena, materialized)?;
-                        if let MptNode::Branch(branch) = arena.get_mut(arena_idx) {
-                            branch.children[child.slot as usize] =
-                                Some(ChildRef::Arena(child_arena));
+                        resolved_children.push((child.slot as usize, child_arena));
+                    }
+                }
+                if !resolved_children.is_empty() {
+                    if let MptNode::Branch(branch) = arena.get_mut(arena_idx) {
+                        for (slot, child_arena) in resolved_children {
+                            branch.children[slot] = Some(ChildRef::Arena(child_arena));
                         }
                     }
                 }

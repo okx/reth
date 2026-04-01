@@ -45,6 +45,13 @@ static SPARSE_PROVIDER_STORAGE_CALLS: std::sync::atomic::AtomicU64 =
 static SPARSE_PROVIDER_ACCOUNT_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+const SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES: usize = 16;
+const SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES: usize = 64;
+const SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS: usize = 2000;
+// Keep a bounded per-call storage map size for reveal_decoded_multiproof to
+// avoid very large transient allocations under 10K-account blocks.
+const SPARSE_STORAGE_REVEAL_BATCH_CHUNK: usize = 8192;
+
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
 /// Wraps a string message into a `SparseTrieError` via the `Other` variant.
@@ -974,6 +981,42 @@ pub(crate) fn build_storage_segments_from_sparse_trie(
 
 // ── Phase 2: apply_all_storage_changes_sparse ─────────────────────────────────
 
+#[inline]
+fn extract_storage_multiproof_for_account(
+    reader: &StorageTrieSegmentReader<'_>,
+    dirty: &DirtyAccount,
+    enable_full_scan: bool,
+) -> MptResult<DecodedStorageMultiProof> {
+    let storage_change_len = dirty.storage_changes.len();
+    let should_force_full_scan = enable_full_scan &&
+        (SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES..=SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES)
+            .contains(&storage_change_len);
+
+    if should_force_full_scan {
+        return reader.extract_full_decoded_multiproof();
+    }
+    if storage_change_len == 1 {
+        return reader
+            .extract_decoded_multiproof(std::slice::from_ref(&dirty.storage_changes[0].slot_key));
+    }
+
+    let mut dirty_keys: Vec<Nibbles> = Vec::with_capacity(storage_change_len);
+    dirty_keys.extend(dirty.storage_changes.iter().map(|c| c.slot_key.clone()));
+
+    // Two-layer full-scan decision:
+    // 1) `enable_full_scan` (workload-level gate) decides whether this block is allowed to use any
+    //    full-trie extraction path.
+    // 2) segment-reader internal heuristic (keys/node_count) is still active when calling
+    //    `extract_decoded_multiproof`.
+    // For large-account workloads (e.g. B4.6), call the explicit no-full-scan
+    // variant to disable layer-2 heuristic entirely.
+    if enable_full_scan {
+        reader.extract_decoded_multiproof(&dirty_keys)
+    } else {
+        reader.extract_decoded_multiproof_no_full_scan(&dirty_keys)
+    }
+}
+
 /// Applies all storage and account changes from `dirty_accounts` to a fresh
 /// `SparseStateTrie` in one pass.
 ///
@@ -1020,11 +1063,6 @@ pub(crate) fn apply_all_storage_changes_sparse(
     dirty_accounts: &[DirtyAccount],
     skip_already_revealed_storage: bool,
 ) -> MptResult<()> {
-    const SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES: usize = 16;
-    const SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES: usize = 64;
-    const SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS: usize = 2000;
-    const SPARSE_STORAGE_REVEAL_BATCH_CHUNK: usize = 8192;
-
     if dirty_accounts.is_empty() {
         return Ok(());
     }
@@ -1104,26 +1142,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
                         MptDbError::Other(format!("open storage segment reader {hashed_addr}: {e}"))
                     })?;
                     let dirty = &dirty_accounts[dirty_idx];
-                    let storage_change_len = dirty.storage_changes.len();
-                    let proof = if enable_full_scan &&
-                        (SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES..=
-                            SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES)
-                            .contains(&storage_change_len)
-                    {
-                        reader.extract_full_decoded_multiproof()
-                    } else if storage_change_len == 1 {
-                        reader.extract_decoded_multiproof(std::slice::from_ref(
-                            &dirty.storage_changes[0].slot_key,
-                        ))
-                    } else {
-                        let mut dirty_keys: Vec<Nibbles> = Vec::with_capacity(storage_change_len);
-                        dirty_keys.extend(dirty.storage_changes.iter().map(|c| c.slot_key.clone()));
-                        if enable_full_scan {
-                            reader.extract_decoded_multiproof(&dirty_keys)
-                        } else {
-                            reader.extract_decoded_multiproof_no_full_scan(&dirty_keys)
-                        }
-                    }
+                    let proof = extract_storage_multiproof_for_account(&reader, dirty, enable_full_scan)
                     .map_err(|e| {
                         MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
                     })?;
@@ -1145,26 +1164,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
                         MptDbError::Other(format!("open storage segment reader {hashed_addr}: {e}"))
                     })?;
                     let dirty = &dirty_accounts[dirty_idx];
-                    let storage_change_len = dirty.storage_changes.len();
-                    let proof = if enable_full_scan &&
-                        (SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES..=
-                            SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES)
-                            .contains(&storage_change_len)
-                    {
-                        reader.extract_full_decoded_multiproof()
-                    } else if storage_change_len == 1 {
-                        reader.extract_decoded_multiproof(std::slice::from_ref(
-                            &dirty.storage_changes[0].slot_key,
-                        ))
-                    } else {
-                        let mut dirty_keys: Vec<Nibbles> = Vec::with_capacity(storage_change_len);
-                        dirty_keys.extend(dirty.storage_changes.iter().map(|c| c.slot_key.clone()));
-                        if enable_full_scan {
-                            reader.extract_decoded_multiproof(&dirty_keys)
-                        } else {
-                            reader.extract_decoded_multiproof_no_full_scan(&dirty_keys)
-                        }
-                    }
+                    let proof = extract_storage_multiproof_for_account(&reader, dirty, enable_full_scan)
                     .map_err(|e| {
                         MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
                     })?;
@@ -1213,27 +1213,10 @@ pub(crate) fn apply_all_storage_changes_sparse(
         if let Some(reader) = provider_factory.get_storage_reader(hashed_addr) {
             accounts_segment_reveal += 1;
             let extract_start = trace_enabled.then(std::time::Instant::now);
-            let proof = if enable_full_scan &&
-                (SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES..=SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES)
-                    .contains(&storage_change_len)
-            {
-                reader.extract_full_decoded_multiproof()
-            } else if storage_change_len == 1 {
-                reader.extract_decoded_multiproof(std::slice::from_ref(
-                    &dirty.storage_changes[0].slot_key,
-                ))
-            } else {
-                let dirty_keys: Vec<Nibbles> =
-                    dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
-                if enable_full_scan {
-                    reader.extract_decoded_multiproof(&dirty_keys)
-                } else {
-                    reader.extract_decoded_multiproof_no_full_scan(&dirty_keys)
-                }
-            }
-            .map_err(|e| {
-                MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
-            })?;
+            let proof = extract_storage_multiproof_for_account(&reader, dirty, enable_full_scan)
+                .map_err(|e| {
+                    MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
+                })?;
             if let Some(start) = extract_start {
                 t_extract_storage_proof += start.elapsed();
             }
