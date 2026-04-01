@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::{
     arena::MutableTrieArena,
     encoding::{encode_branch, encode_extension, encode_leaf},
-    flat_layout::{encode_page, read_page_header_light, FlatPageHeader, FLAT_PAGE_HEADER_LEN},
+    flat_layout::{encode_page, read_page_header_light, FLAT_PAGE_HEADER_LEN},
     hash,
     node::{BranchNode, ChildRef, ExtensionNode, LeafNode, MptNode},
     tree::MptTree,
@@ -211,6 +211,15 @@ impl SegmentPageLease {
         self.root_record_off
     }
 
+    #[inline]
+    fn payload_slice(&self) -> Result<&[u8]> {
+        let bytes = self.page.as_slice();
+        if bytes.len() < FLAT_PAGE_HEADER_LEN {
+            return Err(MptDbError::Other("flat page too short".to_string()));
+        }
+        Ok(&bytes[FLAT_PAGE_HEADER_LEN..])
+    }
+
     #[cfg(test)]
     pub(crate) fn as_ptr(&self) -> *const u8 {
         self.page.as_ptr()
@@ -318,6 +327,13 @@ impl<'a> StorageTrieSegmentReader<'a> {
         expected_root: B256,
         expected_record_off: u32,
     ) -> Result<Self> {
+        if expected_root == lease.root() && expected_record_off == lease.root_record_off() {
+            // Hot path: for a trusted SegmentPageLease we can skip repeated flat-page
+            // header parsing and open directly from payload bytes.
+            let mut reader = Self::open_payload(lease.payload_slice()?, expected_root)?;
+            reader.lease = Some(Arc::clone(lease));
+            return Ok(reader);
+        }
         let mut reader = Self::open_page(lease.as_slice(), expected_root, expected_record_off)?;
         reader.lease = Some(Arc::clone(lease));
         Ok(reader)
@@ -341,7 +357,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
         let payload = bytes
             .get(page.payload_off as usize..page_end)
             .ok_or_else(|| MptDbError::Other("flat page payload out of bounds".to_string()))?;
-        Self::open_payload(payload, expected_root, page)
+        Self::open_payload(payload, expected_root)
     }
 
     pub fn open(bytes: &'a [u8], expected_root: B256) -> Result<Self> {
@@ -349,7 +365,7 @@ impl<'a> StorageTrieSegmentReader<'a> {
         Self::open_page(bytes, expected_root, page.root_record_off)
     }
 
-    fn open_payload(bytes: &'a [u8], expected_root: B256, _page: FlatPageHeader) -> Result<Self> {
+    fn open_payload(bytes: &'a [u8], expected_root: B256) -> Result<Self> {
         if bytes.len() < SEGMENT_HEADER_LEN {
             return Err(MptDbError::Other("segment too short".to_string()));
         }

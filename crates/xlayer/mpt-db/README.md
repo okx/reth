@@ -126,8 +126,8 @@ Each updated account has its nonce and balance modified, plus **all** of its sto
 | B4.3 | 1K | 10 | 200 | 10 | 5.39 ms | 2.38 ms | **2.3x** |
 | B4.4 | 200K | 10 | 2K | 10 | 285 ms | 24 ms | **11.9x** |
 | B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 83 ms | **14.6x** |
-| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 839 ms | **10.1x** |
-| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 245 ms | **8.1x** |
+| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 491 ms | **17.3x** |
+| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 58 ms | **34.2x** |
 
 ### Workload vs real-world comparison
 
@@ -144,8 +144,8 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 
 - **Small datasets (B4.1–B4.3)**: reth's MDBX keeps everything in page cache, so both systems are fast. mpt-db's advantage is modest (1–2x) because the WAL append overhead is a significant fraction of the per-block time.
 - **Large datasets (B4.4–B4.6)**: reth's MDBX page cache becomes cold as the dataset exceeds cache capacity. Random reads from disk dominate reth's `overlay_root_with_updates` and `write_trie_updates`. mpt-db's in-memory tries are unaffected by dataset size, giving **10–15x** speedup for B4.4/B4.5.
-- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each. mpt-db completes in ~839ms. The dominant cost is L3 segment load (10K L2 misses/block): deferred handle drop removes ~195ms of synchronous allocator pressure from the critical path; L3 overlay pre-allocation eliminates per-trie HashMap resize chains.
-- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). Overlay capacity recycling + parallel hash for large tries + deferred handle drop + incremental published-view refresh brings B4.7 from ~395ms to ~245ms (-38%).
+- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each. mpt-db completes in ~491ms. The SparseStateTrie migration replaced full-trie loading with dirty-path-only witness reveal; parallel pre-extraction of segment multiproofs and batch parallel storage reveal further reduce sp_ch. Account root now uses the fast `root_hash_only_parallel` path on the legacy arena trie instead of `SerialSparseTrie::root()`.
+- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). mpt-db completes in ~58ms. The full-trie materialization path (`extract_full_decoded_multiproof`) replaces per-key path tracing for dense 200-slot updates, reducing segment decode overhead by ~4x. Cross-block SparseStateTrie reuse keeps storage tries revealed across blocks, eliminating re-reveal cost for hot accounts.
 
 ### B4.6 detailed breakdown
 
@@ -158,19 +158,15 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 | `write_hashed_state` | 844 ms |
 | `commit` | 276 ms |
 
-**mpt-db (~839 ms/block):**
+**mpt-db (~491 ms/block, SparseStateTrie path):**
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| `trie_load` (L2 cache + L3 segment load) | ~630 ms | L2 hits: ~2K, L3 hits: ~8K/block |
-| `slot_updates` (apply + hash merged) | ~155 ms | |
-| `commit` | ~170 ms | |
-| `storage_roots` (collect + parallel snapshot) | ~55 ms | `fast_path_drop` ~36ms (deferred to next block start) |
-| `wal_append` | ~25 ms | |
-| `account_updates` | ~65 ms | |
-| `account_root` (parallel hash) | ~12 ms | |
+| `apply_bundle_state` | ~372 ms | |
+| `sp_ch` (parallel extract + batch reveal + storage roots) | ~310 ms | 10K × 30 slots, full-scan for 16–64 slot accounts |
+| `account_root` (arena parallel hash) | ~45 ms | `root_hash_only_parallel` on legacy account trie |
+| `segment_build` | ~34 ms | background-deferred in wal_first mode |
+| `wal_append` | ~15 ms | |
 
-L2 hits: ~2K/block, L3 hits: ~8K/block (cache_capacity=50K × 4 = 200K LRU limit).
-Primary bottleneck is L3 `pub_open` (mmap page access for 8K tries/block) and `changes_preload`
-(path materialisation). See `.claude/problems/b4_6_hotspot_code_analysis.md` for root cause
-analysis and planned optimisations.
+Primary bottleneck is `sp_ch`: parallel segment multiproof extraction and batch reveal for 10K accounts.
+Account root uses the fast arena path (`root_hash_only_parallel`) rather than `SerialSparseTrie::root()`.
