@@ -19,6 +19,7 @@ pub mod sparse_storage;
 pub mod ss_changeset;
 pub mod state;
 pub mod storage_cow;
+pub(crate) mod storage_recompute;
 pub mod r#trait;
 pub mod tree;
 pub mod tree_algo;

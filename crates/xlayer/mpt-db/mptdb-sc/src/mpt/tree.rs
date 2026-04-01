@@ -41,6 +41,17 @@ struct NodeArtifacts {
     dirty_blobs: Vec<(B256, Vec<u8>)>,
 }
 
+struct HashOnlyChildArtifacts {
+    embed: Vec<u8>,
+    hash_updates: Vec<(u32, B256)>,
+}
+
+struct HashOnlyNodeArtifacts {
+    rlp: Vec<u8>,
+    hash: B256,
+    hash_updates: Vec<(u32, B256)>,
+}
+
 impl MptTree {
     /// Create an empty trie.
     pub fn new() -> Self {
@@ -588,6 +599,39 @@ impl MptTree {
         (root_hash, dirty_blobs)
     }
 
+    /// Parallel root hash that only refreshes hash cache (no dirty blob/rlp collection).
+    ///
+    /// Intended for hash-only commit paths where we need account root and clean hash cache,
+    /// but do not persist dirty trie node blobs.
+    pub(crate) fn root_hash_parallel_hash_cache_only(
+        &mut self,
+        thresholds: &ParallelismThresholds,
+    ) -> B256 {
+        let root_idx = match self.root {
+            Some(idx) => idx,
+            None => return alloy_trie::EMPTY_ROOT_HASH,
+        };
+
+        let frontier_width = self.parallel_frontier_width();
+        if !self.arena.is_dirty(root_idx) ||
+            !thresholds.should_parallelize_account_frontier(frontier_width)
+        {
+            return self.root_hash();
+        }
+
+        let Some((root_hash, hash_updates)) =
+            self.root_hash_parallel_hash_cache_only_inner(root_idx)
+        else {
+            return self.root_hash();
+        };
+
+        for (idx, hash) in hash_updates {
+            self.arena.set_hash(idx, hash);
+        }
+
+        root_hash
+    }
+
     /// Collect all arena nodes (for segment build / snapshot export).
     pub fn arena_nodes(&self) -> Vec<MptNode> {
         self.arena.collect_all_nodes()
@@ -775,6 +819,55 @@ impl MptTree {
         }
     }
 
+    fn root_hash_parallel_hash_cache_only_inner(
+        &self,
+        root_idx: u32,
+    ) -> Option<(B256, Vec<(u32, B256)>)> {
+        match self.arena.get(root_idx) {
+            MptNode::Branch(branch) => {
+                let tasks: Vec<(usize, ChildRef)> = branch
+                    .children
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, child)| child.clone().map(|child| (slot, child)))
+                    .collect();
+
+                let mut results: Vec<(usize, HashOnlyChildArtifacts)> = tasks
+                    .into_par_iter()
+                    .map(|(slot, child)| {
+                        (slot, self.encode_child_for_parent_collect_hash_only(&child))
+                    })
+                    .collect();
+                results.sort_by_key(|(slot, _)| *slot);
+
+                let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
+                let mut hash_updates = Vec::new();
+                for (slot, artifacts) in results {
+                    children_bytes[slot] = Some(artifacts.embed);
+                    hash_updates.extend(artifacts.hash_updates);
+                }
+
+                let root_rlp = encode_branch(&children_bytes, branch.value.as_deref());
+                let root_hash = hash::hash_rlp(&root_rlp);
+                if root_rlp.len() >= 32 {
+                    hash_updates.push((root_idx, root_hash));
+                }
+                Some((root_hash, hash_updates))
+            }
+            MptNode::Extension(ext) => {
+                let child = self.encode_child_for_parent_collect_hash_only(&ext.child);
+                let root_rlp = encode_extension(&ext.nibbles, &child.embed);
+                let root_hash = hash::hash_rlp(&root_rlp);
+                let mut hash_updates = child.hash_updates;
+                if root_rlp.len() >= 32 {
+                    hash_updates.push((root_idx, root_hash));
+                }
+                Some((root_hash, hash_updates))
+            }
+            _ => None,
+        }
+    }
+
     fn encode_child_for_parent_collect_readonly(&self, child: &ChildRef) -> ChildArtifacts {
         match child {
             ChildRef::Arena(idx) => {
@@ -821,6 +914,44 @@ impl MptTree {
         }
     }
 
+    fn encode_child_for_parent_collect_hash_only(
+        &self,
+        child: &ChildRef,
+    ) -> HashOnlyChildArtifacts {
+        match child {
+            ChildRef::Arena(idx) => {
+                let idx = *idx;
+                if !self.arena.is_dirty(idx) {
+                    if let Some(hash) = self.arena.get_hash(idx) {
+                        return HashOnlyChildArtifacts {
+                            embed: hash.to_vec(),
+                            hash_updates: Vec::new(),
+                        };
+                    }
+                    if let Some(rlp) = self.arena.get_rlp(idx) {
+                        let hash = hash::hash_rlp(rlp);
+                        let embed = if rlp.len() < 32 { rlp.clone() } else { hash.to_vec() };
+                        let hash_updates =
+                            if rlp.len() >= 32 { vec![(idx, hash)] } else { Vec::new() };
+                        return HashOnlyChildArtifacts { embed, hash_updates };
+                    }
+                }
+
+                let node = self.compute_node_hash_only(idx);
+                HashOnlyChildArtifacts {
+                    embed: if node.rlp.len() < 32 { node.rlp.clone() } else { node.hash.to_vec() },
+                    hash_updates: node.hash_updates,
+                }
+            }
+            ChildRef::Inline(rlp) => {
+                HashOnlyChildArtifacts { embed: rlp.clone(), hash_updates: Vec::new() }
+            }
+            ChildRef::Hash(hash) => {
+                HashOnlyChildArtifacts { embed: hash.to_vec(), hash_updates: Vec::new() }
+            }
+        }
+    }
+
     fn compute_node_artifacts(&self, idx: u32) -> NodeArtifacts {
         let mut cache_updates = Vec::new();
         let mut dirty_blobs = Vec::new();
@@ -857,6 +988,37 @@ impl MptTree {
         }
 
         NodeArtifacts { rlp, hash: node_hash, cache_updates, dirty_blobs }
+    }
+
+    fn compute_node_hash_only(&self, idx: u32) -> HashOnlyNodeArtifacts {
+        let mut hash_updates = Vec::new();
+
+        let rlp = match self.arena.get(idx) {
+            MptNode::Leaf(leaf) => encode_leaf(&leaf.nibbles, &leaf.value),
+            MptNode::Extension(ext) => {
+                let child = self.encode_child_for_parent_collect_hash_only(&ext.child);
+                hash_updates.extend(child.hash_updates);
+                encode_extension(&ext.nibbles, &child.embed)
+            }
+            MptNode::Branch(branch) => {
+                let mut children_bytes: [Option<Vec<u8>>; 16] = std::array::from_fn(|_| None);
+                for (slot, child) in branch.children.iter().enumerate() {
+                    if let Some(child) = child {
+                        let artifacts = self.encode_child_for_parent_collect_hash_only(child);
+                        children_bytes[slot] = Some(artifacts.embed);
+                        hash_updates.extend(artifacts.hash_updates);
+                    }
+                }
+                encode_branch(&children_bytes, branch.value.as_deref())
+            }
+        };
+
+        let node_hash = self.arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
+        if rlp.len() >= 32 {
+            hash_updates.push((idx, node_hash));
+        }
+
+        HashOnlyNodeArtifacts { rlp, hash: node_hash, hash_updates }
     }
 }
 

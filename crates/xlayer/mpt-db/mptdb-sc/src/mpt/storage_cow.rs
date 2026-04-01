@@ -14,12 +14,14 @@ use super::{
     encoding::decode_node,
     node::{BranchNode, ChildRef, ExtensionNode, LeafNode, MptNode},
     overlay::StorageOverlay,
+    parallel::ParallelismThresholds,
     persisted::{self, PersistedTrieStore},
     segment::{
         SegmentChildEmbedRef, SegmentNodeKind, SegmentNodeRef, SegmentPageLease,
         StorageTrieSegment, StorageTrieSegmentReader,
     },
     state::StorageChange,
+    storage_recompute,
     tree::MptTree,
     tree_algo,
 };
@@ -67,6 +69,8 @@ pub struct StorageTrieCow {
 }
 
 impl StorageTrieCow {
+    const ROOT_HASH_ONLY_PARALLEL_MIN_ARENA_NODES: usize = 4096;
+
     pub fn empty() -> Self {
         Self {
             root: CowRootRef::Empty,
@@ -632,9 +636,10 @@ impl StorageTrieCow {
         let root = match self.root {
             CowRootRef::Empty => alloy_trie::EMPTY_ROOT_HASH,
             CowRootRef::Arena(idx) => {
-                // Build an MptTree view (borrows the arena) and compute hash.
-                // MptTree::root_hash handles ChildRef::Hash without store access.
-                let mut tree = MptTree { arena: self.arena.clone(), root: Some(idx) };
+                // Build an MptTree from the owned arena and compute hash in-place.
+                // Avoid cloning the whole arena on the hot commit path.
+                let arena = std::mem::replace(&mut self.arena, MutableTrieArena::new());
+                let mut tree = MptTree { arena, root: Some(idx) };
                 let h = tree.root_hash();
                 // Propagate computed hashes back so the next block's proof
                 // extraction can read arena.get_hash(idx).
@@ -653,10 +658,45 @@ impl StorageTrieCow {
 
     /// Parallel variant — delegates to serial (no parallel optimisation needed).
     pub fn root_hash_only_parallel(
-        self,
+        mut self,
         store: &PersistedTrieStore,
     ) -> Result<(B256, StorageTrieCow)> {
+        if let CowRootRef::Arena(idx) = self.root {
+            let arena = std::mem::replace(&mut self.arena, MutableTrieArena::new());
+            let mut tree = MptTree { arena, root: Some(idx) };
+            let root = if tree.arena_len() >= Self::ROOT_HASH_ONLY_PARALLEL_MIN_ARENA_NODES {
+                tree.root_hash_parallel_hash_cache_only(&ParallelismThresholds::default())
+            } else {
+                tree.root_hash()
+            };
+            self.arena = tree.arena;
+            self.arena.snapshot();
+            return Ok((root, self));
+        }
         self.root_hash_only(store)
+    }
+
+    /// Account-trie hash-only parallel path (legacy recompute kernel).
+    ///
+    /// This intentionally mirrors the pre-sparse account-root computation path:
+    /// materialize lazy root if needed, then run `storage_recompute::recompute_hash_only_parallel`
+    /// and update hash cache in-place. No dirty blob collection.
+    pub fn root_hash_only_parallel_account(
+        mut self,
+        store: &PersistedTrieStore,
+    ) -> Result<(B256, StorageTrieCow)> {
+        let root = match self.root.clone() {
+            CowRootRef::Empty => None,
+            CowRootRef::Arena(idx) => Some(idx),
+            CowRootRef::Lazy(_) => self.materialize_root_subtree(store, self.root.clone())?,
+        };
+        self.root = match root {
+            Some(idx) => CowRootRef::Arena(idx),
+            None => CowRootRef::Empty,
+        };
+        self.prune_pending_lazy_children();
+        let hash = storage_recompute::recompute_hash_only_parallel(&mut self.arena, root);
+        Ok((hash, self))
     }
 
     /// Compute root hash and collect dirty node blobs for RocksDB persistence.

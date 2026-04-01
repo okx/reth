@@ -3768,7 +3768,7 @@ impl MptCommitStore {
         }
 
         // ── Phase 3: compute account root (no WAL, no version increment) ──
-        let (root, _) = account_trie.root_hash_only_parallel(&self.persisted)?;
+        let (root, _) = account_trie.root_hash_only_parallel_account(&self.persisted)?;
 
         Ok(root)
     }
@@ -5743,20 +5743,64 @@ impl MptCommitStore {
         let (state_root, account_blobs, account_cow) = if let Some(mut pending) =
             self.pending_sparse_state.take()
         {
-            // Sparse path: use SparseStateTrie.root_with_updates for the root.
-            // The account_cow (normal working trie after Phase 2 account updates)
-            // is used as the committed base for the next block.
-            let (root, trie_updates) = if mode.wal_first {
-                let root = pending
-                    .trie
-                    .root(&pending.factory)
-                    .map_err(|e| MptDbError::Other(format!("sparse root: {e}")))?;
-                (root, TrieUpdates::default())
+            // Sparse path:
+            // - wal_first: state root comes from the legacy account trie
+            //   (`root_hash_only_parallel`), which is already updated in Phase 2 with storage roots
+            //   produced by SparseStateTrie.
+            // - non-wal_first: keep SparseStateTrie::root_with_updates so we can collect
+            //   TrieUpdates for dirty blob generation.
+            let (root, trie_updates, account_cow) = if mode.wal_first {
+                let verify_sparse_root =
+                    std::env::var_os("MPT_VERIFY_WAL_SPARSE_ACCOUNT_ROOT").is_some();
+                let sparse_root = if verify_sparse_root {
+                    Some(
+                        pending
+                            .trie
+                            .root(&pending.factory)
+                            .map_err(|e| MptDbError::Other(format!("sparse root (verify): {e}")))?,
+                    )
+                } else {
+                    None
+                };
+
+                let (root, account_cow) = account_trie
+                    .root_hash_only_parallel_account(&self.persisted)
+                    .map_err(|err| {
+                        MptDbError::Other(format!("account trie root hash (wal_first): {err}"))
+                    })?;
+
+                if let Some(sparse_root) = sparse_root &&
+                    sparse_root != root
+                {
+                    return Err(MptDbError::Other(format!(
+                        "wal_first sparse root mismatch: sparse={sparse_root:?}, account_trie={root:?}"
+                    )));
+                }
+
+                (root, TrieUpdates::default(), account_cow)
             } else {
-                pending
+                let (root, trie_updates) = pending
                     .trie
                     .root_with_updates(&pending.factory)
-                    .map_err(|e| MptDbError::Other(format!("sparse root_with_updates: {e}")))?
+                    .map_err(|e| MptDbError::Other(format!("sparse root_with_updates: {e}")))?;
+                // Refresh hash cache on the old account trie for proof generation.
+                // In cross-block sparse steady state, account paths are usually
+                // already revealed (`last_sparse_account_reveal_keys == 0`).
+                // Keep snapshot-only in this path to avoid extra hashing cost.
+                let refresh_account_hash_cache =
+                    !self.config.cross_block_sparse || self.last_sparse_account_reveal_keys > 0;
+                let account_cow = if refresh_account_hash_cache {
+                    let (_, account_cow) = account_trie
+                        .root_hash_only_parallel_account(&self.persisted)
+                        .map_err(|err| {
+                            MptDbError::Other(format!("account trie hash cache update: {err}"))
+                        })?;
+                    account_cow
+                } else {
+                    account_trie.snapshot();
+                    account_trie
+                };
+                (root, trie_updates, account_cow)
             };
 
             // Phase 3b: generate dirty blobs for non-wal_first mode.
@@ -5795,36 +5839,6 @@ impl MptCommitStore {
                     storage_segment_build_elapsed += sparse_build_start.elapsed();
                 }
             }
-            // Update the account trie's hash_cache before storing as committed base.
-            //
-            // Without this, `convert_arena_to_account_proof_nodes_for_paths` triggers
-            // O(N_subtree) `compute_inline_rlp` recursion for every non-included sibling
-            // branch when building account proofs in the next block.  With N growing to
-            // hundreds of thousands of accounts during pre-pop, this causes O(N) work per
-            // block instead of O(K) (K = new accounts), making pre-pop 2× slower.
-            //
-            // `root_hash_only_parallel` processes only the dirty prefix_set (~70 K nodes
-            // for 10 K dirty accounts × path depth 7), costing ~7 ms per block — a
-            // negligible price to avoid the O(N) recursion on subsequent blocks.
-            //
-            // In cross-block sparse steady state, account paths are usually already
-            // revealed (`last_sparse_account_reveal_keys == 0`).  In that case this
-            // eager refresh is pure overhead on the critical path (B4.6: hundreds of
-            // ms/block).  Keep the arena snapshot only, and refresh hashes only on
-            // blocks that actually reveal new account paths.
-            let refresh_account_hash_cache =
-                !self.config.cross_block_sparse || self.last_sparse_account_reveal_keys > 0;
-            let account_cow = if refresh_account_hash_cache {
-                let (_, account_cow) =
-                    account_trie.root_hash_only_parallel(&self.persisted).map_err(|err| {
-                        MptDbError::Other(format!("account trie hash cache update: {err}"))
-                    })?;
-                account_cow
-            } else {
-                account_trie.snapshot();
-                account_trie
-            };
-
             // Store sparse trie for proof generation (latest committed version).
             // In cross-block mode, also return the trie to cross_block_sparse
             // so it can be reused in the next block's apply.
@@ -5843,7 +5857,7 @@ impl MptCommitStore {
             // Empty bundle (no pending sparse state) or non-sparse path.
             // Compute root from the working account trie without collecting blobs.
             let (root, cow) = account_trie
-                .root_hash_only_parallel(&self.persisted)
+                .root_hash_only_parallel_account(&self.persisted)
                 .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?;
             (root, Vec::<(B256, Vec<u8>)>::new(), cow)
         } else {
