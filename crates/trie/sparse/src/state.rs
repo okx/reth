@@ -578,6 +578,77 @@ where
         self.storage.tries.get_mut(&account).and_then(|trie| trie.root())
     }
 
+    /// Returns storage trie roots for the provided accounts.
+    ///
+    /// For `std` builds this computes roots in parallel by temporarily taking
+    /// the requested tries out of the internal map, matching the parallel
+    /// reveal pattern used by `reveal_decoded_multiproof`.
+    pub fn storage_roots_for_accounts(
+        &mut self,
+        accounts: &[B256],
+    ) -> SparseStateTrieResult<B256Map<B256>> {
+        #[cfg(not(feature = "std"))]
+        {
+            let mut out = B256Map::default();
+            for account in accounts {
+                if let Some(root) = self.storage_root(*account) {
+                    out.insert(*account, root);
+                }
+            }
+            return Ok(out)
+        }
+
+        #[cfg(feature = "std")]
+        {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let mut selected: Vec<(B256, SparseTrie<S>)> = Vec::new();
+            selected.reserve(accounts.len());
+            for account in accounts {
+                if let Some(trie) = self.storage.tries.remove(account) {
+                    selected.push((*account, trie));
+                }
+            }
+
+            let results: Vec<(B256, SparseTrie<S>, SparseStateTrieResult<B256>)> =
+                if selected.len() >= 64 {
+                    selected
+                        .into_par_iter()
+                        .map(|(account, mut trie)| {
+                            let root = trie.root().ok_or(SparseTrieErrorKind::Blind.into());
+                            (account, trie, root)
+                        })
+                        .collect()
+                } else {
+                    selected
+                        .into_iter()
+                        .map(|(account, mut trie)| {
+                            let root = trie.root().ok_or(SparseTrieErrorKind::Blind.into());
+                            (account, trie, root)
+                        })
+                        .collect()
+                };
+
+            let mut out = B256Map::default();
+            let mut any_err = None;
+            for (account, trie, root_result) in results {
+                self.storage.tries.insert(account, trie);
+                match root_result {
+                    Ok(root) => {
+                        out.insert(account, root);
+                    }
+                    Err(err) => {
+                        any_err = Some(err);
+                    }
+                }
+            }
+
+            if let Some(err) = any_err {
+                return Err(err);
+            }
+            Ok(out)
+        }
+    }
+
     /// Returns mutable reference to the revealed account sparse trie.
     ///
     /// If the trie is not revealed yet, its root will be revealed using the trie node provider.
@@ -626,6 +697,11 @@ where
         // record revealed node metrics
         #[cfg(feature = "metrics")]
         self.metrics.record();
+
+        if !self.retain_updates {
+            let root = self.revealed_trie_mut(provider_factory)?.root();
+            return Ok((root, TrieUpdates::default()));
+        }
 
         let storage_tries = self.storage_trie_updates();
         let revealed = self.revealed_trie_mut(provider_factory)?;

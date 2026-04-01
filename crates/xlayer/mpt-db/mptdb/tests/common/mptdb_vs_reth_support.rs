@@ -699,7 +699,9 @@ pub fn run_mpt_only_profile(scenario: ProfileScenario) -> MptRun {
                 profile.apply_l3_published_post_flush_hits;
             println!(
                 "  block {:>2}: total={} apply={} commit={} trie_load={} slot_updates={} \
-storage_roots={} wal_append={} wal_lock_wait={} l3_load={} l3_hits={} root_handles={}/{}",
+storage_roots={} wal_append={} wal_lock_wait={} l3_load={} l3_hits={} root_handles={}/{} \
+sseg={}/{} smiss={} srm={} t3={}/{} t12={} creuse={} cmiss={} \
+sp_fb={} sp_ap={} sp_ch={}",
                 block_idx + 1,
                 fmt_ms(profile.apply_bundle_state + profile.total_commit),
                 fmt_ms(profile.apply_bundle_state),
@@ -713,6 +715,18 @@ storage_roots={} wal_append={} wal_lock_wait={} l3_load={} l3_hits={} root_handl
                 l3_hits,
                 profile.storage_roots_precomputed_handles,
                 profile.storage_roots_working_handles,
+                profile.sparse_factory_segment_hits,
+                profile.sparse_factory_segment_lookups,
+                profile.sparse_factory_segment_miss + profile.sparse_factory_segment_miss_no_store,
+                profile.sparse_factory_segment_root_mismatch,
+                profile.sparse_factory_tier3_hits,
+                profile.sparse_factory_tier3_attempts,
+                profile.sparse_factory_tier12_attempts,
+                profile.sparse_factory_cross_reuse_accounts,
+                profile.sparse_factory_cross_missing_slots,
+                fmt_ms(profile.sparse_apply_factory_build),
+                fmt_ms(profile.sparse_apply_account_proof),
+                fmt_ms(profile.sparse_apply_apply_changes),
             );
         }
         accumulate_mptdb_profile(&mut mptdb_totals, &profile);

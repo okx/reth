@@ -5,7 +5,7 @@ use fs4::fs_std::FileExt;
 use mptdb_common::error::{MptDbError, Result};
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use reth_trie_common::AccountProof;
+use reth_trie_common::{updates::TrieUpdates, AccountProof};
 use reth_trie_sparse::SparseStateTrie;
 use revm_database::BundleState;
 use schnellru::{ByLength, LruMap};
@@ -36,9 +36,10 @@ use super::{
     segment::StorageTrieSegment,
     snapshot::{SnapshotExporter, SnapshotImporter},
     sparse_storage::{
-        apply_all_storage_changes_sparse, convert_arena_to_account_proof_nodes,
-        convert_arena_to_decoded_storage_multiproof, extract_account_proof_from_sparse_trie,
-        extract_storage_proof_from_sparse_trie, SegmentTrieNodeProviderFactory,
+        apply_all_storage_changes_sparse, build_storage_segments_from_sparse_trie,
+        convert_arena_to_account_proof_nodes_for_paths,
+        convert_arena_to_decoded_storage_multiproof, extract_storage_proof_from_sparse_trie,
+        SegmentTrieNodeProviderFactory,
     },
     state::{self, DirtyAccount},
     storage_cow::{CowRootRef, StorageTrieCow},
@@ -553,6 +554,36 @@ pub struct CommitProfile {
     pub apply_branch_collapse_to_extension: u64,
     pub apply_extension_leaf_merges: u64,
     pub apply_extension_extension_merges: u64,
+    /// Sparse apply: time spent building SegmentTrieNodeProviderFactory.
+    pub sparse_apply_factory_build: Duration,
+    /// Sparse apply: time spent extracting account multiproof.
+    pub sparse_apply_account_proof: Duration,
+    /// Sparse apply: time spent in apply_all_storage_changes_sparse.
+    pub sparse_apply_apply_changes: Duration,
+    /// Sparse factory: number of dirty accounts examined.
+    pub sparse_factory_dirty_accounts: u64,
+    /// Sparse factory: number of accounts with storage changes.
+    pub sparse_factory_storage_accounts: u64,
+    /// Sparse factory: published segment lookup attempts.
+    pub sparse_factory_segment_lookups: u64,
+    /// Sparse factory: published segment lookup hits.
+    pub sparse_factory_segment_hits: u64,
+    /// Sparse factory: segment lookup missed because published_store is absent.
+    pub sparse_factory_segment_miss_no_store: u64,
+    /// Sparse factory: segment lookup miss (entry missing/stale/corrupt).
+    pub sparse_factory_segment_miss: u64,
+    /// Sparse factory: subset of misses where entry exists but root mismatches expected_root.
+    pub sparse_factory_segment_root_mismatch: u64,
+    /// Sparse factory: tier-3 dirty-path proof preload attempts.
+    pub sparse_factory_tier3_attempts: u64,
+    /// Sparse factory: tier-3 dirty-path proof preload successes.
+    pub sparse_factory_tier3_hits: u64,
+    /// Sparse factory: fallback to tier1/2 proof construction attempts.
+    pub sparse_factory_tier12_attempts: u64,
+    /// Sparse factory (cross-block): accounts already revealed in cross trie.
+    pub sparse_factory_cross_reuse_accounts: u64,
+    /// Sparse factory (cross-block): total newly-touched slots not yet revealed.
+    pub sparse_factory_cross_missing_slots: u64,
     pub storage_roots: Duration,
     pub storage_roots_prefill: Duration,
     pub storage_roots_take_handles: Duration,
@@ -628,6 +659,22 @@ struct StorageTrieLoadStats {
     l3_latest_load: Duration,
     l3_published_load: Duration,
     refresh_elapsed: Duration,
+}
+
+#[derive(Default, Clone, Copy)]
+struct SparseFactoryStats {
+    dirty_accounts: u64,
+    storage_accounts: u64,
+    segment_lookups: u64,
+    segment_hits: u64,
+    segment_miss_no_store: u64,
+    segment_miss: u64,
+    segment_root_mismatch: u64,
+    tier3_attempts: u64,
+    tier3_hits: u64,
+    tier12_attempts: u64,
+    cross_reuse_accounts: u64,
+    cross_missing_slots: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -725,6 +772,15 @@ pub struct MptCommitStore {
     last_apply_branch_collapse_to_extension: u64,
     last_apply_extension_leaf_merges: u64,
     last_apply_extension_extension_merges: u64,
+    last_sparse_apply_factory_build: Duration,
+    last_sparse_apply_account_proof: Duration,
+    last_sparse_apply_apply_changes: Duration,
+    /// Number of account paths that required reveal in the latest sparse apply.
+    ///
+    /// When this is zero in cross-block sparse mode, the next commit can skip
+    /// eager account-trie hash-cache refresh and keep only arena snapshots.
+    last_sparse_account_reveal_keys: usize,
+    last_apply_sparse_factory: SparseFactoryStats,
     last_wal_append_lock_wait: Duration,
     last_wal_append_write: Duration,
     last_wal_serialize: Duration,
@@ -797,6 +853,10 @@ fn is_sparse_storage_forced() -> bool {
 impl MptCommitStore {
     fn diagnostics_enabled() -> bool {
         std::env::var_os("MPT_DEBUG_DIAGNOSTICS").is_some()
+    }
+
+    fn sparse_l3_trace_enabled() -> bool {
+        std::env::var_os("MPT_SPARSE_L3_TRACE").is_some()
     }
 
     fn l2_freq_admission_enabled_from_env() -> bool {
@@ -1344,15 +1404,29 @@ impl MptCommitStore {
             .filter(|d| d.info.is_none() && d.storage_wiped)
             .map(|d| d.hashed_address)
             .collect();
-        let mut published_deletes = deleted_accounts.iter().copied().collect::<Vec<_>>();
-        published_deletes.extend(storage_cache_candidates.iter().filter_map(|(addr, _)| {
-            match storage_roots.get(addr).copied() {
-                Some(root) if root == EMPTY_ROOT_HASH && !deleted_accounts.contains(addr) => {
-                    Some(*addr)
-                }
-                _ => None,
+        let mut published_deletes_set: HashSet<B256> = deleted_accounts.clone();
+        for (addr, _) in storage_cache_candidates {
+            if storage_roots.get(addr).copied() == Some(EMPTY_ROOT_HASH) &&
+                !deleted_accounts.contains(addr)
+            {
+                published_deletes_set.insert(*addr);
             }
-        }));
+        }
+        // Sparse-only path has no storage_cache_candidates.  For any account
+        // that touched storage this block and ended at EMPTY_ROOT_HASH, publish
+        // a delete so L3 does not retain stale old-root pages.
+        for dirty in &self.dirty_accounts {
+            if deleted_accounts.contains(&dirty.hashed_address) {
+                continue;
+            }
+            if !dirty.storage_wiped && dirty.storage_changes.is_empty() {
+                continue;
+            }
+            if storage_roots.get(&dirty.hashed_address).copied() == Some(EMPTY_ROOT_HASH) {
+                published_deletes_set.insert(dirty.hashed_address);
+            }
+        }
+        let published_deletes = published_deletes_set.into_iter().collect::<Vec<_>>();
 
         let use_async = allow_async &&
             all_blobs_len < self.config.async_blob_threshold &&
@@ -1388,6 +1462,7 @@ impl MptCommitStore {
         storage_roots: &HashMap<B256, B256>,
         storage_cache_candidates: &mut [(B256, StorageTrieCow)],
         deferred_published_roots: Vec<(B256, B256)>,
+        sparse_published_puts: Vec<(B256, StorageTrieSegment)>,
         mode: CommitExecutionMode,
         storage_segment_build_elapsed: &mut Duration,
     ) -> Result<SavedStorageVersion> {
@@ -1420,21 +1495,22 @@ impl MptCommitStore {
             // Parallel via rayon: amortizes 5000 storage tries across cores,
             // adapting sei-db's single-tree COW model to Ethereum's two-layer
             // trie architecture.
-            let committed_tries = if mode.wal_first && mode.publish_baseline {
-                storage_cache_candidates
-                    .par_iter_mut()
-                    .filter_map(|(addr, trie)| {
-                        let root = storage_roots.get(addr).copied().unwrap_or(EMPTY_ROOT_HASH);
-                        if root == EMPTY_ROOT_HASH {
-                            return None;
-                        }
-                        trie.snapshot();
-                        Some((*addr, root, trie.clone()))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            let committed_tries =
+                if mode.wal_first && mode.publish_baseline && sparse_published_puts.is_empty() {
+                    storage_cache_candidates
+                        .par_iter_mut()
+                        .filter_map(|(addr, trie)| {
+                            let root = storage_roots.get(addr).copied().unwrap_or(EMPTY_ROOT_HASH);
+                            if root == EMPTY_ROOT_HASH {
+                                return None;
+                            }
+                            trie.snapshot();
+                            Some((*addr, root, trie.clone()))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
             let (job_deferred_roots, job_blobs) = if mode.wal_first {
                 // No blobs, no deferred roots — worker builds from trie clones.
@@ -1449,7 +1525,7 @@ impl MptCommitStore {
                 barrier_only: false,
                 replay_from_wal: false,
                 blobs: job_blobs,
-                published_puts: Vec::new(),
+                published_puts: sparse_published_puts,
                 deferred_published_roots: job_deferred_roots,
                 published_deletes: prepared.published_deletes.clone(),
                 publish_baseline: mode.publish_baseline,
@@ -1464,12 +1540,16 @@ impl MptCommitStore {
             tx.send(job).map_err(|e| MptDbError::Other(format!("send persist job: {e}")))?;
         } else {
             if mode.publish_baseline {
-                let segment_build_start = std::time::Instant::now();
-                published_puts = Self::build_publish_segments_from_tries(
-                    storage_roots,
-                    storage_cache_candidates,
-                )?;
-                *storage_segment_build_elapsed += segment_build_start.elapsed();
+                if sparse_published_puts.is_empty() {
+                    let segment_build_start = std::time::Instant::now();
+                    published_puts = Self::build_publish_segments_from_tries(
+                        storage_roots,
+                        storage_cache_candidates,
+                    )?;
+                    *storage_segment_build_elapsed += segment_build_start.elapsed();
+                } else {
+                    published_puts = sparse_published_puts;
+                }
             }
             let persist_batch_start = std::time::Instant::now();
             self.persisted.persist_batch(&all_blobs, true)?;
@@ -3010,6 +3090,11 @@ impl MptCommitStore {
             last_apply_branch_collapse_to_extension: 0,
             last_apply_extension_leaf_merges: 0,
             last_apply_extension_extension_merges: 0,
+            last_sparse_apply_factory_build: Duration::ZERO,
+            last_sparse_apply_account_proof: Duration::ZERO,
+            last_sparse_apply_apply_changes: Duration::ZERO,
+            last_sparse_account_reveal_keys: 0,
+            last_apply_sparse_factory: SparseFactoryStats::default(),
             last_wal_append_lock_wait: Duration::ZERO,
             last_wal_append_write: Duration::ZERO,
             last_wal_serialize: Duration::ZERO,
@@ -3429,6 +3514,11 @@ impl MptCommitStore {
             last_apply_branch_collapse_to_extension: 0,
             last_apply_extension_leaf_merges: 0,
             last_apply_extension_extension_merges: 0,
+            last_sparse_apply_factory_build: Duration::ZERO,
+            last_sparse_apply_account_proof: Duration::ZERO,
+            last_sparse_apply_apply_changes: Duration::ZERO,
+            last_sparse_account_reveal_keys: 0,
+            last_apply_sparse_factory: SparseFactoryStats::default(),
             last_wal_append_lock_wait: Duration::ZERO,
             last_wal_append_write: Duration::ZERO,
             last_wal_serialize: Duration::ZERO,
@@ -4549,26 +4639,42 @@ impl MptCommitStore {
     fn build_sparse_factory(
         &self,
         dirty_accounts: &[DirtyAccount],
+        stats: &mut SparseFactoryStats,
     ) -> SegmentTrieNodeProviderFactory {
         let mut factory = SegmentTrieNodeProviderFactory::new();
+        stats.dirty_accounts = dirty_accounts.len() as u64;
         for dirty in dirty_accounts {
             if dirty.storage_known_empty || dirty.storage_wiped {
                 factory.known_empty_accounts.insert(dirty.hashed_address);
             } else if !dirty.storage_changes.is_empty() {
+                stats.storage_accounts += 1;
                 let root = self.get_existing_storage_root(&dirty.hashed_address);
                 if root == EMPTY_ROOT_HASH {
                     factory.known_empty_accounts.insert(dirty.hashed_address);
                 } else if let Some(store) = &self.published_store {
+                    stats.segment_lookups += 1;
                     match store.open_trie_page(&dirty.hashed_address, root) {
                         Ok(Some(loaded)) => {
+                            stats.segment_hits += 1;
                             factory.storage_segments.insert(dirty.hashed_address, loaded.lease);
                         }
                         _ => {
+                            stats.segment_miss += 1;
+                            if Self::sparse_l3_trace_enabled() {
+                                if let Ok(Some(entry_root)) =
+                                    store.lookup_trie_root(&dirty.hashed_address)
+                                {
+                                    if entry_root != root {
+                                        stats.segment_root_mismatch += 1;
+                                    }
+                                }
+                            }
                             // Segment missing or stale root mismatch.
                             // Account HAS prior storage — do NOT mark as known_empty.
                             // Fall back to sparse trie / L2 cache / persisted store.
                             let dirty_keys: Vec<Nibbles> =
                                 dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
+                            stats.tier12_attempts += 1;
                             self.try_build_l2_proof(
                                 &dirty.hashed_address,
                                 root,
@@ -4578,9 +4684,11 @@ impl MptCommitStore {
                         }
                     }
                 } else {
+                    stats.segment_miss_no_store += 1;
                     // No published store at all: fall back to sparse trie / L2 / persisted.
                     let dirty_keys: Vec<Nibbles> =
                         dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
+                    stats.tier12_attempts += 1;
                     self.try_build_l2_proof(&dirty.hashed_address, root, &dirty_keys, &mut factory);
                 }
             }
@@ -4607,8 +4715,10 @@ impl MptCommitStore {
         &self,
         dirty_accounts: &[DirtyAccount],
         cross_trie: &SparseStateTrie,
+        stats: &mut SparseFactoryStats,
     ) -> SegmentTrieNodeProviderFactory {
         let mut factory = SegmentTrieNodeProviderFactory::new();
+        stats.dirty_accounts = dirty_accounts.len() as u64;
         for dirty in dirty_accounts {
             if dirty.storage_known_empty || dirty.storage_wiped {
                 factory.known_empty_accounts.insert(dirty.hashed_address);
@@ -4618,6 +4728,7 @@ impl MptCommitStore {
                 // Balance/nonce-only change: no storage reveal needed.
                 continue;
             }
+            stats.storage_accounts += 1;
 
             let root = self.get_existing_storage_root(&dirty.hashed_address);
             if root == EMPTY_ROOT_HASH {
@@ -4627,14 +4738,29 @@ impl MptCommitStore {
 
             // Try published segment first (O(1)).
             let segment_ok = if let Some(store) = &self.published_store {
+                stats.segment_lookups += 1;
                 match store.open_trie_page(&dirty.hashed_address, root) {
                     Ok(Some(loaded)) => {
+                        stats.segment_hits += 1;
                         factory.storage_segments.insert(dirty.hashed_address, loaded.lease);
                         true
                     }
-                    _ => false,
+                    _ => {
+                        stats.segment_miss += 1;
+                        if Self::sparse_l3_trace_enabled() {
+                            if let Ok(Some(entry_root)) =
+                                store.lookup_trie_root(&dirty.hashed_address)
+                            {
+                                if entry_root != root {
+                                    stats.segment_root_mismatch += 1;
+                                }
+                            }
+                        }
+                        false
+                    }
                 }
             } else {
+                stats.segment_miss_no_store += 1;
                 false
             };
             if segment_ok {
@@ -4647,18 +4773,43 @@ impl MptCommitStore {
 
             if cross_trie.storage_trie_ref(&dirty.hashed_address).is_some() {
                 // Account is already revealed in the cross-block trie.
-                // Skip tier-1/2 full-arena DFS; use tier-3 dirty-key preload only.
-                // The provider's `pre_built_proof` will serve any Hash-blinded nodes
-                // encountered for genuinely new dirty slots.
+                stats.cross_reuse_accounts += 1;
+                // For slots already revealed in previous blocks, no proof work is needed.
+                let missing_keys: Vec<Nibbles> = dirty
+                    .storage_changes
+                    .iter()
+                    .filter(|c| {
+                        !cross_trie.is_storage_slot_revealed(dirty.hashed_address, c.hashed_slot)
+                    })
+                    .map(|c| c.slot_key.clone())
+                    .collect();
+                stats.cross_missing_slots += missing_keys.len() as u64;
+                if missing_keys.is_empty() {
+                    continue;
+                }
+                // Only build tier-3 proof for newly-touched slots.
+                self.try_build_l2_proof_tier3_only(
+                    &dirty.hashed_address,
+                    root,
+                    &missing_keys,
+                    &mut factory,
+                    stats,
+                );
+            } else {
+                // Account not yet in cross-block trie:
+                // prefer tier-3 dirty-path proof first to avoid full-arena DFS.
+                let before = factory.pre_built_storage_proofs.len();
                 self.try_build_l2_proof_tier3_only(
                     &dirty.hashed_address,
                     root,
                     &dirty_keys,
                     &mut factory,
+                    stats,
                 );
-            } else {
-                // Account not yet in cross-block trie: full tier-1/2/3 fallback.
-                self.try_build_l2_proof(&dirty.hashed_address, root, &dirty_keys, &mut factory);
+                if factory.pre_built_storage_proofs.len() == before {
+                    stats.tier12_attempts += 1;
+                    self.try_build_l2_proof(&dirty.hashed_address, root, &dirty_keys, &mut factory);
+                }
             }
         }
         factory
@@ -4676,14 +4827,17 @@ impl MptCommitStore {
         root: B256,
         dirty_keys: &[Nibbles],
         factory: &mut SegmentTrieNodeProviderFactory,
+        stats: &mut SparseFactoryStats,
     ) {
         if dirty_keys.is_empty() {
             return;
         }
+        stats.tier3_attempts += 1;
         let mut cow = StorageTrieCow::from_persisted_root(root);
         if cow.preload_paths(&self.persisted, dirty_keys).is_ok() {
             match convert_arena_to_decoded_storage_multiproof(cow.arena(), cow.root_index(), root) {
                 Ok(proof) => {
+                    stats.tier3_hits += 1;
                     factory.pre_built_storage_proofs.insert(*hashed_addr, proof);
                     return;
                 }
@@ -4697,38 +4851,41 @@ impl MptCommitStore {
         // already has the account fully revealed (no Hash nodes on dirty paths).
     }
 
-    /// Extract the account trie proof for sparse reveal.
+    /// Extract a **path-limited** account trie proof for sparse reveal.
     ///
-    /// Prefers the **previous block's committed sparse trie** (`last_committed_sparse_trie`)
-    /// because its node hashes are always correct (computed by `root_with_updates`).
-    ///
-    /// Falls back to the committed arena (`account_trie.base`) on the first block or
-    /// after restart when no sparse trie is available yet.
-    fn extract_account_proof_from_base(
+    /// Only dirty account paths are materialized and exported, avoiding a full
+    /// account-trie DFS on each block.
+    fn extract_account_proof_from_keys(
         &mut self,
-        dirty_accounts: &[DirtyAccount],
+        account_keys: &[Nibbles],
     ) -> Result<(alloy_trie::proof::DecodedProofNodes, reth_trie_common::BranchNodeMasksMap)> {
-        // Prefer previous sparse trie: hashes are always up-to-date.
-        if let Some(ref prev_sparse) = self.last_committed_sparse_trie {
-            return extract_account_proof_from_sparse_trie(prev_sparse);
+        if account_keys.is_empty() {
+            return Ok((
+                alloy_trie::proof::DecodedProofNodes::default(),
+                reth_trie_common::BranchNodeMasksMap::default(),
+            ));
         }
-        if let Some(ref cross) = self.cross_block_sparse {
-            if !cross.trie.state_trie_ref().is_none() {
-                return extract_account_proof_from_sparse_trie(&cross.trie);
-            }
-        }
-        // First block or restart: fall back to committed arena.
+
         let working_version = self.current_working_version();
         self.account_trie.checkout_for_write(working_version);
-        let account_keys: Vec<Nibbles> =
-            dirty_accounts.iter().map(|d| d.account_key.clone()).collect();
-        if self.account_trie.base.is_lazy_root() {
+
+        if let Some(working) = self.account_trie.working.as_mut() {
             let persisted = Arc::clone(&self.persisted);
-            self.account_trie.base.preload_paths(&persisted, &account_keys)?;
+            working.preload_paths(&persisted, account_keys)?;
+            return convert_arena_to_account_proof_nodes_for_paths(
+                working.arena(),
+                working.root_index(),
+                account_keys,
+            );
         }
-        convert_arena_to_account_proof_nodes(
+
+        // Defensive fallback: if no working copy is present, load from base.
+        let persisted = Arc::clone(&self.persisted);
+        self.account_trie.base.preload_paths(&persisted, account_keys)?;
+        convert_arena_to_account_proof_nodes_for_paths(
             self.account_trie.base.arena(),
             self.account_trie.base.root_index(),
+            account_keys,
         )
     }
 
@@ -4743,6 +4900,7 @@ impl MptCommitStore {
     /// `dirty_accounts` is empty — the normal Phase 2b path handles empty
     /// blocks correctly and produces the unchanged previous state root.
     fn apply_dirty_accounts_inner_sparse(&mut self, dirty_accounts: &[DirtyAccount]) -> Result<()> {
+        let mut sparse_stats = SparseFactoryStats::default();
         // Always set working_version so account_trie_handle_versions() is correct.
         let working_version = self.current_working_version();
         self.account_trie.checkout_for_write(working_version);
@@ -4752,17 +4910,37 @@ impl MptCommitStore {
             // so Phase 2 of commit_inner_with_mode doesn't re-encode the PREVIOUS
             // block's accounts, which would produce a wrong state root.
             self.dirty_accounts = Vec::new();
+            self.last_sparse_account_reveal_keys = 0;
+            self.last_apply_sparse_factory = sparse_stats;
             return Ok(());
         }
 
+        // Sparse path reads published segments directly in factory-building.
+        // Refresh the published view so open_trie_page() can hit newly-published
+        // generations after flush_persist/background publish.
+        self.maybe_refresh_published_view()?;
+
         if self.config.cross_block_sparse {
-            return self.apply_dirty_accounts_inner_cross_block(dirty_accounts);
+            let result =
+                self.apply_dirty_accounts_inner_cross_block(dirty_accounts, &mut sparse_stats);
+            self.last_apply_sparse_factory = sparse_stats;
+            return result;
         }
 
-        let factory = self.build_sparse_factory(dirty_accounts);
-        let account_proof = self.extract_account_proof_from_base(dirty_accounts)?;
+        let factory_start = std::time::Instant::now();
+        let factory = self.build_sparse_factory(dirty_accounts, &mut sparse_stats);
+        self.last_sparse_apply_factory_build = factory_start.elapsed();
 
-        let mut sparse_trie = SparseStateTrie::default().with_updates(true);
+        let account_proof_start = std::time::Instant::now();
+        let account_keys: Vec<Nibbles> =
+            dirty_accounts.iter().map(|d| d.account_key.clone()).collect();
+        self.last_sparse_account_reveal_keys = account_keys.len();
+        let account_proof = self.extract_account_proof_from_keys(&account_keys)?;
+        self.last_sparse_apply_account_proof = account_proof_start.elapsed();
+
+        let mut sparse_trie =
+            SparseStateTrie::default().with_updates(!self.config.wal_first_commit);
+        let apply_changes_start = std::time::Instant::now();
         apply_all_storage_changes_sparse(
             &mut sparse_trie,
             account_proof,
@@ -4770,11 +4948,13 @@ impl MptCommitStore {
             dirty_accounts,
             false, // fresh trie: full reveal required
         )?;
+        self.last_sparse_apply_apply_changes = apply_changes_start.elapsed();
 
         self.pending_sparse_state =
             Some(Box::new(PendingSparseState { trie: sparse_trie, factory }));
         // Store dirty_accounts — the normal apply no longer runs in sparse mode.
         self.dirty_accounts = dirty_accounts.to_vec();
+        self.last_apply_sparse_factory = sparse_stats;
         Ok(())
     }
 
@@ -4794,7 +4974,9 @@ impl MptCommitStore {
     fn apply_dirty_accounts_inner_cross_block(
         &mut self,
         dirty_accounts: &[DirtyAccount],
+        stats: &mut SparseFactoryStats,
     ) -> Result<()> {
+        let mut sparse_apply_changes_elapsed = Duration::ZERO;
         let next_version = self.version + 1;
 
         // ── Phase A: build factory and account proof (immutable/exclusive borrows
@@ -4804,42 +4986,42 @@ impl MptCommitStore {
         // Factory build: for the reuse path, borrow cross.trie immutably to
         // check which accounts are already revealed.  This borrow is released
         // before the mutable Phase B begins.
+        let factory_start = std::time::Instant::now();
         let factory = if in_reuse_mode {
             // SAFETY: both borrows are immutable.  &cross.trie is a sub-borrow of
             // &self; &self is the receiver of build_sparse_factory_cross_block_reuse.
             // Rust allows multiple shared references simultaneously.
             let cross_trie = &self.cross_block_sparse.as_ref().unwrap().trie;
-            self.build_sparse_factory_cross_block_reuse(dirty_accounts, cross_trie)
+            self.build_sparse_factory_cross_block_reuse(dirty_accounts, cross_trie, stats)
         } else {
-            self.build_sparse_factory(dirty_accounts)
+            self.build_sparse_factory(dirty_accounts, stats)
         };
+        self.last_sparse_apply_factory_build = factory_start.elapsed();
 
-        // Account proof: check if ALL dirty accounts are already in the cross-block
-        // account trie.  If yes, the entire DFS + reveal is skipped (empty proof is
-        // a no-op for `reveal_decoded_account_multiproof` when the trie is already
-        // fully populated).  This eliminates the O(all_account_nodes) DFS for the
-        // common case where only previously-touched accounts are dirty.
-        //
-        // If ANY new account appears (not yet in cross.trie), fall back to the full
-        // proof extraction so that `is_account_revealed` is set for it, enabling the
-        // correct `update_account` path in Step 3.
-        let all_account_trie_revealed = if in_reuse_mode {
+        // Account proof: in reuse mode, reveal only NEW account paths that are
+        // not yet present in cross.trie.
+        let account_keys_to_reveal: Vec<Nibbles> = if in_reuse_mode {
             let cross_trie = &self.cross_block_sparse.as_ref().unwrap().trie;
-            dirty_accounts.iter().all(|d| cross_trie.is_account_revealed(d.hashed_address))
+            dirty_accounts
+                .iter()
+                .filter(|d| !cross_trie.is_account_revealed(d.hashed_address))
+                .map(|d| d.account_key.clone())
+                .collect()
         } else {
-            false
+            dirty_accounts.iter().map(|d| d.account_key.clone()).collect()
         };
-
-        let account_proof = if in_reuse_mode && all_account_trie_revealed {
+        self.last_sparse_account_reveal_keys = account_keys_to_reveal.len();
+        let account_proof_start = std::time::Instant::now();
+        let account_proof = if account_keys_to_reveal.is_empty() {
             // All accounts already in account trie: pass empty proof (no-op reveal).
             (
                 alloy_trie::proof::DecodedProofNodes::default(),
                 reth_trie_common::BranchNodeMasksMap::default(),
             )
         } else {
-            // First block, or some new accounts: build full proof.
-            self.extract_account_proof_from_base(dirty_accounts)?
+            self.extract_account_proof_from_keys(&account_keys_to_reveal)?
         };
+        self.last_sparse_apply_account_proof = account_proof_start.elapsed();
 
         // ── Phase B: apply changes (mutable borrow of cross.trie) ────────────
         if let Some(ref mut cross) = self.cross_block_sparse {
@@ -4850,6 +5032,7 @@ impl MptCommitStore {
 
             // Apply changes with skip_already_revealed_storage=true:
             // storage tries already in cross.trie skip the reveal step entirely.
+            let apply_changes_start = std::time::Instant::now();
             apply_all_storage_changes_sparse(
                 &mut cross.trie,
                 account_proof,
@@ -4857,6 +5040,7 @@ impl MptCommitStore {
                 dirty_accounts,
                 true, // skip_already_revealed_storage
             )?;
+            sparse_apply_changes_elapsed += apply_changes_start.elapsed();
 
             // Update access version for dirty storage accounts.
             for dirty in dirty_accounts {
@@ -4884,8 +5068,10 @@ impl MptCommitStore {
             // Build pending from the reused trie (factory already updated above).
             // We take the trie out of cross_block_sparse temporarily;
             // commit_inner_with_mode will put it back.
-            let trie_for_pending =
-                std::mem::replace(&mut cross.trie, SparseStateTrie::default().with_updates(true));
+            let trie_for_pending = std::mem::replace(
+                &mut cross.trie,
+                SparseStateTrie::default().with_updates(!self.config.wal_first_commit),
+            );
             let factory_clone = SegmentTrieNodeProviderFactory {
                 account_segment: cross.factory.account_segment.clone(),
                 storage_segments: cross.factory.storage_segments.clone(),
@@ -4899,7 +5085,9 @@ impl MptCommitStore {
         } else {
             // ── First block: initialise cross-block state ─────────────────────
             // factory and account_proof were built in Phase A above.
-            let mut sparse_trie = SparseStateTrie::default().with_updates(true);
+            let mut sparse_trie =
+                SparseStateTrie::default().with_updates(!self.config.wal_first_commit);
+            let apply_changes_start = std::time::Instant::now();
             apply_all_storage_changes_sparse(
                 &mut sparse_trie,
                 account_proof,
@@ -4907,6 +5095,7 @@ impl MptCommitStore {
                 dirty_accounts,
                 false, // first block: all storage tries need full reveal
             )?;
+            sparse_apply_changes_elapsed += apply_changes_start.elapsed();
 
             // Initialise access tracking for dirty storage accounts.
             let mut storage_last_block = alloy_primitives::map::HashMap::default();
@@ -4926,7 +5115,7 @@ impl MptCommitStore {
                 known_empty_accounts: factory.known_empty_accounts.clone(),
             };
             self.cross_block_sparse = Some(Box::new(CrossBlockSparseState {
-                trie: SparseStateTrie::default().with_updates(true), // placeholder
+                trie: SparseStateTrie::default().with_updates(!self.config.wal_first_commit), /* placeholder */
                 factory: factory_clone,
                 storage_last_block,
             }));
@@ -4934,26 +5123,20 @@ impl MptCommitStore {
                 Some(Box::new(PendingSparseState { trie: sparse_trie, factory }));
         }
         self.dirty_accounts = dirty_accounts.to_vec();
+        self.last_sparse_apply_apply_changes = sparse_apply_changes_elapsed;
         Ok(())
     }
 
     fn apply_dirty_accounts_inner(&mut self, dirty_accounts: Vec<DirtyAccount>) -> Result<()> {
+        self.last_apply_sparse_factory = SparseFactoryStats::default();
+        self.last_sparse_apply_factory_build = Duration::ZERO;
+        self.last_sparse_apply_account_proof = Duration::ZERO;
+        self.last_sparse_apply_apply_changes = Duration::ZERO;
+        self.last_sparse_account_reveal_keys = 0;
         if self.config.use_sparse_storage {
             self.apply_dirty_accounts_inner_sparse(&dirty_accounts)?;
-            // Non-wal_first: sparse-only path — no dual-write needed because the
-            // persisted store (RocksDB) holds all nodes after `persist_batch`.
-            //
-            // wal_first: also run the normal apply to keep the StorageTrieCow
-            // segment-publishing pipeline alive.  Without the dual-write, the
-            // background worker receives empty `committed_tries` and no published
-            // segments are built, breaking the proof-source chain across blocks.
-            //
-            // TODO: replace dual-write for wal_first once the background worker
-            // can build segments directly from the sparse trie (Phase 4 Option A).
-            if !self.config.wal_first_commit {
-                return Ok(());
-            }
-            // wal_first: fall through to the normal apply below.
+            // Sparse-only path (wal_first and non-wal_first).
+            return Ok(());
         }
         let published_refreshes = 0u64;
         let l3_into_tree = Duration::ZERO;
@@ -5556,59 +5739,118 @@ impl MptCommitStore {
         // wal_first: hash-only (no blob collection) — matching sei-db.
         // sync: hash + collect blobs for RocksDB persist.
         let account_root_start = std::time::Instant::now();
-        let (state_root, account_blobs, account_cow) =
-            if let Some(mut pending) = self.pending_sparse_state.take() {
-                // Sparse path: use SparseStateTrie.root_with_updates for the root.
-                // The account_cow (normal working trie after Phase 2 account updates)
-                // is used as the committed base for the next block.
-                let (root, trie_updates) = pending
+        let mut sparse_published_puts: Vec<(B256, StorageTrieSegment)> = Vec::new();
+        let (state_root, account_blobs, account_cow) = if let Some(mut pending) =
+            self.pending_sparse_state.take()
+        {
+            // Sparse path: use SparseStateTrie.root_with_updates for the root.
+            // The account_cow (normal working trie after Phase 2 account updates)
+            // is used as the committed base for the next block.
+            let (root, trie_updates) = if mode.wal_first {
+                let root = pending
+                    .trie
+                    .root(&pending.factory)
+                    .map_err(|e| MptDbError::Other(format!("sparse root: {e}")))?;
+                (root, TrieUpdates::default())
+            } else {
+                pending
                     .trie
                     .root_with_updates(&pending.factory)
-                    .map_err(|e| MptDbError::Other(format!("sparse root_with_updates: {e}")))?;
+                    .map_err(|e| MptDbError::Other(format!("sparse root_with_updates: {e}")))?
+            };
 
-                // Phase 3b: generate dirty blobs for non-wal_first mode.
-                // In wal_first mode, the WAL + segments provide crash recovery, so
-                // dirty blobs are not written to RocksDB.  In non-wal_first mode,
-                // RocksDB trie tables must be kept current.
-                let blobs = if !mode.wal_first {
-                    super::sparse_storage::sparse_trie_to_dirty_blobs(&pending.trie, &trie_updates)
-                        .map_err(|e| MptDbError::Other(format!("sparse dirty blobs: {e}")))?
-                } else {
-                    Vec::<(B256, Vec<u8>)>::new()
-                };
-                // The working account trie (after Phase 2 account leaf updates)
-                // is passed directly as the committed base for the next block.
-                // Its hash_cache may be stale for modified accounts, but
-                // convert_arena_to_account_proof_nodes will recompute from
-                // the sparse trie on the next proof request.
-                let account_cow = account_trie;
+            // Phase 3b: generate dirty blobs for non-wal_first mode.
+            // In wal_first mode, the WAL + segments provide crash recovery, so
+            // dirty blobs are not written to RocksDB.  In non-wal_first mode,
+            // RocksDB trie tables must be kept current.
+            let blobs = if !mode.wal_first {
+                super::sparse_storage::sparse_trie_to_dirty_blobs(&pending.trie, &trie_updates)
+                    .map_err(|e| MptDbError::Other(format!("sparse dirty blobs: {e}")))?
+            } else {
+                Vec::<(B256, Vec<u8>)>::new()
+            };
+            if mode.publish_baseline {
+                let publish_targets: Vec<(B256, B256)> = self
+                    .dirty_accounts
+                    .iter()
+                    .filter_map(|dirty| {
+                        if !dirty.storage_wiped && dirty.storage_changes.is_empty() {
+                            return None;
+                        }
+                        let root = storage_roots
+                            .get(&dirty.hashed_address)
+                            .copied()
+                            .unwrap_or(EMPTY_ROOT_HASH);
+                        if root == EMPTY_ROOT_HASH {
+                            None
+                        } else {
+                            Some((dirty.hashed_address, root))
+                        }
+                    })
+                    .collect();
+                if !publish_targets.is_empty() {
+                    let sparse_build_start = std::time::Instant::now();
+                    sparse_published_puts =
+                        build_storage_segments_from_sparse_trie(&pending.trie, &publish_targets)?;
+                    storage_segment_build_elapsed += sparse_build_start.elapsed();
+                }
+            }
+            // Update the account trie's hash_cache before storing as committed base.
+            //
+            // Without this, `convert_arena_to_account_proof_nodes_for_paths` triggers
+            // O(N_subtree) `compute_inline_rlp` recursion for every non-included sibling
+            // branch when building account proofs in the next block.  With N growing to
+            // hundreds of thousands of accounts during pre-pop, this causes O(N) work per
+            // block instead of O(K) (K = new accounts), making pre-pop 2× slower.
+            //
+            // `root_hash_only_parallel` processes only the dirty prefix_set (~70 K nodes
+            // for 10 K dirty accounts × path depth 7), costing ~7 ms per block — a
+            // negligible price to avoid the O(N) recursion on subsequent blocks.
+            //
+            // In cross-block sparse steady state, account paths are usually already
+            // revealed (`last_sparse_account_reveal_keys == 0`).  In that case this
+            // eager refresh is pure overhead on the critical path (B4.6: hundreds of
+            // ms/block).  Keep the arena snapshot only, and refresh hashes only on
+            // blocks that actually reveal new account paths.
+            let refresh_account_hash_cache =
+                !self.config.cross_block_sparse || self.last_sparse_account_reveal_keys > 0;
+            let account_cow = if refresh_account_hash_cache {
+                let (_, account_cow) =
+                    account_trie.root_hash_only_parallel(&self.persisted).map_err(|err| {
+                        MptDbError::Other(format!("account trie hash cache update: {err}"))
+                    })?;
+                account_cow
+            } else {
+                account_trie.snapshot();
+                account_trie
+            };
 
-                // Store sparse trie for proof generation (latest committed version).
-                // In cross-block mode, also return the trie to cross_block_sparse
-                // so it can be reused in the next block's apply.
-                if self.config.cross_block_sparse {
-                    if let Some(ref mut cross) = self.cross_block_sparse {
-                        cross.trie = pending.trie;
-                        self.last_committed_sparse_trie = None;
-                    } else {
-                        self.last_committed_sparse_trie = Some(Box::new(pending.trie));
-                    }
+            // Store sparse trie for proof generation (latest committed version).
+            // In cross-block mode, also return the trie to cross_block_sparse
+            // so it can be reused in the next block's apply.
+            if self.config.cross_block_sparse {
+                if let Some(ref mut cross) = self.cross_block_sparse {
+                    cross.trie = pending.trie;
+                    self.last_committed_sparse_trie = None;
                 } else {
                     self.last_committed_sparse_trie = Some(Box::new(pending.trie));
                 }
-                (root, blobs, account_cow)
-            } else if hash_only {
-                // Empty bundle (no pending sparse state) or non-sparse path.
-                // Compute root from the working account trie without collecting blobs.
-                let (root, cow) = account_trie
-                    .root_hash_only_parallel(&self.persisted)
-                    .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?;
-                (root, Vec::<(B256, Vec<u8>)>::new(), cow)
             } else {
-                account_trie
-                    .root_hash_and_dirty_blobs_parallel(&self.persisted)
-                    .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?
-            };
+                self.last_committed_sparse_trie = Some(Box::new(pending.trie));
+            }
+            (root, blobs, account_cow)
+        } else if hash_only {
+            // Empty bundle (no pending sparse state) or non-sparse path.
+            // Compute root from the working account trie without collecting blobs.
+            let (root, cow) = account_trie
+                .root_hash_only_parallel(&self.persisted)
+                .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?;
+            (root, Vec::<(B256, Vec<u8>)>::new(), cow)
+        } else {
+            account_trie
+                .root_hash_and_dirty_blobs_parallel(&self.persisted)
+                .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?
+        };
         let account_root_elapsed = account_root_start.elapsed();
 
         // Separate node blobs from tries so we can cache tries after persist
@@ -5697,6 +5939,7 @@ impl MptCommitStore {
             &storage_roots,
             &mut storage_cache_candidates,
             deferred_published_roots,
+            sparse_published_puts,
             mode,
             &mut storage_segment_build_elapsed,
         ) {
@@ -5858,6 +6101,27 @@ impl MptCommitStore {
             apply_branch_collapse_to_extension: self.last_apply_branch_collapse_to_extension,
             apply_extension_leaf_merges: self.last_apply_extension_leaf_merges,
             apply_extension_extension_merges: self.last_apply_extension_extension_merges,
+            sparse_apply_factory_build: self.last_sparse_apply_factory_build,
+            sparse_apply_account_proof: self.last_sparse_apply_account_proof,
+            sparse_apply_apply_changes: self.last_sparse_apply_apply_changes,
+            sparse_factory_dirty_accounts: self.last_apply_sparse_factory.dirty_accounts,
+            sparse_factory_storage_accounts: self.last_apply_sparse_factory.storage_accounts,
+            sparse_factory_segment_lookups: self.last_apply_sparse_factory.segment_lookups,
+            sparse_factory_segment_hits: self.last_apply_sparse_factory.segment_hits,
+            sparse_factory_segment_miss_no_store: self
+                .last_apply_sparse_factory
+                .segment_miss_no_store,
+            sparse_factory_segment_miss: self.last_apply_sparse_factory.segment_miss,
+            sparse_factory_segment_root_mismatch: self
+                .last_apply_sparse_factory
+                .segment_root_mismatch,
+            sparse_factory_tier3_attempts: self.last_apply_sparse_factory.tier3_attempts,
+            sparse_factory_tier3_hits: self.last_apply_sparse_factory.tier3_hits,
+            sparse_factory_tier12_attempts: self.last_apply_sparse_factory.tier12_attempts,
+            sparse_factory_cross_reuse_accounts: self
+                .last_apply_sparse_factory
+                .cross_reuse_accounts,
+            sparse_factory_cross_missing_slots: self.last_apply_sparse_factory.cross_missing_slots,
             storage_roots: storage_roots_elapsed,
             storage_roots_prefill: storage_roots_prefill_elapsed,
             storage_roots_take_handles: storage_roots_take_handles_elapsed,

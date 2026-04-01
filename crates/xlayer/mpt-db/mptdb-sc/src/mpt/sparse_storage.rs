@@ -1,4 +1,3 @@
-
 //! Segment-backed `TrieNodeProviderFactory` for `SparseStateTrie` integration.
 //!
 //! Implements the single custom interface that connects mpt-db's mmap-backed
@@ -16,6 +15,7 @@ use alloy_trie::{
     proof::DecodedProofNodes,
 };
 use mptdb_common::error::{MptDbError, Result as MptResult};
+use rayon::prelude::*;
 use reth_execution_errors::{SparseTrieError, SparseTrieErrorKind};
 use reth_primitives_traits::Account as RethAccount;
 use reth_trie_common::{
@@ -35,10 +35,15 @@ use std::{
 use super::{
     arena::MutableTrieArena,
     encoding::{encode_branch, encode_extension, encode_leaf},
-    node::{ChildRef, MptNode},
-    segment::{SegmentPageLease, StorageTrieSegmentReader},
+    node::{BranchNode, ChildRef, ExtensionNode, LeafNode, MptNode},
+    segment::{SegmentPageLease, StorageTrieSegment, StorageTrieSegmentReader},
     state::DirtyAccount,
 };
+
+static SPARSE_PROVIDER_STORAGE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SPARSE_PROVIDER_ACCOUNT_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
@@ -153,6 +158,7 @@ impl TrieNodeProvider for SegmentStorageNodeProvider {
         &self,
         path: &Nibbles,
     ) -> std::result::Result<Option<RevealedNode>, SparseTrieError> {
+        SPARSE_PROVIDER_STORAGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(ref lease) = self.lease {
             return open_reader_and_get(lease, path);
         }
@@ -191,6 +197,7 @@ impl TrieNodeProvider for SegmentAccountNodeProvider {
         &self,
         path: &Nibbles,
     ) -> std::result::Result<Option<RevealedNode>, SparseTrieError> {
+        SPARSE_PROVIDER_ACCOUNT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(ref lease) = self.lease else {
             // A missing account segment is ALWAYS a data-loss condition.
             // `Ok(None)` would silently set the account root to EMPTY_ROOT_HASH
@@ -490,6 +497,85 @@ pub(crate) fn convert_arena_to_account_proof_nodes(
     Ok((DecodedProofNodes::from_iter(pairs), branch_masks))
 }
 
+/// Path-limited variant of `convert_arena_to_account_proof_nodes`.
+///
+/// Builds account multiproof nodes for only the requested account-key paths,
+/// avoiding a full-arena DFS on large account tries.
+pub(crate) fn convert_arena_to_account_proof_nodes_for_paths(
+    arena: &MutableTrieArena,
+    root_idx: Option<u32>,
+    keys: &[Nibbles],
+) -> MptResult<(DecodedProofNodes, BranchNodeMasksMap)> {
+    if root_idx.is_none() {
+        let subtree = DecodedProofNodes::from_iter([(Nibbles::default(), TrieNode::EmptyRoot)]);
+        return Ok((subtree, BranchNodeMasksMap::default()));
+    }
+    if keys.is_empty() {
+        return convert_arena_to_account_proof_nodes(arena, root_idx);
+    }
+
+    let root_idx = root_idx.unwrap();
+    let mut include_paths: HashSet<Nibbles> = HashSet::default();
+    include_paths.insert(Nibbles::default());
+
+    for key in keys {
+        let mut current_idx = root_idx;
+        let mut current_path = Nibbles::default();
+        let mut offset = 0usize;
+
+        loop {
+            include_paths.insert(current_path.clone());
+            match arena.get(current_idx) {
+                MptNode::Leaf(_) => break,
+                MptNode::Extension(ext) => {
+                    let ext_len = ext.nibbles.len();
+                    if offset + ext_len > key.len() {
+                        break;
+                    }
+                    let mut matched = true;
+                    for i in 0..ext_len {
+                        if key.get_unchecked(offset + i) != ext.nibbles.get_unchecked(i) {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        break;
+                    }
+                    offset += ext_len;
+                    match ext.child {
+                        ChildRef::Arena(child_idx) => {
+                            current_path = nibbles_extend(&current_path, &ext.nibbles);
+                            current_idx = child_idx;
+                        }
+                        _ => break,
+                    }
+                }
+                MptNode::Branch(branch) => {
+                    if offset >= key.len() {
+                        break;
+                    }
+                    let nibble = key.get_unchecked(offset);
+                    offset += 1;
+                    let Some(child_ref) = branch.children[nibble as usize].as_ref() else {
+                        break;
+                    };
+                    match child_ref {
+                        ChildRef::Arena(child_idx) => {
+                            current_path = nibbles_push(&current_path, nibble);
+                            current_idx = *child_idx;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
+    let (pairs, branch_masks) = arena_to_proof_nodes_for_paths(arena, root_idx, &include_paths)?;
+    Ok((DecodedProofNodes::from_iter(pairs), branch_masks))
+}
+
 /// Iterative DFS over the materialized arena, converting each node to a
 /// `(trie_path, TrieNode)` pair.
 ///
@@ -550,6 +636,85 @@ fn arena_to_proof_nodes(
                         tree_mask.set_bit(slot);
                         let child_path = nibbles_push(&path, slot);
                         stack.push((*child_idx, child_path));
+                    }
+                    rlp_stack.push(rlp_node);
+                }
+
+                pairs.push((
+                    path.clone(),
+                    TrieNode::Branch(TrieBranchNode::new(rlp_stack, state_mask)),
+                ));
+                if tree_mask.get() != 0 || hash_mask.get() != 0 {
+                    branch_masks.insert(path, BranchNodeMasks { tree_mask, hash_mask });
+                }
+            }
+        }
+    }
+
+    Ok((pairs, branch_masks))
+}
+
+fn arena_to_proof_nodes_for_paths(
+    arena: &MutableTrieArena,
+    root_idx: u32,
+    include_paths: &HashSet<Nibbles>,
+) -> MptResult<(Vec<(Nibbles, TrieNode)>, BranchNodeMasksMap)> {
+    let mut pairs: Vec<(Nibbles, TrieNode)> = Vec::new();
+    let mut branch_masks: BranchNodeMasksMap = BranchNodeMasksMap::default();
+    let mut visited: HashSet<Nibbles> = HashSet::default();
+    let mut stack: Vec<(u32, Nibbles)> = vec![(root_idx, Nibbles::default())];
+
+    while let Some((idx, path)) = stack.pop() {
+        if !include_paths.contains(&path) {
+            continue;
+        }
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+
+        match arena.get(idx) {
+            MptNode::Leaf(leaf) => {
+                pairs.push((
+                    path,
+                    TrieNode::Leaf(TrieLeafNode::new(leaf.nibbles.clone(), leaf.value.clone())),
+                ));
+            }
+            MptNode::Extension(ext) => {
+                let child_path = nibbles_extend(&path, &ext.nibbles);
+                let include_child = include_paths.contains(&child_path);
+                let child_rlp = child_to_rlp_node(arena, &ext.child)?.0;
+                pairs.push((
+                    path,
+                    TrieNode::Extension(TrieExtensionNode::new(ext.nibbles.clone(), child_rlp)),
+                ));
+
+                if include_child {
+                    if let ChildRef::Arena(child_idx) = ext.child {
+                        stack.push((child_idx, child_path));
+                    }
+                }
+            }
+            MptNode::Branch(branch) => {
+                let mut rlp_stack: Vec<RlpNode> = Vec::new();
+                let mut state_mask = reth_trie_common::TrieMask::default();
+                let mut tree_mask = reth_trie_common::TrieMask::default();
+                let mut hash_mask = reth_trie_common::TrieMask::default();
+
+                for (slot, child_opt) in branch.children.iter().enumerate() {
+                    let Some(child_ref) = child_opt else { continue };
+                    let slot = slot as u8;
+                    state_mask.set_bit(slot);
+                    let child_path = nibbles_push(&path, slot);
+                    let include_child = include_paths.contains(&child_path);
+                    let (rlp_node, is_hash) = child_to_rlp_node(arena, child_ref)?;
+                    if is_hash {
+                        hash_mask.set_bit(slot);
+                    }
+                    if include_child {
+                        if let ChildRef::Arena(child_idx) = child_ref {
+                            tree_mask.set_bit(slot);
+                            stack.push((*child_idx, child_path));
+                        }
                     }
                     rlp_stack.push(rlp_node);
                 }
@@ -655,6 +820,158 @@ fn nibbles_extend(base: &Nibbles, extra: &Nibbles) -> Nibbles {
     result
 }
 
+// ── Sparse trie → segment conversion ─────────────────────────────────────────
+
+struct SparseArenaBuilder<'a> {
+    nodes: &'a alloy_primitives::map::HashMap<Nibbles, SparseNode>,
+    values: &'a alloy_primitives::map::HashMap<Nibbles, Vec<u8>>,
+    path_to_idx: HashMap<Nibbles, u32>,
+    arena_nodes: Vec<MptNode>,
+    arena_hash_cache: Vec<Option<B256>>,
+}
+
+impl<'a> SparseArenaBuilder<'a> {
+    fn new(
+        nodes: &'a alloy_primitives::map::HashMap<Nibbles, SparseNode>,
+        values: &'a alloy_primitives::map::HashMap<Nibbles, Vec<u8>>,
+    ) -> Self {
+        Self {
+            nodes,
+            values,
+            path_to_idx: HashMap::new(),
+            arena_nodes: Vec::new(),
+            arena_hash_cache: Vec::new(),
+        }
+    }
+
+    fn build_child_ref(&mut self, path: &Nibbles) -> MptResult<ChildRef> {
+        let Some(node) = self.nodes.get(path) else {
+            return Err(MptDbError::Other(format!(
+                "sparse trie missing child node at path {:?}",
+                path
+            )));
+        };
+        Ok(match node {
+            SparseNode::Hash(h) => ChildRef::Hash(*h),
+            SparseNode::Empty => {
+                return Err(MptDbError::Other(format!(
+                    "sparse trie has Empty child at path {:?}",
+                    path
+                )));
+            }
+            SparseNode::Leaf { .. } | SparseNode::Extension { .. } | SparseNode::Branch { .. } => {
+                ChildRef::Arena(self.build_node(path)?)
+            }
+        })
+    }
+
+    fn build_node(&mut self, path: &Nibbles) -> MptResult<u32> {
+        if let Some(idx) = self.path_to_idx.get(path).copied() {
+            return Ok(idx);
+        }
+
+        let Some(node) = self.nodes.get(path) else {
+            return Err(MptDbError::Other(format!("sparse trie missing node at path {:?}", path)));
+        };
+        if matches!(node, SparseNode::Hash(_) | SparseNode::Empty) {
+            return Err(MptDbError::Other(format!(
+                "cannot materialize sparse node {:?} at path {:?}",
+                node, path
+            )));
+        }
+
+        let idx = self.arena_nodes.len() as u32;
+        self.path_to_idx.insert(path.clone(), idx);
+        self.arena_nodes.push(MptNode::Branch(BranchNode::new()));
+        self.arena_hash_cache.push(get_node_hash(self.nodes, path));
+
+        let converted = match node {
+            SparseNode::Leaf { key, .. } => {
+                let full_path = nibbles_extend(path, key);
+                let value = self.values.get(&full_path).cloned().ok_or_else(|| {
+                    MptDbError::Other(format!("missing sparse leaf value at path {:?}", full_path))
+                })?;
+                MptNode::Leaf(LeafNode { nibbles: key.clone(), value })
+            }
+            SparseNode::Extension { key, .. } => {
+                let child_path = nibbles_extend(path, key);
+                let child = self.build_child_ref(&child_path)?;
+                MptNode::Extension(ExtensionNode { nibbles: key.clone(), child })
+            }
+            SparseNode::Branch { state_mask, .. } => {
+                let mut branch = BranchNode::new();
+                branch.value = self.values.get(path).cloned();
+                for slot in 0u8..16 {
+                    if !state_mask.is_bit_set(slot) {
+                        continue;
+                    }
+                    let child_path = nibbles_push(path, slot);
+                    branch.children[slot as usize] = Some(self.build_child_ref(&child_path)?);
+                }
+                MptNode::Branch(branch)
+            }
+            SparseNode::Hash(_) | SparseNode::Empty => unreachable!(),
+        };
+
+        self.arena_nodes[idx as usize] = converted;
+        Ok(idx)
+    }
+}
+
+fn build_storage_segment_from_sparse_serial(
+    trie: &SerialSparseTrie,
+    root: B256,
+) -> MptResult<StorageTrieSegment> {
+    let nodes = trie.nodes_ref();
+    let values = trie.values_ref();
+    let mut builder = SparseArenaBuilder::new(nodes, values);
+    let root_path = Nibbles::default();
+    let root_idx = builder.build_node(&root_path)?;
+    StorageTrieSegment::from_parts(
+        &builder.arena_nodes,
+        &builder.arena_hash_cache,
+        Some(root_idx),
+        root,
+    )
+}
+
+/// Build storage trie segments directly from the current sparse trie.
+///
+/// Each `(hashed_address, root)` entry corresponds to one storage trie to
+/// publish for the current generation. Empty roots are skipped.
+pub(crate) fn build_storage_segments_from_sparse_trie(
+    sparse_trie: &SparseStateTrie,
+    targets: &[(B256, B256)],
+) -> MptResult<Vec<(B256, StorageTrieSegment)>> {
+    let build_one =
+        |(hashed_addr, root): &(B256, B256)| -> MptResult<Option<(B256, StorageTrieSegment)>> {
+            if *root == EMPTY_ROOT_HASH {
+                return Ok(None);
+            }
+            let storage_trie = sparse_trie.storage_trie_ref(hashed_addr).ok_or_else(|| {
+                MptDbError::Other(format!(
+                    "sparse storage trie missing for account {} root {}",
+                    hashed_addr, root
+                ))
+            })?;
+            let segment =
+                build_storage_segment_from_sparse_serial(storage_trie, *root).map_err(|e| {
+                    MptDbError::Other(format!(
+                        "build sparse segment for account {} root {}: {e}",
+                        hashed_addr, root
+                    ))
+                })?;
+            Ok(Some((*hashed_addr, segment)))
+        };
+
+    let built: Vec<Option<(B256, StorageTrieSegment)>> = if targets.len() >= 64 {
+        targets.par_iter().map(build_one).collect::<MptResult<Vec<_>>>()?
+    } else {
+        targets.iter().map(build_one).collect::<MptResult<Vec<_>>>()?
+    };
+    Ok(built.into_iter().flatten().collect())
+}
+
 // ── Phase 2: apply_all_storage_changes_sparse ─────────────────────────────────
 
 /// Applies all storage and account changes from `dirty_accounts` to a fresh
@@ -706,6 +1023,26 @@ pub(crate) fn apply_all_storage_changes_sparse(
     if dirty_accounts.is_empty() {
         return Ok(());
     }
+    let trace_enabled = std::env::var_os("MPT_SPARSE_APPLY_TRACE").is_some();
+    let apply_total_start = trace_enabled.then(std::time::Instant::now);
+    let mut t_reveal_account = std::time::Duration::ZERO;
+    let mut t_reveal_storage = std::time::Duration::ZERO;
+    let mut t_extract_storage_proof = std::time::Duration::ZERO;
+    let mut t_storage_updates = std::time::Duration::ZERO;
+    let mut t_storage_root_compute = std::time::Duration::ZERO;
+    let mut t_account_updates = std::time::Duration::ZERO;
+    let mut accounts_wiped = 0usize;
+    let mut accounts_segment_reveal = 0usize;
+    let mut accounts_prebuilt_reveal = 0usize;
+    let mut accounts_empty_reveal = 0usize;
+    let mut storage_change_total = 0usize;
+    let mut pre_extracted_segment_proofs: HashMap<B256, DecodedStorageMultiProof> =
+        HashMap::default();
+    let provider_storage_before =
+        SPARSE_PROVIDER_STORAGE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let provider_account_before =
+        SPARSE_PROVIDER_ACCOUNT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let mut storage_root_accounts: Vec<B256> = Vec::new();
 
     // ── Step 0: reveal account trie for ALL dirty addresses in one batch ──────
     //
@@ -718,15 +1055,96 @@ pub(crate) fn apply_all_storage_changes_sparse(
     // O(all_account_nodes) HashMap construction and reveal.
     let (account_nodes, account_masks) = account_proof;
     if !account_nodes.is_empty() {
+        let step_start = trace_enabled.then(std::time::Instant::now);
         trie.reveal_decoded_account_multiproof(account_nodes, account_masks)
             .map_err(|e| MptDbError::Other(format!("reveal account multiproof: {e}")))?;
+        if let Some(start) = step_start {
+            t_reveal_account += start.elapsed();
+        }
+    }
+
+    // Pre-extract segment proofs in parallel before the per-account mutation loop.
+    // This turns the dominant per-account serial extract cost into a batched step.
+    let pre_extract_start = trace_enabled.then(std::time::Instant::now);
+    let mut segment_extract_candidates: Vec<(B256, Arc<SegmentPageLease>, Vec<Nibbles>)> =
+        Vec::with_capacity(dirty_accounts.len());
+    for dirty in dirty_accounts {
+        if dirty.storage_wiped || dirty.storage_changes.is_empty() {
+            continue;
+        }
+        if skip_already_revealed_storage && trie.storage_trie_ref(&dirty.hashed_address).is_some() {
+            continue;
+        }
+        if provider_factory.pre_built_storage_proofs.contains_key(&dirty.hashed_address) {
+            continue;
+        }
+        let Some(lease) = provider_factory.storage_segments.get(&dirty.hashed_address) else {
+            continue;
+        };
+        segment_extract_candidates.push((
+            dirty.hashed_address,
+            Arc::clone(lease),
+            dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect(),
+        ));
+    }
+    if !segment_extract_candidates.is_empty() {
+        let extracted = if segment_extract_candidates.len() >= 64 {
+            segment_extract_candidates
+                .into_par_iter()
+                .map(|(hashed_addr, lease, keys)| -> MptResult<(B256, DecodedStorageMultiProof)> {
+                    let reader = StorageTrieSegmentReader::open_shared_page(
+                        &lease,
+                        lease.root(),
+                        lease.root_record_off(),
+                    )
+                    .map_err(|e| {
+                        MptDbError::Other(format!("open storage segment reader {hashed_addr}: {e}"))
+                    })?;
+                    let proof = reader.extract_decoded_multiproof(&keys).map_err(|e| {
+                        MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
+                    })?;
+                    Ok((hashed_addr, proof))
+                })
+                .collect::<MptResult<Vec<_>>>()?
+        } else {
+            segment_extract_candidates
+                .into_iter()
+                .map(|(hashed_addr, lease, keys)| -> MptResult<(B256, DecodedStorageMultiProof)> {
+                    let reader = StorageTrieSegmentReader::open_shared_page(
+                        &lease,
+                        lease.root(),
+                        lease.root_record_off(),
+                    )
+                    .map_err(|e| {
+                        MptDbError::Other(format!("open storage segment reader {hashed_addr}: {e}"))
+                    })?;
+                    let proof = reader.extract_decoded_multiproof(&keys).map_err(|e| {
+                        MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
+                    })?;
+                    Ok((hashed_addr, proof))
+                })
+                .collect::<MptResult<Vec<_>>>()?
+        };
+        pre_extracted_segment_proofs.extend(extracted);
+    }
+    if let Some(start) = pre_extract_start {
+        t_extract_storage_proof += start.elapsed();
     }
 
     // ── Per-account loop ──────────────────────────────────────────────────────
     for dirty in dirty_accounts {
         let hashed_addr = dirty.hashed_address;
-        let dirty_keys: Vec<Nibbles> =
-            dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
+        storage_change_total += dirty.storage_changes.len();
+        let mut dirty_keys_vec: Option<Vec<Nibbles>> = None;
+        let dirty_keys: &[Nibbles] = if dirty.storage_changes.len() == 1 {
+            std::slice::from_ref(&dirty.storage_changes[0].slot_key)
+        } else if dirty.storage_changes.len() > 1 {
+            dirty_keys_vec =
+                Some(dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect());
+            dirty_keys_vec.as_ref().unwrap()
+        } else {
+            &[]
+        };
 
         // ── Step 1: storage trie reveal ───────────────────────────────────────
         //
@@ -744,17 +1162,32 @@ pub(crate) fn apply_all_storage_changes_sparse(
         //      updates=None and wipe() is a no-op.)
         //   2. wipe_storage — sets updates=Some(wiped) for TrieUpdates.
         if dirty.storage_wiped {
+            accounts_wiped += 1;
+            let step_start = trace_enabled.then(std::time::Instant::now);
             trie.reveal_decoded_storage_multiproof(hashed_addr, DecodedStorageMultiProof::empty())
                 .map_err(|e| {
                     MptDbError::Other(format!("reveal empty storage (wiped) {hashed_addr}: {e}"))
                 })?;
             trie.wipe_storage(hashed_addr)
                 .map_err(|e| MptDbError::Other(format!("wipe_storage {hashed_addr}: {e}")))?;
+            if let Some(start) = step_start {
+                t_reveal_storage += start.elapsed();
+            }
             // Fall through: new storage slots (if any) are written in Step 2.
         } else if skip_already_revealed_storage && trie.storage_trie_ref(&hashed_addr).is_some() {
             // Cross-block reuse: storage trie already revealed — skip reveal.
             // Step 2 applies changes directly; the provider handles Hash-blinded
             // boundaries via segment or `pre_built_proof` fallback.
+        } else if let Some(proof) = pre_extracted_segment_proofs.remove(&hashed_addr) {
+            if !dirty_keys.is_empty() {
+                accounts_segment_reveal += 1;
+                let reveal_start = trace_enabled.then(std::time::Instant::now);
+                trie.reveal_decoded_storage_multiproof(hashed_addr, proof)
+                    .map_err(|e| MptDbError::Other(format!("reveal storage {hashed_addr}: {e}")))?;
+                if let Some(start) = reveal_start {
+                    t_reveal_storage += start.elapsed();
+                }
+            }
         } else if let Some(reader) = provider_factory.get_storage_reader(hashed_addr) {
             // Existing account with a published segment: eager-reveal dirty paths.
             //
@@ -764,11 +1197,20 @@ pub(crate) fn apply_all_storage_changes_sparse(
             // (balance/nonce only change) — `update_account` will read the
             // storage root directly from the existing account leaf.
             if !dirty_keys.is_empty() {
+                accounts_segment_reveal += 1;
+                let extract_start = trace_enabled.then(std::time::Instant::now);
                 let proof = reader.extract_decoded_multiproof(&dirty_keys).map_err(|e| {
                     MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
                 })?;
+                if let Some(start) = extract_start {
+                    t_extract_storage_proof += start.elapsed();
+                }
+                let reveal_start = trace_enabled.then(std::time::Instant::now);
                 trie.reveal_decoded_storage_multiproof(hashed_addr, proof)
                     .map_err(|e| MptDbError::Other(format!("reveal storage {hashed_addr}: {e}")))?;
+                if let Some(start) = reveal_start {
+                    t_reveal_storage += start.elapsed();
+                }
             }
             // else: no storage changes → no storage trie reveal needed.
         } else if let Some(proof) =
@@ -778,9 +1220,14 @@ pub(crate) fn apply_all_storage_changes_sparse(
             // the committed StorageTrieCow is available in the L2 cache.  Use the
             // pre-built proof from `build_sparse_factory`.
             if !dirty_keys.is_empty() {
+                accounts_prebuilt_reveal += 1;
+                let reveal_start = trace_enabled.then(std::time::Instant::now);
                 trie.reveal_decoded_storage_multiproof(hashed_addr, proof).map_err(|e| {
                     MptDbError::Other(format!("reveal storage (L2 fallback) {hashed_addr}: {e}"))
                 })?;
+                if let Some(start) = reveal_start {
+                    t_reveal_storage += start.elapsed();
+                }
             }
         } else {
             // No published segment and NOT storage_wiped.
@@ -805,6 +1252,8 @@ pub(crate) fn apply_all_storage_changes_sparse(
             //     (b) root_with_updates sees the new slots (updates=None on
             //         Box::default() means the slots would not appear in TrieUpdates)
             if !dirty_keys.is_empty() {
+                accounts_empty_reveal += 1;
+                let reveal_start = trace_enabled.then(std::time::Instant::now);
                 trie.reveal_decoded_storage_multiproof(
                     hashed_addr,
                     DecodedStorageMultiProof::empty(),
@@ -814,9 +1263,13 @@ pub(crate) fn apply_all_storage_changes_sparse(
                         "reveal empty storage (new account) {hashed_addr}: {e}"
                     ))
                 })?;
+                if let Some(start) = reveal_start {
+                    t_reveal_storage += start.elapsed();
+                }
             }
         }
         // ── Step 2: apply storage changes ────────────────────────────────────
+        let storage_apply_start = trace_enabled.then(std::time::Instant::now);
         for change in &dirty.storage_changes {
             if change.value.is_zero() {
                 trie.remove_storage_leaf(hashed_addr, &change.slot_key, provider_factory).map_err(
@@ -843,57 +1296,43 @@ pub(crate) fn apply_all_storage_changes_sparse(
                 })?;
             }
         }
-        // ── Step 3: apply account change ─────────────────────────────────────
-        //
-        // Safety note — info=None + storage_wiped=false:
-        // Verified via revm source (account_status.rs:50-54): info=None only
-        // arises from Destroyed or DestroyedAgain, both of which have
-        // was_destroyed()=true → storage_wiped=true.  So info=None ⟹
-        // storage_wiped=true in all revm execution paths.  No extra guard needed.
-        //
-        // `update_account` requires `is_account_revealed(addr)` which is only
-        // true for accounts whose path was included in the eager reveal proof.
-        // For EXISTING accounts, `convert_arena_to_account_proof_nodes` produces
-        // a proof that includes their leaf path → `is_account_revealed=true`.
-        // For NEW accounts (not in prior committed trie), the EmptyRoot proof
-        // contains no leaf paths → `is_account_revealed=false`.
-        //
-        // New-account fix: call `update_account_leaf` directly, which inserts
-        // the path into `revealed_account_paths` automatically.  We compute the
-        // storage root from the storage subtrie (if modified) or use EMPTY_ROOT_HASH.
+        if let Some(start) = storage_apply_start {
+            t_storage_updates += start.elapsed();
+        }
+        if dirty.storage_wiped || !dirty.storage_changes.is_empty() {
+            storage_root_accounts.push(hashed_addr);
+        }
+    }
+
+    let storage_root_compute_start = trace_enabled.then(std::time::Instant::now);
+    let storage_roots = trie
+        .storage_roots_for_accounts(&storage_root_accounts)
+        .map_err(|e| MptDbError::Other(format!("compute sparse storage roots: {e}")))?;
+    if let Some(start) = storage_root_compute_start {
+        t_storage_root_compute += start.elapsed();
+    }
+
+    // ── Step 3: apply account changes using precomputed storage roots ────────
+    for dirty in dirty_accounts {
+        let hashed_addr = dirty.hashed_address;
+        let account_apply_start = trace_enabled.then(std::time::Instant::now);
         match &dirty.info {
             Some(info) => {
-                if trie.is_account_revealed(hashed_addr) {
-                    // Existing account: update_account reads the current storage
-                    // root from the storage subtrie or existing leaf value.
-                    trie.update_account(hashed_addr, RethAccount::from(info), provider_factory)
-                        .map_err(|e| {
-                            MptDbError::Other(format!("update_account {hashed_addr}: {e}"))
-                        })?;
+                let has_storage_delta = dirty.storage_wiped || !dirty.storage_changes.is_empty();
+                let storage_root = if has_storage_delta {
+                    storage_roots.get(&hashed_addr).copied().unwrap_or(EMPTY_ROOT_HASH)
                 } else {
-                    // Account not yet in `revealed_account_paths`.
-                    //
-                    // Two cases:
-                    // (a) Truly new account (never committed) → storage_root = EMPTY or
-                    //     from the storage subtrie (if storage was just revealed/modified).
-                    // (b) Existing account whose leaf IS the trie root (single-account
-                    //     trie or root-leaf case).  In this case `is_account_revealed`
-                    //     returns false because `filter_map_revealed_nodes` never adds
-                    //     the root path to `revealed_account_paths`.  The leaf VALUE is
-                    //     in `values_ref()` at the full 64-nibble path.  We must read
-                    //     the existing storage root from there, not use EMPTY_ROOT_HASH,
-                    //     otherwise we silently discard the account's prior storage root.
-                    let storage_root =
-                        // First: try the revealed storage subtrie (if storage was modified).
-                        trie.storage_root(hashed_addr)
-                        // Second: decode the existing account leaf value from values_ref()
-                        // (root-leaf case for single-account tries).
-                        .or_else(|| {
-                            trie.get_account_value(&hashed_addr)
-                                .and_then(|v| TrieAccount::decode(&mut v.as_slice()).ok())
-                                .map(|ta| ta.storage_root)
-                        })
-                        .unwrap_or(EMPTY_ROOT_HASH);
+                    trie.get_account_value(&hashed_addr)
+                        .and_then(|v| TrieAccount::decode(&mut v.as_slice()).ok())
+                        .map(|ta| ta.storage_root)
+                        .unwrap_or(EMPTY_ROOT_HASH)
+                };
+
+                if info.is_empty() && storage_root == EMPTY_ROOT_HASH {
+                    trie.remove_account_leaf(&dirty.account_key, provider_factory).map_err(
+                        |e| MptDbError::Other(format!("remove_account_leaf {hashed_addr}: {e}")),
+                    )?;
+                } else {
                     let trie_account = TrieAccount {
                         nonce: info.nonce,
                         balance: info.balance,
@@ -902,14 +1341,10 @@ pub(crate) fn apply_all_storage_changes_sparse(
                     };
                     let mut rlp_buf = Vec::new();
                     trie_account.encode(&mut rlp_buf);
-                    trie.update_account_leaf(
-                        Nibbles::unpack(hashed_addr),
-                        rlp_buf,
-                        provider_factory,
-                    )
-                    .map_err(|e| {
-                        MptDbError::Other(format!("update_account_leaf {hashed_addr}: {e}"))
-                    })?;
+                    trie.update_account_leaf(dirty.account_key.clone(), rlp_buf, provider_factory)
+                        .map_err(|e| {
+                            MptDbError::Other(format!("update_account_leaf {hashed_addr}: {e}"))
+                        })?;
                 }
             }
             None => {
@@ -918,6 +1353,34 @@ pub(crate) fn apply_all_storage_changes_sparse(
                 })?;
             }
         }
+        if let Some(start) = account_apply_start {
+            t_account_updates += start.elapsed();
+        }
+    }
+
+    if let Some(start) = apply_total_start {
+        let provider_storage_after =
+            SPARSE_PROVIDER_STORAGE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let provider_account_after =
+            SPARSE_PROVIDER_ACCOUNT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[mptsparse] accounts={} changes={} reveal_acct={:.1}ms extract={:.1}ms reveal_storage={:.1}ms storage_apply={:.1}ms root_compute={:.1}ms account_apply={:.1}ms total={:.1}ms seg={} prebuilt={} empty={} wiped={} provider_storage={} provider_account={}",
+            dirty_accounts.len(),
+            storage_change_total,
+            t_reveal_account.as_secs_f64() * 1000.0,
+            t_extract_storage_proof.as_secs_f64() * 1000.0,
+            t_reveal_storage.as_secs_f64() * 1000.0,
+            t_storage_updates.as_secs_f64() * 1000.0,
+            t_storage_root_compute.as_secs_f64() * 1000.0,
+            t_account_updates.as_secs_f64() * 1000.0,
+            start.elapsed().as_secs_f64() * 1000.0,
+            accounts_segment_reveal,
+            accounts_prebuilt_reveal,
+            accounts_empty_reveal,
+            accounts_wiped,
+            provider_storage_after.saturating_sub(provider_storage_before),
+            provider_account_after.saturating_sub(provider_account_before),
+        );
     }
 
     Ok(())

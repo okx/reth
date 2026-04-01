@@ -2,7 +2,7 @@ use alloy_primitives::{Bytes, B256};
 use alloy_trie::{proof::DecodedProofNodes, Nibbles, TrieMask};
 use memmap2::Mmap;
 use mptdb_common::error::{MptDbError, Result};
-use reth_trie_common::{BranchNodeMasksMap, DecodedStorageMultiProof};
+use reth_trie_common::{BranchNodeMasks, BranchNodeMasksMap, DecodedStorageMultiProof};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -667,6 +667,9 @@ impl<'a> StorageTrieSegmentReader<'a> {
     /// }
     /// ```
     pub fn extract_decoded_multiproof(&self, keys: &[Nibbles]) -> Result<DecodedStorageMultiProof> {
+        if keys.len() == 1 {
+            return self.extract_single_key_decoded_multiproof(&keys[0]);
+        }
         let (arena, root_idx, _lazy_siblings) = self.trace_touched_paths(keys)?.into_parts();
         super::sparse_storage::convert_arena_to_decoded_storage_multiproof(
             &arena, root_idx, self.root,
@@ -722,6 +725,109 @@ impl<'a> StorageTrieSegmentReader<'a> {
             root: Some(root_idx),
             touched_keys: keys.len(),
             lazy_siblings,
+        })
+    }
+
+    fn extract_single_key_decoded_multiproof(
+        &self,
+        key: &Nibbles,
+    ) -> Result<DecodedStorageMultiProof> {
+        let mut pairs: Vec<(Nibbles, alloy_trie::nodes::TrieNode)> = Vec::new();
+        let mut branch_masks: BranchNodeMasksMap = BranchNodeMasksMap::default();
+        let mut seg_idx = self.root_idx;
+        let mut offset = 0usize;
+        let mut path = Nibbles::default();
+
+        loop {
+            let node = self.view_node(seg_idx)?;
+            match node.kind {
+                SegmentNodeKind::Leaf { nibbles, value } => {
+                    pairs.push((
+                        path,
+                        alloy_trie::nodes::TrieNode::Leaf(alloy_trie::nodes::LeafNode::new(
+                            Nibbles::from_nibbles(nibbles),
+                            value.to_vec(),
+                        )),
+                    ));
+                    break;
+                }
+                SegmentNodeKind::Extension { nibbles, child } => {
+                    let ext_nibbles = Nibbles::from_nibbles(nibbles);
+                    let child_rlp = segment_child_embed_to_rlp_node(&child)?;
+                    pairs.push((
+                        path.clone(),
+                        alloy_trie::nodes::TrieNode::Extension(
+                            alloy_trie::nodes::ExtensionNode::new(ext_nibbles.clone(), child_rlp),
+                        ),
+                    ));
+
+                    let remaining = key.slice(offset..);
+                    if remaining.len() < ext_nibbles.len() ||
+                        remaining.slice(..ext_nibbles.len()) != ext_nibbles
+                    {
+                        break;
+                    }
+                    let Some(next_idx) = child.target_idx else {
+                        break;
+                    };
+                    path = nibbles_extend(&path, &ext_nibbles);
+                    offset += ext_nibbles.len();
+                    seg_idx = next_idx;
+                }
+                SegmentNodeKind::Branch { children, value: _, .. } => {
+                    let mut rlp_stack: Vec<alloy_trie::nodes::RlpNode> = Vec::new();
+                    let mut state_mask = TrieMask::default();
+                    let mut tree_mask = TrieMask::default();
+                    let mut hash_mask = TrieMask::default();
+                    let next_nibble = (offset < key.len()).then(|| key.get_unchecked(offset) as u8);
+                    let mut next_idx: Option<u32> = None;
+
+                    for child_result in children.iter() {
+                        let child = child_result?;
+                        state_mask.set_bit(child.slot);
+                        let child_rlp = segment_child_embed_to_rlp_node(&child)?;
+                        if matches!(child.embed, SegmentChildEmbedRef::Hash(_)) {
+                            hash_mask.set_bit(child.slot);
+                        }
+                        if Some(child.slot) == next_nibble {
+                            if let Some(idx) = child.target_idx {
+                                tree_mask.set_bit(child.slot);
+                                next_idx = Some(idx);
+                            }
+                        }
+                        rlp_stack.push(child_rlp);
+                    }
+
+                    pairs.push((
+                        path.clone(),
+                        alloy_trie::nodes::TrieNode::Branch(alloy_trie::nodes::BranchNode::new(
+                            rlp_stack, state_mask,
+                        )),
+                    ));
+                    if tree_mask.get() != 0 || hash_mask.get() != 0 {
+                        branch_masks.insert(path.clone(), BranchNodeMasks { tree_mask, hash_mask });
+                    }
+
+                    let Some(nibble) = next_nibble else {
+                        break;
+                    };
+                    if !state_mask.is_bit_set(nibble) {
+                        break;
+                    }
+                    let Some(idx) = next_idx else {
+                        break;
+                    };
+                    path.push_unchecked(nibble);
+                    offset += 1;
+                    seg_idx = idx;
+                }
+            }
+        }
+
+        Ok(DecodedStorageMultiProof {
+            root: self.root,
+            subtree: DecodedProofNodes::from_iter(pairs),
+            branch_node_masks: branch_masks,
         })
     }
 
@@ -1024,6 +1130,34 @@ impl<'a> StorageTrieSegmentReader<'a> {
             .get(start..end)
             .ok_or_else(|| MptDbError::Other("segment blob slice out of bounds".to_string()))
     }
+}
+
+fn segment_child_embed_to_rlp_node(
+    child: &SegmentChildView<'_>,
+) -> Result<alloy_trie::nodes::RlpNode> {
+    match child.embed {
+        SegmentChildEmbedRef::Hash(hash) => Ok(alloy_trie::nodes::RlpNode::word_rlp(&hash)),
+        SegmentChildEmbedRef::Inline(rlp) => {
+            alloy_trie::nodes::RlpNode::from_raw(rlp).ok_or_else(|| {
+                MptDbError::Other(format!(
+                    "segment inline child at slot {} exceeds inline bound",
+                    child.slot
+                ))
+            })
+        }
+        SegmentChildEmbedRef::None => Err(MptDbError::Other(format!(
+            "segment child at slot {} has None embed (corrupted segment data)",
+            child.slot
+        ))),
+    }
+}
+
+fn nibbles_extend(base: &Nibbles, extra: &Nibbles) -> Nibbles {
+    let mut result = base.clone();
+    for nibble in extra.iter() {
+        result.push_unchecked(nibble);
+    }
+    result
 }
 
 impl<'a> StoragePathCursor<'a> {

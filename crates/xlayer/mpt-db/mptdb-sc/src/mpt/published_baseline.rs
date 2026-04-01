@@ -274,6 +274,10 @@ impl PublishedBaselineReader {
         }))
     }
 
+    pub fn lookup_trie_root(&self, hashed_address: &B256) -> Result<Option<B256>> {
+        Ok(self.lookup_entry(hashed_address)?.map(|entry| entry.root))
+    }
+
     fn lookup_entry(&self, hashed_address: &B256) -> Result<Option<DeltaEntry>> {
         if let Some(entry) = self.merged_puts.get(hashed_address) {
             return Ok(Some(*entry));
