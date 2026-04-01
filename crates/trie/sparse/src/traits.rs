@@ -237,17 +237,6 @@ pub trait SparseTrieInterface: Sized + Debug + Send + Sync {
     /// Shrink the capacity of the sparse trie's value storage to the given size.
     /// This will reduce memory usage if the current capacity is higher than the given size.
     fn shrink_values_to(&mut self, size: usize);
-
-    /// Prunes revealed subtrie nodes back to `Hash` nodes at hash-mask
-    /// boundaries that are safe to re-blind.
-    ///
-    /// Must be called *after* [`Self::root`] so that all hash fields in nodes
-    /// are up-to-date.  `dirty_paths` lists the full leaf paths modified in
-    /// this block; their ancestors are excluded from pruning.
-    ///
-    /// The default implementation is a no-op; override for implementations
-    /// that maintain `branch_node_masks` state.
-    fn prune_hash_boundaries(&mut self, _dirty_paths: &[Nibbles]) {}
 }
 
 /// Tracks modifications to the sparse trie structure.

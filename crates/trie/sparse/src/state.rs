@@ -649,20 +649,6 @@ where
         }
     }
 
-    /// Prunes revealed account trie nodes back to `Hash` boundaries that are
-    /// safe to re-blind.
-    ///
-    /// Call this **after** [`Self::root`] in cross-block mode to prevent
-    /// unbounded accumulation of revealed account-trie nodes.
-    ///
-    /// `dirty_account_paths`: the 64-nibble hashed paths of accounts modified
-    /// this block (from [`DirtyAccount::account_key`]).
-    pub fn prune_account_trie_boundaries(&mut self, dirty_account_paths: &[Nibbles]) {
-        if let SparseTrie::Revealed(ref mut trie) = self.state {
-            trie.prune_hash_boundaries(dirty_account_paths);
-        }
-    }
-
     /// Returns mutable reference to the revealed account sparse trie.
     ///
     /// If the trie is not revealed yet, its root will be revealed using the trie node provider.

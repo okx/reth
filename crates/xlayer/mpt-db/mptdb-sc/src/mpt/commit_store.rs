@@ -5759,17 +5759,6 @@ impl MptCommitStore {
                     .map_err(|e| MptDbError::Other(format!("sparse root_with_updates: {e}")))?
             };
 
-            // In cross-block mode, prune revealed account-trie nodes that are
-            // safe to re-blind back to Hash.  This prevents unbounded
-            // accumulation of revealed nodes across blocks, keeping root() cost
-            // proportional to the current block's dirty set rather than the
-            // total accumulated state.
-            if self.config.cross_block_sparse && !self.dirty_accounts.is_empty() {
-                let dirty_account_paths: Vec<Nibbles> =
-                    self.dirty_accounts.iter().map(|d| d.account_key.clone()).collect();
-                pending.trie.prune_account_trie_boundaries(&dirty_account_paths);
-            }
-
             // Phase 3b: generate dirty blobs for non-wal_first mode.
             // In wal_first mode, the WAL + segments provide crash recovery, so
             // dirty blobs are not written to RocksDB.  In non-wal_first mode,
