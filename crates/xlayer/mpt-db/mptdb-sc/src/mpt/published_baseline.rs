@@ -769,11 +769,28 @@ impl PublishedBaselineManager {
             .seek(SeekFrom::End(0))
             .map_err(|e| MptDbError::Other(format!("seek published pages index append: {e}")))?;
         let mut delta_records = Vec::new();
+        // Reuse an existing page locator for accounts whose storage root is identical.
+        // This converts per-account physical pages into shared-page layout and
+        // significantly reduces page fan-out for workloads like B4.6.
+        let mut dedup_pages_by_root: HashMap<B256, DeltaEntry> = HashMap::new();
+        let mut dedup_reused_pages = 0usize;
+        let mut dedup_new_pages = 0usize;
         if let Some(mut full_index) = rewritten_index {
+            // Snapshot-rewrite path: seed dedup map from the existing merged index
+            // so unchanged roots can keep pointing to already-written pages.
+            for entry in full_index.values() {
+                dedup_pages_by_root.entry(entry.root).or_insert(*entry);
+            }
             for hashed_address in deletes {
                 full_index.remove(hashed_address);
             }
             for (hashed_address, image) in puts {
+                let root = image.root();
+                if let Some(entry) = dedup_pages_by_root.get(&root).copied() {
+                    dedup_reused_pages += 1;
+                    full_index.insert(*hashed_address, entry);
+                    continue;
+                }
                 if let Some(ref mut lim) = limiter {
                     lim.account(image.as_bytes().len());
                 }
@@ -783,16 +800,16 @@ impl PublishedBaselineManager {
                     &mut next_page_off,
                     image,
                 )?;
-                full_index.insert(
-                    *hashed_address,
-                    DeltaEntry {
-                        page_off: page.page_off,
-                        record_off: page.root_record_off,
-                        total_len: page.total_len,
-                        root: image.root(),
-                        format_version: page.layout_version,
-                    },
-                );
+                let entry = DeltaEntry {
+                    page_off: page.page_off,
+                    record_off: page.root_record_off,
+                    total_len: page.total_len,
+                    root,
+                    format_version: page.layout_version,
+                };
+                dedup_new_pages += 1;
+                dedup_pages_by_root.insert(root, entry);
+                full_index.insert(*hashed_address, entry);
             }
             delta_records.reserve(full_index.len());
             for (hashed_address, entry) in full_index {
@@ -812,6 +829,20 @@ impl PublishedBaselineManager {
                 delta_records.push((DELTA_OP_DELETE, *hashed_address, B256::ZERO, 0, 0, 0, 0));
             }
             for (hashed_address, image) in puts {
+                let root = image.root();
+                if let Some(entry) = dedup_pages_by_root.get(&root).copied() {
+                    dedup_reused_pages += 1;
+                    delta_records.push((
+                        DELTA_OP_PUT,
+                        *hashed_address,
+                        entry.root,
+                        entry.page_off,
+                        entry.record_off,
+                        entry.total_len,
+                        entry.format_version,
+                    ));
+                    continue;
+                }
                 if let Some(ref mut lim) = limiter {
                     lim.account(image.as_bytes().len());
                 }
@@ -821,16 +852,36 @@ impl PublishedBaselineManager {
                     &mut next_page_off,
                     image,
                 )?;
+                let entry = DeltaEntry {
+                    page_off: page.page_off,
+                    record_off: page.root_record_off,
+                    total_len: page.total_len,
+                    root,
+                    format_version: page.layout_version,
+                };
+                dedup_new_pages += 1;
+                dedup_pages_by_root.insert(root, entry);
                 delta_records.push((
                     DELTA_OP_PUT,
                     *hashed_address,
-                    image.root(),
-                    page.page_off,
-                    page.root_record_off,
-                    page.total_len,
-                    page.layout_version,
+                    root,
+                    entry.page_off,
+                    entry.record_off,
+                    entry.total_len,
+                    entry.format_version,
                 ));
             }
+        }
+
+        if std::env::var_os("MPT_PUBLISHED_SEGMENT_DEDUP_TRACE").is_some() {
+            eprintln!(
+                "[published:dedup] version={} puts={} unique_roots={} reused={} new_pages={}",
+                version,
+                puts.len(),
+                dedup_pages_by_root.len(),
+                dedup_reused_pages,
+                dedup_new_pages,
+            );
         }
 
         Self::write_delta_file(&self.delta_path(generation), &delta_records)?;

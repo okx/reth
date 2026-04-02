@@ -1066,7 +1066,8 @@ pub(crate) fn apply_all_storage_changes_sparse(
     if dirty_accounts.is_empty() {
         return Ok(());
     }
-    let trace_enabled = std::env::var_os("MPT_SPARSE_APPLY_TRACE").is_some();
+    let trace_verbose = std::env::var_os("MPT_SPARSE_APPLY_TRACE_VERBOSE").is_some();
+    let trace_enabled = trace_verbose || std::env::var_os("MPT_SPARSE_APPLY_TRACE").is_some();
     let apply_total_start = trace_enabled.then(std::time::Instant::now);
     let mut t_reveal_account = std::time::Duration::ZERO;
     let mut t_reveal_storage = std::time::Duration::ZERO;
@@ -1074,11 +1075,27 @@ pub(crate) fn apply_all_storage_changes_sparse(
     let mut t_storage_updates = std::time::Duration::ZERO;
     let mut t_storage_root_compute = std::time::Duration::ZERO;
     let mut t_account_updates = std::time::Duration::ZERO;
+    let mut t_pre_extract_plan = std::time::Duration::ZERO;
+    let mut t_pre_extract_exec = std::time::Duration::ZERO;
+    let mut t_step1_plan = std::time::Duration::ZERO;
+    let mut t_step1_reveal = std::time::Duration::ZERO;
+    let mut t_step1_wipe = std::time::Duration::ZERO;
     let mut accounts_wiped = 0usize;
     let mut accounts_segment_reveal = 0usize;
+    let mut accounts_segment_pre_extracted_reveal = 0usize;
+    let mut accounts_segment_reader_reveal = 0usize;
     let mut accounts_prebuilt_reveal = 0usize;
     let mut accounts_empty_reveal = 0usize;
+    let mut pre_extract_skip_wiped_or_empty = 0usize;
+    let mut pre_extract_skip_reused = 0usize;
+    let mut pre_extract_skip_prebuilt = 0usize;
+    let mut pre_extract_skip_missing_segment = 0usize;
     let mut storage_change_total = 0usize;
+    let mut storage_update_ops = 0usize;
+    let mut storage_delete_ops = 0usize;
+    let mut account_update_ops = 0usize;
+    let mut account_remove_empty_ops = 0usize;
+    let mut account_remove_deleted_ops = 0usize;
     let enable_full_scan = dirty_accounts.len() <= SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS;
     let mut pre_extracted_segment_proofs: HashMap<B256, DecodedStorageMultiProof> =
         HashMap::with_capacity(dirty_accounts.len());
@@ -1109,24 +1126,33 @@ pub(crate) fn apply_all_storage_changes_sparse(
 
     // Pre-extract segment proofs in parallel before the per-account mutation loop.
     // This turns the dominant per-account serial extract cost into a batched step.
-    let pre_extract_start = trace_enabled.then(std::time::Instant::now);
+    let pre_extract_plan_start = trace_enabled.then(std::time::Instant::now);
     let mut segment_extract_candidates: Vec<(B256, Arc<SegmentPageLease>, usize)> =
         Vec::with_capacity(dirty_accounts.len());
     for (dirty_idx, dirty) in dirty_accounts.iter().enumerate() {
         if dirty.storage_wiped || dirty.storage_changes.is_empty() {
+            pre_extract_skip_wiped_or_empty += 1;
             continue;
         }
         if skip_already_revealed_storage && trie.storage_trie_ref(&dirty.hashed_address).is_some() {
+            pre_extract_skip_reused += 1;
             continue;
         }
         if provider_factory.pre_built_storage_proofs.contains_key(&dirty.hashed_address) {
+            pre_extract_skip_prebuilt += 1;
             continue;
         }
         let Some(lease) = provider_factory.storage_segments.get(&dirty.hashed_address) else {
+            pre_extract_skip_missing_segment += 1;
             continue;
         };
         segment_extract_candidates.push((dirty.hashed_address, Arc::clone(lease), dirty_idx));
     }
+    if let Some(start) = pre_extract_plan_start {
+        t_pre_extract_plan += start.elapsed();
+    }
+    let pre_extract_exec_start = trace_enabled.then(std::time::Instant::now);
+    let segment_extract_candidate_count = segment_extract_candidates.len();
     if !segment_extract_candidates.is_empty() {
         let extracted = if segment_extract_candidates.len() >= 64 {
             segment_extract_candidates
@@ -1175,8 +1201,9 @@ pub(crate) fn apply_all_storage_changes_sparse(
         };
         pre_extracted_segment_proofs.extend(extracted);
     }
-    if let Some(start) = pre_extract_start {
-        t_extract_storage_proof += start.elapsed();
+    if let Some(start) = pre_extract_exec_start {
+        t_pre_extract_exec += start.elapsed();
+        t_extract_storage_proof += t_pre_extract_plan + t_pre_extract_exec;
     }
 
     // ── Step 1: plan and batch-reveal storage tries ───────────────────────────
@@ -1188,6 +1215,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
         Vec::with_capacity(dirty_accounts.len());
     let mut storage_reveal_non_empty = 0usize;
     let mut storage_wipe_after_reveal: Vec<B256> = Vec::with_capacity(dirty_accounts.len() / 8);
+    let step1_plan_start = trace_enabled.then(std::time::Instant::now);
     for dirty in dirty_accounts {
         let hashed_addr = dirty.hashed_address;
         let storage_change_len = dirty.storage_changes.len();
@@ -1206,12 +1234,14 @@ pub(crate) fn apply_all_storage_changes_sparse(
         }
         if let Some(proof) = pre_extracted_segment_proofs.remove(&hashed_addr) {
             accounts_segment_reveal += 1;
+            accounts_segment_pre_extracted_reveal += 1;
             storage_reveal_entries.push((hashed_addr, proof));
             storage_reveal_non_empty += 1;
             continue;
         }
         if let Some(reader) = provider_factory.get_storage_reader(hashed_addr) {
             accounts_segment_reveal += 1;
+            accounts_segment_reader_reveal += 1;
             let extract_start = trace_enabled.then(std::time::Instant::now);
             let proof = extract_storage_multiproof_for_account(&reader, dirty, enable_full_scan)
                 .map_err(|e| {
@@ -1241,6 +1271,9 @@ pub(crate) fn apply_all_storage_changes_sparse(
         }
         accounts_empty_reveal += 1;
         storage_reveal_entries.push((hashed_addr, DecodedStorageMultiProof::empty()));
+    }
+    if let Some(start) = step1_plan_start {
+        t_step1_plan += start.elapsed();
     }
     if !storage_reveal_entries.is_empty() {
         let reveal_start = trace_enabled.then(std::time::Instant::now);
@@ -1281,7 +1314,9 @@ pub(crate) fn apply_all_storage_changes_sparse(
             }
         }
         if let Some(start) = reveal_start {
-            t_reveal_storage += start.elapsed();
+            let elapsed = start.elapsed();
+            t_reveal_storage += elapsed;
+            t_step1_reveal += elapsed;
         }
     }
     if !storage_wipe_after_reveal.is_empty() {
@@ -1291,7 +1326,9 @@ pub(crate) fn apply_all_storage_changes_sparse(
                 .map_err(|e| MptDbError::Other(format!("wipe_storage {hashed_addr}: {e}")))?;
         }
         if let Some(start) = wipe_start {
-            t_reveal_storage += start.elapsed();
+            let elapsed = start.elapsed();
+            t_reveal_storage += elapsed;
+            t_step1_wipe += elapsed;
         }
     }
 
@@ -1303,6 +1340,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
         let storage_apply_start = trace_enabled.then(std::time::Instant::now);
         for change in &dirty.storage_changes {
             if change.value.is_zero() {
+                storage_delete_ops += 1;
                 trie.remove_storage_leaf(hashed_addr, &change.slot_key, provider_factory).map_err(
                     |e| {
                         MptDbError::Other(format!(
@@ -1312,6 +1350,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
                     },
                 )?;
             } else {
+                storage_update_ops += 1;
                 let encoded = change.encoded_value.clone().unwrap_or_default();
                 trie.update_storage_leaf(
                     hashed_addr,
@@ -1360,10 +1399,12 @@ pub(crate) fn apply_all_storage_changes_sparse(
                 };
 
                 if info.is_empty() && storage_root == EMPTY_ROOT_HASH {
+                    account_remove_empty_ops += 1;
                     trie.remove_account_leaf(&dirty.account_key, provider_factory).map_err(
                         |e| MptDbError::Other(format!("remove_account_leaf {hashed_addr}: {e}")),
                     )?;
                 } else {
+                    account_update_ops += 1;
                     let trie_account = TrieAccount {
                         nonce: info.nonce,
                         balance: info.balance,
@@ -1379,6 +1420,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
                 }
             }
             None => {
+                account_remove_deleted_ops += 1;
                 trie.remove_account_leaf(&dirty.account_key, provider_factory).map_err(|e| {
                     MptDbError::Other(format!("remove_account_leaf {hashed_addr}: {e}"))
                 })?;
@@ -1412,6 +1454,32 @@ pub(crate) fn apply_all_storage_changes_sparse(
             provider_storage_after.saturating_sub(provider_storage_before),
             provider_account_after.saturating_sub(provider_account_before),
         );
+        if trace_verbose {
+            eprintln!(
+                "[mptsparse:detail] pre_extract(candidates={},skip_wiped_or_empty={},skip_reused={},skip_prebuilt={},skip_missing_seg={},plan={:.1}ms,exec={:.1}ms) step1(plan={:.1}ms,reveal={:.1}ms,wipe={:.1}ms,seg_pre_extracted={},seg_reader={},prebuilt={},known_empty={},wiped={}) step2(storage_updates={},storage_deletes={},root_accounts={}) step3(account_updates={},account_remove_empty={},account_remove_deleted={})",
+                segment_extract_candidate_count,
+                pre_extract_skip_wiped_or_empty,
+                pre_extract_skip_reused,
+                pre_extract_skip_prebuilt,
+                pre_extract_skip_missing_segment,
+                t_pre_extract_plan.as_secs_f64() * 1000.0,
+                t_pre_extract_exec.as_secs_f64() * 1000.0,
+                t_step1_plan.as_secs_f64() * 1000.0,
+                t_step1_reveal.as_secs_f64() * 1000.0,
+                t_step1_wipe.as_secs_f64() * 1000.0,
+                accounts_segment_pre_extracted_reveal,
+                accounts_segment_reader_reveal,
+                accounts_prebuilt_reveal,
+                accounts_empty_reveal,
+                accounts_wiped,
+                storage_update_ops,
+                storage_delete_ops,
+                storage_root_accounts.len(),
+                account_update_ops,
+                account_remove_empty_ops,
+                account_remove_deleted_ops,
+            );
+        }
     }
 
     Ok(())
