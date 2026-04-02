@@ -114,6 +114,7 @@ The profile output includes granular sub-timers for commit hot spots:
 All benchmarks use **chunked incremental pre-population** for both reth and mpt-db, matching real blockchain state accumulation (one block at a time, no batch shortcuts).
 
 Machine: Apple M-series, 32GB RAM, SSD.
+Latest refresh: April 2, 2026 (`USE_SPARSE=1`, default allocator, `MPT_BENCH_ITERS=1` for B4.2-B4.5 benchmarks; one-shot profile for B4.6-B4.7).
 
 ### Summary
 
@@ -122,12 +123,12 @@ Each updated account has its nonce and balance modified, plus **all** of its sto
 | Test | Pre-pop accounts | Storage slots per account | Accounts updated per block | Blocks | reth per-block | mpt-db per-block | Speedup |
 |------|-----------------|--------------------------|---------------------------|--------|---------------|-----------------|---------|
 | B4.1 | 0 (fresh) | 10 | 100 | 1 | 1.26 ms | 1.31 ms | 1.0x |
-| B4.2 | 1K | 10 | 200 | 1 | 5.73 ms | 2.98 ms | **1.9x** |
-| B4.3 | 1K | 10 | 200 | 10 | 5.39 ms | 2.38 ms | **2.3x** |
-| B4.4 | 200K | 10 | 2K | 10 | 285 ms | 24 ms | **11.9x** |
-| B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 83 ms | **14.6x** |
-| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 491 ms | **17.3x** |
-| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 58 ms | **34.2x** |
+| B4.2 | 1K | 10 | 200 | 1 | 5.73 ms | 3.0 ms | **1.9x** |
+| B4.3 | 1K | 10 | 200 | 10 | 5.39 ms | 3.1 ms | **1.7x** |
+| B4.4 | 200K | 10 | 2K | 10 | 285 ms | 42.5 ms | **6.7x** |
+| B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 104.7 ms | **11.6x** |
+| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 390.2 ms | **21.8x** |
+| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 51.0 ms | **38.9x** |
 
 ### Workload vs real-world comparison
 
@@ -144,8 +145,8 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 
 - **Small datasets (B4.1–B4.3)**: reth's MDBX keeps everything in page cache, so both systems are fast. mpt-db's advantage is modest (1–2x) because the WAL append overhead is a significant fraction of the per-block time.
 - **Large datasets (B4.4–B4.6)**: reth's MDBX page cache becomes cold as the dataset exceeds cache capacity. Random reads from disk dominate reth's `overlay_root_with_updates` and `write_trie_updates`. mpt-db's in-memory tries are unaffected by dataset size, giving **10–15x** speedup for B4.4/B4.5.
-- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each. mpt-db completes in ~491ms. The SparseStateTrie migration replaced full-trie loading with dirty-path-only witness reveal; parallel pre-extraction of segment multiproofs and batch parallel storage reveal further reduce sp_ch. Account root now uses the fast `root_hash_only_parallel` path on the legacy arena trie instead of `SerialSparseTrie::root()`.
-- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). mpt-db completes in ~58ms. The full-trie materialization path (`extract_full_decoded_multiproof`) replaces per-key path tracing for dense 200-slot updates, reducing segment decode overhead by ~4x. Cross-block SparseStateTrie reuse keeps storage tries revealed across blocks, eliminating re-reveal cost for hot accounts.
+- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each. mpt-db completes in ~390ms. The SparseStateTrie migration replaced full-trie loading with dirty-path-only witness reveal; parallel pre-extraction of segment multiproofs and batch parallel storage reveal keep `sp_ch` around ~169ms. Account root uses the fast `root_hash_only_parallel` path on the legacy arena trie (~49.5ms).
+- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). mpt-db completes in ~51ms. The full-trie materialization path (`extract_full_decoded_multiproof`) replaces per-key path tracing for dense 200-slot updates, and cross-block SparseStateTrie reuse keeps storage tries revealed across blocks; `account_root` is ~9.4ms.
 
 ### B4.6 detailed breakdown
 
@@ -158,15 +159,15 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 | `write_hashed_state` | 844 ms |
 | `commit` | 276 ms |
 
-**mpt-db (~491 ms/block, SparseStateTrie path):**
+**mpt-db (~390 ms/block, SparseStateTrie path):**
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| `apply_bundle_state` | ~372 ms | |
-| `sp_ch` (parallel extract + batch reveal + storage roots) | ~310 ms | 10K × 30 slots, full-scan for 16–64 slot accounts |
-| `account_root` (arena parallel hash) | ~45 ms | `root_hash_only_parallel` on legacy account trie |
-| `segment_build` | ~34 ms | background-deferred in wal_first mode |
-| `wal_append` | ~15 ms | |
+| `apply_bundle_state` | ~262 ms | |
+| `sp_ch` (parallel extract + batch reveal + storage roots) | ~169 ms | 10K × 30 slots, full-scan for 16–64 slot accounts |
+| `account_root` (arena parallel hash) | ~49.5 ms | `root_hash_only_parallel` on legacy account trie |
+| `segment_build` | ~0 ms | background-deferred in wal_first mode |
+| `wal_append` | ~15.7 ms | |
 
 Primary bottleneck is `sp_ch`: parallel segment multiproof extraction and batch reveal for 10K accounts.
 Account root uses the fast arena path (`root_hash_only_parallel`) rather than `SerialSparseTrie::root()`.
