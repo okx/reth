@@ -29,7 +29,7 @@ use reth_trie_sparse::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use super::{
@@ -47,10 +47,24 @@ static SPARSE_PROVIDER_ACCOUNT_CALLS: std::sync::atomic::AtomicU64 =
 
 const SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES: usize = 16;
 const SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES: usize = 64;
-const SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS: usize = 2_000;
+// Allow B4.6-style high-account-count blocks (10K dirty accounts) to still
+// use full-scan extraction for dense per-account slot updates (16..=64 keys).
+const SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS: usize = 20_000;
 // Keep a bounded per-call storage map size for reveal_decoded_multiproof to
 // avoid very large transient allocations under 10K-account blocks.
 const SPARSE_STORAGE_REVEAL_BATCH_CHUNK: usize = 8_192;
+
+#[inline]
+fn sparse_storage_full_scan_max_dirty_accounts() -> usize {
+    static FULL_SCAN_MAX_DIRTY_ACCOUNTS: OnceLock<usize> = OnceLock::new();
+    *FULL_SCAN_MAX_DIRTY_ACCOUNTS.get_or_init(|| {
+        std::env::var("MPT_SPARSE_FULL_SCAN_MAX_DIRTY_ACCOUNTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS)
+    })
+}
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
@@ -1096,7 +1110,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
     let mut account_update_ops = 0usize;
     let mut account_remove_empty_ops = 0usize;
     let mut account_remove_deleted_ops = 0usize;
-    let enable_full_scan = dirty_accounts.len() <= SPARSE_STORAGE_FULL_SCAN_MAX_DIRTY_ACCOUNTS;
+    let enable_full_scan = dirty_accounts.len() <= sparse_storage_full_scan_max_dirty_accounts();
     let mut pre_extracted_segment_proofs: HashMap<B256, DecodedStorageMultiProof> =
         HashMap::with_capacity(dirty_accounts.len());
     let provider_storage_before =
