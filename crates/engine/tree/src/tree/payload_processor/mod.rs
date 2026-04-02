@@ -17,7 +17,7 @@ use alloy_primitives::B256;
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use metrics::{Counter, Histogram};
 use multiproof::{SparseTrieUpdate, *};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use prewarm::PrewarmMetrics;
 use rayon::prelude::*;
 use reth_evm::{
@@ -105,8 +105,135 @@ type IteratorPayloadHandle<Evm, I, N> = PayloadHandle<
 >;
 
 /// Entrypoint for executing the payload.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PayloadProcessor<Evm>
+where
+    Evm: ConfigureEvm,
+{
+    inner: Arc<Mutex<PayloadProcessorInner<Evm>>>,
+    executor: Runtime,
+}
+
+impl<N, Evm> PayloadProcessor<Evm>
+where
+    N: NodePrimitives,
+    Evm: ConfigureEvm<Primitives = N> + 'static,
+{
+    /// Returns a reference to the workload executor driving payload tasks.
+    pub const fn executor(&self) -> &Runtime {
+        &self.executor
+    }
+
+    /// Creates a new payload processor.
+    pub fn new(
+        executor: Runtime,
+        evm_config: Evm,
+        config: &TreeConfig,
+        precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(PayloadProcessorInner::new(
+                executor.clone(),
+                evm_config,
+                config,
+                precompile_cache_map,
+            ))),
+            executor,
+        }
+    }
+
+    /// Spawns all background tasks and returns a handle connected to the tasks.
+    ///
+    /// - Transaction prewarming task
+    /// - State root task
+    /// - Sparse trie task
+    ///
+    /// # Transaction prewarming task
+    ///
+    /// Responsible for feeding state updates to the multi proof task.
+    ///
+    /// This task runs until:
+    ///  - externally cancelled (e.g. sequential block execution is complete)
+    ///
+    /// ## Multi proof task
+    ///
+    /// Responsible for preparing sparse trie messages for the sparse trie task.
+    /// A state update (e.g. tx output) is converted into a multiproof calculation that returns an
+    /// output back to this task.
+    ///
+    /// Receives updates from sequential execution.
+    /// This task runs until it receives a shutdown signal, which should be after the block
+    /// was fully executed.
+    ///
+    /// ## Sparse trie task
+    ///
+    /// Responsible for calculating the state root based on the received [`SparseTrieUpdate`].
+    ///
+    /// This task runs until there are no further updates to process.
+    ///
+    /// This returns a handle to await the final state root and to interact with the tasks (e.g.
+    /// canceling)
+    pub fn spawn<P, F, I: ExecutableTxIterator<Evm>>(
+        &self,
+        env: ExecutionEnv<Evm>,
+        transactions: I,
+        provider_builder: StateProviderBuilder<N, P>,
+        multiproof_provider_factory: F,
+        config: &TreeConfig,
+        bal: Option<Arc<BlockAccessList>>,
+    ) -> IteratorPayloadHandle<Evm, I, N>
+    where
+        P: BlockReader + StateProviderFactory + StateReader + Clone + 'static,
+        F: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
+            + Clone
+            + Send
+            + 'static,
+    {
+        self.inner.lock().spawn(
+            env,
+            transactions,
+            provider_builder,
+            multiproof_provider_factory,
+            config,
+            bal,
+        )
+    }
+
+    /// Spawns a task that exclusively handles cache prewarming for transaction execution.
+    ///
+    /// Returns a [`PayloadHandle`] to communicate with the task.
+    pub fn spawn_cache_exclusive<P, I: ExecutableTxIterator<Evm>>(
+        &self,
+        env: ExecutionEnv<Evm>,
+        transactions: I,
+        provider_builder: StateProviderBuilder<N, P>,
+        bal: Option<Arc<BlockAccessList>>,
+    ) -> IteratorPayloadHandle<Evm, I, N>
+    where
+        P: BlockReader + StateProviderFactory + StateReader + Clone + 'static,
+    {
+        self.inner.lock().spawn_cache_exclusive(env, transactions, provider_builder, bal)
+    }
+
+    /// Updates the execution cache with the post-execution state from an inserted block.
+    ///
+    /// This is used when blocks are inserted directly (e.g., locally built blocks by sequencers)
+    /// to ensure the cache remains warm for subsequent block execution.
+    ///
+    /// The cache enables subsequent blocks to reuse account, storage, and bytecode data without
+    /// hitting the database, maintaining performance consistency.
+    pub fn on_inserted_executed_block(
+        &self,
+        block_with_parent: BlockWithParent,
+        bundle_state: &BundleState,
+    ) {
+        self.inner.lock().on_inserted_executed_block(block_with_parent, bundle_state)
+    }
+}
+
+/// Inner payload processor implementation.
+#[derive(Debug)]
+pub struct PayloadProcessorInner<Evm>
 where
     Evm: ConfigureEvm,
 {
@@ -144,7 +271,7 @@ where
     disable_cache_metrics: bool,
 }
 
-impl<N, Evm> PayloadProcessor<Evm>
+impl<N, Evm> PayloadProcessorInner<Evm>
 where
     N: NodePrimitives,
     Evm: ConfigureEvm<Primitives = N>,
@@ -181,51 +308,20 @@ where
     }
 }
 
-impl<N, Evm> PayloadProcessor<Evm>
+impl<N, Evm> PayloadProcessorInner<Evm>
 where
     N: NodePrimitives,
     Evm: ConfigureEvm<Primitives = N> + 'static,
 {
-    /// Spawns all background tasks and returns a handle connected to the tasks.
-    ///
-    /// - Transaction prewarming task
-    /// - State root task
-    /// - Sparse trie task
-    ///
-    /// # Transaction prewarming task
-    ///
-    /// Responsible for feeding state updates to the multi proof task.
-    ///
-    /// This task runs until:
-    ///  - externally cancelled (e.g. sequential block execution is complete)
-    ///
-    /// ## Multi proof task
-    ///
-    /// Responsible for preparing sparse trie messages for the sparse trie task.
-    /// A state update (e.g. tx output) is converted into a multiproof calculation that returns an
-    /// output back to this task.
-    ///
-    /// Receives updates from sequential execution.
-    /// This task runs until it receives a shutdown signal, which should be after the block
-    /// was fully executed.
-    ///
-    /// ## Sparse trie task
-    ///
-    /// Responsible for calculating the state root based on the received [`SparseTrieUpdate`].
-    ///
-    /// This task runs until there are no further updates to process.
-    ///
-    ///
-    /// This returns a handle to await the final state root and to interact with the tasks (e.g.
-    /// canceling)
+    /// Inner implementation of [`PayloadProcessor::spawn`].
     #[instrument(
         level = "debug",
         target = "engine::tree::payload_processor",
         name = "payload processor",
         skip_all
     )]
-    pub fn spawn<P, F, I: ExecutableTxIterator<Evm>>(
-        &mut self,
+    fn spawn<P, F, I: ExecutableTxIterator<Evm>>(
+        &self,
         env: ExecutionEnv<Evm>,
         transactions: I,
         provider_builder: StateProviderBuilder<N, P>,
@@ -335,9 +431,7 @@ where
         }
     }
 
-    /// Spawns a task that exclusively handles cache prewarming for transaction execution.
-    ///
-    /// Returns a [`PayloadHandle`] to communicate with the task.
+    /// Inner implementation of [`PayloadProcessor::spawn_cache_exclusive`].
     #[instrument(level = "debug", target = "engine::tree::payload_processor", skip_all)]
     pub fn spawn_cache_exclusive<P, I: ExecutableTxIterator<Evm>>(
         &self,
@@ -444,8 +538,8 @@ where
                     let _ = execute_tx.send(tx);
                     next_for_execution += 1;
 
-                    while let Some(entry) = queue.first_entry()
-                        && *entry.key() == next_for_execution
+                    while let Some(entry) = queue.first_entry() &&
+                        *entry.key() == next_for_execution
                     {
                         let _ = execute_tx.send(entry.remove());
                         next_for_execution += 1;
@@ -675,13 +769,7 @@ where
         });
     }
 
-    /// Updates the execution cache with the post-execution state from an inserted block.
-    ///
-    /// This is used when blocks are inserted directly (e.g., locally built blocks by sequencers)
-    /// to ensure the cache remains warm for subsequent block execution.
-    ///
-    /// The cache enables subsequent blocks to reuse account, storage, and bytecode data without
-    /// hitting the database, maintaining performance consistency.
+    /// Inner implementation of [`PayloadProcessor::on_inserted_executed_block`].
     pub fn on_inserted_executed_block(
         &self,
         block_with_parent: BlockWithParent,
@@ -1069,7 +1157,9 @@ mod tests {
     use super::PayloadExecutionCache;
     use crate::tree::{
         cached_state::{CachedStateMetrics, ExecutionCache, SavedCache},
-        payload_processor::{evm_state_to_hashed_post_state, PayloadProcessor},
+        payload_processor::{
+            evm_state_to_hashed_post_state, PayloadProcessor, PayloadProcessorInner,
+        },
         precompile_cache::PrecompileCacheMap,
         StateProviderBuilder, TreeConfig,
     };
@@ -1178,7 +1268,7 @@ mod tests {
 
     #[test]
     fn on_inserted_executed_block_populates_cache() {
-        let payload_processor = PayloadProcessor::new(
+        let payload_processor = PayloadProcessorInner::new(
             reth_tasks::Runtime::test(),
             EthEvmConfig::new(Arc::new(ChainSpec::default())),
             &TreeConfig::default(),
@@ -1207,7 +1297,7 @@ mod tests {
 
     #[test]
     fn on_inserted_executed_block_skips_on_parent_mismatch() {
-        let payload_processor = PayloadProcessor::new(
+        let payload_processor = PayloadProcessorInner::new(
             reth_tasks::Runtime::test(),
             EthEvmConfig::new(Arc::new(ChainSpec::default())),
             &TreeConfig::default(),
@@ -1342,7 +1432,7 @@ mod tests {
             }
         }
 
-        let mut payload_processor = PayloadProcessor::new(
+        let payload_processor = PayloadProcessor::new(
             reth_tasks::Runtime::test(),
             EthEvmConfig::new(factory.chain_spec()),
             &TreeConfig::default(),
