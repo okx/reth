@@ -108,14 +108,33 @@ pub(crate) fn insert_recursive(
             // need one child ref (8 bytes) — cloning the full BranchNode
             // (~260 bytes with 16 children) is wasteful.
             enum Route {
-                Leaf,
-                Extension,
+                LeafExact,
+                LeafSplit(LeafNode),
+                ExtensionDescend { child_idx: u32, next_offset: usize },
+                ExtensionSplit(ExtensionNode),
                 BranchDescend { nibble: usize, child_idx: Option<u32> },
                 BranchSetValue,
             }
             let route = match arena.get(idx) {
-                MptNode::Leaf(_) => Route::Leaf,
-                MptNode::Extension(_) => Route::Extension,
+                MptNode::Leaf(leaf) => {
+                    if leaf.nibbles == remaining {
+                        Route::LeafExact
+                    } else {
+                        Route::LeafSplit(leaf.clone())
+                    }
+                }
+                MptNode::Extension(ext) => {
+                    let common_len = ext.nibbles.common_prefix_length(&remaining);
+                    if common_len == ext.nibbles.len() {
+                        let child_idx = match &ext.child {
+                            ChildRef::Arena(c) => *c,
+                            _ => panic!("Phase 1: only Arena child refs"),
+                        };
+                        Route::ExtensionDescend { child_idx, next_offset: offset + common_len }
+                    } else {
+                        Route::ExtensionSplit(ext.clone())
+                    }
+                }
                 MptNode::Branch(branch) => {
                     if offset >= key.len() {
                         Route::BranchSetValue
@@ -145,18 +164,22 @@ pub(crate) fn insert_recursive(
                     }
                     idx
                 }
-                Route::Leaf => {
-                    let leaf = match arena.get(idx) {
-                        MptNode::Leaf(l) => l.clone(),
-                        _ => unreachable!(),
-                    };
-                    insert_at_leaf(arena, idx, &leaf, &remaining, value)
+                Route::LeafExact => {
+                    if let MptNode::Leaf(l) = arena.get_mut(idx) {
+                        l.value = value;
+                    }
+                    idx
                 }
-                Route::Extension => {
-                    let ext = match arena.get(idx) {
-                        MptNode::Extension(e) => e.clone(),
-                        _ => unreachable!(),
-                    };
+                Route::LeafSplit(leaf) => insert_at_leaf(arena, idx, &leaf, &remaining, value),
+                Route::ExtensionDescend { child_idx, next_offset } => {
+                    let new_child =
+                        insert_recursive(arena, Some(child_idx), key, next_offset, value);
+                    if let MptNode::Extension(e) = arena.get_mut(idx) {
+                        e.child = ChildRef::Arena(new_child);
+                    }
+                    idx
+                }
+                Route::ExtensionSplit(ext) => {
                     insert_at_extension(arena, idx, &ext, key, offset, value)
                 }
             }

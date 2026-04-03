@@ -283,6 +283,24 @@ pub(crate) fn extract_account_proof_from_sparse_trie(
     sparse_nodes_to_account_proof_nodes(account_trie)
 }
 
+/// Path-limited variant of `extract_account_proof_from_sparse_trie`.
+///
+/// Exports only account-trie nodes along `keys` paths (plus required branch
+/// sibling hashes) so sparse apply can reveal just the dirty-account subset.
+pub(crate) fn extract_account_proof_from_sparse_trie_for_paths(
+    sparse_trie: &SparseStateTrie,
+    keys: &[Nibbles],
+) -> MptResult<(DecodedProofNodes, BranchNodeMasksMap)> {
+    let Some(account_trie) = sparse_trie.state_trie_ref() else {
+        let subtree = DecodedProofNodes::from_iter([(Nibbles::default(), TrieNode::EmptyRoot)]);
+        return Ok((subtree, BranchNodeMasksMap::default()));
+    };
+    if keys.is_empty() {
+        return sparse_nodes_to_account_proof_nodes(account_trie);
+    }
+    sparse_nodes_to_account_proof_nodes_for_paths(account_trie, keys)
+}
+
 /// Builds a `DecodedStorageMultiProof` for a single account's storage trie
 /// from a previously-committed `SparseStateTrie`.
 ///
@@ -447,6 +465,109 @@ fn sparse_nodes_to_account_proof_nodes(
             }
         }
     }
+    Ok((DecodedProofNodes::from_iter(pairs), branch_masks))
+}
+
+/// Path-limited account-proof extraction from a `SerialSparseTrie`.
+fn sparse_nodes_to_account_proof_nodes_for_paths(
+    trie: &SerialSparseTrie,
+    keys: &[Nibbles],
+) -> MptResult<(DecodedProofNodes, BranchNodeMasksMap)> {
+    let nodes = trie.nodes_ref();
+    let values = trie.values_ref();
+    let include_paths = collect_sparse_include_paths_for_keys(nodes, keys);
+
+    let mut pairs: Vec<(Nibbles, TrieNode)> = Vec::new();
+    let mut branch_masks: BranchNodeMasksMap = BranchNodeMasksMap::default();
+    let mut visited: HashSet<Nibbles> = HashSet::default();
+    let mut stack: Vec<Nibbles> = vec![Nibbles::default()];
+
+    while let Some(path) = stack.pop() {
+        if !include_paths.contains(&path) {
+            continue;
+        }
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+
+        let node = match nodes.get(&path) {
+            Some(n) => n,
+            None => continue,
+        };
+        match node {
+            SparseNode::Empty => {
+                pairs.push((path, TrieNode::EmptyRoot));
+            }
+            SparseNode::Hash(_) => {
+                // Blinded nodes are represented by parent hash refs.
+            }
+            SparseNode::Leaf { key, .. } => {
+                let full_path = nibbles_extend(&path, key);
+                let value = values.get(&full_path).cloned().unwrap_or_default();
+                pairs.push((
+                    path,
+                    TrieNode::Leaf(alloy_trie::nodes::LeafNode::new(key.clone(), value)),
+                ));
+            }
+            SparseNode::Extension { key, .. } => {
+                let child_path = nibbles_extend(&path, key);
+                let child_hash = sparse_node_rlp(nodes, &child_path);
+                pairs.push((
+                    path,
+                    TrieNode::Extension(alloy_trie::nodes::ExtensionNode::new(
+                        key.clone(),
+                        child_hash,
+                    )),
+                ));
+
+                if include_paths.contains(&child_path) {
+                    let is_revealed = nodes
+                        .get(&child_path)
+                        .map(|n| !matches!(n, SparseNode::Hash(_)))
+                        .unwrap_or(false);
+                    if is_revealed {
+                        stack.push(child_path);
+                    }
+                }
+            }
+            SparseNode::Branch { state_mask, .. } => {
+                let mut rlp_stack: Vec<alloy_trie::nodes::RlpNode> = Vec::new();
+                let mut tree_mask = reth_trie_common::TrieMask::default();
+                let mut hash_mask = reth_trie_common::TrieMask::default();
+
+                for i in 0u8..16 {
+                    if !state_mask.is_bit_set(i) {
+                        continue;
+                    }
+                    let child_path = nibbles_push(&path, i);
+                    let child_rlp = sparse_node_rlp(nodes, &child_path);
+                    if child_rlp.is_hash() {
+                        hash_mask.set_bit(i);
+                    }
+                    if include_paths.contains(&child_path) {
+                        let is_revealed = nodes
+                            .get(&child_path)
+                            .map(|n| !matches!(n, SparseNode::Hash(_)))
+                            .unwrap_or(false);
+                        if is_revealed {
+                            tree_mask.set_bit(i);
+                            stack.push(child_path);
+                        }
+                    }
+                    rlp_stack.push(child_rlp);
+                }
+
+                pairs.push((
+                    path.clone(),
+                    TrieNode::Branch(alloy_trie::nodes::BranchNode::new(rlp_stack, *state_mask)),
+                ));
+                if tree_mask.get() != 0 || hash_mask.get() != 0 {
+                    branch_masks.insert(path, BranchNodeMasks { tree_mask, hash_mask });
+                }
+            }
+        }
+    }
+
     Ok((DecodedProofNodes::from_iter(pairs), branch_masks))
 }
 

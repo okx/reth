@@ -40,8 +40,9 @@ use super::{
         convert_arena_to_account_proof_nodes_for_paths,
         convert_arena_to_decoded_storage_multiproof,
         convert_arena_to_decoded_storage_multiproof_for_paths,
-        extract_storage_proof_from_sparse_trie, extract_storage_proof_from_sparse_trie_for_paths,
-        storage_key_requires_provider_reveal, SegmentTrieNodeProviderFactory,
+        extract_account_proof_from_sparse_trie_for_paths, extract_storage_proof_from_sparse_trie,
+        extract_storage_proof_from_sparse_trie_for_paths, storage_key_requires_provider_reveal,
+        SegmentTrieNodeProviderFactory,
     },
     state::{self, DirtyAccount},
     storage_cow::{CowRootRef, StorageTrieCow},
@@ -4976,6 +4977,20 @@ impl MptCommitStore {
             ));
         }
 
+        // In sparse mode, prefer deriving path-limited account proof directly
+        // from the latest sparse trie to avoid depending on account-trie hot-path
+        // updates during wal_first commits.
+        if self.config.use_sparse_storage {
+            if let Some(ref cross) = self.cross_block_sparse &&
+                cross.trie.state_trie_ref().is_some()
+            {
+                return extract_account_proof_from_sparse_trie_for_paths(&cross.trie, account_keys);
+            }
+            if let Some(ref sparse) = self.last_committed_sparse_trie {
+                return extract_account_proof_from_sparse_trie_for_paths(sparse, account_keys);
+            }
+        }
+
         let working_version = self.current_working_version();
         self.account_trie.checkout_for_write(working_version);
 
@@ -5738,6 +5753,15 @@ impl MptCommitStore {
         // Phase 2: precompute account writes in parallel, then apply to the
         // single shared account trie serially.
         let account_updates_start = std::time::Instant::now();
+        let wal_sparse_root_enabled =
+            mode.wal_first && std::env::var_os("MPT_WAL_DISABLE_SPARSE_ROOT").is_none();
+        let force_account_trie_updates =
+            std::env::var_os("MPT_WAL_FORCE_ACCOUNT_TRIE_UPDATES").is_some();
+        let diag_skip_account_trie_updates =
+            std::env::var_os("MPT_WAL_SKIP_ACCOUNT_TRIE_UPDATES").is_some();
+        let skip_account_trie_updates = wal_sparse_root_enabled &&
+            self.config.use_sparse_storage &&
+            (diag_skip_account_trie_updates || !force_account_trie_updates);
         let encode_account = |dirty: &DirtyAccount| {
             let storage_root = storage_roots[&dirty.hashed_address];
             match &dirty.info {
@@ -5829,36 +5853,54 @@ impl MptCommitStore {
             None
         };
 
-        let account_writes: Vec<Option<Vec<u8>>> = if self.dirty_accounts.len() >= 1_024 {
-            self.dirty_accounts.par_iter().map(encode_account).collect()
-        } else {
-            self.dirty_accounts.iter().map(encode_account).collect()
-        };
-
         let working_version = self.current_working_version();
         self.account_trie.checkout_for_write(working_version);
         let mut account_trie = self.account_trie.take_working_or_base_for_version(working_version);
-        // Use the fast materialized path when the account trie has no lazy
-        // root (true after bulk_load and all subsequent blocks).
-        let materialized = !account_trie.is_lazy_root();
-        for (dirty, encoded) in self.dirty_accounts.iter().zip(account_writes.into_iter()) {
-            let key = &dirty.account_key;
-            if materialized {
-                account_trie.apply_change_materialized(key, encoded);
-            } else if let Some(rlp_buf) = encoded {
-                account_trie.apply_change(&self.persisted, key, Some(rlp_buf)).map_err(|err| {
-                    MptDbError::Other(format!(
-                        "account trie apply_change for {}: {err}",
-                        dirty.hashed_address
-                    ))
-                })?;
+        if !skip_account_trie_updates {
+            let account_updates_trace = std::env::var_os("MPT_ACCOUNT_UPDATES_TRACE").is_some();
+            let account_encode_start = std::time::Instant::now();
+            let account_writes: Vec<Option<Vec<u8>>> = if self.dirty_accounts.len() >= 1_024 {
+                self.dirty_accounts.par_iter().map(encode_account).collect()
             } else {
-                account_trie.apply_change(&self.persisted, key, None).map_err(|err| {
-                    MptDbError::Other(format!(
-                        "account trie apply_change delete for {}: {err}",
-                        dirty.hashed_address
-                    ))
-                })?;
+                self.dirty_accounts.iter().map(encode_account).collect()
+            };
+            let account_encode_elapsed = account_encode_start.elapsed();
+
+            // Use the fast materialized path when the account trie has no lazy
+            // root (true after bulk_load and all subsequent blocks).
+            let materialized = !account_trie.is_lazy_root();
+            let account_apply_start = std::time::Instant::now();
+            for (dirty, encoded) in self.dirty_accounts.iter().zip(account_writes.into_iter()) {
+                let key = &dirty.account_key;
+                if materialized {
+                    account_trie.apply_change_materialized(key, encoded);
+                } else if let Some(rlp_buf) = encoded {
+                    account_trie.apply_change(&self.persisted, key, Some(rlp_buf)).map_err(
+                        |err| {
+                            MptDbError::Other(format!(
+                                "account trie apply_change for {}: {err}",
+                                dirty.hashed_address
+                            ))
+                        },
+                    )?;
+                } else {
+                    account_trie.apply_change(&self.persisted, key, None).map_err(|err| {
+                        MptDbError::Other(format!(
+                            "account trie apply_change delete for {}: {err}",
+                            dirty.hashed_address
+                        ))
+                    })?;
+                }
+            }
+            let account_apply_elapsed = account_apply_start.elapsed();
+            if account_updates_trace {
+                eprintln!(
+                    "[mptdiag:account_updates] dirty_accounts={} encode_ms={:.3} apply_ms={:.3} materialized={}",
+                    self.dirty_accounts.len(),
+                    account_encode_elapsed.as_secs_f64() * 1000.0,
+                    account_apply_elapsed.as_secs_f64() * 1000.0,
+                    materialized
+                );
             }
         }
         let account_updates_elapsed = account_updates_start.elapsed();
@@ -5874,9 +5916,8 @@ impl MptCommitStore {
             self.pending_sparse_state.take()
         {
             // Sparse path:
-            // - wal_first: state root comes from the legacy account trie
-            //   (`root_hash_only_parallel`), which is already updated in Phase 2 with storage roots
-            //   produced by SparseStateTrie.
+            // - wal_first: default to SparseStateTrie root; account_trie updates are optional and
+            //   can be skipped on the commit hot path.
             // - non-wal_first: keep SparseStateTrie::root_with_updates so we can collect
             //   TrieUpdates for dirty blob generation.
             let (root, trie_updates, account_cow) = if let Some(external_root) = external_state_root
@@ -5904,7 +5945,7 @@ impl MptCommitStore {
                 //
                 // Keep MPT_WAL_USE_SPARSE_ROOT for backward compatibility with
                 // existing scripts (it is effectively a no-op when default is on).
-                let use_sparse_root = std::env::var_os("MPT_WAL_DISABLE_SPARSE_ROOT").is_none();
+                let use_sparse_root = wal_sparse_root_enabled;
                 let sparse_root = if use_sparse_root || verify_sparse_root {
                     Some(
                         pending
@@ -5918,7 +5959,7 @@ impl MptCommitStore {
 
                 if use_sparse_root {
                     let root = sparse_root.expect("sparse root must exist when use_sparse_root");
-                    if verify_sparse_root {
+                    if verify_sparse_root && !skip_account_trie_updates {
                         let (account_root, _) = account_trie
                             .clone()
                             .root_hash_only_parallel_account(&self.persisted)
@@ -5932,6 +5973,10 @@ impl MptCommitStore {
                                 "wal_first sparse root mismatch (sparse-root mode): sparse={root:?}, account_trie={account_root:?}"
                             )));
                         }
+                    } else if verify_sparse_root && skip_account_trie_updates {
+                        eprintln!(
+                            "[mptdiag] skip account-trie sparse-root verify: account_trie hot-path updates disabled"
+                        );
                     }
                     (root, TrieUpdates::default(), account_trie)
                 } else {
@@ -6146,7 +6191,8 @@ impl MptCommitStore {
         // Commit succeeded: update internal state
         self.manifest = saved.manifest;
         self.version = saved.new_version;
-        let checkpoint_account_trie_nodes = Some(account_cow.arena_len());
+        let checkpoint_account_trie_nodes =
+            if skip_account_trie_updates { None } else { Some(account_cow.arena_len()) };
         let committed_account_trie = if state_root == EMPTY_ROOT_HASH {
             StorageTrieCow::empty()
         } else {
