@@ -5897,7 +5897,14 @@ impl MptCommitStore {
             } else if mode.wal_first {
                 let verify_sparse_root =
                     std::env::var_os("MPT_VERIFY_WAL_SPARSE_ACCOUNT_ROOT").is_some();
-                let use_sparse_root = std::env::var_os("MPT_WAL_USE_SPARSE_ROOT").is_some();
+                // Default to sparse-root in wal_first mode to avoid duplicate
+                // account-trie hash computation on the commit hot path.
+                // Set MPT_WAL_DISABLE_SPARSE_ROOT=1 to force legacy account-trie
+                // root hashing for diagnostics.
+                //
+                // Keep MPT_WAL_USE_SPARSE_ROOT for backward compatibility with
+                // existing scripts (it is effectively a no-op when default is on).
+                let use_sparse_root = std::env::var_os("MPT_WAL_DISABLE_SPARSE_ROOT").is_none();
                 let sparse_root = if use_sparse_root || verify_sparse_root {
                     Some(
                         pending

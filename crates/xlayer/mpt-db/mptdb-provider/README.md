@@ -88,6 +88,8 @@ Key env knobs:
 - `MPTDB_PROVIDER_BENCH_SC_STORAGE_TRIE_CACHE_CAPACITY` (SC L2 storage-trie cache capacity)
 - `MPTDB_PROVIDER_BENCH_SC_PERSISTED_NODE_CACHE_CAPACITY` (SC persisted-node cache capacity)
 - `MPTDB_PROVIDER_BENCH_SC_CROSS_BLOCK_SPARSE_MAX_LAG` (cross-block sparse trie eviction lag)
+- `MPT_WAL_DISABLE_SPARSE_ROOT=1` (diagnostic fallback: force wal_first to use legacy account-trie root hash path)
+- `MPT_VERIFY_WAL_SPARSE_ACCOUNT_ROOT=1` (diagnostic parity check: compute both sparse-root and account-trie root)
 
 Interpretation caveat:
 
@@ -936,3 +938,42 @@ Conclusion:
 
 - Current bottleneck is still SC-side apply/commit CPU path under wal-first integration, not a
   dominant RocksDB option miss in this benchmark profile.
+
+### 9.14 P1.3 Follow-up: wal_first Default to Sparse-Root (April 3, 2026)
+
+Problem after 9.12/9.13:
+
+- SC commit still paid duplicate root work in wal_first mode:
+  - sparse trie path already has enough data to derive state root
+  - commit still defaulted to legacy `account_trie.root_hash_only_parallel_account(...)`
+
+Code change:
+
+- `mptdb-sc/src/mpt/commit_store.rs`
+  - In wal_first branch, default `use_sparse_root=true`.
+  - Added fallback knob:
+    - `MPT_WAL_DISABLE_SPARSE_ROOT=1` => force legacy account-trie hash path.
+  - Kept `MPT_VERIFY_WAL_SPARSE_ACCOUNT_ROOT=1` for strict parity diagnostics.
+
+Verification (provider workload):
+
+- target: `erc20_transfer_10pct_contract_pool/mptdb`
+- after P1.3:
+  - `time: [2.4620 s 2.4878 s 2.5156 s]`
+  - SC profile (avg/blk, representative):
+    - `total_commit ~84-86ms`
+    - `account_root ~30-33ms` (lower than previous default path)
+
+Control:
+
+- `reth_mdbx` on same run window:
+  - `time: [2.5245 s 2.5531 s 2.5846 s]`
+
+Parity diagnostic:
+
+- With `MPT_VERIFY_WAL_SPARSE_ACCOUNT_ROOT=1`, no mismatch error observed.
+- Expected overhead is large in this mode (it intentionally computes both roots).
+
+B4.8 regression guard:
+
+- Re-ran `profile_b4_8_integration_scale_mpt_only` (`10 blocks`): pass.
