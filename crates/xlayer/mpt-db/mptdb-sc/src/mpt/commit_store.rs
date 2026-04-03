@@ -64,6 +64,9 @@ use alloy_primitives::U256;
 const L2_FREQ_SKETCH_ROWS: usize = 4;
 const L2_FREQ_SKETCH_WIDTH: usize = 256;
 const L2_FREQ_SKETCH_AGE_INTERVAL: u64 = 65_536;
+const SPARSE_DEFERRED_MATERIALIZE_INTERVAL_LARGE_DEFAULT: i64 = 4;
+const SPARSE_DEFERRED_MATERIALIZE_MIN_PENDING_TARGETS: usize = 2_048;
+const SPARSE_DEFERRED_MATERIALIZE_MAX_PENDING_TARGETS: usize = 20_000;
 const L2_FREQ_SEEDS: [u32; L2_FREQ_SKETCH_ROWS] =
     [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
 
@@ -846,6 +849,9 @@ pub struct MptCommitStore {
     /// `Some` when `config.cross_block_sparse=true` and at least one block
     /// has been committed.
     cross_block_sparse: Option<Box<CrossBlockSparseState>>,
+    /// Coalesced storage roots awaiting deferred sparse segment materialization.
+    /// Key: hashed account address; Value: latest storage root to publish.
+    sparse_deferred_publish_roots: HashMap<B256, B256>,
 }
 
 /// Returns `true` when the `MPT_USE_SPARSE_STORAGE` env var is set to a
@@ -3140,6 +3146,7 @@ impl MptCommitStore {
             pending_sparse_state: None,
             last_committed_sparse_trie: None,
             cross_block_sparse: None,
+            sparse_deferred_publish_roots: HashMap::default(),
         })
     }
 
@@ -3278,6 +3285,7 @@ impl MptCommitStore {
         self.last_committed_sparse_trie = None;
         self.cross_block_sparse = None;
         self.pending_sparse_state = None;
+        self.sparse_deferred_publish_roots.clear();
         Ok(())
     }
 
@@ -3564,6 +3572,7 @@ impl MptCommitStore {
             pending_sparse_state: None,
             last_committed_sparse_trie: None,
             cross_block_sparse: None,
+            sparse_deferred_publish_roots: HashMap::default(),
         };
 
         if store.config.wal_first_commit && version < committed_version {
@@ -3839,6 +3848,31 @@ impl MptCommitStore {
             return override_raw != "0";
         }
         self.config.wal_first_defer_segment_build
+    }
+
+    fn sparse_deferred_materialize_interval(&self, pending_targets: usize) -> i64 {
+        if let Some(raw) = std::env::var_os("MPT_WAL_SPARSE_MATERIALIZE_INTERVAL") {
+            if let Ok(parsed) = raw.to_string_lossy().parse::<i64>() {
+                return parsed.max(1);
+            }
+        }
+        if pending_targets >= SPARSE_DEFERRED_MATERIALIZE_MIN_PENDING_TARGETS {
+            SPARSE_DEFERRED_MATERIALIZE_INTERVAL_LARGE_DEFAULT
+        } else {
+            1
+        }
+    }
+
+    fn should_materialize_sparse_deferred_now(
+        &self,
+        next_version: i64,
+        pending_targets: usize,
+    ) -> (bool, i64) {
+        let interval = self.sparse_deferred_materialize_interval(pending_targets);
+        if pending_targets >= SPARSE_DEFERRED_MATERIALIZE_MAX_PENDING_TARGETS {
+            return (true, interval);
+        }
+        (next_version % interval == 0, interval)
     }
 
     fn default_commit_mode(&self) -> CommitExecutionMode {
@@ -4280,6 +4314,7 @@ impl MptCommitter for MptCommitStore {
         self.last_committed_sparse_trie = None;
         self.cross_block_sparse = None;
         self.pending_sparse_state = None;
+        self.sparse_deferred_publish_roots.clear();
         Ok(())
     }
 
@@ -5937,6 +5972,15 @@ impl MptCommitStore {
         // wal_first: hash-only (no blob collection) — matching sei-db.
         // sync: hash + collect blobs for RocksDB persist.
         let account_root_start = std::time::Instant::now();
+        let account_root_trace = std::env::var_os("MPT_ACCOUNT_ROOT_TRACE").is_some();
+        let mut account_root_sparse_root_elapsed = Duration::ZERO;
+        let mut account_root_sparse_blob_elapsed = Duration::ZERO;
+        let mut account_root_sparse_segment_build_elapsed = Duration::ZERO;
+        let mut account_root_sparse_deferred_snapshot_elapsed = Duration::ZERO;
+        let mut account_root_sparse_publish_targets: usize = 0;
+        let mut account_root_sparse_snapshot_targets: usize = 0;
+        let mut account_root_sparse_pending_targets: usize = 0;
+        let mut account_root_sparse_materialize_interval: i64 = 1;
         let mut sparse_published_puts: Vec<(B256, StorageTrieSegment)> = Vec::new();
         let mut sparse_committed_tries: Vec<(B256, B256, SerialSparseTrie)> = Vec::new();
         let defer_sparse_segment_build =
@@ -5952,10 +5996,12 @@ impl MptCommitStore {
             let (root, trie_updates, account_cow) = if let Some(external_root) = external_state_root
             {
                 if std::env::var_os("MPT_VERIFY_WAL_EXTERNAL_STATE_ROOT").is_some() {
+                    let sparse_root_start = std::time::Instant::now();
                     let sparse_root = pending
                         .trie
                         .root(&pending.factory)
                         .map_err(|e| MptDbError::Other(format!("sparse root (verify): {e}")))?;
+                    account_root_sparse_root_elapsed += sparse_root_start.elapsed();
                     if sparse_root != external_root {
                         return Err(MptDbError::Other(format!(
                             "wal_first external root mismatch: sparse={sparse_root:?}, external={external_root:?}"
@@ -5976,12 +6022,17 @@ impl MptCommitStore {
                 // existing scripts (it is effectively a no-op when default is on).
                 let use_sparse_root = wal_sparse_root_enabled;
                 let sparse_root = if use_sparse_root || verify_sparse_root {
+                    let sparse_root_start = std::time::Instant::now();
                     Some(
                         pending
                             .trie
                             .root(&pending.factory)
                             .map_err(|e| MptDbError::Other(format!("sparse root (verify): {e}")))?,
                     )
+                    .map(|root| {
+                        account_root_sparse_root_elapsed += sparse_root_start.elapsed();
+                        root
+                    })
                 } else {
                     None
                 };
@@ -6054,12 +6105,14 @@ impl MptCommitStore {
             // In wal_first mode, the WAL + segments provide crash recovery, so
             // dirty blobs are not written to RocksDB.  In non-wal_first mode,
             // RocksDB trie tables must be kept current.
+            let sparse_blob_start = std::time::Instant::now();
             let blobs = if !mode.wal_first {
                 super::sparse_storage::sparse_trie_to_dirty_blobs(&pending.trie, &trie_updates)
                     .map_err(|e| MptDbError::Other(format!("sparse dirty blobs: {e}")))?
             } else {
                 Vec::<(B256, Vec<u8>)>::new()
             };
+            account_root_sparse_blob_elapsed += sparse_blob_start.elapsed();
             if mode.publish_baseline && !defer_sparse_segment_build {
                 let publish_targets: Vec<(B256, B256)> = self
                     .dirty_accounts
@@ -6079,44 +6132,94 @@ impl MptCommitStore {
                         }
                     })
                     .collect();
+                account_root_sparse_publish_targets = publish_targets.len();
                 if !publish_targets.is_empty() {
                     let sparse_build_start = std::time::Instant::now();
                     sparse_published_puts =
                         build_storage_segments_from_sparse_trie(&pending.trie, &publish_targets)?;
-                    storage_segment_build_elapsed += sparse_build_start.elapsed();
+                    let sparse_build_elapsed = sparse_build_start.elapsed();
+                    storage_segment_build_elapsed += sparse_build_elapsed;
+                    account_root_sparse_segment_build_elapsed += sparse_build_elapsed;
                 }
             } else if mode.publish_baseline && defer_sparse_segment_build {
-                let publish_targets: Vec<(B256, B256)> = self
+                account_root_sparse_publish_targets = self
                     .dirty_accounts
                     .iter()
-                    .filter_map(|dirty| {
+                    .filter(|dirty| {
                         if !dirty.storage_wiped && dirty.storage_changes.is_empty() {
-                            return None;
+                            return false;
                         }
                         let root = storage_roots
                             .get(&dirty.hashed_address)
                             .copied()
                             .unwrap_or(EMPTY_ROOT_HASH);
-                        if root == EMPTY_ROOT_HASH {
-                            None
+                        root != EMPTY_ROOT_HASH
+                    })
+                    .count();
+                // Coalesce hot-account root churn across blocks.  Instead of
+                // snapshot-cloning all changed sparse tries every block, keep
+                // only latest roots and materialize periodically.
+                //
+                // This preserves eventual segment freshness while removing the
+                // dominant per-block deferred snapshot clone cost on large
+                // account sets.
+                for dirty in &self.dirty_accounts {
+                    if !dirty.storage_wiped && dirty.storage_changes.is_empty() {
+                        continue;
+                    }
+                    let root = storage_roots
+                        .get(&dirty.hashed_address)
+                        .copied()
+                        .unwrap_or(EMPTY_ROOT_HASH);
+                    if root == EMPTY_ROOT_HASH {
+                        self.sparse_deferred_publish_roots.remove(&dirty.hashed_address);
+                    } else {
+                        self.sparse_deferred_publish_roots.insert(dirty.hashed_address, root);
+                    }
+                }
+
+                account_root_sparse_pending_targets = self.sparse_deferred_publish_roots.len();
+                let next_version = self.version + 1;
+                let (materialize_now, interval) = self.should_materialize_sparse_deferred_now(
+                    next_version,
+                    account_root_sparse_pending_targets,
+                );
+                account_root_sparse_materialize_interval = interval;
+
+                if materialize_now && !self.sparse_deferred_publish_roots.is_empty() {
+                    let snapshot_targets: Vec<(B256, B256)> = self
+                        .sparse_deferred_publish_roots
+                        .iter()
+                        .map(|(addr, root)| (*addr, *root))
+                        .collect();
+                    account_root_sparse_snapshot_targets = snapshot_targets.len();
+                    let sparse_snapshot_start = std::time::Instant::now();
+                    let mut snapshots: Vec<(B256, B256, SerialSparseTrie)> =
+                        Vec::with_capacity(snapshot_targets.len());
+                    let mut materialized_addrs: Vec<B256> =
+                        Vec::with_capacity(snapshot_targets.len());
+                    let mut missing_sparse_tries = 0usize;
+                    for (hashed_addr, root) in snapshot_targets {
+                        if let Some(trie) = pending.trie.storage_trie_ref(&hashed_addr) {
+                            snapshots.push((hashed_addr, root, trie.clone()));
+                            materialized_addrs.push(hashed_addr);
                         } else {
-                            Some((dirty.hashed_address, root))
+                            missing_sparse_tries += 1;
                         }
-                    })
-                    .collect();
-                sparse_committed_tries = publish_targets
-                    .into_iter()
-                    .map(|(hashed_addr, root)| {
-                        let trie =
-                            pending.trie.storage_trie_ref(&hashed_addr).ok_or_else(|| {
-                                MptDbError::Other(format!(
-                                    "sparse storage trie missing for deferred publish account {} root {}",
-                                    hashed_addr, root
-                                ))
-                            })?;
-                        Ok((hashed_addr, root, trie.clone()))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                    }
+                    if account_root_trace && missing_sparse_tries > 0 {
+                        eprintln!(
+                            "[mptdiag:account_root] deferred materialize miss sparse tries={missing_sparse_tries}"
+                        );
+                    }
+                    sparse_committed_tries = snapshots;
+                    for addr in materialized_addrs {
+                        self.sparse_deferred_publish_roots.remove(&addr);
+                    }
+                    account_root_sparse_pending_targets = self.sparse_deferred_publish_roots.len();
+                    account_root_sparse_deferred_snapshot_elapsed +=
+                        sparse_snapshot_start.elapsed();
+                }
             }
             // Store sparse trie for proof generation (latest committed version).
             // In cross-block mode, also return the trie to cross_block_sparse
@@ -6148,6 +6251,20 @@ impl MptCommitStore {
                 .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?
         };
         let account_root_elapsed = account_root_start.elapsed();
+        if account_root_trace {
+            eprintln!(
+                "[mptdiag:account_root] total_ms={:.3} sparse_root_ms={:.3} sparse_blob_ms={:.3} sparse_segment_build_ms={:.3} sparse_deferred_snapshot_ms={:.3} sparse_publish_targets={} sparse_snapshot_targets={} sparse_pending_targets={} sparse_interval={}",
+                account_root_elapsed.as_secs_f64() * 1000.0,
+                account_root_sparse_root_elapsed.as_secs_f64() * 1000.0,
+                account_root_sparse_blob_elapsed.as_secs_f64() * 1000.0,
+                account_root_sparse_segment_build_elapsed.as_secs_f64() * 1000.0,
+                account_root_sparse_deferred_snapshot_elapsed.as_secs_f64() * 1000.0,
+                account_root_sparse_publish_targets,
+                account_root_sparse_snapshot_targets,
+                account_root_sparse_pending_targets,
+                account_root_sparse_materialize_interval,
+            );
+        }
 
         // Separate node blobs from tries so we can cache tries after persist
         let mut storage_cache_candidates: Vec<(B256, StorageTrieCow)> =

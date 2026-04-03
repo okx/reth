@@ -977,3 +977,62 @@ Parity diagnostic:
 B4.8 regression guard:
 
 - Re-ran `profile_b4_8_integration_scale_mpt_only` (`10 blocks`): pass.
+
+### 9.15 P1.4 Follow-up: Deferred Sparse Snapshot Coalescing (April 3, 2026)
+
+Diagnosis (from new SC trace):
+
+- Added `MPT_ACCOUNT_ROOT_TRACE=1` in `mptdb-sc/src/mpt/commit_store.rs`.
+- On `erc20_transfer_10pct_contract_pool/mptdb`, `account_root` hot path split showed:
+  - `sparse_root_ms ~5-7ms`
+  - `sparse_deferred_snapshot_ms ~9-20ms` (dominant)
+- So the residual commit bottleneck was not root hash itself, but per-block cloning of
+  ~3k `SerialSparseTrie` snapshots for deferred segment materialization.
+
+Code change:
+
+- `mptdb-sc/src/mpt/commit_store.rs`
+  - Introduced coalesced deferred-publish root backlog:
+    - `sparse_deferred_publish_roots: HashMap<B256, B256>`
+  - In wal_first + deferred-segment mode:
+    - stop cloning sparse tries for every touched account every block
+    - keep only latest `(hashed_addr -> storage_root)` in backlog
+    - materialize snapshots periodically (default interval policy):
+      - if pending targets `< 2048`: every block (`interval=1`)
+      - if pending targets `>= 2048`: every 4 blocks (`interval=4`)
+    - force a drain when pending targets reach `20000` (safety bound)
+  - New override knob:
+    - `MPT_WAL_SPARSE_MATERIALIZE_INTERVAL=<N>` (`N>=1`)
+
+Provider verification (`erc20_transfer_10pct_contract_pool/mptdb`):
+
+- before P1.4:
+  - criterion: `time ~[1.996s, 2.024s, 2.066s]`
+  - SC profile (avg/blk):
+    - `account_root ~20-21ms`
+    - `total_commit ~30-31ms`
+- after P1.4:
+  - criterion: `time ~[1.880s, 1.895s, 1.911s]`
+  - SC profile (avg/blk):
+    - `account_root ~9-10ms`
+    - `total_commit ~18-19ms`
+
+reth control (same window):
+
+- `erc20_transfer_10pct_contract_pool/reth_mdbx`
+  - criterion: `time ~[2.461s, 2.487s, 2.516s]`
+
+Current interpretation:
+
+- P1.4 removes the dominant deferred snapshot clone overhead from SC commit hot path.
+- On the decision workload, mptdb block lifecycle is now ~`24%` faster than reth+mdbx in this run
+  window (`~1.90s` vs `~2.49s` for 10 blocks).
+
+Regression guard (SC micro-profiles):
+
+- `profile_b4_6_mpt_only`: pass
+  - per-block `~243.3ms`, commit `~61.7ms`
+- `profile_b4_7_mainnet_realistic_mpt_only`: pass
+  - per-block `~38.4ms`, commit `~9.4ms`
+- `profile_b4_8_integration_scale_mpt_only`: pass
+  - per-block `~233.0ms`, commit `~84.3ms`
