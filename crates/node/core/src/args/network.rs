@@ -356,7 +356,7 @@ impl NetworkArgs {
             // apply discovery settings
             .apply(|builder| {
                 let rlpx_socket = (addr, self.port).into();
-                self.discovery.apply_to_builder(builder, rlpx_socket, chain_bootnodes)
+                self.discovery.apply_to_builder_with_nat(builder, rlpx_socket, chain_bootnodes, Some(&self.nat))
             })
             .listener_addr(SocketAddr::new(
                 addr, // set discovery port based on instance number
@@ -569,9 +569,24 @@ impl DiscoveryArgs {
     /// Apply the discovery settings to the given [`NetworkConfigBuilder`]
     pub fn apply_to_builder<N>(
         &self,
+        network_config_builder: NetworkConfigBuilder<N>,
+        rlpx_tcp_socket: SocketAddr,
+        boot_nodes: impl IntoIterator<Item = NodeRecord>,
+    ) -> NetworkConfigBuilder<N>
+    where
+        N: NetworkPrimitives,
+    {
+        self.apply_to_builder_with_nat(network_config_builder, rlpx_tcp_socket, boot_nodes, None)
+    }
+
+    /// Apply the discovery settings to the given [`NetworkConfigBuilder`], using the NAT resolver
+    /// to set the external IP for discv5 ENR when the bind address is unspecified.
+    pub fn apply_to_builder_with_nat<N>(
+        &self,
         mut network_config_builder: NetworkConfigBuilder<N>,
         rlpx_tcp_socket: SocketAddr,
         boot_nodes: impl IntoIterator<Item = NodeRecord>,
+        nat: Option<&NatResolver>,
     ) -> NetworkConfigBuilder<N>
     where
         N: NetworkPrimitives,
@@ -591,7 +606,7 @@ impl DiscoveryArgs {
 
         if self.should_enable_discv5() {
             network_config_builder = network_config_builder
-                .discovery_v5(self.discovery_v5_builder(rlpx_tcp_socket, boot_nodes));
+                .discovery_v5(self.discovery_v5_builder_with_nat(rlpx_tcp_socket, boot_nodes, nat));
         }
 
         network_config_builder
@@ -602,6 +617,18 @@ impl DiscoveryArgs {
         &self,
         rlpx_tcp_socket: SocketAddr,
         boot_nodes: impl IntoIterator<Item = NodeRecord>,
+    ) -> reth_discv5::ConfigBuilder {
+        self.discovery_v5_builder_with_nat(rlpx_tcp_socket, boot_nodes, None)
+    }
+
+    /// Creates a [`reth_discv5::ConfigBuilder`] filling it with the values from this struct,
+    /// using the NAT-resolved external IP for the discv5 ENR when the bind address is
+    /// unspecified (0.0.0.0).
+    pub fn discovery_v5_builder_with_nat(
+        &self,
+        rlpx_tcp_socket: SocketAddr,
+        boot_nodes: impl IntoIterator<Item = NodeRecord>,
+        nat: Option<&NatResolver>,
     ) -> reth_discv5::ConfigBuilder {
         let Self {
             discv5_addr,
@@ -614,8 +641,14 @@ impl DiscoveryArgs {
             ..
         } = self;
 
-        // Use rlpx address if none given
-        let discv5_addr_ipv4 = discv5_addr.or(match rlpx_tcp_socket {
+        // Resolve external IPv4 from NAT if available
+        let nat_ipv4 = nat.and_then(|n| match n.clone().as_external_ip(0) {
+            Some(IpAddr::V4(ip)) if !ip.is_unspecified() => Some(ip),
+            _ => None,
+        });
+
+        // Use explicit discv5 addr first, then NAT-resolved IP, then rlpx address as fallback
+        let discv5_addr_ipv4 = discv5_addr.or(nat_ipv4).or(match rlpx_tcp_socket {
             SocketAddr::V4(addr) => Some(*addr.ip()),
             SocketAddr::V6(_) => None,
         });
