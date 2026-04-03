@@ -558,6 +558,7 @@ fn run_mptdb_bench(
         let mut sc_sparse_factory_tier12_attempts_total: u64 = 0;
         let mut sc_sparse_factory_cross_reuse_accounts_total: u64 = 0;
         let mut sc_sparse_factory_cross_missing_slots_total: u64 = 0;
+        let mut sc_sparse_factory_cross_missing_proof_slots_total: u64 = 0;
         let mut sc_trie_load_total = Duration::ZERO;
         let mut sc_slot_updates_total = Duration::ZERO;
         let mut sc_storage_roots_total = Duration::ZERO;
@@ -596,6 +597,7 @@ fn run_mptdb_bench(
             let mut sc_sparse_factory_tier12_attempts_phase: u64 = 0;
             let mut sc_sparse_factory_cross_reuse_accounts_phase: u64 = 0;
             let mut sc_sparse_factory_cross_missing_slots_phase: u64 = 0;
+            let mut sc_sparse_factory_cross_missing_proof_slots_phase: u64 = 0;
             let mut sc_trie_load_phase = Duration::ZERO;
             let mut sc_slot_updates_phase = Duration::ZERO;
             let mut sc_storage_roots_phase = Duration::ZERO;
@@ -798,6 +800,8 @@ fn run_mptdb_bench(
                         profile.sparse_factory_cross_reuse_accounts;
                     sc_sparse_factory_cross_missing_slots_phase +=
                         profile.sparse_factory_cross_missing_slots;
+                    sc_sparse_factory_cross_missing_proof_slots_phase +=
+                        profile.sparse_factory_cross_missing_proof_slots;
                     sc_trie_load_phase += profile.apply_get_or_load_storage_tries;
                     sc_slot_updates_phase += profile.apply_storage_slot_updates;
                     sc_storage_roots_phase += profile.storage_roots;
@@ -917,6 +921,8 @@ fn run_mptdb_bench(
                 sc_sparse_factory_cross_reuse_accounts_phase;
             sc_sparse_factory_cross_missing_slots_total +=
                 sc_sparse_factory_cross_missing_slots_phase;
+            sc_sparse_factory_cross_missing_proof_slots_total +=
+                sc_sparse_factory_cross_missing_proof_slots_phase;
             sc_trie_load_total += sc_trie_load_phase;
             sc_slot_updates_total += sc_slot_updates_phase;
             sc_storage_roots_total += sc_storage_roots_phase;
@@ -966,7 +972,7 @@ fn run_mptdb_bench(
                         outcome_storage_slots_phase,
                     );
                     eprintln!(
-                        "[trace][{}][iter {}] sparse_factory_stats(dirty={} storage={} seg={}/{} miss_no_store={} miss={} root_mismatch={} t3={}/{} t12={} cross_reuse={} cross_missing_slots={})",
+                        "[trace][{}][iter {}] sparse_factory_stats(dirty={} storage={} seg={}/{} miss_no_store={} miss={} root_mismatch={} t3={}/{} t12={} cross_reuse={} cross_missing_slots={} cross_missing_proof_slots={})",
                         label,
                         iter_idx + 1,
                         sc_sparse_factory_dirty_accounts_phase,
@@ -981,6 +987,7 @@ fn run_mptdb_bench(
                         sc_sparse_factory_tier12_attempts_phase,
                         sc_sparse_factory_cross_reuse_accounts_phase,
                         sc_sparse_factory_cross_missing_slots_phase,
+                        sc_sparse_factory_cross_missing_proof_slots_phase,
                     );
                 }
             }
@@ -1036,7 +1043,7 @@ fn run_mptdb_bench(
                 outcome_storage_slots_total / total_blocks as u64,
             );
             eprintln!(
-                "[{}] avg/sparse_factory per-block: dirty={} storage={} seg={}/{} miss_no_store={} miss={} root_mismatch={} t3={}/{} t12={} cross_reuse={} cross_missing_slots={}",
+                "[{}] avg/sparse_factory per-block: dirty={} storage={} seg={}/{} miss_no_store={} miss={} root_mismatch={} t3={}/{} t12={} cross_reuse={} cross_missing_slots={} cross_missing_proof_slots={}",
                 label,
                 sc_sparse_factory_dirty_accounts_total / total_blocks as u64,
                 sc_sparse_factory_storage_accounts_total / total_blocks as u64,
@@ -1050,6 +1057,7 @@ fn run_mptdb_bench(
                 sc_sparse_factory_tier12_attempts_total / total_blocks as u64,
                 sc_sparse_factory_cross_reuse_accounts_total / total_blocks as u64,
                 sc_sparse_factory_cross_missing_slots_total / total_blocks as u64,
+                sc_sparse_factory_cross_missing_proof_slots_total / total_blocks as u64,
             );
         }
         eprintln!("[{}] criterion measure mode: {:?}", label, measure_mode);

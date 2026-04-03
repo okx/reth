@@ -758,3 +758,123 @@ Effect:
 - `sc_write` reduced by roughly `~17%`
 - `apply` reduced by roughly `~28-30%`
 - `sparse_factory` miss/t12 counters were largely unchanged, so the gain is mainly from cache-hit/memory locality improvements in SC internals.
+
+### 9.10 P1 Fix Landed: Cross-Missing Proof Gating (April 3, 2026)
+
+Problem after P0 + cache tuning:
+
+- Provider heavy run still had large `cross_missing_slots` in cross-block reuse mode.
+- Even when those missing slots could be inserted on already-revealed in-memory paths,
+  SC still spent time preparing fallback reveal/proof path.
+
+Scope of code change:
+
+- `mptdb-sc/src/mpt/sparse_storage.rs`
+  - Added `storage_key_requires_provider_reveal(storage_trie, slot_key)`:
+    - Returns `true` only when path analysis indicates Hash-blinded/unknown nodes may require provider reveal.
+    - Returns `false` for branch-miss / fully-revealed in-memory paths.
+- `mptdb-sc/src/mpt/commit_store.rs`
+  - In cross-block reuse path, for `cross_missing_slots`:
+    - Build fallback proof only for `proof_keys` that actually require provider reveal.
+    - If `proof_keys` is empty, inject `DecodedStorageMultiProof::empty()` as explicit prebuilt proof
+      (to satisfy sparse-apply reveal planning for existing accounts without forcing fallback build).
+  - Added profile counter:
+    - `sparse_factory_cross_missing_proof_slots`
+- `mptdb-provider/benches/block_execution.rs`
+  - Exposed and printed `cross_missing_proof_slots` in sparse-factory trace and avg lines.
+
+#### 9.10.1 Verification run (same provider workload)
+
+Workload:
+
+- `erc20_transfer_10pct_contract_pool/mptdb`
+- `500000acc_50000tx_10blk_30c_128kv_pool15000`
+- `MPTDB_PROVIDER_BENCH_SC_PROFILE=1`
+- `MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle`
+- `MPTDB_PROVIDER_BENCH_TRACE=1`
+- `MPTDB_PROVIDER_BENCH_TRACE_ITERS=1`
+
+First trace sample after P1:
+
+- `EVM ~4.02s/iter`
+- `SC write ~7.78s/iter`
+- `apply ~2.98s/iter` (`~298ms/blk`)
+- `total_commit ~4.78s/iter` (`~478ms/blk`)
+- `avg/blk(block-lifecycle) ~1.18s`
+
+Sparse factory counters (per-block):
+
+- `cross_reuse ~12552`
+- `cross_missing_slots ~43382`
+- `cross_missing_proof_slots ~0`
+- `t3=0`, `t12=0`
+
+Interpretation:
+
+- Under this integration-scale workload, cross-missing slots are predominantly
+  branch-miss / already-revealed-path inserts, so provider-backed proof build was unnecessary.
+- P1 removes this residual sparse-factory overhead and further reduces `apply + sc_write`.
+
+#### 9.10.2 Reference comparison vs reth_mdbx (same workload, first trace sample)
+
+- `reth_mdbx avg/blk(block-lifecycle) ~1.20s`
+- `mptdb(P1) avg/blk(block-lifecycle) ~1.18s`
+
+This is first-trace diagnostic comparison (not full criterion convergence), but confirms
+P1 eliminated the previous integration slow-path on this workload.
+
+#### 9.10.3 Correctness guard
+
+- Re-ran `profile_b4_8_integration_scale_mpt_only` (`10 blocks`) after P1: pass.
+- This verifies root/state path remains valid under the optimization.
+
+### 9.11 P1.1 Follow-up: No-Reveal Fast Path for Cross-Missing Slots (April 3, 2026)
+
+Observation after 9.10:
+
+- `cross_missing_proof_slots` was already `~0`, meaning most cross-missing slots did not need
+  provider reveal/proof nodes.
+- But Step-1 in `apply_all_storage_changes_sparse` still paid non-trivial overhead by carrying
+  these accounts through storage reveal planning.
+
+Code change:
+
+- `mptdb-sc/src/mpt/sparse_storage.rs`
+  - Added `SegmentTrieNodeProviderFactory.no_reveal_accounts`.
+  - In Step-1 storage reveal planning, accounts in `no_reveal_accounts` are skipped directly.
+- `mptdb-sc/src/mpt/commit_store.rs`
+  - In cross-reuse path, when `proof_keys.is_empty()`, mark account in
+    `factory.no_reveal_accounts` (instead of forcing an empty prebuilt proof path).
+  - Kept `cross_missing_proof_slots` counter for diagnostics.
+
+#### 9.11.1 Verification (parallel mode, integration workload)
+
+Workload: same `erc20_transfer_10pct_contract_pool/mptdb`
+(`500000acc_50000tx_10blk_30c_128kv_pool15000`, `block_lifecycle`, `SC_PROFILE=1`).
+
+Before 9.11 (after 9.10):
+
+- `avg/blk ~1.18s`
+- `sc_write ~7.73-7.78s/iter`
+- `apply ~293-298ms/blk`
+
+After 9.11:
+
+- `avg/blk ~1.11-1.13s`
+- `sc_write ~7.16-7.34s/iter`
+- `apply ~239-247ms/blk`
+- `cross_missing_proof_slots ~0` (unchanged, as expected)
+
+Interpretation:
+
+- Additional gain comes from removing unnecessary Step-1 reveal bookkeeping for accounts whose
+  storage updates can proceed entirely on already-revealed in-memory paths.
+
+#### 9.11.2 Current reference vs reth_mdbx
+
+Same workload, first trace diagnostics:
+
+- `mptdb`: `~1.11-1.13s/blk`
+- `reth_mdbx`: `~1.21-1.23s/blk`
+
+So mptdb now holds a clearer lead in provider integration mode under this workload.

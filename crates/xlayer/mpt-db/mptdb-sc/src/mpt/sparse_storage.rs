@@ -140,6 +140,12 @@ pub struct SegmentTrieNodeProviderFactory {
     ///
     /// Built in `MptCommitStore::build_sparse_factory` from `storage_trie_handles`.
     pub pre_built_storage_proofs: alloy_primitives::map::HashMap<B256, DecodedStorageMultiProof>,
+    /// Accounts that are already revealed in the reused cross-block trie and
+    /// whose currently dirty storage writes can proceed without additional
+    /// reveal/proof materialization.
+    ///
+    /// For these accounts, Step-1 storage reveal in sparse apply is skipped.
+    pub no_reveal_accounts: HashSet<B256>,
     /// Accounts confirmed to have no prior storage (new accounts or
     /// `storage_wiped` accounts after `apply_all_storage_changes_sparse`
     /// processes them).
@@ -161,6 +167,7 @@ impl SegmentTrieNodeProviderFactory {
             account_segment: None,
             storage_segments: HashMap::new(),
             pre_built_storage_proofs: alloy_primitives::map::HashMap::default(),
+            no_reveal_accounts: HashSet::new(),
             known_empty_accounts: HashSet::new(),
         }
     }
@@ -310,6 +317,51 @@ pub(crate) fn extract_storage_proof_from_sparse_trie_for_paths(
         return Ok(Some(sparse_nodes_to_decoded_storage_multiproof(storage_trie, root)?));
     }
     Ok(Some(sparse_nodes_to_decoded_storage_multiproof_for_paths(storage_trie, root, keys)?))
+}
+
+/// Returns `true` if updating `slot_key` in an already-revealed storage trie
+/// may still require provider-backed reveal due to blinded path nodes.
+///
+/// Cross-block reuse uses this to avoid constructing fallback proofs for
+/// missing slots that can be inserted purely from in-memory revealed nodes.
+pub(crate) fn storage_key_requires_provider_reveal(
+    storage_trie: &SerialSparseTrie,
+    slot_key: &Nibbles,
+) -> bool {
+    let nodes = storage_trie.nodes_ref();
+    let mut current = Nibbles::default();
+
+    loop {
+        let Some(node) = nodes.get(&current) else {
+            // Conservative fallback: unknown structure, keep proof path enabled.
+            return true;
+        };
+        match node {
+            SparseNode::Hash(_) => return true,
+            SparseNode::Empty | SparseNode::Leaf { .. } => return false,
+            SparseNode::Branch { state_mask, .. } => {
+                if current.len() >= slot_key.len() {
+                    return false;
+                }
+                let nibble = slot_key.get_unchecked(current.len());
+                if !state_mask.is_bit_set(nibble) {
+                    return false;
+                }
+                current = nibbles_push(&current, nibble);
+            }
+            SparseNode::Extension { key: ext_key, .. } => {
+                let child_path = nibbles_extend(&current, ext_key);
+                if !slot_key.starts_with(&child_path) {
+                    // Extension split path only needs provider when child is hash-blinded.
+                    return nodes
+                        .get(&child_path)
+                        .map(|n| matches!(n, SparseNode::Hash(_)))
+                        .unwrap_or(true);
+                }
+                current = child_path;
+            }
+        }
+    }
 }
 
 /// DFS over a `SerialSparseTrie`'s revealed nodes to produce
@@ -1326,6 +1378,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
     let mut accounts_segment_pre_extracted_reveal = 0usize;
     let mut accounts_segment_reader_reveal = 0usize;
     let mut accounts_prebuilt_reveal = 0usize;
+    let mut accounts_no_reveal_shortcut = 0usize;
     let mut accounts_empty_reveal = 0usize;
     let mut pre_extract_skip_wiped_or_empty = 0usize;
     let mut pre_extract_skip_reused = 0usize;
@@ -1495,6 +1548,10 @@ pub(crate) fn apply_all_storage_changes_sparse(
             if all_slots_already_revealed {
                 continue;
             }
+        }
+        if provider_factory.no_reveal_accounts.contains(&hashed_addr) {
+            accounts_no_reveal_shortcut += 1;
+            continue;
         }
         if let Some(proof) = pre_extracted_segment_proofs.remove(&hashed_addr) {
             accounts_segment_reveal += 1;
@@ -1707,7 +1764,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
         let provider_account_after =
             SPARSE_PROVIDER_ACCOUNT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "[mptsparse] accounts={} changes={} reveal_acct={:.1}ms extract={:.1}ms reveal_storage={:.1}ms storage_apply={:.1}ms root_compute={:.1}ms account_apply={:.1}ms total={:.1}ms seg={} prebuilt={} empty={} wiped={} provider_storage={} provider_account={}",
+            "[mptsparse] accounts={} changes={} reveal_acct={:.1}ms extract={:.1}ms reveal_storage={:.1}ms storage_apply={:.1}ms root_compute={:.1}ms account_apply={:.1}ms total={:.1}ms seg={} prebuilt={} no_reveal={} empty={} wiped={} provider_storage={} provider_account={}",
             dirty_accounts.len(),
             storage_change_total,
             t_reveal_account.as_secs_f64() * 1000.0,
@@ -1719,6 +1776,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
             start.elapsed().as_secs_f64() * 1000.0,
             accounts_segment_reveal,
             accounts_prebuilt_reveal,
+            accounts_no_reveal_shortcut,
             accounts_empty_reveal,
             accounts_wiped,
             provider_storage_after.saturating_sub(provider_storage_before),
@@ -1726,7 +1784,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
         );
         if trace_verbose {
             eprintln!(
-                "[mptsparse:detail] pre_extract(candidates={},skip_wiped_or_empty={},skip_reused={},skip_prebuilt={},skip_missing_seg={},plan={:.1}ms,exec={:.1}ms) step1(plan={:.1}ms,reveal={:.1}ms,wipe={:.1}ms,seg_pre_extracted={},seg_reader={},prebuilt={},known_empty={},wiped={}) step2(storage_updates={},storage_deletes={},root_accounts={}) step3(account_updates={},account_remove_empty={},account_remove_deleted={})",
+                "[mptsparse:detail] pre_extract(candidates={},skip_wiped_or_empty={},skip_reused={},skip_prebuilt={},skip_missing_seg={},plan={:.1}ms,exec={:.1}ms) step1(plan={:.1}ms,reveal={:.1}ms,wipe={:.1}ms,seg_pre_extracted={},seg_reader={},prebuilt={},no_reveal={},known_empty={},wiped={}) step2(storage_updates={},storage_deletes={},root_accounts={}) step3(account_updates={},account_remove_empty={},account_remove_deleted={})",
                 segment_extract_candidate_count,
                 pre_extract_skip_wiped_or_empty,
                 pre_extract_skip_reused,
@@ -1740,6 +1798,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
                 accounts_segment_pre_extracted_reveal,
                 accounts_segment_reader_reveal,
                 accounts_prebuilt_reveal,
+                accounts_no_reveal_shortcut,
                 accounts_empty_reveal,
                 accounts_wiped,
                 storage_update_ops,

@@ -41,7 +41,7 @@ use super::{
         convert_arena_to_decoded_storage_multiproof,
         convert_arena_to_decoded_storage_multiproof_for_paths,
         extract_storage_proof_from_sparse_trie, extract_storage_proof_from_sparse_trie_for_paths,
-        SegmentTrieNodeProviderFactory,
+        storage_key_requires_provider_reveal, SegmentTrieNodeProviderFactory,
     },
     state::{self, DirtyAccount},
     storage_cow::{CowRootRef, StorageTrieCow},
@@ -586,6 +586,9 @@ pub struct CommitProfile {
     pub sparse_factory_cross_reuse_accounts: u64,
     /// Sparse factory (cross-block): total newly-touched slots not yet revealed.
     pub sparse_factory_cross_missing_slots: u64,
+    /// Sparse factory (cross-block): newly-touched slots that still need
+    /// provider-backed reveal/proof construction.
+    pub sparse_factory_cross_missing_proof_slots: u64,
     pub storage_roots: Duration,
     pub storage_roots_prefill: Duration,
     pub storage_roots_take_handles: Duration,
@@ -677,6 +680,7 @@ struct SparseFactoryStats {
     tier12_attempts: u64,
     cross_reuse_accounts: u64,
     cross_missing_slots: u64,
+    cross_missing_proof_slots: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -4828,20 +4832,35 @@ impl MptCommitStore {
             let dirty_keys: Vec<Nibbles> =
                 dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
 
-            if cross_trie.storage_trie_ref(&dirty.hashed_address).is_some() {
+            if let Some(storage_trie) = cross_trie.storage_trie_ref(&dirty.hashed_address) {
                 // Account is already revealed in the cross-block trie.
                 stats.cross_reuse_accounts += 1;
                 // For slots already revealed in previous blocks, no proof work is needed.
-                let missing_keys: Vec<Nibbles> = dirty
-                    .storage_changes
-                    .iter()
-                    .filter(|c| {
-                        !cross_trie.is_storage_slot_revealed(dirty.hashed_address, c.hashed_slot)
-                    })
-                    .map(|c| c.slot_key.clone())
-                    .collect();
-                stats.cross_missing_slots += missing_keys.len() as u64;
-                if missing_keys.is_empty() {
+                // For newly-touched slots, only a subset requires fallback proof:
+                // branch-miss inserts on fully-revealed paths can update in-memory
+                // without touching the provider.
+                let mut missing_count = 0usize;
+                let mut proof_keys: Vec<Nibbles> = Vec::new();
+                for change in &dirty.storage_changes {
+                    if cross_trie.is_storage_slot_revealed(dirty.hashed_address, change.hashed_slot)
+                    {
+                        continue;
+                    }
+                    missing_count += 1;
+                    if storage_key_requires_provider_reveal(storage_trie, &change.slot_key) {
+                        proof_keys.push(change.slot_key.clone());
+                    }
+                }
+                stats.cross_missing_slots += missing_count as u64;
+                stats.cross_missing_proof_slots += proof_keys.len() as u64;
+                if missing_count == 0 {
+                    continue;
+                }
+                if proof_keys.is_empty() {
+                    // All missing slots can be inserted on already-revealed
+                    // in-memory paths; skip Step-1 storage reveal for this
+                    // account entirely.
+                    factory.no_reveal_accounts.insert(dirty.hashed_address);
                     continue;
                 }
                 // Only build tier-3 proof for newly-touched slots.
@@ -4849,7 +4868,7 @@ impl MptCommitStore {
                 self.try_build_l2_proof_tier3_only(
                     &dirty.hashed_address,
                     root,
-                    &missing_keys,
+                    &proof_keys,
                     &mut factory,
                     stats,
                 );
@@ -4859,12 +4878,7 @@ impl MptCommitStore {
                     // sources (previous sparse trie / L2 cache) to avoid
                     // missing-proof errors in sparse apply.
                     stats.tier12_attempts += 1;
-                    self.try_build_l2_proof(
-                        &dirty.hashed_address,
-                        root,
-                        &missing_keys,
-                        &mut factory,
-                    );
+                    self.try_build_l2_proof(&dirty.hashed_address, root, &proof_keys, &mut factory);
                 }
             } else {
                 // Account not yet in cross-block trie:
@@ -5157,6 +5171,7 @@ impl MptCommitStore {
                 account_segment: cross.factory.account_segment.clone(),
                 storage_segments: cross.factory.storage_segments.clone(),
                 pre_built_storage_proofs: cross.factory.pre_built_storage_proofs.clone(),
+                no_reveal_accounts: cross.factory.no_reveal_accounts.clone(),
                 known_empty_accounts: cross.factory.known_empty_accounts.clone(),
             };
             self.pending_sparse_state = Some(Box::new(PendingSparseState {
@@ -5193,6 +5208,7 @@ impl MptCommitStore {
                 account_segment: factory.account_segment.clone(),
                 storage_segments: factory.storage_segments.clone(),
                 pre_built_storage_proofs: factory.pre_built_storage_proofs.clone(),
+                no_reveal_accounts: factory.no_reveal_accounts.clone(),
                 known_empty_accounts: factory.known_empty_accounts.clone(),
             };
             self.cross_block_sparse = Some(Box::new(CrossBlockSparseState {
@@ -6269,6 +6285,9 @@ impl MptCommitStore {
                 .last_apply_sparse_factory
                 .cross_reuse_accounts,
             sparse_factory_cross_missing_slots: self.last_apply_sparse_factory.cross_missing_slots,
+            sparse_factory_cross_missing_proof_slots: self
+                .last_apply_sparse_factory
+                .cross_missing_proof_slots,
             storage_roots: storage_roots_elapsed,
             storage_roots_prefill: storage_roots_prefill_elapsed,
             storage_roots_take_handles: storage_roots_take_handles_elapsed,
