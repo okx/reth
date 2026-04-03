@@ -1242,7 +1242,6 @@ fn nibbles_extend(base: &Nibbles, extra: &Nibbles) -> Nibbles {
 struct SparseArenaBuilder<'a> {
     nodes: &'a alloy_primitives::map::HashMap<Nibbles, SparseNode>,
     values: &'a alloy_primitives::map::HashMap<Nibbles, Vec<u8>>,
-    path_to_idx: HashMap<Nibbles, u32>,
     arena_nodes: Vec<MptNode>,
     arena_hash_cache: Vec<Option<B256>>,
 }
@@ -1252,13 +1251,7 @@ impl<'a> SparseArenaBuilder<'a> {
         nodes: &'a alloy_primitives::map::HashMap<Nibbles, SparseNode>,
         values: &'a alloy_primitives::map::HashMap<Nibbles, Vec<u8>>,
     ) -> Self {
-        Self {
-            nodes,
-            values,
-            path_to_idx: HashMap::new(),
-            arena_nodes: Vec::new(),
-            arena_hash_cache: Vec::new(),
-        }
+        Self { nodes, values, arena_nodes: Vec::new(), arena_hash_cache: Vec::new() }
     }
 
     fn build_child_ref(&mut self, path: &Nibbles) -> MptResult<ChildRef> {
@@ -1283,10 +1276,6 @@ impl<'a> SparseArenaBuilder<'a> {
     }
 
     fn build_node(&mut self, path: &Nibbles) -> MptResult<u32> {
-        if let Some(idx) = self.path_to_idx.get(path).copied() {
-            return Ok(idx);
-        }
-
         let Some(node) = self.nodes.get(path) else {
             return Err(MptDbError::Other(format!("sparse trie missing node at path {:?}", path)));
         };
@@ -1298,7 +1287,6 @@ impl<'a> SparseArenaBuilder<'a> {
         }
 
         let idx = self.arena_nodes.len() as u32;
-        self.path_to_idx.insert(path.clone(), idx);
         self.arena_nodes.push(MptNode::Branch(BranchNode::new()));
         self.arena_hash_cache.push(get_node_hash(self.nodes, path));
 
@@ -1335,7 +1323,7 @@ impl<'a> SparseArenaBuilder<'a> {
     }
 }
 
-fn build_storage_segment_from_sparse_serial(
+pub(crate) fn build_storage_segment_from_sparse_serial(
     trie: &SerialSparseTrie,
     root: B256,
 ) -> MptResult<StorageTrieSegment> {
@@ -1344,7 +1332,7 @@ fn build_storage_segment_from_sparse_serial(
     let mut builder = SparseArenaBuilder::new(nodes, values);
     let root_path = Nibbles::default();
     let root_idx = builder.build_node(&root_path)?;
-    StorageTrieSegment::from_parts(
+    StorageTrieSegment::from_dense_reachable_parts(
         &builder.arena_nodes,
         &builder.arena_hash_cache,
         Some(root_idx),
@@ -1385,6 +1373,38 @@ pub(crate) fn build_storage_segments_from_sparse_trie(
         targets.par_iter().map(build_one).collect::<MptResult<Vec<_>>>()?
     } else {
         targets.iter().map(build_one).collect::<MptResult<Vec<_>>>()?
+    };
+    Ok(built.into_iter().flatten().collect())
+}
+
+/// Build storage trie segments from explicit `(account, root, trie)` sparse
+/// snapshots.
+///
+/// This is used by wal_first background segment materialization: frontend
+/// commit captures sparse storage trie snapshots, and the persist worker
+/// performs serialization off the hot path.
+pub(crate) fn build_storage_segments_from_sparse_snapshots(
+    snapshots: &[(B256, B256, SerialSparseTrie)],
+) -> MptResult<Vec<(B256, StorageTrieSegment)>> {
+    let build_one = |(hashed_addr, root, trie): &(B256, B256, SerialSparseTrie)| -> MptResult<
+        Option<(B256, StorageTrieSegment)>,
+    > {
+        if *root == EMPTY_ROOT_HASH {
+            return Ok(None);
+        }
+        let segment = build_storage_segment_from_sparse_serial(trie, *root).map_err(|e| {
+            MptDbError::Other(format!(
+                "build sparse segment from snapshot for account {} root {}: {e}",
+                hashed_addr, root
+            ))
+        })?;
+        Ok(Some((*hashed_addr, segment)))
+    };
+
+    let built: Vec<Option<(B256, StorageTrieSegment)>> = if snapshots.len() >= 64 {
+        snapshots.par_iter().map(build_one).collect::<MptResult<Vec<_>>>()?
+    } else {
+        snapshots.iter().map(build_one).collect::<MptResult<Vec<_>>>()?
     };
     Ok(built.into_iter().flatten().collect())
 }

@@ -15,6 +15,14 @@ pub struct MptConfig {
     pub async_blob_threshold: usize,
     /// Enable phase-1 shadow WAL append on commit.
     pub wal_first_commit: bool,
+    /// In wal_first mode, build published storage segments in the background
+    /// persist worker from committed trie snapshots instead of on the frontend
+    /// commit hot path.
+    ///
+    /// This keeps `commit+root` CPU cost low on large account sets while still
+    /// publishing segments for mmap/L3 reads after the worker catches up.
+    /// Default: `true`.
+    pub wal_first_defer_segment_build: bool,
     /// When enabled alongside `wal_first_commit`, perform extra parity checks.
     pub wal_shadow_validate: bool,
     /// How many committed versions to advance before rewriting a fresh published snapshot.
@@ -86,6 +94,7 @@ impl Default for MptConfig {
             async_queue_depth: 64,
             async_blob_threshold: 50_000,
             wal_first_commit: false,
+            wal_first_defer_segment_build: true,
             wal_shadow_validate: false,
             published_snapshot_interval: 64,
             published_rewrite_timeout_secs: 60,

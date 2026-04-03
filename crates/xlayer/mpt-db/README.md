@@ -16,6 +16,12 @@ mpt-db keeps the account trie and storage tries resident in memory with a WAL (W
 - **Multi-gen try_extend**: The published-view refresh fast path can fast-forward across multiple background-worker generations, preventing fallback to full chain rebuild under any worker lag.
 - **Empty-trie lifecycle control**: Empty-storage handles activated during apply are removed from `storage_trie_handles` after commit, preventing unbounded map growth and LRU slot pollution.
 
+### WAL-first segment materialization strategy
+
+- Default (`MptConfig::wal_first_defer_segment_build = true`): in wal-first mode, storage segment serialization is deferred to the background persist worker.
+- Sparse apply path uses sparse trie snapshots for background materialization, so frontend `segment_build` stays off the commit hot path while published segments are still backfilled.
+- Diagnostic override: `MPT_WAL_DEFER_SPARSE_SEGMENT_BUILD=0` forces foreground sparse segment build for A/B checks.
+
 ### Crate structure
 
 | Crate | Description |

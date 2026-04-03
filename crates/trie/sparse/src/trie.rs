@@ -41,6 +41,15 @@ const SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_DEPTH: usize = 1;
 const SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_MAX_PREFIX_KEYS: usize = 1_024;
 /// Minimum targets required for shallow split parallel pre-hash.
 const SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_MIN_TARGETS: usize = 8;
+const SPARSE_ROOT_TRACE_MIN_PREFIX_DEFAULT: usize = 4096;
+
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug)]
+struct ParallelPrehashStats {
+    depth: usize,
+    target_count: usize,
+    prefix_len_after: usize,
+}
 
 /// A sparse trie that is either in a "blind" state (no nodes are revealed, root node hash is
 /// unknown) or in a "revealed" state (root node has been revealed and the trie can be updated).
@@ -934,18 +943,81 @@ impl SparseTrieInterface for SerialSparseTrie {
     fn root(&mut self) -> B256 {
         // Take the current prefix set
         let mut prefix_set = core::mem::take(&mut self.prefix_set).freeze();
+        let prefix_len_before = prefix_set.len();
+        let root_trace_min_prefix = std::env::var("MPT_SPARSE_ROOT_TRACE_MIN_PREFIX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(SPARSE_ROOT_TRACE_MIN_PREFIX_DEFAULT);
+        let root_trace = std::env::var_os("MPT_SPARSE_ROOT_TRACE").is_some() &&
+            prefix_len_before >= root_trace_min_prefix;
+        let root_total_start = root_trace.then(std::time::Instant::now);
+        #[cfg(feature = "std")]
+        let mut prehash_stats: Option<ParallelPrehashStats> = None;
+        let prehash_start = root_trace.then(std::time::Instant::now);
         // Fast path for wal_first-like callers (updates disabled): pre-hash
         // independent subtries in parallel, then let `rlp_node_allocate` merge
         // the shallow frontier serially.
         #[cfg(feature = "std")]
         if self.updates.is_none() {
-            self.parallel_prehash_subtries_no_updates(&mut prefix_set);
+            prehash_stats = self.parallel_prehash_subtries_no_updates(&mut prefix_set);
         }
+        let prehash_elapsed = prehash_start.map(|s| s.elapsed());
+        let merge_start = root_trace.then(std::time::Instant::now);
         let rlp_node = self.rlp_node_allocate(&mut prefix_set);
+        let merge_elapsed = merge_start.map(|s| s.elapsed());
         if let Some(root_hash) = rlp_node.as_hash() {
+            if let Some(total_start) = root_total_start {
+                let total_elapsed = total_start.elapsed();
+                #[cfg(feature = "std")]
+                eprintln!(
+                    "[mptsparse:root] prefix_before={} prehash_used={} prehash_ms={:.3} prehash_depth={} prehash_targets={} prefix_after={} merge_ms={:.3} total_ms={:.3}",
+                    prefix_len_before,
+                    prehash_stats.is_some(),
+                    prehash_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                    prehash_stats.map_or(0, |s| s.depth),
+                    prehash_stats.map_or(0, |s| s.target_count),
+                    prehash_stats.map_or(prefix_set.len(), |s| s.prefix_len_after),
+                    merge_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                    total_elapsed.as_secs_f64() * 1000.0
+                );
+                #[cfg(not(feature = "std"))]
+                eprintln!(
+                    "[mptsparse:root] prefix_before={} prehash_used=false prehash_ms={:.3} prehash_depth=0 prehash_targets=0 prefix_after={} merge_ms={:.3} total_ms={:.3}",
+                    prefix_len_before,
+                    prehash_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                    prefix_set.len(),
+                    merge_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                    total_elapsed.as_secs_f64() * 1000.0
+                );
+            }
             root_hash
         } else {
-            keccak256(rlp_node)
+            let out = keccak256(rlp_node);
+            if let Some(total_start) = root_total_start {
+                let total_elapsed = total_start.elapsed();
+                #[cfg(feature = "std")]
+                eprintln!(
+                    "[mptsparse:root] prefix_before={} prehash_used={} prehash_ms={:.3} prehash_depth={} prehash_targets={} prefix_after={} merge_ms={:.3} total_ms={:.3}",
+                    prefix_len_before,
+                    prehash_stats.is_some(),
+                    prehash_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                    prehash_stats.map_or(0, |s| s.depth),
+                    prehash_stats.map_or(0, |s| s.target_count),
+                    prehash_stats.map_or(prefix_set.len(), |s| s.prefix_len_after),
+                    merge_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                    total_elapsed.as_secs_f64() * 1000.0
+                );
+                #[cfg(not(feature = "std"))]
+                eprintln!(
+                    "[mptsparse:root] prefix_before={} prehash_used=false prehash_ms={:.3} prehash_depth=0 prehash_targets=0 prefix_after={} merge_ms={:.3} total_ms={:.3}",
+                    prefix_len_before,
+                    prehash_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                    prefix_set.len(),
+                    merge_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                    total_elapsed.as_secs_f64() * 1000.0
+                );
+            }
+            out
         }
     }
 
@@ -1435,14 +1507,18 @@ impl SerialSparseTrie {
     /// parallel and shrinks `prefix_set` to only shallow nodes, so the final
     /// `root()` merge stays cheap on large account batches.
     #[cfg(feature = "std")]
-    fn parallel_prehash_subtries_no_updates(&mut self, prefix_set: &mut PrefixSet) {
+    fn parallel_prehash_subtries_no_updates(
+        &mut self,
+        prefix_set: &mut PrefixSet,
+    ) -> Option<ParallelPrehashStats> {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let prefix_len_before = prefix_set.len();
 
-        if prefix_set.len() < SPARSE_TRIE_PARALLEL_ROOT_MIN_PREFIX_KEYS {
-            return;
+        if prefix_len_before < SPARSE_TRIE_PARALLEL_ROOT_MIN_PREFIX_KEYS {
+            return None;
         }
 
-        let depth = if prefix_set.len() <= SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_MAX_PREFIX_KEYS {
+        let depth = if prefix_len_before <= SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_MAX_PREFIX_KEYS {
             SPARSE_TRIE_PARALLEL_ROOT_SHALLOW_DEPTH
         } else {
             SPARSE_TRIE_SUBTRIE_HASHES_LEVEL
@@ -1454,8 +1530,9 @@ impl SerialSparseTrie {
         };
         let (targets, new_prefix_set) = self.get_changed_nodes_at_depth(prefix_set, depth);
         if targets.len() < min_targets {
-            return;
+            return None;
         }
+        let target_count = targets.len();
 
         let updates = {
             let trie_ref: &SerialSparseTrie = self;
@@ -1483,7 +1560,9 @@ impl SerialSparseTrie {
             }
         }
 
+        let prefix_len_after = new_prefix_set.len();
         *prefix_set = new_prefix_set.freeze();
+        Some(ParallelPrehashStats { depth, target_count, prefix_len_after })
     }
 
     /// Read-only recursive RLP/hash computation for no-updates mode.

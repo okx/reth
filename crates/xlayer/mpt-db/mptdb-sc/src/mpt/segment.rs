@@ -101,6 +101,43 @@ impl StorageTrieSegment {
         Ok(Self { bytes: encode_page(&payload, root, root_record_off), root, root_record_off })
     }
 
+    /// Build a storage segment from a dense, fully-reachable arena.
+    ///
+    /// This fast path skips the generic reachability/remap pass used by
+    /// [`Self::from_parts`]. It assumes:
+    /// - every node in `nodes` is reachable from `root_idx`
+    /// - `ChildRef::Arena(idx)` points to the same dense index space
+    ///
+    /// Used by sparse->segment conversion where the arena is constructed from
+    /// the sparse trie in one DFS and already satisfies these invariants.
+    pub(crate) fn from_dense_reachable_parts(
+        nodes: &[MptNode],
+        hash_cache: &[Option<B256>],
+        root_idx: Option<u32>,
+        root: B256,
+    ) -> Result<Self> {
+        let Some(root_idx) = root_idx else {
+            return Err(MptDbError::Other("segment requires non-empty trie".to_string()));
+        };
+        let root_idx_usize = root_idx as usize;
+        if root_idx_usize >= nodes.len() {
+            return Err(MptDbError::Other(format!(
+                "segment root idx out of bounds: {root_idx_usize} >= {}",
+                nodes.len()
+            )));
+        }
+
+        let mut build_nodes = Vec::with_capacity(nodes.len());
+        for arena_idx in 0..nodes.len() as u32 {
+            build_nodes.push(build_node_dense(nodes, hash_cache, arena_idx)?);
+        }
+
+        let payload = encode_segment(&build_nodes, root, root_idx);
+        let root_record_off =
+            (FLAT_PAGE_HEADER_LEN + SEGMENT_HEADER_LEN) as u32 + root_idx * NODE_RECORD_LEN as u32;
+        Ok(Self { bytes: encode_page(&payload, root, root_record_off), root, root_record_off })
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -1411,6 +1448,35 @@ fn build_node(
     }
 }
 
+fn build_node_dense(
+    nodes: &[MptNode],
+    hash_cache: &[Option<B256>],
+    arena_idx: u32,
+) -> Result<BuildNode> {
+    let hash = node_hash(nodes, hash_cache, arena_idx)?;
+    match &nodes[arena_idx as usize] {
+        MptNode::Leaf(leaf) => Ok(BuildNode::Leaf {
+            nibbles: leaf.nibbles.iter().collect(),
+            value: leaf.value.clone(),
+            hash,
+        }),
+        MptNode::Extension(ext) => Ok(BuildNode::Extension {
+            nibbles: ext.nibbles.iter().collect(),
+            hash,
+            child: build_child_dense(nodes, hash_cache, 0, &ext.child)?,
+        }),
+        MptNode::Branch(branch) => {
+            let mut children = Vec::new();
+            for (slot, child) in branch.children.iter().enumerate() {
+                if let Some(child) = child {
+                    children.push(build_child_dense(nodes, hash_cache, slot as u8, child)?);
+                }
+            }
+            Ok(BuildNode::Branch { value: branch.value.clone(), hash, children })
+        }
+    }
+}
+
 fn build_child(
     nodes: &[MptNode],
     hash_cache: &[Option<B256>],
@@ -1422,6 +1488,30 @@ fn build_child(
         ChildRef::Arena(idx) => BuildChild {
             slot,
             target_idx: arena_to_segment.get(*idx as usize).copied().flatten(),
+            embed: match child_embed(nodes, hash_cache, *idx)? {
+                ChildEmbedOwned::Hash(hash) => ChildEmbedOwned::Hash(hash),
+                ChildEmbedOwned::Inline(bytes) => ChildEmbedOwned::Inline(bytes),
+            },
+        },
+        ChildRef::Hash(hash) => {
+            BuildChild { slot, target_idx: None, embed: ChildEmbedOwned::Hash(*hash) }
+        }
+        ChildRef::Inline(bytes) => {
+            BuildChild { slot, target_idx: None, embed: ChildEmbedOwned::Inline(bytes.clone()) }
+        }
+    })
+}
+
+fn build_child_dense(
+    nodes: &[MptNode],
+    hash_cache: &[Option<B256>],
+    slot: u8,
+    child: &ChildRef,
+) -> Result<BuildChild> {
+    Ok(match child {
+        ChildRef::Arena(idx) => BuildChild {
+            slot,
+            target_idx: Some(*idx),
             embed: match child_embed(nodes, hash_cache, *idx)? {
                 ChildEmbedOwned::Hash(hash) => ChildEmbedOwned::Hash(hash),
                 ChildEmbedOwned::Inline(bytes) => ChildEmbedOwned::Inline(bytes),

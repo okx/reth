@@ -6,7 +6,7 @@ use mptdb_common::error::{MptDbError, Result};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use reth_trie_common::{updates::TrieUpdates, AccountProof};
-use reth_trie_sparse::SparseStateTrie;
+use reth_trie_sparse::{SerialSparseTrie, SparseStateTrie};
 use revm_database::BundleState;
 use schnellru::{ByLength, LruMap};
 use serde::{Deserialize, Serialize};
@@ -36,8 +36,8 @@ use super::{
     segment::StorageTrieSegment,
     snapshot::{SnapshotExporter, SnapshotImporter},
     sparse_storage::{
-        apply_all_storage_changes_sparse, build_storage_segments_from_sparse_trie,
-        convert_arena_to_account_proof_nodes_for_paths,
+        apply_all_storage_changes_sparse, build_storage_segments_from_sparse_snapshots,
+        build_storage_segments_from_sparse_trie, convert_arena_to_account_proof_nodes_for_paths,
         convert_arena_to_decoded_storage_multiproof,
         convert_arena_to_decoded_storage_multiproof_for_paths,
         extract_account_proof_from_sparse_trie_for_paths, extract_storage_proof_from_sparse_trie,
@@ -469,6 +469,10 @@ struct PersistJob {
     /// and serialization is deferred to a background goroutine via COW
     /// tree clone.  After `snapshot()`, cloning is O(1) (Arc clone).
     committed_tries: Vec<(B256, B256, StorageTrieCow)>,
+    /// Sparse storage trie snapshots captured on the frontend for background
+    /// segment materialization. Used when sparse apply is enabled: the normal
+    /// storage cache candidates may not include the latest sparse updates.
+    committed_sparse_tries: Vec<(B256, B256, SerialSparseTrie)>,
 }
 
 struct PublishedRewriteJob {
@@ -1470,6 +1474,7 @@ impl MptCommitStore {
         storage_cache_candidates: &mut [(B256, StorageTrieCow)],
         deferred_published_roots: Vec<(B256, B256)>,
         sparse_published_puts: Vec<(B256, StorageTrieSegment)>,
+        sparse_committed_tries: Vec<(B256, B256, SerialSparseTrie)>,
         mode: CommitExecutionMode,
         storage_segment_build_elapsed: &mut Duration,
     ) -> Result<SavedStorageVersion> {
@@ -1479,11 +1484,13 @@ impl MptCommitStore {
         let mut manifest_save_elapsed = Duration::ZERO;
         let mut publish_generation_elapsed = Duration::ZERO;
         let mut open_published_store_elapsed = Duration::ZERO;
+        let use_bg_segment_materialization =
+            mode.wal_first && mode.publish_baseline && self.wal_first_defer_segment_build_enabled();
 
         if mode.wal_first || prepared.use_async {
-            // WAL-first: frontend builds segments from in-memory tries,
-            // background worker publishes them to mmap.  WAL + segments
-            // provide full crash recovery — RocksDB is no longer on the
+            // WAL-first: segment generation defaults to background
+            // materialization from committed trie snapshots. WAL + published
+            // segments provide crash recovery; RocksDB is no longer on the
             // critical path.
             //
             // Async (non-wal_first): legacy path — blobs + deferred roots
@@ -1502,8 +1509,10 @@ impl MptCommitStore {
             // Parallel via rayon: amortizes 5000 storage tries across cores,
             // adapting sei-db's single-tree COW model to Ethereum's two-layer
             // trie architecture.
+            let committed_sparse_tries =
+                if use_bg_segment_materialization { sparse_committed_tries } else { Vec::new() };
             let committed_tries =
-                if mode.wal_first && mode.publish_baseline && sparse_published_puts.is_empty() {
+                if use_bg_segment_materialization && committed_sparse_tries.is_empty() {
                     storage_cache_candidates
                         .par_iter_mut()
                         .filter_map(|(addr, trie)| {
@@ -1518,6 +1527,8 @@ impl MptCommitStore {
                 } else {
                     Vec::new()
                 };
+            let worker_published_puts =
+                if use_bg_segment_materialization { Vec::new() } else { sparse_published_puts };
 
             let (job_deferred_roots, job_blobs) = if mode.wal_first {
                 // No blobs, no deferred roots — worker builds from trie clones.
@@ -1532,7 +1543,7 @@ impl MptCommitStore {
                 barrier_only: false,
                 replay_from_wal: false,
                 blobs: job_blobs,
-                published_puts: sparse_published_puts,
+                published_puts: worker_published_puts,
                 deferred_published_roots: job_deferred_roots,
                 published_deletes: prepared.published_deletes.clone(),
                 publish_baseline: mode.publish_baseline,
@@ -1543,6 +1554,7 @@ impl MptCommitStore {
                 version: prepared.new_version,
                 done: None,
                 committed_tries,
+                committed_sparse_tries,
             };
             tx.send(job).map_err(|e| MptDbError::Other(format!("send persist job: {e}")))?;
         } else {
@@ -2388,14 +2400,21 @@ impl MptCommitStore {
                                 let mut publish_puts = job.published_puts.clone();
                                 let mut skip_publish = false;
 
-                                // wal_first: build segments from COW trie clones
-                                // (sei-db model: serialization in background).
+                                // wal_first: build segments in background.
                                 //
-                                // Freeze each clone first (sole owner → Arc::make_mut
-                                // is in-place, O(overlay)).  Then build segments in
-                                // parallel via rayon using zero-copy frozen refs —
-                                // avoids the extra allocation of collect_all_nodes().
-                                if !job.committed_tries.is_empty() {
+                                // Sparse path publishes from sparse trie snapshots.
+                                // Non-sparse path publishes from COW trie snapshots.
+                                if !job.committed_sparse_tries.is_empty() {
+                                    match build_storage_segments_from_sparse_snapshots(
+                                        &job.committed_sparse_tries,
+                                    ) {
+                                        Ok(mut built) => publish_puts.append(&mut built),
+                                        Err(e) => {
+                                            Self::warn_nonfatal_async_error(&e);
+                                            skip_publish = true;
+                                        }
+                                    }
+                                } else if !job.committed_tries.is_empty() {
                                     // Sequential materialize + freeze.
                                     // Materialization resolves pending segment-lazy
                                     // edges into arena refs so segment serialization
@@ -3815,6 +3834,13 @@ impl MptCommitStore {
         Ok(())
     }
 
+    fn wal_first_defer_segment_build_enabled(&self) -> bool {
+        if let Some(override_raw) = std::env::var_os("MPT_WAL_DEFER_SPARSE_SEGMENT_BUILD") {
+            return override_raw != "0";
+        }
+        self.config.wal_first_defer_segment_build
+    }
+
     fn default_commit_mode(&self) -> CommitExecutionMode {
         if self.replay_materializer {
             CommitExecutionMode {
@@ -3829,9 +3855,8 @@ impl MptCommitStore {
                 allow_async: !self.config.wal_first_commit,
                 save_manifest: true,
                 // Always publish segments so the mmap-backed published store
-                // stays current. In wal_first mode segments are built from
-                // in-memory tries on the frontend and published by the
-                // background worker each block.
+                // stays current. In wal_first mode, segment generation defaults
+                // to the background worker using committed trie snapshots.
                 publish_baseline: true,
             }
         }
@@ -3868,6 +3893,7 @@ impl MptCommitStore {
                     version: self.version,
                     done: Some(done_tx),
                     committed_tries: vec![],
+                    committed_sparse_tries: vec![],
                 };
                 if tx.send(job).is_ok() {
                     match done_rx.recv() {
@@ -5912,6 +5938,9 @@ impl MptCommitStore {
         // sync: hash + collect blobs for RocksDB persist.
         let account_root_start = std::time::Instant::now();
         let mut sparse_published_puts: Vec<(B256, StorageTrieSegment)> = Vec::new();
+        let mut sparse_committed_tries: Vec<(B256, B256, SerialSparseTrie)> = Vec::new();
+        let defer_sparse_segment_build =
+            mode.wal_first && self.wal_first_defer_segment_build_enabled();
         let (state_root, account_blobs, account_cow) = if let Some(mut pending) =
             self.pending_sparse_state.take()
         {
@@ -6031,7 +6060,7 @@ impl MptCommitStore {
             } else {
                 Vec::<(B256, Vec<u8>)>::new()
             };
-            if mode.publish_baseline {
+            if mode.publish_baseline && !defer_sparse_segment_build {
                 let publish_targets: Vec<(B256, B256)> = self
                     .dirty_accounts
                     .iter()
@@ -6056,6 +6085,38 @@ impl MptCommitStore {
                         build_storage_segments_from_sparse_trie(&pending.trie, &publish_targets)?;
                     storage_segment_build_elapsed += sparse_build_start.elapsed();
                 }
+            } else if mode.publish_baseline && defer_sparse_segment_build {
+                let publish_targets: Vec<(B256, B256)> = self
+                    .dirty_accounts
+                    .iter()
+                    .filter_map(|dirty| {
+                        if !dirty.storage_wiped && dirty.storage_changes.is_empty() {
+                            return None;
+                        }
+                        let root = storage_roots
+                            .get(&dirty.hashed_address)
+                            .copied()
+                            .unwrap_or(EMPTY_ROOT_HASH);
+                        if root == EMPTY_ROOT_HASH {
+                            None
+                        } else {
+                            Some((dirty.hashed_address, root))
+                        }
+                    })
+                    .collect();
+                sparse_committed_tries = publish_targets
+                    .into_iter()
+                    .map(|(hashed_addr, root)| {
+                        let trie =
+                            pending.trie.storage_trie_ref(&hashed_addr).ok_or_else(|| {
+                                MptDbError::Other(format!(
+                                    "sparse storage trie missing for deferred publish account {} root {}",
+                                    hashed_addr, root
+                                ))
+                            })?;
+                        Ok((hashed_addr, root, trie.clone()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
             }
             // Store sparse trie for proof generation (latest committed version).
             // In cross-block mode, also return the trie to cross_block_sparse
@@ -6175,6 +6236,7 @@ impl MptCommitStore {
             &mut storage_cache_candidates,
             deferred_published_roots,
             sparse_published_puts,
+            sparse_committed_tries,
             mode,
             &mut storage_segment_build_elapsed,
         ) {
@@ -7367,6 +7429,80 @@ mod tests {
         assert_eq!(published.root, root);
         store.maybe_refresh_published_view().unwrap();
         assert!(store.has_published_store());
+    }
+
+    #[test]
+    fn wal_first_default_defers_sparse_segment_build_to_background() {
+        let dir = TempDir::new().unwrap();
+        let mut config = MptConfig::default();
+        config.wal_first_commit = true;
+        let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+
+        let bundle = make_bundle(vec![
+            (
+                Address::repeat_byte(0x71),
+                Some(default_info(1, 1001)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(1), U256::ZERO, U256::from(11))],
+            ),
+            (
+                Address::repeat_byte(0x72),
+                Some(default_info(2, 1002)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(2), U256::ZERO, U256::from(22))],
+            ),
+            (
+                Address::repeat_byte(0x73),
+                Some(default_info(3, 1003)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(3), U256::ZERO, U256::from(33))],
+            ),
+        ]);
+        store.apply_bundle_state(&bundle).unwrap();
+        let ((_version, _root), profile) = store.commit_with_profile().unwrap();
+
+        assert_eq!(
+            profile.storage_segment_build,
+            Duration::ZERO,
+            "wal_first default should defer sparse segment build to background worker"
+        );
+    }
+
+    #[test]
+    fn wal_first_can_force_foreground_sparse_segment_build() {
+        let dir = TempDir::new().unwrap();
+        let mut config = MptConfig::default();
+        config.wal_first_commit = true;
+        config.wal_first_defer_segment_build = false;
+        let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
+
+        let bundle = make_bundle(vec![
+            (
+                Address::repeat_byte(0x81),
+                Some(default_info(1, 2001)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(1), U256::ZERO, U256::from(111))],
+            ),
+            (
+                Address::repeat_byte(0x82),
+                Some(default_info(2, 2002)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(2), U256::ZERO, U256::from(222))],
+            ),
+            (
+                Address::repeat_byte(0x83),
+                Some(default_info(3, 2003)),
+                revm_database::AccountStatus::Changed,
+                vec![(U256::from(3), U256::ZERO, U256::from(333))],
+            ),
+        ]);
+        store.apply_bundle_state(&bundle).unwrap();
+        let ((_version, _root), profile) = store.commit_with_profile().unwrap();
+
+        assert!(
+            profile.storage_segment_build > Duration::ZERO,
+            "foreground mode should spend non-zero time on sparse segment build"
+        );
     }
 
     #[test]
