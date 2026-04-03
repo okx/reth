@@ -60,12 +60,19 @@ cargo test -p mptdb --release --features jemalloc --test profile_mptdb_vs_reth p
 # B4.6 (~6 min, needs ~80GB free disk)
 cargo test -p mptdb --release --features jemalloc --test profile_mptdb_vs_reth profile_b4_6_mpt_only -- --ignored --nocapture --exact
 
+# B4.7 (~3 min)
+cargo test -p mptdb --release --features jemalloc --test profile_mptdb_vs_reth profile_b4_7_mainnet_realistic_mpt_only -- --ignored --nocapture --exact
+
+# B4.8 (~3 min, provider-aligned ERC20 pool workload)
+cargo test -p mptdb --release --features jemalloc --test profile_mptdb_vs_reth profile_b4_8_integration_scale_mpt_only -- --ignored --nocapture --exact
+
 # Compare both reth and mpt-db side by side
 cargo test -p mptdb --release --features jemalloc --test profile_mptdb_vs_reth profile_b4_5_single_run_compare -- --ignored --nocapture --exact
 cargo test -p mptdb --release --features jemalloc --test profile_mptdb_vs_reth profile_b4_6_single_run_compare -- --ignored --nocapture --exact
 
 # reth-only (skip mpt-db pre-pop to save disk)
 cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_6_reth_only -- --ignored --nocapture --exact
+cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_8_integration_scale_reth_only -- --ignored --nocapture --exact
 ```
 
 ### Benchmark tests (repeated runs, averaged)
@@ -74,12 +81,14 @@ cargo test -p mptdb --release --test profile_mptdb_vs_reth profile_b4_6_reth_onl
 # Single iteration (fast validation)
 MPT_BENCH_ITERS=1 cargo test -p mptdb --release --features jemalloc --test benchmark_mptdb_vs_reth bench_b4_2_mpt_only -- --ignored --nocapture --exact
 MPT_BENCH_ITERS=1 cargo test -p mptdb --release --features jemalloc --test benchmark_mptdb_vs_reth bench_b4_5_mpt_only -- --ignored --nocapture --exact
+MPT_BENCH_ITERS=1 cargo test -p mptdb --release --features jemalloc --test benchmark_mptdb_vs_reth bench_b4_8_integration_scale_mpt_only -- --ignored --nocapture --exact
 
 # Multiple iterations (stable average, default=3)
 cargo test -p mptdb --release --features jemalloc --test benchmark_mptdb_vs_reth bench_b4_4_mpt_only -- --ignored --nocapture --exact
 
 # Compare reth vs mpt-db
 MPT_BENCH_ITERS=1 cargo test -p mptdb --release --test benchmark_mptdb_vs_reth bench_b4_5_reth_only -- --ignored --nocapture --exact
+MPT_BENCH_ITERS=1 cargo test -p mptdb --release --test benchmark_mptdb_vs_reth bench_b4_8_integration_scale_reth_only -- --ignored --nocapture --exact
 ```
 
 ### Quick regression check
@@ -114,11 +123,12 @@ The profile output includes granular sub-timers for commit hot spots:
 All benchmarks use **chunked incremental pre-population** for both reth and mpt-db, matching real blockchain state accumulation (one block at a time, no batch shortcuts).
 
 Machine: Apple M-series, 32GB RAM, SSD.
-Latest refresh: April 2, 2026 (`USE_SPARSE=1`, default allocator, `MPT_BENCH_ITERS=1` for B4.2-B4.5 benchmarks; one-shot profile for B4.6-B4.7).
+Latest refresh: April 3, 2026 (`USE_SPARSE=1`, default allocator, `MPT_BENCH_ITERS=1` for B4.2-B4.5 benchmarks; one-shot profile for B4.6-B4.8).
 
 ### Summary
 
-Each updated account has its nonce and balance modified, plus **all** of its storage slots rewritten. For example, B4.6 with 10K accounts updated × 30 slots = 300K storage slot changes per block.
+For B4.1-B4.7, each updated account has its nonce and balance modified, plus all configured storage slots rewritten.  
+B4.8 is different: it is tx-style ERC20 pool traffic (provider-aligned), so writes are sparse/incremental rather than full-slot rewrites.
 
 | Test | Pre-pop accounts | Storage slots per account | Accounts updated per block | Blocks | reth per-block | mpt-db per-block | Speedup |
 |------|-----------------|--------------------------|---------------------------|--------|---------------|-----------------|---------|
@@ -129,6 +139,7 @@ Each updated account has its nonce and balance modified, plus **all** of its sto
 | B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 104.7 ms | **11.6x** |
 | B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 390.2 ms | **21.8x** |
 | B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 51.0 ms | **38.9x** |
+| B4.8 | 500K mixed | 128 (30% contracts, active pool 10%) | 50K tx-style updates | 10 | 12,172.2 ms | 729.9 ms | **16.7x** |
 
 ### Workload vs real-world comparison
 
@@ -138,8 +149,9 @@ Each updated account has its nonce and balance modified, plus **all** of its sto
 | B4.4 | 20K | Typical Ethereum mainnet block |
 | B4.5 | 50K | Busy mainnet / moderate L2 |
 | B4.6 | 300K | High-throughput L2 / stress test |
+| B4.8 | ~100K slot updates + 50K sender nonce updates | Provider-aligned ERC20 transfer pool |
 
-Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4–B4.5 are the most representative of current mainnet workloads. B4.6 targets future high-throughput scenarios (increased gas limit, L2 sequencers).
+Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4-B4.5 are the most representative of current mainnet workloads. B4.6 targets future high-throughput scenarios (increased gas limit, L2 sequencers). B4.8 is the provider-aligned integration workload (`erc20_transfer_10pct_contract_pool` style).
 
 ### Analysis
 
@@ -147,6 +159,7 @@ Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4
 - **Large datasets (B4.4–B4.6)**: reth's MDBX page cache becomes cold as the dataset exceeds cache capacity. Random reads from disk dominate reth's `overlay_root_with_updates` and `write_trie_updates`. mpt-db's in-memory tries are unaffected by dataset size, giving **10–15x** speedup for B4.4/B4.5.
 - **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each. mpt-db completes in ~390ms. The SparseStateTrie migration replaced full-trie loading with dirty-path-only witness reveal; parallel pre-extraction of segment multiproofs and batch parallel storage reveal keep `sp_ch` around ~169ms. Account root uses the fast `root_hash_only_parallel` path on the legacy arena trie (~49.5ms).
 - **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). mpt-db completes in ~51ms. The full-trie materialization path (`extract_full_decoded_multiproof`) replaces per-key path tracing for dense 200-slot updates, and cross-block SparseStateTrie reuse keeps storage tries revealed across blocks; `account_root` is ~9.4ms.
+- **Provider-aligned ERC20 pool (B4.8)**: 500K mixed accounts (30% contracts, 128 pre-pop holders per contract, active contract pool 10%), 50K tx-style updates per block. mpt-db completes in ~730ms while reth is ~12.17s (~16.7x). A blind-node regression in cross-block sparse reveal was fixed by forcing full reveal on first-touch accounts and only skipping reveal when all dirty slots are already revealed.
 
 ### B4.6 detailed breakdown
 

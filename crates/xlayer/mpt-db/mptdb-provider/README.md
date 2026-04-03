@@ -180,6 +180,49 @@ Related but different (SC micro profile, not full provider integration):
 - `crates/xlayer/mpt-db/mptdb/tests/profile_mptdb_vs_reth.rs`
 - `crates/xlayer/mpt-db/mptdb/tests/benchmark_mptdb_vs_reth.rs`
 
+### 7.1 B4.8 alignment snapshot (April 3, 2026)
+
+Purpose:
+
+- keep a provider-aligned SC micro-profile reference for `erc20_transfer_10pct_contract_pool`.
+
+Workload alignment (B4.8 in `mptdb/tests/profile_mptdb_vs_reth.rs`):
+
+- `prepop_accounts = 500000`
+- `updates_per_block = 50000`
+- `block_count = 10`
+- `contract_ratio = 30%`
+- `contract_kv_per_contract = 128`
+- `active_contract_pool_ratio = 10%`
+
+Commands:
+
+```bash
+# mptdb (SC-only profile)
+PROTOC=/Users/louisliuxiong/golang/bin/protoc \
+cargo test -p mptdb --release --test profile_mptdb_vs_reth \
+  profile_b4_8_integration_scale_mpt_only -- --ignored --nocapture --exact
+
+# reth baseline (same B4.8 dataset generator)
+PROTOC=/Users/louisliuxiong/golang/bin/protoc \
+cargo test -p mptdb --release --test profile_mptdb_vs_reth \
+  profile_b4_8_integration_scale_reth_only -- --ignored --nocapture --exact
+```
+
+Latest observed result (April 3, 2026):
+
+| lane | per-block |
+|---|---:|
+| `mptdb` | `729.9 ms` |
+| `reth` | `12172.2 ms` |
+
+SC micro-profile speedup: `~16.7x` (`reth / mptdb`).
+
+Important scope note:
+
+- This is SC-only (`apply + commit/root`) and excludes provider-layer EVM/read wrapper costs.
+- Use `benches/block_execution.rs` integration benchmark as the final decision metric.
+
 ## 8. Practical checklist for future AI changes
 
 Before claiming "mptdb vs reth" integration result:

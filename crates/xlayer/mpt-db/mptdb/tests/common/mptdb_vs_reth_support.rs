@@ -1,5 +1,5 @@
 use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{map::HashMap as PrimitivesHashMap, Address, B256, U256};
+use alloy_primitives::{keccak256, map::HashMap as PrimitivesHashMap, Address, B256, U256};
 use mptdb_sc::mpt::{CommitProfile, MptCommitStore, MptCommitter};
 use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use reth_provider::{
@@ -11,12 +11,36 @@ use reth_trie_db::DatabaseStateRoot;
 use revm_database::{states::StorageSlot, AccountStatus, StorageWithOriginalValues};
 use revm_state::AccountInfo;
 use std::{
+    collections::HashMap as StdHashMap,
     env,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
 
 pub const PREPOP_CHUNK_SIZE: usize = 10_000;
+const ERC20_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
+const EOA_INITIAL_BALANCE: u128 = 1_000_000_000_000_000_000;
+const ERC20_INITIAL_BALANCE: u128 = 1_000_000;
+const ERC20_TRANSFER_AMOUNT: u128 = 100;
+
+// Same runtime bytecode used by mptdb-provider benchmark (393 bytes).
+static ERC20_RUNTIME_BYTECODE: [u8; 393] = {
+    const HEX: &[u8] = b"608060405234801561000f575f5ffd5b5060043610610034575f3560e01c806370a0823114610038578063a9059cbb1461006a575b5f5ffd5b610057610046366004610104565b5f6020819052908152604090205481565b6040519081526020015b60405180910390f35b61007d610078366004610124565b61008d565b6040519015158152602001610061565b335f908152602081905260408120805483919083906100ad908490610160565b90915550506001600160a01b0383165f90815260208190526040812080548492906100d9908490610173565b9091555060019150505b92915050565b80356001600160a01b03811681146100ff575f5ffd5b919050565b5f60208284031215610114575f5ffd5b61011d826100e9565b9392505050565b5f5f60408385031215610135575f5ffd5b61013e836100e9565b946020939093013593505050565b634e487b7160e01b5f52601160045260245ffd5b818103818111156100e3576100e361014c565b808201808211156100e3576100e361014c56fea26469706673582212202ab3fe360a062c91ad12f573bd1c234812f445f817ce8adbad19c108f60a822d64736f6c634300081e0033";
+    const fn h(c: u8) -> u8 {
+        if c >= b'0' && c <= b'9' {
+            c - b'0'
+        } else {
+            c - b'a' + 10
+        }
+    }
+    let mut out = [0u8; 393];
+    let mut i = 0;
+    while i < 393 {
+        out[i] = h(HEX[i * 2]) << 4 | h(HEX[i * 2 + 1]);
+        i += 1;
+    }
+    out
+};
 
 #[derive(Default)]
 pub struct RethBlockProfile {
@@ -82,9 +106,27 @@ pub struct MptdbTotals {
 
 #[derive(Clone, Copy)]
 pub enum ProfileWorkload {
-    FreshUniform { accounts: usize, slots_per: usize },
-    Uniform { slots_per: usize },
-    Mixed { contract_slots: usize, contract_ratio: f64 },
+    FreshUniform {
+        accounts: usize,
+        slots_per: usize,
+    },
+    Uniform {
+        slots_per: usize,
+    },
+    Mixed {
+        contract_slots: usize,
+        contract_ratio: f64,
+    },
+    MixedDecoupled {
+        prepop_contract_slots: usize,
+        update_contract_slots: usize,
+        contract_ratio: f64,
+    },
+    Erc20PoolLike {
+        contract_ratio: f64,
+        contract_kv_per_contract: usize,
+        active_contract_pool_ratio: f64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -130,6 +172,9 @@ fn wal_first_config() -> mptdb_sc::mpt::MptConfig {
     //   USE_SPARSE=0 cargo test ...
     if std::env::var("USE_SPARSE").as_deref() == Ok("0") {
         config.use_sparse_storage = false;
+    }
+    if std::env::var("MPT_CROSS_BLOCK_SPARSE").as_deref() == Ok("0") {
+        config.cross_block_sparse = false;
     }
     config
 }
@@ -350,6 +395,278 @@ fn generate_updates_mixed(
     }
 }
 
+#[derive(Clone, Copy)]
+struct PoolLayout {
+    contract_count: usize,
+    eoa_offset: usize,
+    eoa_count: usize,
+    kv_per_contract: usize,
+    active_contracts: usize,
+}
+
+fn erc20_runtime_code_hash() -> B256 {
+    keccak256(ERC20_RUNTIME_BYTECODE)
+}
+
+fn erc20_balance_slot(holder: Address) -> B256 {
+    let mut buf = [0u8; 64];
+    buf[12..32].copy_from_slice(holder.as_slice());
+    keccak256(buf)
+}
+
+fn build_pool_layout(
+    total_accounts: usize,
+    updates_per_block: usize,
+    contract_ratio: f64,
+    contract_kv_per_contract: usize,
+    active_contract_pool_ratio: f64,
+) -> PoolLayout {
+    let min_eoa = updates_per_block.max(1).min(total_accounts);
+    let requested_contracts = ((total_accounts as f64) * contract_ratio).round() as usize;
+    let max_contracts = total_accounts.saturating_sub(min_eoa);
+    let contract_count = requested_contracts.min(max_contracts);
+    let eoa_offset = contract_count;
+    let eoa_count = total_accounts.saturating_sub(contract_count);
+    let kv_per_contract = contract_kv_per_contract.min(eoa_count.max(1));
+    let active_contracts = if contract_count == 0 {
+        0
+    } else {
+        ((contract_count as f64) * active_contract_pool_ratio)
+            .ceil()
+            .max(1.0)
+            .min(contract_count as f64) as usize
+    };
+    PoolLayout { contract_count, eoa_offset, eoa_count, kv_per_contract, active_contracts }
+}
+
+fn is_initial_holder(layout: PoolLayout, contract_idx: usize, eoa_local_idx: usize) -> bool {
+    if layout.eoa_count == 0 || layout.kv_per_contract == 0 {
+        return false;
+    }
+    if layout.kv_per_contract >= layout.eoa_count {
+        return true;
+    }
+    let start = (contract_idx * layout.kv_per_contract) % layout.eoa_count;
+    let end = start + layout.kv_per_contract;
+    if end <= layout.eoa_count {
+        eoa_local_idx >= start && eoa_local_idx < end
+    } else {
+        eoa_local_idx >= start || eoa_local_idx < (end - layout.eoa_count)
+    }
+}
+
+fn initial_erc20_balance_for_holder(
+    layout: PoolLayout,
+    contract_idx: usize,
+    eoa_local_idx: usize,
+) -> u128 {
+    if is_initial_holder(layout, contract_idx, eoa_local_idx) {
+        ERC20_INITIAL_BALANCE
+    } else {
+        0
+    }
+}
+
+fn pair_key(contract_idx: usize, eoa_local_idx: usize) -> u64 {
+    ((contract_idx as u64) << 32) | (eoa_local_idx as u64)
+}
+
+fn split_pair_key(key: u64) -> (usize, usize) {
+    ((key >> 32) as usize, (key & 0xffff_ffff) as usize)
+}
+
+fn generate_account_chunk_erc20_pool_like(
+    all_addresses: &[Address],
+    global_start: usize,
+    global_end: usize,
+    layout: PoolLayout,
+) -> revm_database::BundleState {
+    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+        PrimitivesHashMap::default();
+    let contract_code_hash = erc20_runtime_code_hash();
+
+    for global_idx in global_start..global_end {
+        let addr = all_addresses[global_idx];
+        if global_idx < layout.contract_count {
+            let mut storage = StorageWithOriginalValues::default();
+            for j in 0..layout.kv_per_contract {
+                let holder_local_idx = (global_idx * layout.kv_per_contract + j) % layout.eoa_count;
+                let holder = all_addresses[layout.eoa_offset + holder_local_idx];
+                storage.insert(
+                    erc20_balance_slot(holder).into(),
+                    StorageSlot::new_changed(U256::ZERO, U256::from(ERC20_INITIAL_BALANCE)),
+                );
+            }
+            state.insert(
+                addr,
+                revm_database::BundleAccount {
+                    info: Some(AccountInfo {
+                        nonce: 1,
+                        balance: U256::ZERO,
+                        code_hash: contract_code_hash,
+                        account_id: None,
+                        code: None,
+                    }),
+                    original_info: None,
+                    status: AccountStatus::Changed,
+                    storage,
+                },
+            );
+        } else {
+            state.insert(
+                addr,
+                revm_database::BundleAccount {
+                    info: Some(AccountInfo {
+                        nonce: 0,
+                        balance: U256::from(EOA_INITIAL_BALANCE),
+                        code_hash: KECCAK_EMPTY,
+                        account_id: None,
+                        code: None,
+                    }),
+                    original_info: None,
+                    status: AccountStatus::Changed,
+                    storage: StorageWithOriginalValues::default(),
+                },
+            );
+        }
+    }
+
+    revm_database::BundleState {
+        state,
+        contracts: Default::default(),
+        reverts: Default::default(),
+        state_size: 0,
+        reverts_size: 0,
+    }
+}
+
+fn apply_pool_transfer_delta(
+    layout: PoolLayout,
+    current_balances: &mut StdHashMap<u64, u128>,
+    block_changes: &mut StdHashMap<u64, (u128, u128)>,
+    contract_idx: usize,
+    eoa_local_idx: usize,
+    is_credit: bool,
+) {
+    let key = pair_key(contract_idx, eoa_local_idx);
+    let prev = current_balances
+        .get(&key)
+        .copied()
+        .unwrap_or_else(|| initial_erc20_balance_for_holder(layout, contract_idx, eoa_local_idx));
+    let new = if is_credit {
+        prev.saturating_add(ERC20_TRANSFER_AMOUNT)
+    } else {
+        prev.saturating_sub(ERC20_TRANSFER_AMOUNT)
+    };
+    current_balances.insert(key, new);
+    block_changes.entry(key).and_modify(|entry| entry.1 = new).or_insert((prev, new));
+}
+
+fn generate_updates_erc20_pool_like(
+    addresses: &[Address],
+    updates_per_block: usize,
+    block_count: usize,
+    layout: PoolLayout,
+    rng: &mut StdRng,
+) -> Vec<revm_database::BundleState> {
+    let mut blocks = Vec::with_capacity(block_count);
+    let contract_code_hash = erc20_runtime_code_hash();
+    let mut sender_nonces = vec![0u64; layout.eoa_count];
+    let mut current_balances: StdHashMap<u64, u128> = StdHashMap::default();
+
+    for _ in 0..block_count {
+        let mut sender_nonce_updates: StdHashMap<usize, u64> = StdHashMap::default();
+        let mut block_storage_changes: StdHashMap<u64, (u128, u128)> = StdHashMap::default();
+
+        for _ in 0..updates_per_block {
+            let contract_idx = rng.random_range(0..layout.active_contracts);
+            let sender_local = (contract_idx * layout.kv_per_contract +
+                rng.random_range(0..layout.kv_per_contract)) %
+                layout.eoa_count;
+            let receiver_local = rng.random_range(0..layout.eoa_count);
+
+            sender_nonces[sender_local] = sender_nonces[sender_local].saturating_add(1);
+            sender_nonce_updates.insert(sender_local, sender_nonces[sender_local]);
+
+            apply_pool_transfer_delta(
+                layout,
+                &mut current_balances,
+                &mut block_storage_changes,
+                contract_idx,
+                sender_local,
+                false,
+            );
+            apply_pool_transfer_delta(
+                layout,
+                &mut current_balances,
+                &mut block_storage_changes,
+                contract_idx,
+                receiver_local,
+                true,
+            );
+        }
+
+        let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+            PrimitivesHashMap::default();
+        for (eoa_local_idx, nonce) in sender_nonce_updates {
+            let addr = addresses[layout.eoa_offset + eoa_local_idx];
+            state.insert(
+                addr,
+                revm_database::BundleAccount {
+                    info: Some(AccountInfo {
+                        nonce,
+                        balance: U256::from(EOA_INITIAL_BALANCE),
+                        code_hash: KECCAK_EMPTY,
+                        account_id: None,
+                        code: None,
+                    }),
+                    original_info: None,
+                    status: AccountStatus::Changed,
+                    storage: StorageWithOriginalValues::default(),
+                },
+            );
+        }
+
+        let mut ordered_changes: Vec<(u64, (u128, u128))> =
+            block_storage_changes.into_iter().collect();
+        ordered_changes.sort_unstable_by_key(|(key, _)| *key);
+        for (key, (old, new)) in ordered_changes {
+            if old == new {
+                continue;
+            }
+            let (contract_idx, eoa_local_idx) = split_pair_key(key);
+            let contract = addresses[contract_idx];
+            let holder = addresses[layout.eoa_offset + eoa_local_idx];
+            let account = state.entry(contract).or_insert_with(|| revm_database::BundleAccount {
+                info: Some(AccountInfo {
+                    nonce: 1,
+                    balance: U256::ZERO,
+                    code_hash: contract_code_hash,
+                    account_id: None,
+                    code: None,
+                }),
+                original_info: None,
+                status: AccountStatus::Changed,
+                storage: StorageWithOriginalValues::default(),
+            });
+            account.storage.insert(
+                erc20_balance_slot(holder).into(),
+                StorageSlot::new_changed(U256::from(old), U256::from(new)),
+            );
+        }
+
+        blocks.push(revm_database::BundleState {
+            state,
+            contracts: Default::default(),
+            reverts: Default::default(),
+            state_size: 0,
+            reverts_size: 0,
+        });
+    }
+
+    blocks
+}
+
 fn accumulate_mptdb_profile(totals: &mut MptdbTotals, profile: &CommitProfile) {
     totals.trie_load += profile.apply_get_or_load_storage_tries;
     totals.slot_updates += profile.apply_storage_slot_updates;
@@ -508,6 +825,25 @@ pub fn scenario_b4_7() -> ProfileScenario {
     }
 }
 
+pub fn scenario_b4_8() -> ProfileScenario {
+    ProfileScenario {
+        code: "B4.8",
+        title: "Provider-Equivalent ERC20 Pool",
+        dataset:
+            "500K accounts, 30% contracts x 128 pre-pop holders, active pool 10%, 10 blocks x 50K tx-style updates",
+        addr_seed: 4800,
+        block_seed: 4801,
+        prepop_accounts: 500_000,
+        updates_per_block: 50_000,
+        block_count: 10,
+        workload: ProfileWorkload::Erc20PoolLike {
+            contract_ratio: 0.3,
+            contract_kv_per_contract: 128,
+            active_contract_pool_ratio: ERC20_ACTIVE_CONTRACT_POOL_RATIO,
+        },
+    }
+}
+
 pub fn generate_profile_inputs(
     scenario: ProfileScenario,
 ) -> (Vec<Address>, Vec<revm_database::BundleState>) {
@@ -520,24 +856,63 @@ pub fn generate_profile_inputs(
     let addrs = generate_addresses(address_count, &mut rng);
 
     let mut rng_blocks = StdRng::seed_from_u64(scenario.block_seed);
-    let blocks = (0..scenario.block_count)
-        .map(|i| match scenario.workload {
-            ProfileWorkload::FreshUniform { slots_per, .. } => {
-                generate_account_chunk(&addrs, 0, slots_per)
-            }
-            ProfileWorkload::Uniform { slots_per } => {
-                generate_updates(&addrs, scenario.updates_per_block, slots_per, i, &mut rng_blocks)
-            }
-            ProfileWorkload::Mixed { contract_slots, contract_ratio } => generate_updates_mixed(
+    let blocks = match scenario.workload {
+        ProfileWorkload::Erc20PoolLike {
+            contract_ratio,
+            contract_kv_per_contract,
+            active_contract_pool_ratio,
+        } => {
+            let layout = build_pool_layout(
+                addrs.len(),
+                scenario.updates_per_block,
+                contract_ratio,
+                contract_kv_per_contract,
+                active_contract_pool_ratio,
+            );
+            generate_updates_erc20_pool_like(
                 &addrs,
                 scenario.updates_per_block,
-                contract_slots,
-                contract_ratio,
-                i,
+                scenario.block_count,
+                layout,
                 &mut rng_blocks,
-            ),
-        })
-        .collect();
+            )
+        }
+        _ => (0..scenario.block_count)
+            .map(|i| match scenario.workload {
+                ProfileWorkload::FreshUniform { slots_per, .. } => {
+                    generate_account_chunk(&addrs, 0, slots_per)
+                }
+                ProfileWorkload::Uniform { slots_per } => generate_updates(
+                    &addrs,
+                    scenario.updates_per_block,
+                    slots_per,
+                    i,
+                    &mut rng_blocks,
+                ),
+                ProfileWorkload::Mixed { contract_slots, contract_ratio } => {
+                    generate_updates_mixed(
+                        &addrs,
+                        scenario.updates_per_block,
+                        contract_slots,
+                        contract_ratio,
+                        i,
+                        &mut rng_blocks,
+                    )
+                }
+                ProfileWorkload::MixedDecoupled {
+                    update_contract_slots, contract_ratio, ..
+                } => generate_updates_mixed(
+                    &addrs,
+                    scenario.updates_per_block,
+                    update_contract_slots,
+                    contract_ratio,
+                    i,
+                    &mut rng_blocks,
+                ),
+                ProfileWorkload::Erc20PoolLike { .. } => unreachable!(),
+            })
+            .collect(),
+    };
 
     (addrs, blocks)
 }
@@ -565,6 +940,34 @@ pub fn prepopulate_reth_profile(
                     total,
                     contract_slots,
                     contract_ratio,
+                )
+            }
+            ProfileWorkload::MixedDecoupled { prepop_contract_slots, contract_ratio, .. } => {
+                generate_account_chunk_mixed(
+                    chunk,
+                    global_start,
+                    total,
+                    prepop_contract_slots,
+                    contract_ratio,
+                )
+            }
+            ProfileWorkload::Erc20PoolLike {
+                contract_ratio,
+                contract_kv_per_contract,
+                active_contract_pool_ratio,
+            } => {
+                let layout = build_pool_layout(
+                    total,
+                    scenario.updates_per_block,
+                    contract_ratio,
+                    contract_kv_per_contract,
+                    active_contract_pool_ratio,
+                );
+                generate_account_chunk_erc20_pool_like(
+                    addrs,
+                    global_start,
+                    global_start + chunk.len(),
+                    layout,
                 )
             }
         };
@@ -603,6 +1006,34 @@ pub fn prepopulate_mpt_profile(
                     total,
                     contract_slots,
                     contract_ratio,
+                )
+            }
+            ProfileWorkload::MixedDecoupled { prepop_contract_slots, contract_ratio, .. } => {
+                generate_account_chunk_mixed(
+                    chunk,
+                    global_start,
+                    total,
+                    prepop_contract_slots,
+                    contract_ratio,
+                )
+            }
+            ProfileWorkload::Erc20PoolLike {
+                contract_ratio,
+                contract_kv_per_contract,
+                active_contract_pool_ratio,
+            } => {
+                let layout = build_pool_layout(
+                    total,
+                    scenario.updates_per_block,
+                    contract_ratio,
+                    contract_kv_per_contract,
+                    active_contract_pool_ratio,
+                );
+                generate_account_chunk_erc20_pool_like(
+                    addrs,
+                    global_start,
+                    global_start + chunk.len(),
+                    layout,
                 )
             }
         };
@@ -685,6 +1116,7 @@ pub fn run_mpt_only_profile(scenario: ProfileScenario) -> MptRun {
     if scenario.prepop_accounts > 0 {
         store.flush_persist().unwrap();
     }
+    let enable_block_prewarm = matches!(scenario.workload, ProfileWorkload::Erc20PoolLike { .. });
     let mut mptdb_totals = MptdbTotals::default();
     for (block_idx, block) in blocks.iter().enumerate() {
         let apply_start = Instant::now();
@@ -730,6 +1162,19 @@ sp_fb={} sp_ap={} sp_ch={}",
             );
         }
         accumulate_mptdb_profile(&mut mptdb_totals, &profile);
+
+        if enable_block_prewarm {
+            store.maybe_refresh_published_view_for_prewarm();
+            for (addr, account) in block.state().iter() {
+                if !account.storage.is_empty() {
+                    let _ =
+                        store.prewarm_storage_trie_by_hashed_address(keccak256(addr.as_slice()));
+                }
+            }
+            // For provider-equivalent heavy pool workloads, force publish before
+            // the next block so storage-root lookups do not depend on async lag.
+            store.flush_persist().unwrap();
+        }
     }
     store.close().unwrap();
 

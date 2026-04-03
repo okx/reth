@@ -1000,7 +1000,11 @@ fn extract_storage_multiproof_for_account(
     reader: &StorageTrieSegmentReader<'_>,
     dirty: &DirtyAccount,
     enable_full_scan: bool,
+    force_full_reveal: bool,
 ) -> MptResult<DecodedStorageMultiProof> {
+    if force_full_reveal {
+        return reader.extract_full_decoded_multiproof();
+    }
     let storage_change_len = dirty.storage_changes.len();
     let should_force_full_scan = enable_full_scan &&
         (SPARSE_STORAGE_FULL_SCAN_MIN_CHANGES..=SPARSE_STORAGE_FULL_SCAN_MAX_CHANGES)
@@ -1149,8 +1153,13 @@ pub(crate) fn apply_all_storage_changes_sparse(
             continue;
         }
         if skip_already_revealed_storage && trie.storage_trie_ref(&dirty.hashed_address).is_some() {
-            pre_extract_skip_reused += 1;
-            continue;
+            let all_slots_already_revealed = dirty.storage_changes.iter().all(|change| {
+                trie.is_storage_slot_revealed(dirty.hashed_address, change.hashed_slot)
+            });
+            if all_slots_already_revealed {
+                pre_extract_skip_reused += 1;
+                continue;
+            }
         }
         if provider_factory.pre_built_storage_proofs.contains_key(&dirty.hashed_address) {
             pre_extract_skip_prebuilt += 1;
@@ -1182,7 +1191,13 @@ pub(crate) fn apply_all_storage_changes_sparse(
                         MptDbError::Other(format!("open storage segment reader {hashed_addr}: {e}"))
                     })?;
                     let dirty = &dirty_accounts[dirty_idx];
-                    let proof = extract_storage_multiproof_for_account(&reader, dirty, enable_full_scan)
+                    let force_full_reveal = trie.storage_trie_ref(&hashed_addr).is_none();
+                    let proof = extract_storage_multiproof_for_account(
+                        &reader,
+                        dirty,
+                        enable_full_scan,
+                        force_full_reveal,
+                    )
                     .map_err(|e| {
                         MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
                     })?;
@@ -1204,7 +1219,13 @@ pub(crate) fn apply_all_storage_changes_sparse(
                         MptDbError::Other(format!("open storage segment reader {hashed_addr}: {e}"))
                     })?;
                     let dirty = &dirty_accounts[dirty_idx];
-                    let proof = extract_storage_multiproof_for_account(&reader, dirty, enable_full_scan)
+                    let force_full_reveal = trie.storage_trie_ref(&hashed_addr).is_none();
+                    let proof = extract_storage_multiproof_for_account(
+                        &reader,
+                        dirty,
+                        enable_full_scan,
+                        force_full_reveal,
+                    )
                     .map_err(|e| {
                         MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
                     })?;
@@ -1244,7 +1265,13 @@ pub(crate) fn apply_all_storage_changes_sparse(
             continue;
         }
         if skip_already_revealed_storage && trie.storage_trie_ref(&hashed_addr).is_some() {
-            continue;
+            let all_slots_already_revealed = dirty
+                .storage_changes
+                .iter()
+                .all(|change| trie.is_storage_slot_revealed(hashed_addr, change.hashed_slot));
+            if all_slots_already_revealed {
+                continue;
+            }
         }
         if let Some(proof) = pre_extracted_segment_proofs.remove(&hashed_addr) {
             accounts_segment_reveal += 1;
@@ -1257,10 +1284,16 @@ pub(crate) fn apply_all_storage_changes_sparse(
             accounts_segment_reveal += 1;
             accounts_segment_reader_reveal += 1;
             let extract_start = trace_enabled.then(std::time::Instant::now);
-            let proof = extract_storage_multiproof_for_account(&reader, dirty, enable_full_scan)
-                .map_err(|e| {
-                    MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
-                })?;
+            let force_full_reveal = trie.storage_trie_ref(&hashed_addr).is_none();
+            let proof = extract_storage_multiproof_for_account(
+                &reader,
+                dirty,
+                enable_full_scan,
+                force_full_reveal,
+            )
+            .map_err(|e| {
+                MptDbError::Other(format!("extract storage multiproof {hashed_addr}: {e}"))
+            })?;
             if let Some(start) = extract_start {
                 t_extract_storage_proof += start.elapsed();
             }

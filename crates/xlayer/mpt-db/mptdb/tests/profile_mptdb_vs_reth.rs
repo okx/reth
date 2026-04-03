@@ -1,4 +1,4 @@
-//! Lightweight one-shot profile runners for B4.1-B4.7.
+//! Lightweight one-shot profile runners for B4.1-B4.8.
 //!
 //! Run with:
 //! `PROTOC=/Users/louisliuxiong/golang/bin/protoc cargo test -p mptdb --release --test
@@ -12,7 +12,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use common::mptdb_vs_reth_support::{
     run_profile_compare, run_profile_mpt_only, run_profile_reth_only, scenario_b4_1, scenario_b4_2,
-    scenario_b4_3, scenario_b4_4, scenario_b4_5, scenario_b4_6, scenario_b4_7,
+    scenario_b4_3, scenario_b4_4, scenario_b4_5, scenario_b4_6, scenario_b4_7, scenario_b4_8,
 };
 
 macro_rules! define_profile_only_tests {
@@ -59,4 +59,9 @@ define_profile_only_tests!(
     profile_b4_7_mainnet_realistic_reth_only,
     profile_b4_7_mainnet_realistic_mpt_only,
     scenario_b4_7
+);
+define_profile_only_tests!(
+    profile_b4_8_integration_scale_reth_only,
+    profile_b4_8_integration_scale_mpt_only,
+    scenario_b4_8
 );

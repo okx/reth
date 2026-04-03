@@ -1,4 +1,4 @@
-//! Benchmark-style repeated runners for B4.2-B4.7.
+//! Benchmark-style repeated runners for B4.2-B4.8.
 //!
 //! Run with:
 //! `PROTOC=/Users/louisliuxiong/golang/bin/protoc MPT_BENCH_ITERS=5 cargo test -p mptdb --release
@@ -14,7 +14,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use common::mptdb_vs_reth_support::{
     benchmark_iterations_from_env, print_mpt_benchmark, print_reth_benchmark, run_mpt_benchmark,
     run_reth_benchmark, scenario_b4_1, scenario_b4_2, scenario_b4_3, scenario_b4_4, scenario_b4_5,
-    scenario_b4_6, scenario_b4_7,
+    scenario_b4_6, scenario_b4_7, scenario_b4_8,
 };
 
 fn run_benchmark_reth_only(scenario: common::mptdb_vs_reth_support::ProfileScenario) {
@@ -55,4 +55,9 @@ define_benchmark_only_tests!(
     bench_b4_7_mainnet_realistic_reth_only,
     bench_b4_7_mainnet_realistic_mpt_only,
     scenario_b4_7
+);
+define_benchmark_only_tests!(
+    bench_b4_8_integration_scale_reth_only,
+    bench_b4_8_integration_scale_mpt_only,
+    scenario_b4_8
 );
