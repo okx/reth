@@ -85,6 +85,9 @@ pub struct ConfigBuilder {
     /// Custom filter rules to apply to a discovered peer in order to determine if it should be
     /// passed up to rlpx or dropped.
     discovered_peer_filter: Option<MustNotIncludeKeys>,
+    /// Optional external IPv4 address resolved from NAT, to be advertised in the ENR when the
+    /// listen address is unspecified (0.0.0.0).
+    external_ip: Option<Ipv4Addr>,
 }
 
 impl ConfigBuilder {
@@ -100,6 +103,7 @@ impl ConfigBuilder {
             bootstrap_lookup_interval,
             bootstrap_lookup_countdown,
             discovered_peer_filter,
+            external_ip,
         } = discv5_config;
 
         Self {
@@ -112,6 +116,7 @@ impl ConfigBuilder {
             bootstrap_lookup_interval: Some(bootstrap_lookup_interval),
             bootstrap_lookup_countdown: Some(bootstrap_lookup_countdown),
             discovered_peer_filter: Some(discovered_peer_filter),
+            external_ip,
         }
     }
 
@@ -214,6 +219,13 @@ impl ConfigBuilder {
         self
     }
 
+    /// Sets the external IPv4 address resolved from NAT, to be advertised in the ENR when the
+    /// listen address is unspecified (0.0.0.0).
+    pub const fn external_ip(mut self, ip: Ipv4Addr) -> Self {
+        self.external_ip = Some(ip);
+        self
+    }
+
     /// Returns a new [`Config`].
     pub fn build(self) -> Config {
         let Self {
@@ -226,6 +238,7 @@ impl ConfigBuilder {
             bootstrap_lookup_interval,
             bootstrap_lookup_countdown,
             discovered_peer_filter,
+            external_ip,
         } = self;
 
         let mut discv5_config = discv5_config.unwrap_or_else(|| {
@@ -256,6 +269,7 @@ impl ConfigBuilder {
             bootstrap_lookup_interval,
             bootstrap_lookup_countdown,
             discovered_peer_filter,
+            external_ip,
         }
     }
 }
@@ -289,6 +303,9 @@ pub struct Config {
     /// Custom filter rules to apply to a discovered peer in order to determine if it should be
     /// passed up to rlpx or dropped.
     pub(super) discovered_peer_filter: MustNotIncludeKeys,
+    /// Optional external IPv4 address resolved from NAT, to be advertised in the ENR when the
+    /// listen address is unspecified (0.0.0.0).
+    pub(super) external_ip: Option<Ipv4Addr>,
 }
 
 impl Config {
@@ -305,6 +322,7 @@ impl Config {
             bootstrap_lookup_interval: None,
             bootstrap_lookup_countdown: None,
             discovered_peer_filter: None,
+            external_ip: None,
         }
     }
 

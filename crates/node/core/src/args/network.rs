@@ -647,8 +647,8 @@ impl DiscoveryArgs {
             _ => None,
         });
 
-        // Use explicit discv5 addr first, then NAT-resolved IP, then rlpx address as fallback
-        let discv5_addr_ipv4 = discv5_addr.or(nat_ipv4).or(match rlpx_tcp_socket {
+        // Use rlpx address if none given
+        let discv5_addr_ipv4 = discv5_addr.or(match rlpx_tcp_socket {
             SocketAddr::V4(addr) => Some(*addr.ip()),
             SocketAddr::V6(_) => None,
         });
@@ -657,7 +657,7 @@ impl DiscoveryArgs {
             SocketAddr::V6(addr) => Some(*addr.ip()),
         });
 
-        reth_discv5::Config::builder(rlpx_tcp_socket)
+        let mut builder = reth_discv5::Config::builder(rlpx_tcp_socket)
             .discv5_config(
                 reth_discv5::discv5::ConfigBuilder::new(ListenConfig::from_two_sockets(
                     discv5_addr_ipv4.map(|addr| SocketAddrV4::new(addr, *discv5_port)),
@@ -668,7 +668,14 @@ impl DiscoveryArgs {
             .add_unsigned_boot_nodes(boot_nodes)
             .lookup_interval(*discv5_lookup_interval)
             .bootstrap_lookup_interval(*discv5_bootstrap_lookup_interval)
-            .bootstrap_lookup_countdown(*discv5_bootstrap_lookup_countdown)
+            .bootstrap_lookup_countdown(*discv5_bootstrap_lookup_countdown);
+
+        // Set external IP from NAT resolver for the ENR when bind address is 0.0.0.0
+        if let Some(ip) = nat_ipv4 {
+            builder = builder.external_ip(ip);
+        }
+
+        builder
     }
 
     /// Returns true if discv5 discovery should be configured
