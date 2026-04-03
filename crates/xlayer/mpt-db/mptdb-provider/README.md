@@ -81,6 +81,13 @@ Key env knobs:
 - `MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS=1` (measure wrapper/lock overhead)
 - `MPTDB_PROVIDER_BENCH_ENABLE_SC_PREWARM=1`
 - `MPTDB_BENCH_LEGACY_SC=1` (force legacy non-wal-first path)
+- `MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=0|1` (diagnostic A/B: serial vs parallel MDBX writer)
+- `MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE=full|plain|noop` (diagnostic isolation of MDBX write path)
+- `MPTDB_PROVIDER_BENCH_SYNC_PREWARM_AFTER_BLOCK=1` (diagnostic only: force per-block sync prewarm+flush)
+- `MPTDB_PROVIDER_BENCH_FLUSH_AFTER_PREPOP=0|1` (controls flush after genesis pre-pop)
+- `MPTDB_PROVIDER_BENCH_SC_STORAGE_TRIE_CACHE_CAPACITY` (SC L2 storage-trie cache capacity)
+- `MPTDB_PROVIDER_BENCH_SC_PERSISTED_NODE_CACHE_CAPACITY` (SC persisted-node cache capacity)
+- `MPTDB_PROVIDER_BENCH_SC_CROSS_BLOCK_SPARSE_MAX_LAG` (cross-block sparse trie eviction lag)
 
 Interpretation caveat:
 
@@ -491,3 +498,263 @@ Key conclusion:
 - Under this heavy pool workload, `mptdb` is slower mainly because:
   - `apply_bundle_state` is large (`~510ms/blk`)
   - `account_root` inside commit is still large (`~307ms/blk`)
+
+### 9.7 Deep Diagnosis: Why B4.8 Is Fast but Provider Integration Is Slow (April 3, 2026)
+
+Problem statement:
+
+- B4.8 SC micro-profile (`mptdb/tests/profile_mptdb_vs_reth.rs`) is much faster.
+- Provider integration benchmark (`mptdb-provider/benches/block_execution.rs`) on the same workload shape is much slower.
+- Main user concern: EVM phase is close; gap is in `commit/root` stage after EVM.
+
+Short answer:
+
+- In provider integration, the dominant gap is in SC `apply` sub-phases (`sparse_factory_build` + `sparse_apply_changes`), not in the final account-root hash itself.
+- Root cause is low segment hit rate in cross-block sparse reuse, which forces expensive tier1/2 fallback construction.
+- B4.8 keeps segment readiness stable (sync prewarm + flush), so it avoids that fallback path almost entirely.
+
+#### 9.7.1 A/B evidence (heavy pool workload)
+
+Workload used for all runs below:
+
+- `prepop_accounts=500000`
+- `txs_per_block=50000`
+- `num_blocks=10`
+- `contract_ratio=0.30`
+- `contract_kv_per_contract=128`
+- benchmark target: `erc20_transfer_10pct_contract_pool/mptdb`
+
+Baseline provider run (`MPTDB_PROVIDER_BENCH_SC_PROFILE=1`, `mdbx_write_mode=Full`):
+
+- `EVM ~403ms/blk`
+- `SC write ~3.24s/blk`
+- `apply ~2.64s/blk`
+- `total_commit ~599ms/blk`
+- `storage_accounts ~14463/blk`
+- `storage_slots ~99361/blk`
+- sparse factory stats:
+  - `seg hit/lookups = 1911/14463`
+  - `miss = 12552`
+  - `tier12 = 12551`
+  - `cross_reuse = 12552`
+  - `cross_missing_slots = 43382`
+
+B4.8 SC-only profile (same dataset shape):
+
+- `apply ~227ms/blk`
+- sparse stats per block:
+  - `sseg = 14463/14463`
+  - `smiss = 0`
+  - `t12 = 0`
+  - `creuse = 0`
+
+Interpretation:
+
+- Provider path has very low segment hit rate (`~13%`) and heavy fallback.
+- B4.8 has effectively full segment hit rate (`100%`) and near-zero sparse fallback.
+
+#### 9.7.2 Prewarm behavior diagnosis
+
+Async prewarm enabled in provider (`MPTDB_PROVIDER_BENCH_ENABLE_SC_PREWARM=1`):
+
+- Segment hit/miss metrics were essentially unchanged from baseline.
+- `apply` remained around the same level.
+
+Sync prewarm+flush diagnostic mode (bench-only):
+
+- Enabled `MPTDB_PROVIDER_BENCH_SYNC_PREWARM_AFTER_BLOCK=1`.
+- Segment stats became:
+  - `seg hit/lookups = 14463/14463`
+  - `miss = 0`
+  - `tier12 = 0`
+- `apply` dropped significantly (to around `~1.81s/blk` in that run).
+
+Interpretation:
+
+- The async prewarm worker is best-effort and does not guarantee next-block segment readiness.
+- If segment publish/readiness is forced before next block, sparse fallback collapses and `apply` improves.
+
+Relevant code behavior:
+
+- `ScPrewarmDispatcher` uses `try_lock`, can skip items if SC is busy:
+  - `mptdb-provider/src/provider.rs`
+- `maybe_refresh_published_view_for_prewarm()` intentionally does not reload segment view:
+  - `mptdb-sc/src/mpt/commit_store.rs`
+- `prewarm_storage_trie_by_hashed_address()` returns early when published index has no trie yet (wal_first timing window):
+  - `mptdb-sc/src/mpt/commit_store.rs`
+
+#### 9.7.3 MDBX parallel write contention check
+
+Additional diagnostics were run to test whether MDBX write overlap is the primary cause:
+
+- `MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE=full|plain|noop`
+- `MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=0|1`
+
+Observed:
+
+- Even with `mdbx_write_mode=noop`, provider `apply` remained high (`~2.6s/blk` class in parallel mode).
+- This indicates the first-order bottleneck is not “MDBX write work itself”, but SC sparse apply/factory behavior under integration conditions.
+
+#### 9.7.4 Cross-block sparse toggle check
+
+Run with `MPT_CROSS_BLOCK_SPARSE=0` in provider benchmark:
+
+- Performance regressed severely (`apply` became much larger).
+- Conclusion: cross-block sparse reuse is still net-positive; disabling it is not a fix.
+- Real issue is reuse mode encountering low segment readiness and paying repeated fallback cost.
+
+#### 9.7.5 Reproduction commands (diagnostic set)
+
+```bash
+# Baseline provider diagnostic (full write mode + SC profile)
+MPTDB_PROVIDER_BENCH_PREPOP_ACCOUNTS=500000 \
+MPTDB_PROVIDER_BENCH_TXS_PER_BLOCK=50000 \
+MPTDB_PROVIDER_BENCH_NUM_BLOCKS=10 \
+MPTDB_PROVIDER_BENCH_CONTRACT_RATIO=0.30 \
+MPTDB_PROVIDER_BENCH_CONTRACT_KV_PER_CONTRACT=128 \
+MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle \
+MPTDB_PROVIDER_BENCH_WARMUP_SECS=1 \
+MPTDB_PROVIDER_BENCH_MEASUREMENT_SECS=6 \
+MPTDB_PROVIDER_BENCH_TRACE=1 \
+MPTDB_PROVIDER_BENCH_TRACE_ITERS=1 \
+MPTDB_PROVIDER_BENCH_SC_PROFILE=1 \
+MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE=full \
+cargo bench --bench block_execution -p mptdb-provider -- "erc20_transfer_10pct_contract_pool/mptdb"
+
+# Async prewarm toggle (expected: little/no change in seg hit under heavy pressure)
+MPTDB_PROVIDER_BENCH_ENABLE_SC_PREWARM=1 ...
+
+# Sync prewarm+flush diagnostic (bench-only, not production path)
+MPTDB_PROVIDER_BENCH_SYNC_PREWARM_AFTER_BLOCK=1 ...
+
+# MDBX write-path isolation
+MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE=noop ...
+
+# Cross-block sparse off (expected: much slower; diagnostic only)
+MPT_CROSS_BLOCK_SPARSE=0 ...
+```
+
+#### 9.7.6 Main diagnostic conclusion
+
+- B4.8 “fast” and provider “slow” are both real and consistent once sparse-factory counters are compared.
+- The decisive difference is not EVM and not root-hash algorithm mismatch.
+- The decisive difference is integration-time sparse segment readiness:
+  - B4.8 keeps it stable (`seg ~100%`).
+  - Provider heavy run often misses (`seg ~13%`) and falls back to expensive tier1/2 path.
+
+### 9.8 P0 Fix Landed: Path-Limited Fallback Proof Extraction (April 3, 2026)
+
+Scope of code change:
+
+- `mptdb-sc/src/mpt/sparse_storage.rs`
+  - Added path-limited storage proof extraction from `SparseStateTrie`:
+    - `extract_storage_proof_from_sparse_trie_for_paths`
+    - `sparse_nodes_to_decoded_storage_multiproof_for_paths`
+  - Added path-limited storage proof conversion from arena:
+    - `convert_arena_to_decoded_storage_multiproof_for_paths`
+- `mptdb-sc/src/mpt/commit_store.rs`
+  - In `try_build_l2_proof`, tier1/tier2/tier3 now prefer dirty-key path-limited proof build.
+  - This removes repeated full-trie/full-arena DFS in fallback-heavy provider runs.
+
+#### 9.8.1 Verification results
+
+Heavy provider workload (same as 9.7):
+
+- `prepop_accounts=500000`
+- `txs_per_block=50000`
+- `num_blocks=10`
+- `contract_ratio=0.30`
+- `contract_kv_per_contract=128`
+- bench target: `erc20_transfer_10pct_contract_pool/mptdb`
+
+After patch (`MPTDB_PROVIDER_BENCH_SC_PROFILE=1`, `trace_iters=1`, first trace sample):
+
+- `EVM ~3.80s/iter` (similar)
+- `SC write ~12.00s/iter` (previously ~32.43s/iter class)
+- `apply ~7.34s/iter` (previously ~26.4s/iter class)
+- `total_commit ~4.64s/iter` (same order as before; not the main reduction source)
+- `sparse_factory_build ~1.33s/iter` (down materially from previous multi-second class)
+
+Per-block view from same trace:
+
+- `sc_write ~1.20s/blk`
+- `apply ~734ms/blk`
+- `total_commit ~464ms/blk`
+
+Interpretation:
+
+- P0 fix removed the biggest pathological overhead in fallback proof construction.
+- Remaining gap vs `reth_mdbx` is now much smaller, but still present.
+
+#### 9.8.2 MDBX contention re-check after fix
+
+With `MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=0` and `MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE=noop`:
+
+- `sc_write` stayed around `~11.8-12.1s/iter`.
+- Therefore residual bottleneck remains inside SC apply/commit path, not MDBX write overlap.
+
+#### 9.8.3 Current status after P0
+
+- The previous “integration performance collapse” (mptdb several times slower) is largely mitigated.
+- The dominant remaining cost under heavy provider integration is still SC-side (`apply + commit`),
+  with large `cross_missing_slots` and frequent fallback attempts.
+
+### 9.9 Cache tuning + MDBX alignment note (April 3, 2026)
+
+User request:
+
+- Increase cache sizes and align with `reth + mdbx` startup settings where possible.
+
+#### 9.9.1 MDBX “cache size” reality in reth
+
+There is no explicit MDBX block-cache-size knob in reth startup analogous to RocksDB block cache.
+reth MDBX path is mmap-based and relies on OS page cache.
+
+Current reth MDBX startup defaults (from `reth_db::mdbx::DatabaseArguments` and env open path):
+
+- map size upper bound: `8 TB`
+- growth step: `4 GB`
+- page size: default page size (`default_page_size()`, usually `4 KB`)
+- `max_readers`: `32000`
+- `no_rdahead = true`
+- `rp_augment_limit = 256 * 1024`
+
+So for this benchmark, “align cache size with reth+mdbx” means:
+
+- MDBX side already uses the same reth defaults.
+- Tunable cache levers are mainly on SC (`MptConfig`) side.
+
+#### 9.9.2 SC cache knobs added to benchmark
+
+`benches/block_execution.rs` now supports:
+
+- `MPTDB_PROVIDER_BENCH_SC_STORAGE_TRIE_CACHE_CAPACITY`
+- `MPTDB_PROVIDER_BENCH_SC_PERSISTED_NODE_CACHE_CAPACITY`
+- `MPTDB_PROVIDER_BENCH_SC_CROSS_BLOCK_SPARSE_MAX_LAG`
+
+Benchmark defaults are increased to:
+
+- `sc_storage_cache = 200000` (was effectively `50000`)
+- `sc_persisted_cache = 2000000` (was `500000`)
+- `sc_cross_lag = 64` (was `8`)
+
+#### 9.9.3 A/B result on integration workload
+
+Workload: `erc20_transfer_10pct_contract_pool` with
+`500000acc_50000tx_10blk_30c_128kv_pool15000`.
+
+Old cache profile (`50k / 500k / 8`) on same code:
+
+- `sc_write ~12.3-12.5s/iter`
+- `apply ~741-753ms/blk`
+
+New default cache profile (`200k / 2M / 64`):
+
+- `sc_write ~10.3s/iter`
+- `apply ~532-537ms/blk`
+
+Effect:
+
+- `sc_write` reduced by roughly `~17%`
+- `apply` reduced by roughly `~28-30%`
+- `sparse_factory` miss/t12 counters were largely unchanged, so the gain is mainly from cache-hit/memory locality improvements in SC internals.

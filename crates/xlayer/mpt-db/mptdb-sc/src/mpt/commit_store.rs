@@ -38,7 +38,9 @@ use super::{
     sparse_storage::{
         apply_all_storage_changes_sparse, build_storage_segments_from_sparse_trie,
         convert_arena_to_account_proof_nodes_for_paths,
-        convert_arena_to_decoded_storage_multiproof, extract_storage_proof_from_sparse_trie,
+        convert_arena_to_decoded_storage_multiproof,
+        convert_arena_to_decoded_storage_multiproof_for_paths,
+        extract_storage_proof_from_sparse_trie, extract_storage_proof_from_sparse_trie_for_paths,
         SegmentTrieNodeProviderFactory,
     },
     state::{self, DirtyAccount},
@@ -4592,10 +4594,12 @@ impl MptCommitStore {
     /// than failing outright.
     /// Build a pre-built storage proof from the best available source:
     /// 1. Previous block's sparse trie (`last_committed_sparse_trie`) — always correct because
-    ///    computed by `root_with_updates`.
-    /// 2. L2 cache (`storage_trie_handles`) — correct for recently-committed accounts.
+    ///    computed by `root_with_updates`. Uses path-limited extraction when `dirty_keys` is set.
+    /// 2. L2 cache (`storage_trie_handles`) — correct for recently-committed accounts. Uses
+    ///    path-limited arena conversion when `dirty_keys` is set.
     /// 3. Persisted store (RocksDB) — available after non-wal_first commits and WAL replay.  Loads
-    ///    from `persisted.load_trie_at_root` + preloads dirty paths.
+    ///    from `persisted.load_trie_at_root` + preloads dirty paths and exports a path-limited
+    ///    proof.
     /// 4. Fall back to `known_empty` as last resort.
     fn try_build_l2_proof(
         &self,
@@ -4606,17 +4610,31 @@ impl MptCommitStore {
     ) {
         // 1. Prefer previous sparse trie (always correct hashes).
         if let Some(ref prev_sparse) = self.last_committed_sparse_trie {
-            if let Ok(Some(proof)) =
+            if let Ok(Some(proof)) = if dirty_keys.is_empty() {
                 extract_storage_proof_from_sparse_trie(prev_sparse, hashed_addr, root)
-            {
+            } else {
+                extract_storage_proof_from_sparse_trie_for_paths(
+                    prev_sparse,
+                    hashed_addr,
+                    root,
+                    dirty_keys,
+                )
+            } {
                 factory.pre_built_storage_proofs.insert(*hashed_addr, proof);
                 return;
             }
         }
         if let Some(ref cross) = self.cross_block_sparse {
-            if let Ok(Some(proof)) =
+            if let Ok(Some(proof)) = if dirty_keys.is_empty() {
                 extract_storage_proof_from_sparse_trie(&cross.trie, hashed_addr, root)
-            {
+            } else {
+                extract_storage_proof_from_sparse_trie_for_paths(
+                    &cross.trie,
+                    hashed_addr,
+                    root,
+                    dirty_keys,
+                )
+            } {
                 factory.pre_built_storage_proofs.insert(*hashed_addr, proof);
                 return;
             }
@@ -4624,11 +4642,21 @@ impl MptCommitStore {
 
         // 2. L2 cache fallback (StorageTrieCow from dual-write or previous runs).
         if let Some(handle) = self.storage_trie_handles.get(hashed_addr) {
-            match convert_arena_to_decoded_storage_multiproof(
-                handle.base.arena(),
-                handle.base.root_index(),
-                root,
-            ) {
+            let proof_result = if dirty_keys.is_empty() {
+                convert_arena_to_decoded_storage_multiproof(
+                    handle.base.arena(),
+                    handle.base.root_index(),
+                    root,
+                )
+            } else {
+                convert_arena_to_decoded_storage_multiproof_for_paths(
+                    handle.base.arena(),
+                    handle.base.root_index(),
+                    root,
+                    dirty_keys,
+                )
+            };
+            match proof_result {
                 Ok(proof) => {
                     factory.pre_built_storage_proofs.insert(*hashed_addr, proof);
                     return;
@@ -4642,10 +4670,11 @@ impl MptCommitStore {
         if !dirty_keys.is_empty() {
             let mut cow = StorageTrieCow::from_persisted_root(root);
             if cow.preload_paths(&self.persisted, dirty_keys).is_ok() {
-                match convert_arena_to_decoded_storage_multiproof(
+                match convert_arena_to_decoded_storage_multiproof_for_paths(
                     cow.arena(),
                     cow.root_index(),
                     root,
+                    dirty_keys,
                 ) {
                     Ok(proof) => {
                         factory.pre_built_storage_proofs.insert(*hashed_addr, proof);
@@ -4816,6 +4845,7 @@ impl MptCommitStore {
                     continue;
                 }
                 // Only build tier-3 proof for newly-touched slots.
+                let before = factory.pre_built_storage_proofs.len();
                 self.try_build_l2_proof_tier3_only(
                     &dirty.hashed_address,
                     root,
@@ -4823,6 +4853,19 @@ impl MptCommitStore {
                     &mut factory,
                     stats,
                 );
+                if factory.pre_built_storage_proofs.len() == before {
+                    // Tier-3 can fail in wal_first mode when the needed paths
+                    // are not yet persisted/published. Fall back to tier-1/2
+                    // sources (previous sparse trie / L2 cache) to avoid
+                    // missing-proof errors in sparse apply.
+                    stats.tier12_attempts += 1;
+                    self.try_build_l2_proof(
+                        &dirty.hashed_address,
+                        root,
+                        &missing_keys,
+                        &mut factory,
+                    );
+                }
             } else {
                 // Account not yet in cross-block trie:
                 // prefer tier-3 dirty-path proof first to avoid full-arena DFS.
@@ -4863,7 +4906,12 @@ impl MptCommitStore {
         stats.tier3_attempts += 1;
         let mut cow = StorageTrieCow::from_persisted_root(root);
         if cow.preload_paths(&self.persisted, dirty_keys).is_ok() {
-            match convert_arena_to_decoded_storage_multiproof(cow.arena(), cow.root_index(), root) {
+            match convert_arena_to_decoded_storage_multiproof_for_paths(
+                cow.arena(),
+                cow.root_index(),
+                root,
+                dirty_keys,
+            ) {
                 Ok(proof) => {
                     stats.tier3_hits += 1;
                     factory.pre_built_storage_proofs.insert(*hashed_addr, proof);

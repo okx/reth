@@ -292,6 +292,26 @@ pub(crate) fn extract_storage_proof_from_sparse_trie(
     Ok(Some(sparse_nodes_to_decoded_storage_multiproof(storage_trie, root)?))
 }
 
+/// Path-limited variant of `extract_storage_proof_from_sparse_trie`.
+///
+/// Exports only nodes along `keys` (plus required branch siblings), avoiding a
+/// full DFS over previously-revealed storage tries when only a few dirty slots
+/// need fallback proof materialization.
+pub(crate) fn extract_storage_proof_from_sparse_trie_for_paths(
+    sparse_trie: &SparseStateTrie,
+    hashed_addr: &B256,
+    root: B256,
+    keys: &[Nibbles],
+) -> MptResult<Option<DecodedStorageMultiProof>> {
+    let Some(storage_trie) = sparse_trie.storage_trie_ref(hashed_addr) else {
+        return Ok(None);
+    };
+    if keys.is_empty() {
+        return Ok(Some(sparse_nodes_to_decoded_storage_multiproof(storage_trie, root)?));
+    }
+    Ok(Some(sparse_nodes_to_decoded_storage_multiproof_for_paths(storage_trie, root, keys)?))
+}
+
 /// DFS over a `SerialSparseTrie`'s revealed nodes to produce
 /// `(DecodedProofNodes, BranchNodeMasksMap)` for the account trie.
 ///
@@ -460,6 +480,173 @@ fn sparse_nodes_to_decoded_storage_multiproof(
     })
 }
 
+/// Path-limited variant of `sparse_nodes_to_decoded_storage_multiproof`.
+///
+/// Only includes nodes along `keys` paths (plus branch sibling hashes for
+/// correctness), reducing extraction work for cross-block fallback.
+fn sparse_nodes_to_decoded_storage_multiproof_for_paths(
+    trie: &SerialSparseTrie,
+    root: B256,
+    keys: &[Nibbles],
+) -> MptResult<DecodedStorageMultiProof> {
+    if keys.is_empty() {
+        return sparse_nodes_to_decoded_storage_multiproof(trie, root);
+    }
+    let nodes = trie.nodes_ref();
+    let values = trie.values_ref();
+    let include_paths = collect_sparse_include_paths_for_keys(nodes, keys);
+
+    let mut pairs: Vec<(Nibbles, TrieNode)> = Vec::new();
+    let mut branch_masks: BranchNodeMasksMap = BranchNodeMasksMap::default();
+    let mut visited: HashSet<Nibbles> = HashSet::default();
+    let mut stack: Vec<Nibbles> = vec![Nibbles::default()];
+
+    while let Some(path) = stack.pop() {
+        if !include_paths.contains(&path) {
+            continue;
+        }
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+
+        let node = match nodes.get(&path) {
+            Some(n) => n,
+            None => continue,
+        };
+        match node {
+            SparseNode::Empty => {
+                pairs.push((path, TrieNode::EmptyRoot));
+            }
+            SparseNode::Hash(_) => {
+                // Hash-blinded node is referenced by parent RlpNode::word_rlp and
+                // should not be inserted into DecodedProofNodes directly.
+            }
+            SparseNode::Leaf { key, .. } => {
+                let full_path = nibbles_extend(&path, key);
+                let value = values.get(&full_path).cloned().unwrap_or_default();
+                pairs.push((
+                    path,
+                    TrieNode::Leaf(alloy_trie::nodes::LeafNode::new(key.clone(), value)),
+                ));
+            }
+            SparseNode::Extension { key, .. } => {
+                let child_path = nibbles_extend(&path, key);
+                let child_hash = sparse_node_rlp(nodes, &child_path);
+                pairs.push((
+                    path,
+                    TrieNode::Extension(alloy_trie::nodes::ExtensionNode::new(
+                        key.clone(),
+                        child_hash,
+                    )),
+                ));
+
+                if include_paths.contains(&child_path) {
+                    let is_revealed = nodes
+                        .get(&child_path)
+                        .map(|n| !matches!(n, SparseNode::Hash(_)))
+                        .unwrap_or(false);
+                    if is_revealed {
+                        stack.push(child_path);
+                    }
+                }
+            }
+            SparseNode::Branch { state_mask, .. } => {
+                let mut rlp_stack: Vec<alloy_trie::nodes::RlpNode> = Vec::new();
+                let mut tree_mask = reth_trie_common::TrieMask::default();
+                let mut hash_mask = reth_trie_common::TrieMask::default();
+                for i in 0u8..16 {
+                    if !state_mask.is_bit_set(i) {
+                        continue;
+                    }
+                    let child_path = nibbles_push(&path, i);
+                    let child_rlp = sparse_node_rlp(nodes, &child_path);
+                    if child_rlp.is_hash() {
+                        hash_mask.set_bit(i);
+                    }
+                    if include_paths.contains(&child_path) {
+                        let is_revealed = nodes
+                            .get(&child_path)
+                            .map(|n| !matches!(n, SparseNode::Hash(_)))
+                            .unwrap_or(false);
+                        if is_revealed {
+                            tree_mask.set_bit(i);
+                            stack.push(child_path);
+                        }
+                    }
+                    rlp_stack.push(child_rlp);
+                }
+                pairs.push((
+                    path.clone(),
+                    TrieNode::Branch(alloy_trie::nodes::BranchNode::new(rlp_stack, *state_mask)),
+                ));
+                if tree_mask.get() != 0 || hash_mask.get() != 0 {
+                    branch_masks.insert(path, BranchNodeMasks { tree_mask, hash_mask });
+                }
+            }
+        }
+    }
+
+    Ok(DecodedStorageMultiProof {
+        root,
+        subtree: DecodedProofNodes::from_iter(pairs),
+        branch_node_masks: branch_masks,
+    })
+}
+
+fn collect_sparse_include_paths_for_keys(
+    nodes: &alloy_primitives::map::HashMap<Nibbles, SparseNode>,
+    keys: &[Nibbles],
+) -> HashSet<Nibbles> {
+    let mut include_paths: HashSet<Nibbles> = HashSet::default();
+    include_paths.insert(Nibbles::default());
+
+    for key in keys {
+        let mut current_path = Nibbles::default();
+        let mut offset = 0usize;
+
+        loop {
+            include_paths.insert(current_path.clone());
+            let Some(node) = nodes.get(&current_path) else {
+                break;
+            };
+            match node {
+                SparseNode::Leaf { .. } | SparseNode::Hash(_) | SparseNode::Empty => break,
+                SparseNode::Extension { key: ext_key, .. } => {
+                    let ext_len = ext_key.len();
+                    if offset + ext_len > key.len() {
+                        break;
+                    }
+                    let mut matched = true;
+                    for i in 0..ext_len {
+                        if key.get_unchecked(offset + i) != ext_key.get_unchecked(i) {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        break;
+                    }
+                    offset += ext_len;
+                    current_path = nibbles_extend(&current_path, ext_key);
+                }
+                SparseNode::Branch { state_mask, .. } => {
+                    if offset >= key.len() {
+                        break;
+                    }
+                    let nibble = key.get_unchecked(offset);
+                    offset += 1;
+                    if !state_mask.is_bit_set(nibble) {
+                        break;
+                    }
+                    current_path = nibbles_push(&current_path, nibble);
+                }
+            }
+        }
+    }
+
+    include_paths
+}
+
 /// Returns the `RlpNode` representation for the node at `path` in the sparse trie.
 ///
 /// Revealed nodes: returns their hash (or inline RLP if small).
@@ -502,6 +689,33 @@ pub(crate) fn convert_arena_to_decoded_storage_multiproof(
     })
 }
 
+/// Path-limited variant of `convert_arena_to_decoded_storage_multiproof`.
+///
+/// Builds storage multiproof nodes for only the requested storage-key paths,
+/// avoiding a full-arena DFS on large storage tries.
+pub(crate) fn convert_arena_to_decoded_storage_multiproof_for_paths(
+    arena: &MutableTrieArena,
+    root_idx: Option<u32>,
+    root_hash: B256,
+    keys: &[Nibbles],
+) -> MptResult<DecodedStorageMultiProof> {
+    if root_idx.is_none() {
+        return Ok(DecodedStorageMultiProof::empty());
+    }
+    if keys.is_empty() {
+        return convert_arena_to_decoded_storage_multiproof(arena, root_idx, root_hash);
+    }
+
+    let root_idx = root_idx.unwrap();
+    let include_paths = collect_arena_include_paths_for_keys(arena, root_idx, keys);
+    let (pairs, branch_masks) = arena_to_proof_nodes_for_paths(arena, root_idx, &include_paths)?;
+    Ok(DecodedStorageMultiProof {
+        root: root_hash,
+        subtree: DecodedProofNodes::from_iter(pairs),
+        branch_node_masks: branch_masks,
+    })
+}
+
 /// Converts a materialized arena to `(DecodedProofNodes, BranchNodeMasksMap)` as
 /// expected by `SparseStateTrie::reveal_decoded_account_multiproof`.
 ///
@@ -536,6 +750,16 @@ pub(crate) fn convert_arena_to_account_proof_nodes_for_paths(
     }
 
     let root_idx = root_idx.unwrap();
+    let include_paths = collect_arena_include_paths_for_keys(arena, root_idx, keys);
+    let (pairs, branch_masks) = arena_to_proof_nodes_for_paths(arena, root_idx, &include_paths)?;
+    Ok((DecodedProofNodes::from_iter(pairs), branch_masks))
+}
+
+fn collect_arena_include_paths_for_keys(
+    arena: &MutableTrieArena,
+    root_idx: u32,
+    keys: &[Nibbles],
+) -> HashSet<Nibbles> {
     let mut include_paths: HashSet<Nibbles> = HashSet::default();
     include_paths.insert(Nibbles::default());
 
@@ -593,8 +817,7 @@ pub(crate) fn convert_arena_to_account_proof_nodes_for_paths(
         }
     }
 
-    let (pairs, branch_masks) = arena_to_proof_nodes_for_paths(arena, root_idx, &include_paths)?;
-    Ok((DecodedProofNodes::from_iter(pairs), branch_masks))
+    include_paths
 }
 
 /// Iterative DFS over the materialized arena, converting each node to a

@@ -70,6 +70,9 @@ const DEFAULT_MEASUREMENT_SECS: u64 = 120;
 const DEFAULT_CONTRACT_RATIO: f64 = 0.30;
 const DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 32;
 const ERC20_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
+const DEFAULT_SC_STORAGE_TRIE_CACHE_CAPACITY: usize = 200_000;
+const DEFAULT_SC_PERSISTED_NODE_CACHE_CAPACITY: usize = 2_000_000;
+const DEFAULT_SC_CROSS_BLOCK_SPARSE_MAX_LAG: i64 = 64;
 
 fn pre_pop_accounts() -> usize {
     std::env::var("MPTDB_PROVIDER_BENCH_PREPOP_ACCOUNTS")
@@ -111,6 +114,29 @@ fn contract_kv_per_contract() -> usize {
         .unwrap_or(DEFAULT_CONTRACT_KV_PER_CONTRACT)
 }
 
+fn bench_parse_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0)
+}
+
+fn bench_parse_i64(name: &str) -> Option<i64> {
+    std::env::var(name).ok().and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 0)
+}
+
+fn bench_sc_storage_trie_cache_capacity() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_SC_STORAGE_TRIE_CACHE_CAPACITY")
+        .unwrap_or(DEFAULT_SC_STORAGE_TRIE_CACHE_CAPACITY)
+}
+
+fn bench_sc_persisted_node_cache_capacity() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_SC_PERSISTED_NODE_CACHE_CAPACITY")
+        .unwrap_or(DEFAULT_SC_PERSISTED_NODE_CACHE_CAPACITY)
+}
+
+fn bench_sc_cross_block_sparse_max_lag() -> i64 {
+    bench_parse_i64("MPTDB_PROVIDER_BENCH_SC_CROSS_BLOCK_SPARSE_MAX_LAG")
+        .unwrap_or(DEFAULT_SC_CROSS_BLOCK_SPARSE_MAX_LAG)
+}
+
 fn bench_sample_size() -> usize {
     std::env::var("MPTDB_PROVIDER_BENCH_SAMPLE_SIZE")
         .ok()
@@ -148,6 +174,27 @@ fn bench_measure_mode() -> BenchMeasureMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MdbxWriteMode {
+    /// `write_state` + `commit` (default integration path).
+    Full,
+    /// `write_state_changes` + `commit` (skip revert/history writes).
+    PlainOnly,
+    /// `commit` only (diagnostic no-op write path).
+    Noop,
+}
+
+fn bench_mdbx_write_mode() -> MdbxWriteMode {
+    match std::env::var("MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "plain" | "plain_only" => MdbxWriteMode::PlainOnly,
+            "noop" => MdbxWriteMode::Noop,
+            _ => MdbxWriteMode::Full,
+        },
+        Err(_) => MdbxWriteMode::Full,
+    }
+}
+
 fn bench_flag(name: &str) -> bool {
     match std::env::var(name) {
         Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
@@ -181,6 +228,24 @@ fn bench_enable_sc_prewarm() -> bool {
 
 fn bench_sc_profile_enabled() -> bool {
     bench_flag("MPTDB_PROVIDER_BENCH_SC_PROFILE")
+}
+
+fn bench_sync_prewarm_after_block() -> bool {
+    bench_flag("MPTDB_PROVIDER_BENCH_SYNC_PREWARM_AFTER_BLOCK")
+}
+
+fn bench_parallel_mdbx_write() -> bool {
+    match std::env::var("MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE") {
+        Ok(v) if matches!(v.trim(), "0" | "false" | "False" | "FALSE") => false,
+        _ => true,
+    }
+}
+
+fn bench_flush_after_prepop() -> bool {
+    match std::env::var("MPTDB_PROVIDER_BENCH_FLUSH_AFTER_PREPOP") {
+        Ok(v) if matches!(v.trim(), "0" | "false" | "False" | "FALSE") => false,
+        _ => true,
+    }
 }
 
 // ── InMemoryCache — synthetic dataset builder (genesis + tx generation) ───────
@@ -461,13 +526,19 @@ fn run_mptdb_bench(
         let use_provider_reads = bench_use_provider_reads();
         let enable_sc_prewarm = bench_enable_sc_prewarm();
         let enable_sc_profile = bench_sc_profile_enabled();
+        let sync_prewarm_after_block = bench_sync_prewarm_after_block();
+        let parallel_mdbx_write = bench_parallel_mdbx_write();
+        let mdbx_write_mode = bench_mdbx_write_mode();
+        let sc_storage_trie_cache_capacity = bench_sc_storage_trie_cache_capacity();
+        let sc_persisted_node_cache_capacity = bench_sc_persisted_node_cache_capacity();
+        let sc_cross_block_sparse_max_lag = bench_sc_cross_block_sparse_max_lag();
         let mut exec_total = Duration::ZERO;
         let mut wall_total = Duration::ZERO;
         let mut setup_total = Duration::ZERO;
         let mut teardown_total = Duration::ZERO;
         let mut evm_total = Duration::ZERO;
         let mut sc_write_total = Duration::ZERO;
-        let mut write_total = Duration::ZERO; // wall of parallel SC+MDBX
+        let mut write_total = Duration::ZERO; // wall of SC+MDBX phase
         let mut prepop_total = Duration::ZERO;
         let mut sc_apply_total = Duration::ZERO;
         let mut sc_collect_dirty_total = Duration::ZERO;
@@ -475,6 +546,18 @@ fn run_mptdb_bench(
         let mut sc_sparse_factory_build_total = Duration::ZERO;
         let mut sc_sparse_account_proof_total = Duration::ZERO;
         let mut sc_sparse_apply_changes_total = Duration::ZERO;
+        let mut sc_sparse_factory_dirty_accounts_total: u64 = 0;
+        let mut sc_sparse_factory_storage_accounts_total: u64 = 0;
+        let mut sc_sparse_factory_segment_lookups_total: u64 = 0;
+        let mut sc_sparse_factory_segment_hits_total: u64 = 0;
+        let mut sc_sparse_factory_segment_miss_no_store_total: u64 = 0;
+        let mut sc_sparse_factory_segment_miss_total: u64 = 0;
+        let mut sc_sparse_factory_segment_root_mismatch_total: u64 = 0;
+        let mut sc_sparse_factory_tier3_attempts_total: u64 = 0;
+        let mut sc_sparse_factory_tier3_hits_total: u64 = 0;
+        let mut sc_sparse_factory_tier12_attempts_total: u64 = 0;
+        let mut sc_sparse_factory_cross_reuse_accounts_total: u64 = 0;
+        let mut sc_sparse_factory_cross_missing_slots_total: u64 = 0;
         let mut sc_trie_load_total = Duration::ZERO;
         let mut sc_slot_updates_total = Duration::ZERO;
         let mut sc_storage_roots_total = Duration::ZERO;
@@ -484,6 +567,7 @@ fn run_mptdb_bench(
         let mut sc_commit_total = Duration::ZERO;
         let mut outcome_accounts_total: u64 = 0;
         let mut outcome_storage_accounts_total: u64 = 0;
+        let mut outcome_storage_slots_total: u64 = 0;
 
         for iter_idx in 0..iters {
             let iter_start = Instant::now();
@@ -491,7 +575,7 @@ fn run_mptdb_bench(
             let mut pre_pop = Duration::ZERO;
             let mut evm_phase = Duration::ZERO;
             let mut sc_write_phase = Duration::ZERO;
-            let mut write_phase = Duration::ZERO; // wall of parallel SC+MDBX
+            let mut write_phase = Duration::ZERO; // wall of SC+MDBX phase
             let mut drop_phase = Duration::ZERO;
             let mut tmp_drop = Duration::ZERO;
             let mut sc_apply_phase = Duration::ZERO;
@@ -500,6 +584,18 @@ fn run_mptdb_bench(
             let mut sc_sparse_factory_build_phase = Duration::ZERO;
             let mut sc_sparse_account_proof_phase = Duration::ZERO;
             let mut sc_sparse_apply_changes_phase = Duration::ZERO;
+            let mut sc_sparse_factory_dirty_accounts_phase: u64 = 0;
+            let mut sc_sparse_factory_storage_accounts_phase: u64 = 0;
+            let mut sc_sparse_factory_segment_lookups_phase: u64 = 0;
+            let mut sc_sparse_factory_segment_hits_phase: u64 = 0;
+            let mut sc_sparse_factory_segment_miss_no_store_phase: u64 = 0;
+            let mut sc_sparse_factory_segment_miss_phase: u64 = 0;
+            let mut sc_sparse_factory_segment_root_mismatch_phase: u64 = 0;
+            let mut sc_sparse_factory_tier3_attempts_phase: u64 = 0;
+            let mut sc_sparse_factory_tier3_hits_phase: u64 = 0;
+            let mut sc_sparse_factory_tier12_attempts_phase: u64 = 0;
+            let mut sc_sparse_factory_cross_reuse_accounts_phase: u64 = 0;
+            let mut sc_sparse_factory_cross_missing_slots_phase: u64 = 0;
             let mut sc_trie_load_phase = Duration::ZERO;
             let mut sc_slot_updates_phase = Duration::ZERO;
             let mut sc_storage_roots_phase = Duration::ZERO;
@@ -509,6 +605,7 @@ fn run_mptdb_bench(
             let mut sc_commit_phase = Duration::ZERO;
             let mut outcome_accounts_phase: u64 = 0;
             let mut outcome_storage_accounts_phase: u64 = 0;
+            let mut outcome_storage_slots_phase: u64 = 0;
 
             let iter_dir = TempDir::new().unwrap();
 
@@ -520,6 +617,9 @@ fn run_mptdb_bench(
             if std::env::var_os("MPTDB_BENCH_LEGACY_SC").is_none() {
                 sc_config.wal_first_commit = true;
             }
+            sc_config.storage_trie_cache_capacity = sc_storage_trie_cache_capacity;
+            sc_config.persisted_node_cache_capacity = sc_persisted_node_cache_capacity;
+            sc_config.cross_block_sparse_max_lag = sc_cross_block_sparse_max_lag;
             let t = Instant::now();
             let sc = Arc::new(Mutex::new(
                 MptCommitStore::open_with_config(iter_dir.path(), false, sc_config).expect("open SC"),
@@ -577,42 +677,55 @@ fn run_mptdb_bench(
             }
             // Genesis → SC
             sc_writer.pre_populate(&genesis, 0).expect("pre_populate SC");
+            if bench_flush_after_prepop() {
+                sc.lock().flush_persist().expect("flush persist after pre_populate");
+            }
             pre_pop += t.elapsed();
 
-            // Pre-spawn one MDBX worker thread per iteration.
-            // This avoids per-block thread-create overhead and removes the
-            // worker from rayon's thread pool so SC's internal rayon tasks
-            // don't contend with MDBX writes.
-            //
-            // Protocol per block:
-            //   main → job_tx.send(Arc<Outcome>)   (non-blocking: bounded(1))
-            //   main → SC commit (rayon, main thread)
-            //   main → done_rx.recv()              (sync: MDBX done before next EVM)
+            // Default mode: SC and MDBX writes run in parallel.
+            // A/B mode (MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=0):
+            // run MDBX write serially after SC commit to test contention impact.
             type JobOutcome = Arc<Outcome>;
-            let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<JobOutcome>(1);
-            let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(0);
-            let mdbx_worker = {
+            let mut job_tx: Option<std::sync::mpsc::SyncSender<JobOutcome>> = None;
+            let mut done_rx: Option<std::sync::mpsc::Receiver<()>> = None;
+            let mut mdbx_worker: Option<std::thread::JoinHandle<()>> = None;
+            if parallel_mdbx_write {
+                let (tx, job_rx) = std::sync::mpsc::sync_channel::<JobOutcome>(1);
+                let (done_tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
                 let factory = mdbx_factory.clone();
-                std::thread::spawn(move || {
+                let write_mode = mdbx_write_mode;
+                let worker = std::thread::spawn(move || {
                     while let Ok(outcome) = job_rx.recv() {
                         let rw = factory.provider_rw().expect("mdbx rw");
-                        // write_state writes PlainAccountState, PlainStorageState,
-                        // HashedAccountState, AccountChangeSets, StorageChangeSets, etc.
-                        // (see DatabaseProvider::write_state for the full set).
-                        // Intentionally omit overlay_root_with_updates + write_trie_updates:
-                        // SC owns state root; MDBX AccountsTrie/StoragesTrie are not needed
-                        // since EVM reads use PlainState, not the trie tables.
-                        rw.write_state(
-                            outcome.as_ref(),
-                            OriginalValuesKnown::Yes,
-                            bench_state_write_config(),
-                        )
-                            .expect("mdbx write_state");
+                        match write_mode {
+                            MdbxWriteMode::Full => {
+                                // write_state writes PlainAccountState, PlainStorageState,
+                                // HashedAccountState, AccountChangeSets, StorageChangeSets, etc.
+                                // (see DatabaseProvider::write_state for the full set).
+                                // Intentionally omit overlay_root_with_updates + write_trie_updates:
+                                // SC owns state root; MDBX AccountsTrie/StoragesTrie are not needed
+                                // since EVM reads use PlainState, not the trie tables.
+                                rw.write_state(
+                                    outcome.as_ref(),
+                                    OriginalValuesKnown::Yes,
+                                    bench_state_write_config(),
+                                )
+                                .expect("mdbx write_state");
+                            }
+                            MdbxWriteMode::PlainOnly => {
+                                let plain = outcome.state().to_plain_state(OriginalValuesKnown::Yes);
+                                rw.write_state_changes(plain).expect("mdbx write_state_changes");
+                            }
+                            MdbxWriteMode::Noop => {}
+                        }
                         rw.commit().expect("mdbx commit");
                         done_tx.send(()).expect("done signal");
                     }
-                })
-            };
+                });
+                job_tx = Some(tx);
+                done_rx = Some(rx);
+                mdbx_worker = Some(worker);
+            }
 
             let exec_start = Instant::now();
             for (blk_idx, txs) in block_txs.iter().enumerate() {
@@ -641,15 +754,19 @@ fn run_mptdb_bench(
                 // without any large-object clone.
                 let t_wr = Instant::now();
                 let outcome = Arc::new(make_outcome(bundle, blk_idx as u64 + 1));
-                let (changed_accounts, storage_accounts) = {
+                let (changed_accounts, storage_accounts, storage_slots) = {
                     let state = outcome.state().state();
                     let changed = state.len() as u64;
                     let storage = state.values().filter(|acc| !acc.storage.is_empty()).count() as u64;
-                    (changed, storage)
+                    let slots = state.values().map(|acc| acc.storage.len() as u64).sum::<u64>();
+                    (changed, storage, slots)
                 };
                 outcome_accounts_phase += changed_accounts;
                 outcome_storage_accounts_phase += storage_accounts;
-                job_tx.send(Arc::clone(&outcome)).expect("send to mdbx worker");
+                outcome_storage_slots_phase += storage_slots;
+                if let Some(tx) = job_tx.as_ref() {
+                    tx.send(Arc::clone(&outcome)).expect("send to mdbx worker");
+                }
 
                 // SC commit on main thread (uses rayon internally).
                 let t_sc = Instant::now();
@@ -665,6 +782,22 @@ fn run_mptdb_bench(
                     sc_sparse_factory_build_phase += profile.sparse_apply_factory_build;
                     sc_sparse_account_proof_phase += profile.sparse_apply_account_proof;
                     sc_sparse_apply_changes_phase += profile.sparse_apply_apply_changes;
+                    sc_sparse_factory_dirty_accounts_phase += profile.sparse_factory_dirty_accounts;
+                    sc_sparse_factory_storage_accounts_phase += profile.sparse_factory_storage_accounts;
+                    sc_sparse_factory_segment_lookups_phase += profile.sparse_factory_segment_lookups;
+                    sc_sparse_factory_segment_hits_phase += profile.sparse_factory_segment_hits;
+                    sc_sparse_factory_segment_miss_no_store_phase +=
+                        profile.sparse_factory_segment_miss_no_store;
+                    sc_sparse_factory_segment_miss_phase += profile.sparse_factory_segment_miss;
+                    sc_sparse_factory_segment_root_mismatch_phase +=
+                        profile.sparse_factory_segment_root_mismatch;
+                    sc_sparse_factory_tier3_attempts_phase += profile.sparse_factory_tier3_attempts;
+                    sc_sparse_factory_tier3_hits_phase += profile.sparse_factory_tier3_hits;
+                    sc_sparse_factory_tier12_attempts_phase += profile.sparse_factory_tier12_attempts;
+                    sc_sparse_factory_cross_reuse_accounts_phase +=
+                        profile.sparse_factory_cross_reuse_accounts;
+                    sc_sparse_factory_cross_missing_slots_phase +=
+                        profile.sparse_factory_cross_missing_slots;
                     sc_trie_load_phase += profile.apply_get_or_load_storage_tries;
                     sc_slot_updates_phase += profile.apply_storage_slot_updates;
                     sc_storage_roots_phase += profile.storage_roots;
@@ -683,8 +816,29 @@ fn run_mptdb_bench(
                 }
                 sc_write_phase += t_sc.elapsed();
 
-                // Wait for MDBX worker to finish before next block's EVM reads.
-                done_rx.recv().expect("mdbx done");
+                // In parallel mode, wait MDBX worker before next block's EVM read.
+                // In serial mode, write MDBX after SC commit.
+                if let Some(rx) = done_rx.as_ref() {
+                    rx.recv().expect("mdbx done");
+                } else {
+                    let rw = mdbx_factory.provider_rw().expect("mdbx rw");
+                    match mdbx_write_mode {
+                        MdbxWriteMode::Full => {
+                            rw.write_state(
+                                outcome.as_ref(),
+                                OriginalValuesKnown::Yes,
+                                bench_state_write_config(),
+                            )
+                            .expect("mdbx write_state");
+                        }
+                        MdbxWriteMode::PlainOnly => {
+                            let plain = outcome.state().to_plain_state(OriginalValuesKnown::Yes);
+                            rw.write_state_changes(plain).expect("mdbx write_state_changes");
+                        }
+                        MdbxWriteMode::Noop => {}
+                    }
+                    rw.commit().expect("mdbx commit");
+                }
                 write_phase += t_wr.elapsed();
 
                 // Enqueue storage-touching accounts for background SC prewarm AFTER
@@ -700,11 +854,26 @@ fn run_mptdb_bench(
                         }
                     }
                 }
+                // Diagnostic mode: run provider-equivalent prewarm synchronously and
+                // force publish before next block. This mirrors B4.8's per-block
+                // sync prewarm + flush behavior.
+                if sync_prewarm_after_block {
+                    let mut store = sc.lock();
+                    store.maybe_refresh_published_view_for_prewarm();
+                    for (addr, account) in outcome.state().state.iter() {
+                        if !account.storage.is_empty() {
+                            let _ = store.prewarm_storage_trie_by_hashed_address(keccak256(addr.as_slice()));
+                        }
+                    }
+                    store.flush_persist().expect("flush persist after block sync prewarm");
+                }
             }
             exec_total += exec_start.elapsed();
 
             drop(job_tx); // signal MDBX worker to exit
-            mdbx_worker.join().expect("mdbx worker");
+            if let Some(worker) = mdbx_worker.take() {
+                worker.join().expect("mdbx worker");
+            }
             // Drop prewarm dispatcher BEFORE dropping SC.  ScPrewarmDispatcher::Drop
             // closes tx (signals worker exit) then joins the thread, guaranteeing
             // the worker has stopped and there is no cross-iteration backlog.
@@ -732,6 +901,22 @@ fn run_mptdb_bench(
             sc_sparse_factory_build_total += sc_sparse_factory_build_phase;
             sc_sparse_account_proof_total += sc_sparse_account_proof_phase;
             sc_sparse_apply_changes_total += sc_sparse_apply_changes_phase;
+            sc_sparse_factory_dirty_accounts_total += sc_sparse_factory_dirty_accounts_phase;
+            sc_sparse_factory_storage_accounts_total += sc_sparse_factory_storage_accounts_phase;
+            sc_sparse_factory_segment_lookups_total += sc_sparse_factory_segment_lookups_phase;
+            sc_sparse_factory_segment_hits_total += sc_sparse_factory_segment_hits_phase;
+            sc_sparse_factory_segment_miss_no_store_total +=
+                sc_sparse_factory_segment_miss_no_store_phase;
+            sc_sparse_factory_segment_miss_total += sc_sparse_factory_segment_miss_phase;
+            sc_sparse_factory_segment_root_mismatch_total +=
+                sc_sparse_factory_segment_root_mismatch_phase;
+            sc_sparse_factory_tier3_attempts_total += sc_sparse_factory_tier3_attempts_phase;
+            sc_sparse_factory_tier3_hits_total += sc_sparse_factory_tier3_hits_phase;
+            sc_sparse_factory_tier12_attempts_total += sc_sparse_factory_tier12_attempts_phase;
+            sc_sparse_factory_cross_reuse_accounts_total +=
+                sc_sparse_factory_cross_reuse_accounts_phase;
+            sc_sparse_factory_cross_missing_slots_total +=
+                sc_sparse_factory_cross_missing_slots_phase;
             sc_trie_load_total += sc_trie_load_phase;
             sc_slot_updates_total += sc_slot_updates_phase;
             sc_storage_roots_total += sc_storage_roots_phase;
@@ -741,6 +926,7 @@ fn run_mptdb_bench(
             sc_commit_total += sc_commit_phase;
             outcome_accounts_total += outcome_accounts_phase;
             outcome_storage_accounts_total += outcome_storage_accounts_phase;
+            outcome_storage_slots_total += outcome_storage_slots_phase;
 
             if trace && (iter_idx as usize) < trace_iters {
                 eprintln!(
@@ -759,7 +945,7 @@ fn run_mptdb_bench(
                 );
                 if enable_sc_profile {
                     eprintln!(
-                        "[trace][{}][iter {}] sc_profile(apply={:.2?}, collect_dirty={:.2?}, account_checkout={:.2?}, sparse_factory_build={:.2?}, sparse_account_proof={:.2?}, sparse_apply_changes={:.2?}, trie_load={:.2?}, slot_updates={:.2?}, storage_roots={:.2?}, account_updates={:.2?}, account_root={:.2?}, wal={:.2?}, total_commit={:.2?}, changed_accounts={}, storage_accounts={})",
+                        "[trace][{}][iter {}] sc_profile(apply={:.2?}, collect_dirty={:.2?}, account_checkout={:.2?}, sparse_factory_build={:.2?}, sparse_account_proof={:.2?}, sparse_apply_changes={:.2?}, trie_load={:.2?}, slot_updates={:.2?}, storage_roots={:.2?}, account_updates={:.2?}, account_root={:.2?}, wal={:.2?}, total_commit={:.2?}, changed_accounts={}, storage_accounts={}, storage_slots={})",
                         label,
                         iter_idx + 1,
                         sc_apply_phase,
@@ -777,6 +963,24 @@ fn run_mptdb_bench(
                         sc_commit_phase,
                         outcome_accounts_phase,
                         outcome_storage_accounts_phase,
+                        outcome_storage_slots_phase,
+                    );
+                    eprintln!(
+                        "[trace][{}][iter {}] sparse_factory_stats(dirty={} storage={} seg={}/{} miss_no_store={} miss={} root_mismatch={} t3={}/{} t12={} cross_reuse={} cross_missing_slots={})",
+                        label,
+                        iter_idx + 1,
+                        sc_sparse_factory_dirty_accounts_phase,
+                        sc_sparse_factory_storage_accounts_phase,
+                        sc_sparse_factory_segment_hits_phase,
+                        sc_sparse_factory_segment_lookups_phase,
+                        sc_sparse_factory_segment_miss_no_store_phase,
+                        sc_sparse_factory_segment_miss_phase,
+                        sc_sparse_factory_segment_root_mismatch_phase,
+                        sc_sparse_factory_tier3_hits_phase,
+                        sc_sparse_factory_tier3_attempts_phase,
+                        sc_sparse_factory_tier12_attempts_phase,
+                        sc_sparse_factory_cross_reuse_accounts_phase,
+                        sc_sparse_factory_cross_missing_slots_phase,
                     );
                 }
             }
@@ -798,13 +1002,21 @@ fn run_mptdb_bench(
         );
         eprintln!("[{}] avg/iter(end-to-end): {:.2?}", label, wall_total / iters as u32);
         eprintln!(
-            "[{}] read_mode: provider_reads={} sc_prewarm={}",
-            label, use_provider_reads, enable_sc_prewarm
+            "[{}] read_mode: provider_reads={} sc_prewarm={} sync_prewarm_after_block={} parallel_mdbx_write={} mdbx_write_mode={:?} sc_storage_cache={} sc_persisted_cache={} sc_cross_lag={}",
+            label,
+            use_provider_reads,
+            enable_sc_prewarm,
+            sync_prewarm_after_block,
+            parallel_mdbx_write,
+            mdbx_write_mode,
+            sc_storage_trie_cache_capacity,
+            sc_persisted_node_cache_capacity,
+            sc_cross_block_sparse_max_lag
         );
         if enable_sc_profile {
             let total_blocks = (iters * block_txs.len() as u64) as u32;
             eprintln!(
-                "[{}] avg/sc_profile per-block: apply={:.2?} collect_dirty={:.2?} account_checkout={:.2?} sparse_factory_build={:.2?} sparse_account_proof={:.2?} sparse_apply_changes={:.2?} trie_load={:.2?} slot_updates={:.2?} storage_roots={:.2?} account_updates={:.2?} account_root={:.2?} wal={:.2?} total_commit={:.2?} changed_accounts={} storage_accounts={}",
+                "[{}] avg/sc_profile per-block: apply={:.2?} collect_dirty={:.2?} account_checkout={:.2?} sparse_factory_build={:.2?} sparse_account_proof={:.2?} sparse_apply_changes={:.2?} trie_load={:.2?} slot_updates={:.2?} storage_roots={:.2?} account_updates={:.2?} account_root={:.2?} wal={:.2?} total_commit={:.2?} changed_accounts={} storage_accounts={} storage_slots={}",
                 label,
                 sc_apply_total / total_blocks,
                 sc_collect_dirty_total / total_blocks,
@@ -821,6 +1033,23 @@ fn run_mptdb_bench(
                 sc_commit_total / total_blocks,
                 outcome_accounts_total / total_blocks as u64,
                 outcome_storage_accounts_total / total_blocks as u64,
+                outcome_storage_slots_total / total_blocks as u64,
+            );
+            eprintln!(
+                "[{}] avg/sparse_factory per-block: dirty={} storage={} seg={}/{} miss_no_store={} miss={} root_mismatch={} t3={}/{} t12={} cross_reuse={} cross_missing_slots={}",
+                label,
+                sc_sparse_factory_dirty_accounts_total / total_blocks as u64,
+                sc_sparse_factory_storage_accounts_total / total_blocks as u64,
+                sc_sparse_factory_segment_hits_total / total_blocks as u64,
+                sc_sparse_factory_segment_lookups_total / total_blocks as u64,
+                sc_sparse_factory_segment_miss_no_store_total / total_blocks as u64,
+                sc_sparse_factory_segment_miss_total / total_blocks as u64,
+                sc_sparse_factory_segment_root_mismatch_total / total_blocks as u64,
+                sc_sparse_factory_tier3_hits_total / total_blocks as u64,
+                sc_sparse_factory_tier3_attempts_total / total_blocks as u64,
+                sc_sparse_factory_tier12_attempts_total / total_blocks as u64,
+                sc_sparse_factory_cross_reuse_accounts_total / total_blocks as u64,
+                sc_sparse_factory_cross_missing_slots_total / total_blocks as u64,
             );
         }
         eprintln!("[{}] criterion measure mode: {:?}", label, measure_mode);
