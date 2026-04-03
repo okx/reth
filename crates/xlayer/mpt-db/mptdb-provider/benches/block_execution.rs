@@ -471,6 +471,7 @@ fn run_mptdb_bench(
         let mut prepop_total = Duration::ZERO;
         let mut sc_apply_total = Duration::ZERO;
         let mut sc_collect_dirty_total = Duration::ZERO;
+        let mut sc_account_checkout_total = Duration::ZERO;
         let mut sc_sparse_factory_build_total = Duration::ZERO;
         let mut sc_sparse_account_proof_total = Duration::ZERO;
         let mut sc_sparse_apply_changes_total = Duration::ZERO;
@@ -495,6 +496,7 @@ fn run_mptdb_bench(
             let mut tmp_drop = Duration::ZERO;
             let mut sc_apply_phase = Duration::ZERO;
             let mut sc_collect_dirty_phase = Duration::ZERO;
+            let mut sc_account_checkout_phase = Duration::ZERO;
             let mut sc_sparse_factory_build_phase = Duration::ZERO;
             let mut sc_sparse_account_proof_phase = Duration::ZERO;
             let mut sc_sparse_apply_changes_phase = Duration::ZERO;
@@ -659,6 +661,7 @@ fn run_mptdb_bench(
                         sc.lock().commit_with_profile().expect("sc commit_with_profile");
                     sc_apply_phase += profile.apply_bundle_state;
                     sc_collect_dirty_phase += profile.apply_collect_dirty_accounts;
+                    sc_account_checkout_phase += profile.apply_account_trie_checkout;
                     sc_sparse_factory_build_phase += profile.sparse_apply_factory_build;
                     sc_sparse_account_proof_phase += profile.sparse_apply_account_proof;
                     sc_sparse_apply_changes_phase += profile.sparse_apply_apply_changes;
@@ -725,6 +728,7 @@ fn run_mptdb_bench(
             wall_total += iter_start.elapsed();
             sc_apply_total += sc_apply_phase;
             sc_collect_dirty_total += sc_collect_dirty_phase;
+            sc_account_checkout_total += sc_account_checkout_phase;
             sc_sparse_factory_build_total += sc_sparse_factory_build_phase;
             sc_sparse_account_proof_total += sc_sparse_account_proof_phase;
             sc_sparse_apply_changes_total += sc_sparse_apply_changes_phase;
@@ -755,11 +759,12 @@ fn run_mptdb_bench(
                 );
                 if enable_sc_profile {
                     eprintln!(
-                        "[trace][{}][iter {}] sc_profile(apply={:.2?}, collect_dirty={:.2?}, sparse_factory_build={:.2?}, sparse_account_proof={:.2?}, sparse_apply_changes={:.2?}, trie_load={:.2?}, slot_updates={:.2?}, storage_roots={:.2?}, account_updates={:.2?}, account_root={:.2?}, wal={:.2?}, total_commit={:.2?}, changed_accounts={}, storage_accounts={})",
+                        "[trace][{}][iter {}] sc_profile(apply={:.2?}, collect_dirty={:.2?}, account_checkout={:.2?}, sparse_factory_build={:.2?}, sparse_account_proof={:.2?}, sparse_apply_changes={:.2?}, trie_load={:.2?}, slot_updates={:.2?}, storage_roots={:.2?}, account_updates={:.2?}, account_root={:.2?}, wal={:.2?}, total_commit={:.2?}, changed_accounts={}, storage_accounts={})",
                         label,
                         iter_idx + 1,
                         sc_apply_phase,
                         sc_collect_dirty_phase,
+                        sc_account_checkout_phase,
                         sc_sparse_factory_build_phase,
                         sc_sparse_account_proof_phase,
                         sc_sparse_apply_changes_phase,
@@ -799,10 +804,11 @@ fn run_mptdb_bench(
         if enable_sc_profile {
             let total_blocks = (iters * block_txs.len() as u64) as u32;
             eprintln!(
-                "[{}] avg/sc_profile per-block: apply={:.2?} collect_dirty={:.2?} sparse_factory_build={:.2?} sparse_account_proof={:.2?} sparse_apply_changes={:.2?} trie_load={:.2?} slot_updates={:.2?} storage_roots={:.2?} account_updates={:.2?} account_root={:.2?} wal={:.2?} total_commit={:.2?} changed_accounts={} storage_accounts={}",
+                "[{}] avg/sc_profile per-block: apply={:.2?} collect_dirty={:.2?} account_checkout={:.2?} sparse_factory_build={:.2?} sparse_account_proof={:.2?} sparse_apply_changes={:.2?} trie_load={:.2?} slot_updates={:.2?} storage_roots={:.2?} account_updates={:.2?} account_root={:.2?} wal={:.2?} total_commit={:.2?} changed_accounts={} storage_accounts={}",
                 label,
                 sc_apply_total / total_blocks,
                 sc_collect_dirty_total / total_blocks,
+                sc_account_checkout_total / total_blocks,
                 sc_sparse_factory_build_total / total_blocks,
                 sc_sparse_account_proof_total / total_blocks,
                 sc_sparse_apply_changes_total / total_blocks,

@@ -779,6 +779,12 @@ impl SparseTrieInterface for ParallelSparseTrie {
         self.updates.take().unwrap_or_default()
     }
 
+    fn reinit_updates(&mut self) {
+        if self.updates.is_none() {
+            self.updates = Some(SparseTrieUpdates::default());
+        }
+    }
+
     fn wipe(&mut self) {
         self.upper_subtrie.wipe();
         self.lower_subtries = [const { LowerSparseSubtrie::Blind(None) }; NUM_LOWER_SUBTRIES];

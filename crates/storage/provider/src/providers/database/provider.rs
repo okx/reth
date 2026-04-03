@@ -151,6 +151,13 @@ pub enum SaveBlocksMode {
     /// Full mode: write block structure + receipts + state + trie.
     /// Used by engine/production code.
     Full,
+    /// State-only mode for external trie/root backends:
+    /// write block structure + receipts + state/history, but skip MDBX
+    /// hashed-state and trie-table writes.
+    ///
+    /// Used when another component (e.g. mptdb-sc) owns trie persistence and
+    /// root calculation, and MDBX is kept for PlainState/read-path data.
+    StateOnlyNoTrie,
     /// Blocks only: write block structure (headers, txs, senders, indices).
     /// Receipts/state/trie are skipped - they may come later via separate calls.
     /// Used by `insert_block`.
@@ -158,8 +165,18 @@ pub enum SaveBlocksMode {
 }
 
 impl SaveBlocksMode {
-    /// Returns `true` if this is [`SaveBlocksMode::Full`].
+    /// Returns `true` if state/changset tables should be written.
     pub const fn with_state(self) -> bool {
+        matches!(self, Self::Full | Self::StateOnlyNoTrie)
+    }
+
+    /// Returns `true` if hashed-state tables should be written.
+    pub const fn with_hashed_state(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// Returns `true` if trie tables (`AccountsTrie`/`StoragesTrie`) should be written.
+    pub const fn with_trie_updates(self) -> bool {
         matches!(self, Self::Full)
     }
 }
@@ -420,6 +437,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
     /// only). The main thread writes MDBX data (indices, state, trie - Full mode only).
     ///
     /// Use [`SaveBlocksMode::Full`] for production (includes receipts, state, trie).
+    /// Use [`SaveBlocksMode::StateOnlyNoTrie`] for external trie/root backends
+    /// that keep MDBX PlainState but own trie persistence elsewhere.
     /// Use [`SaveBlocksMode::BlocksOnly`] for block structure only (used by `insert_block`).
     #[instrument(level = "debug", target = "providers::db", skip_all, fields(block_count = blocks.len()))]
     pub fn save_blocks(
@@ -549,19 +568,23 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                     )?;
                     timings.write_state += start.elapsed();
 
-                    let trie_data = block.trie_data();
+                    if save_mode.with_hashed_state() {
+                        let trie_data = block.trie_data();
 
-                    // insert hashes and intermediate merkle nodes
-                    let start = Instant::now();
-                    self.write_hashed_state(&trie_data.hashed_state)?;
-                    timings.write_hashed_state += start.elapsed();
+                        // Insert hashed-state intermediates used by MDBX trie
+                        // updates. External trie backends may intentionally skip
+                        // this path.
+                        let start = Instant::now();
+                        self.write_hashed_state(&trie_data.hashed_state)?;
+                        timings.write_hashed_state += start.elapsed();
+                    }
                 }
             }
 
             // Write all trie updates in a single batch.
             // This reduces cursor open/close overhead from N calls to 1.
             // Uses hybrid algorithm: extend_ref for small batches, k-way merge for large.
-            if save_mode.with_state() {
+            if save_mode.with_trie_updates() {
                 const MERGE_BATCH_THRESHOLD: usize = 30;
 
                 let start = Instant::now();

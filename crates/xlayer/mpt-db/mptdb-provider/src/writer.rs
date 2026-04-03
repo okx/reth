@@ -3,6 +3,7 @@
 //! EVM reads are served by reth's PlainState (MDBX) via `StateProviderOverride`.
 //! This writer only commits to SC (MPT state root) — SS writes are removed.
 
+use alloy_primitives::B256;
 use mptdb_common::error::MptDbError;
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
 use parking_lot::Mutex;
@@ -50,6 +51,40 @@ impl<R> MptDbStateWriter<R> {
     pub fn new(sc: Arc<Mutex<MptCommitStore>>) -> Self {
         Self { sc, _phantom: std::marker::PhantomData }
     }
+
+    /// Apply execution outcome to SC without committing.
+    pub fn apply_execution_outcome<'a>(
+        &self,
+        execution_outcome: impl Into<WriteStateInput<'a, R>>,
+    ) -> ProviderResult<()>
+    where
+        R: 'a,
+    {
+        let input: WriteStateInput<'_, R> = execution_outcome.into();
+        let bundle = input.state();
+        let mut sc = self.sc.lock();
+        sc.apply_bundle_state(bundle).map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Commit previously applied state using an externally computed state root.
+    pub fn commit_with_external_root(&self, state_root: B256) -> ProviderResult<(i64, B256)> {
+        self.sc.lock().commit_with_external_root(state_root).map_err(map_err)
+    }
+
+    /// Apply + commit with external root.
+    pub fn write_state_with_external_root<'a>(
+        &self,
+        execution_outcome: impl Into<WriteStateInput<'a, R>>,
+        state_root: B256,
+    ) -> ProviderResult<()>
+    where
+        R: 'a,
+    {
+        self.apply_execution_outcome(execution_outcome)?;
+        self.commit_with_external_root(state_root)?;
+        Ok(())
+    }
 }
 
 impl<R: reth_primitives_traits::Receipt + 'static> StateWriter for MptDbStateWriter<R> {
@@ -61,11 +96,8 @@ impl<R: reth_primitives_traits::Receipt + 'static> StateWriter for MptDbStateWri
         _is_value_known: OriginalValuesKnown,
         _config: StateWriteConfig,
     ) -> ProviderResult<()> {
-        let input: WriteStateInput<'_, R> = execution_outcome.into();
-        let bundle = input.state();
-        let mut sc = self.sc.lock();
-        sc.apply_bundle_state(bundle).map_err(map_err)?;
-        sc.commit().map_err(map_err)?;
+        self.apply_execution_outcome(execution_outcome)?;
+        self.sc.lock().commit().map_err(map_err)?;
         Ok(())
     }
 

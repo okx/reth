@@ -40,6 +40,8 @@ where
     metrics: PersistenceMetrics,
     /// Sender for sync metrics - we only submit sync metrics for persisted blocks
     sync_metrics_tx: MetricEventsSender,
+    /// Save mode for database persistence.
+    save_blocks_mode: SaveBlocksMode,
 }
 
 impl<N> PersistenceService<N>
@@ -53,7 +55,25 @@ where
         pruner: PrunerWithFactory<ProviderFactory<N>>,
         sync_metrics_tx: MetricEventsSender,
     ) -> Self {
-        Self { provider, incoming, pruner, metrics: PersistenceMetrics::default(), sync_metrics_tx }
+        Self::new_with_save_mode(provider, incoming, pruner, sync_metrics_tx, SaveBlocksMode::Full)
+    }
+
+    /// Create a new persistence service with explicit save mode.
+    pub fn new_with_save_mode(
+        provider: ProviderFactory<N>,
+        incoming: Receiver<PersistenceAction<N::Primitives>>,
+        pruner: PrunerWithFactory<ProviderFactory<N>>,
+        sync_metrics_tx: MetricEventsSender,
+        save_blocks_mode: SaveBlocksMode,
+    ) -> Self {
+        Self {
+            provider,
+            incoming,
+            pruner,
+            metrics: PersistenceMetrics::default(),
+            sync_metrics_tx,
+            save_blocks_mode,
+        }
     }
 
     /// Prunes block data before the given block number according to the configured prune
@@ -151,7 +171,7 @@ where
         if last_block.is_some() {
             let provider_rw = self.provider.database_provider_rw()?;
 
-            provider_rw.save_blocks(blocks, SaveBlocksMode::Full)?;
+            provider_rw.save_blocks(blocks, self.save_blocks_mode)?;
             provider_rw.commit()?;
         }
 
@@ -221,6 +241,25 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
     where
         N: ProviderNodeTypes,
     {
+        Self::spawn_service_with_mode(
+            provider_factory,
+            pruner,
+            sync_metrics_tx,
+            SaveBlocksMode::Full,
+        )
+    }
+
+    /// Create a new [`PersistenceHandle`], and spawn the persistence service with explicit
+    /// save mode.
+    pub fn spawn_service_with_mode<N>(
+        provider_factory: ProviderFactory<N>,
+        pruner: PrunerWithFactory<ProviderFactory<N>>,
+        sync_metrics_tx: MetricEventsSender,
+        save_blocks_mode: SaveBlocksMode,
+    ) -> PersistenceHandle<N::Primitives>
+    where
+        N: ProviderNodeTypes,
+    {
         // create the initial channels
         let (db_service_tx, db_service_rx) = std::sync::mpsc::channel();
 
@@ -228,8 +267,13 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
         let persistence_handle = PersistenceHandle::new(db_service_tx);
 
         // spawn the persistence service
-        let db_service =
-            PersistenceService::new(provider_factory, db_service_rx, pruner, sync_metrics_tx);
+        let db_service = PersistenceService::new_with_save_mode(
+            provider_factory,
+            db_service_rx,
+            pruner,
+            sync_metrics_tx,
+            save_blocks_mode,
+        );
         std::thread::Builder::new()
             .name("Persistence Service".to_string())
             .spawn(|| {

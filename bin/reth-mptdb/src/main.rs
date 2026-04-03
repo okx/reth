@@ -333,6 +333,7 @@ fn main() {
 
             let launcher = EngineNodeLauncher::new(task_executor, data_dir, engine_tree_config)
                 .with_on_canonical_commit(on_canonical_commit)
+                .with_persistence_save_mode(reth_provider::SaveBlocksMode::StateOnlyNoTrie)
                 .with_state_provider_override(state_override);
 
             // ── Launch ─────────────────────────────────────────────────────

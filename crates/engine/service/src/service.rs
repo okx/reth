@@ -22,7 +22,7 @@ use reth_node_types::{BlockTy, NodeTypes};
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_provider::{
     providers::{BlockchainProvider, ProviderNodeTypes},
-    ProviderFactory,
+    ProviderFactory, SaveBlocksMode,
 };
 use reth_prune::PrunerWithFactory;
 use reth_stages_api::{MetricEventsSender, Pipeline};
@@ -90,6 +90,7 @@ where
         on_canonical_commit: Option<
             Box<dyn Fn(BlockNumber, BlockHash, &revm_database::BundleState) + Send>,
         >,
+        persistence_save_mode: SaveBlocksMode,
     ) -> Self
     where
         V: EngineValidator<N::Payload>,
@@ -100,8 +101,12 @@ where
 
         let downloader = BasicBlockDownloader::new(client, consensus.clone());
 
-        let persistence_handle =
-            PersistenceHandle::<EthPrimitives>::spawn_service(provider, pruner, sync_metrics_tx);
+        let persistence_handle = PersistenceHandle::<EthPrimitives>::spawn_service_with_mode(
+            provider,
+            pruner,
+            sync_metrics_tx,
+            persistence_save_mode,
+        );
 
         let canonical_in_memory_state = blockchain_db.canonical_in_memory_state();
 
@@ -228,6 +233,7 @@ mod tests {
             evm_config,
             changeset_cache,
             None,
+            SaveBlocksMode::Full,
         );
     }
 }

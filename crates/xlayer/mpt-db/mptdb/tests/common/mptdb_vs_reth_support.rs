@@ -737,14 +737,27 @@ sp_fb={} sp_ap={} sp_ch={}",
 }
 
 pub fn print_reth_run(run: &RethRun) {
+    let blocks = run.blocks_len;
+    let per_block_total = run.totals.total / blocks;
+    let per_block_root_plus_commit = (run.totals.root_updates + run.totals.commit) / blocks;
+    let per_block_root_trie_commit =
+        (run.totals.root_updates + run.totals.write_trie + run.totals.commit) / blocks;
+    let per_block_other_vs_root_commit = per_block_total.saturating_sub(per_block_root_plus_commit);
+    let per_block_other_vs_root_trie_commit =
+        per_block_total.saturating_sub(per_block_root_trie_commit);
+
     println!("\nreth");
     println!("  pre-pop total:       {} ms", fmt_ms(run.prepop));
-    println!("  per-block total:     {} ms", fmt_ms(run.totals.total / run.blocks_len));
-    println!("  hash+sort:           {} ms", fmt_ms(run.totals.hash_and_sort / run.blocks_len));
-    println!("  root_with_updates:   {} ms", fmt_ms(run.totals.root_updates / run.blocks_len));
-    println!("  write_hashed_state:  {} ms", fmt_ms(run.totals.write_hashed / run.blocks_len));
-    println!("  write_trie_updates:  {} ms", fmt_ms(run.totals.write_trie / run.blocks_len));
-    println!("  commit:              {} ms", fmt_ms(run.totals.commit / run.blocks_len));
+    println!("  per-block total:     {} ms", fmt_ms(per_block_total));
+    println!("  hash+sort:           {} ms", fmt_ms(run.totals.hash_and_sort / blocks));
+    println!("  root_with_updates:   {} ms", fmt_ms(run.totals.root_updates / blocks));
+    println!("  write_hashed_state:  {} ms", fmt_ms(run.totals.write_hashed / blocks));
+    println!("  write_trie_updates:  {} ms", fmt_ms(run.totals.write_trie / blocks));
+    println!("  commit:              {} ms", fmt_ms(run.totals.commit / blocks));
+    println!("  root+commit:         {} ms", fmt_ms(per_block_root_plus_commit));
+    println!("  root+trie+commit:    {} ms", fmt_ms(per_block_root_trie_commit));
+    println!("  other(total-root+commit):      {} ms", fmt_ms(per_block_other_vs_root_commit));
+    println!("  other(total-root+trie+commit): {} ms", fmt_ms(per_block_other_vs_root_trie_commit));
 }
 
 pub fn print_mpt_run(run: &MptRun) {

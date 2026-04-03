@@ -4440,6 +4440,34 @@ impl MptCommitStore {
         &self.last_commit_profile
     }
 
+    /// Commit an already-applied block using an externally computed state root.
+    ///
+    /// This is only supported in wal_first mode where commit does hash-only
+    /// persistence. The external root is expected to come from reth's
+    /// `overlay_root_with_updates` path for the same block diff.
+    pub fn commit_with_external_root(&mut self, state_root: B256) -> Result<(i64, B256)> {
+        self.check_writable()?;
+        self.check_not_poisoned()?;
+        self.check_not_bulk_loading()?;
+
+        if !self.applied_this_block {
+            return Err(MptDbError::Other("must call apply_bundle_state before commit".to_string()));
+        }
+
+        let mode = self.default_commit_mode();
+        if !mode.wal_first {
+            return Err(MptDbError::Other(
+                "commit_with_external_root requires wal_first commit mode".to_string(),
+            ));
+        }
+
+        let result = self.commit_inner_with_mode_and_external_root(mode, Some(state_root));
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     pub fn commit_with_profile(&mut self) -> Result<((i64, B256), CommitProfile)> {
         let result = self.commit()?;
         Ok((result, self.last_commit_profile.clone()))
@@ -4899,17 +4927,22 @@ impl MptCommitStore {
     /// Returns immediately (without setting `pending_sparse_state`) when
     /// `dirty_accounts` is empty — the normal Phase 2b path handles empty
     /// blocks correctly and produces the unchanged previous state root.
-    fn apply_dirty_accounts_inner_sparse(&mut self, dirty_accounts: &[DirtyAccount]) -> Result<()> {
+    fn apply_dirty_accounts_inner_sparse(
+        &mut self,
+        dirty_accounts: Vec<DirtyAccount>,
+    ) -> Result<()> {
         let mut sparse_stats = SparseFactoryStats::default();
         // Always set working_version so account_trie_handle_versions() is correct.
         let working_version = self.current_working_version();
+        let acct_checkout_start = std::time::Instant::now();
         self.account_trie.checkout_for_write(working_version);
+        self.last_apply_account_trie_checkout = acct_checkout_start.elapsed();
 
         if dirty_accounts.is_empty() {
             // Empty bundle: sparse path is a no-op.  Always clear dirty_accounts
             // so Phase 2 of commit_inner_with_mode doesn't re-encode the PREVIOUS
             // block's accounts, which would produce a wrong state root.
-            self.dirty_accounts = Vec::new();
+            self.dirty_accounts = dirty_accounts;
             self.last_sparse_account_reveal_keys = 0;
             self.last_apply_sparse_factory = sparse_stats;
             return Ok(());
@@ -4928,7 +4961,7 @@ impl MptCommitStore {
         }
 
         let factory_start = std::time::Instant::now();
-        let factory = self.build_sparse_factory(dirty_accounts, &mut sparse_stats);
+        let factory = self.build_sparse_factory(&dirty_accounts, &mut sparse_stats);
         self.last_sparse_apply_factory_build = factory_start.elapsed();
 
         let account_proof_start = std::time::Instant::now();
@@ -4945,7 +4978,7 @@ impl MptCommitStore {
             &mut sparse_trie,
             account_proof,
             &factory,
-            dirty_accounts,
+            &dirty_accounts,
             false, // fresh trie: full reveal required
         )?;
         self.last_sparse_apply_apply_changes = apply_changes_start.elapsed();
@@ -4953,7 +4986,7 @@ impl MptCommitStore {
         self.pending_sparse_state =
             Some(Box::new(PendingSparseState { trie: sparse_trie, factory }));
         // Store dirty_accounts — the normal apply no longer runs in sparse mode.
-        self.dirty_accounts = dirty_accounts.to_vec();
+        self.dirty_accounts = dirty_accounts;
         self.last_apply_sparse_factory = sparse_stats;
         Ok(())
     }
@@ -4973,7 +5006,7 @@ impl MptCommitStore {
     ///    - Evict storage tries idle for `cross_block_sparse_max_lag` blocks.
     fn apply_dirty_accounts_inner_cross_block(
         &mut self,
-        dirty_accounts: &[DirtyAccount],
+        dirty_accounts: Vec<DirtyAccount>,
         stats: &mut SparseFactoryStats,
     ) -> Result<()> {
         let mut sparse_apply_changes_elapsed = Duration::ZERO;
@@ -4992,9 +5025,9 @@ impl MptCommitStore {
             // &self; &self is the receiver of build_sparse_factory_cross_block_reuse.
             // Rust allows multiple shared references simultaneously.
             let cross_trie = &self.cross_block_sparse.as_ref().unwrap().trie;
-            self.build_sparse_factory_cross_block_reuse(dirty_accounts, cross_trie, stats)
+            self.build_sparse_factory_cross_block_reuse(&dirty_accounts, cross_trie, stats)
         } else {
-            self.build_sparse_factory(dirty_accounts, stats)
+            self.build_sparse_factory(&dirty_accounts, stats)
         };
         self.last_sparse_apply_factory_build = factory_start.elapsed();
 
@@ -5037,13 +5070,13 @@ impl MptCommitStore {
                 &mut cross.trie,
                 account_proof,
                 &cross.factory,
-                dirty_accounts,
+                &dirty_accounts,
                 true, // skip_already_revealed_storage
             )?;
             sparse_apply_changes_elapsed += apply_changes_start.elapsed();
 
             // Update access version for dirty storage accounts.
-            for dirty in dirty_accounts {
+            for dirty in &dirty_accounts {
                 if !dirty.storage_changes.is_empty() || dirty.storage_wiped {
                     cross.storage_last_block.insert(dirty.hashed_address, next_version);
                 }
@@ -5092,14 +5125,14 @@ impl MptCommitStore {
                 &mut sparse_trie,
                 account_proof,
                 &factory,
-                dirty_accounts,
+                &dirty_accounts,
                 false, // first block: all storage tries need full reveal
             )?;
             sparse_apply_changes_elapsed += apply_changes_start.elapsed();
 
             // Initialise access tracking for dirty storage accounts.
             let mut storage_last_block = alloy_primitives::map::HashMap::default();
-            for dirty in dirty_accounts {
+            for dirty in &dirty_accounts {
                 if !dirty.storage_changes.is_empty() || dirty.storage_wiped {
                     storage_last_block.insert(dirty.hashed_address, next_version);
                 }
@@ -5122,7 +5155,7 @@ impl MptCommitStore {
             self.pending_sparse_state =
                 Some(Box::new(PendingSparseState { trie: sparse_trie, factory }));
         }
-        self.dirty_accounts = dirty_accounts.to_vec();
+        self.dirty_accounts = dirty_accounts;
         self.last_sparse_apply_apply_changes = sparse_apply_changes_elapsed;
         Ok(())
     }
@@ -5133,8 +5166,9 @@ impl MptCommitStore {
         self.last_sparse_apply_account_proof = Duration::ZERO;
         self.last_sparse_apply_apply_changes = Duration::ZERO;
         self.last_sparse_account_reveal_keys = 0;
+        self.last_apply_account_trie_checkout = Duration::ZERO;
         if self.config.use_sparse_storage {
-            self.apply_dirty_accounts_inner_sparse(&dirty_accounts)?;
+            self.apply_dirty_accounts_inner_sparse(dirty_accounts)?;
             // Sparse-only path (wal_first and non-wal_first).
             return Ok(());
         }
@@ -5347,16 +5381,19 @@ impl MptCommitStore {
     }
 
     fn bulk_commit_inner(&mut self) -> Result<(i64, B256)> {
-        self.commit_inner_with_mode(CommitExecutionMode {
-            wal_first: false,
-            allow_async: false,
-            save_manifest: true,
-            // Build segments from in-memory tries — the BulkSegmentWriter
-            // streams them directly to pages.data (matching sei-db's
-            // snapshotWriter).  publish_generation is skipped during
-            // bulk_load; one delta file is written at finish.
-            publish_baseline: true,
-        })
+        self.commit_inner_with_mode_and_external_root(
+            CommitExecutionMode {
+                wal_first: false,
+                allow_async: false,
+                save_manifest: true,
+                // Build segments from in-memory tries — the BulkSegmentWriter
+                // streams them directly to pages.data (matching sei-db's
+                // snapshotWriter).  publish_generation is skipped during
+                // bulk_load; one delta file is written at finish.
+                publish_baseline: true,
+            },
+            None,
+        )
     }
 
     /// Core commit logic: compute roots, persist nodes, update manifest.
@@ -5368,10 +5405,19 @@ impl MptCommitStore {
     /// version immediately and rely on the background worker to make that
     /// version durable; callers that need durability must call `flush_persist`.
     fn commit_inner(&mut self) -> Result<(i64, B256)> {
-        self.commit_inner_with_mode(self.default_commit_mode())
+        self.commit_inner_with_mode_and_external_root(self.default_commit_mode(), None)
     }
 
-    fn commit_inner_with_mode(&mut self, mode: CommitExecutionMode) -> Result<(i64, B256)> {
+    fn commit_inner_with_mode_and_external_root(
+        &mut self,
+        mode: CommitExecutionMode,
+        external_state_root: Option<B256>,
+    ) -> Result<(i64, B256)> {
+        if external_state_root.is_some() && !mode.wal_first {
+            return Err(MptDbError::Other(
+                "commit_with_external_root requires wal_first commit mode".to_string(),
+            ));
+        }
         // Phase 1: compute storage roots for all dirty accounts.
         //
         // Collect DELETE/REUSE roots serially (cheap lookups), then compute
@@ -5749,10 +5795,26 @@ impl MptCommitStore {
             //   produced by SparseStateTrie.
             // - non-wal_first: keep SparseStateTrie::root_with_updates so we can collect
             //   TrieUpdates for dirty blob generation.
-            let (root, trie_updates, account_cow) = if mode.wal_first {
+            let (root, trie_updates, account_cow) = if let Some(external_root) = external_state_root
+            {
+                if std::env::var_os("MPT_VERIFY_WAL_EXTERNAL_STATE_ROOT").is_some() {
+                    let sparse_root = pending
+                        .trie
+                        .root(&pending.factory)
+                        .map_err(|e| MptDbError::Other(format!("sparse root (verify): {e}")))?;
+                    if sparse_root != external_root {
+                        return Err(MptDbError::Other(format!(
+                            "wal_first external root mismatch: sparse={sparse_root:?}, external={external_root:?}"
+                        )));
+                    }
+                }
+                account_trie.snapshot();
+                (external_root, TrieUpdates::default(), account_trie)
+            } else if mode.wal_first {
                 let verify_sparse_root =
                     std::env::var_os("MPT_VERIFY_WAL_SPARSE_ACCOUNT_ROOT").is_some();
-                let sparse_root = if verify_sparse_root {
+                let use_sparse_root = std::env::var_os("MPT_WAL_USE_SPARSE_ROOT").is_some();
+                let sparse_root = if use_sparse_root || verify_sparse_root {
                     Some(
                         pending
                             .trie
@@ -5763,21 +5825,41 @@ impl MptCommitStore {
                     None
                 };
 
-                let (root, account_cow) = account_trie
-                    .root_hash_only_parallel_account(&self.persisted)
-                    .map_err(|err| {
-                        MptDbError::Other(format!("account trie root hash (wal_first): {err}"))
-                    })?;
+                if use_sparse_root {
+                    let root = sparse_root.expect("sparse root must exist when use_sparse_root");
+                    if verify_sparse_root {
+                        let (account_root, _) = account_trie
+                            .clone()
+                            .root_hash_only_parallel_account(&self.persisted)
+                            .map_err(|err| {
+                                MptDbError::Other(format!(
+                                    "account trie root hash verify (wal_first sparse-root): {err}"
+                                ))
+                            })?;
+                        if account_root != root {
+                            return Err(MptDbError::Other(format!(
+                                "wal_first sparse root mismatch (sparse-root mode): sparse={root:?}, account_trie={account_root:?}"
+                            )));
+                        }
+                    }
+                    (root, TrieUpdates::default(), account_trie)
+                } else {
+                    let (root, account_cow) = account_trie
+                        .root_hash_only_parallel_account(&self.persisted)
+                        .map_err(|err| {
+                            MptDbError::Other(format!("account trie root hash (wal_first): {err}"))
+                        })?;
 
-                if let Some(sparse_root) = sparse_root &&
-                    sparse_root != root
-                {
-                    return Err(MptDbError::Other(format!(
-                        "wal_first sparse root mismatch: sparse={sparse_root:?}, account_trie={root:?}"
-                    )));
+                    if let Some(sparse_root) = sparse_root &&
+                        sparse_root != root
+                    {
+                        return Err(MptDbError::Other(format!(
+                            "wal_first sparse root mismatch: sparse={sparse_root:?}, account_trie={root:?}"
+                        )));
+                    }
+
+                    (root, TrieUpdates::default(), account_cow)
                 }
-
-                (root, TrieUpdates::default(), account_cow)
             } else {
                 let (root, trie_updates) = pending
                     .trie
@@ -5853,6 +5935,9 @@ impl MptCommitStore {
                 self.last_committed_sparse_trie = Some(Box::new(pending.trie));
             }
             (root, blobs, account_cow)
+        } else if let Some(external_root) = external_state_root {
+            account_trie.snapshot();
+            (external_root, Vec::<(B256, Vec<u8>)>::new(), account_trie)
         } else if hash_only {
             // Empty bundle (no pending sparse state) or non-sparse path.
             // Compute root from the working account trie without collecting blobs.

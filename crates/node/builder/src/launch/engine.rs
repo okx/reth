@@ -33,7 +33,7 @@ use reth_node_core::{
 use reth_node_events::node;
 use reth_provider::{
     providers::{BlockchainProvider, NodeTypesForProvider},
-    BlockNumReader, MetadataProvider,
+    BlockNumReader, MetadataProvider, SaveBlocksMode,
 };
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
@@ -62,6 +62,9 @@ pub struct EngineNodeLauncher {
     /// this factory instead of the default database/in-memory providers.
     pub state_provider_override: Option<reth_provider::providers::StateProviderOverride>,
 
+    /// Persistence save mode for `DatabaseProvider::save_blocks`.
+    pub persistence_save_mode: SaveBlocksMode,
+
     /// When true, skip the `InsertExecutedBlock` fast path so that locally-built
     /// blocks are re-executed through `NewPayload`. This is needed for QMDB
     /// benchmarking: the NewPayload path triggers `state_by_block_hash()` (QMDB
@@ -79,6 +82,7 @@ impl std::fmt::Debug for EngineNodeLauncher {
                 "state_provider_override",
                 &self.state_provider_override.as_ref().map(|_| "Some(...)"),
             )
+            .field("persistence_save_mode", &self.persistence_save_mode)
             .field("force_new_payload_path", &self.force_new_payload_path)
             .finish()
     }
@@ -96,6 +100,7 @@ impl EngineNodeLauncher {
             engine_tree_config,
             on_canonical_commit: None,
             state_provider_override: None,
+            persistence_save_mode: SaveBlocksMode::Full,
             force_new_payload_path: false,
         }
     }
@@ -124,6 +129,12 @@ impl EngineNodeLauncher {
         self
     }
 
+    /// Set persistence save mode used by the engine persistence worker.
+    pub fn with_persistence_save_mode(mut self, mode: SaveBlocksMode) -> Self {
+        self.persistence_save_mode = mode;
+        self
+    }
+
     async fn launch_node<T, CB, AO>(
         self,
         target: NodeBuilderWithComponents<T, CB, AO>,
@@ -144,6 +155,7 @@ impl EngineNodeLauncher {
             engine_tree_config,
             on_canonical_commit,
             state_provider_override,
+            persistence_save_mode,
             force_new_payload_path,
         } = self;
         let NodeBuilderWithComponents {
@@ -321,6 +333,7 @@ impl EngineNodeLauncher {
             ctx.components().evm_config().clone(),
             changeset_cache,
             on_canonical_commit,
+            persistence_save_mode,
         );
 
         info!(target: "reth::cli", "Consensus engine initialized");

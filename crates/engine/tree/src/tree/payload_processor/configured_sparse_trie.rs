@@ -172,6 +172,14 @@ impl SparseTrieInterface for ConfiguredSparseTrie {
             Self::Parallel(trie) => trie.updates_ref(),
         }
     }
+
+    fn reinit_updates(&mut self) {
+        match self {
+            Self::Serial(trie) => trie.reinit_updates(),
+            Self::Parallel(trie) => trie.reinit_updates(),
+        }
+    }
+
     fn shrink_nodes_to(&mut self, size: usize) {
         match self {
             Self::Serial(trie) => trie.shrink_nodes_to(size),

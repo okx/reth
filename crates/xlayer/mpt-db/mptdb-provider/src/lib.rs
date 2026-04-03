@@ -21,7 +21,7 @@ pub mod provider;
 mod writer;
 
 pub use factory::MptDbStateProviderFactory;
-pub use provider::{MptDbStateProvider, SyncProvider};
+pub use provider::{MptDbStateProvider, ScPrewarmDispatcher, SyncProvider};
 pub use writer::MptDbStateWriter;
 
 #[cfg(test)]
