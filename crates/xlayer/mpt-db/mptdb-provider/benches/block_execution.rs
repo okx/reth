@@ -148,8 +148,20 @@ fn bench_measure_mode() -> BenchMeasureMode {
     }
 }
 
+fn bench_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            // Backward-compatible fallback: any non-empty unknown value means enabled.
+            _ => !raw.trim().is_empty(),
+        },
+        Err(_) => false,
+    }
+}
+
 fn bench_trace_enabled() -> bool {
-    std::env::var_os("MPTDB_PROVIDER_BENCH_TRACE").is_some()
+    bench_flag("MPTDB_PROVIDER_BENCH_TRACE")
 }
 
 fn bench_trace_iters() -> usize {
@@ -160,11 +172,15 @@ fn bench_trace_iters() -> usize {
 }
 
 fn bench_use_provider_reads() -> bool {
-    std::env::var_os("MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS").is_some()
+    bench_flag("MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS")
 }
 
 fn bench_enable_sc_prewarm() -> bool {
-    std::env::var_os("MPTDB_PROVIDER_BENCH_ENABLE_SC_PREWARM").is_some()
+    bench_flag("MPTDB_PROVIDER_BENCH_ENABLE_SC_PREWARM")
+}
+
+fn bench_sc_profile_enabled() -> bool {
+    bench_flag("MPTDB_PROVIDER_BENCH_SC_PROFILE")
 }
 
 // ── InMemoryCache — synthetic dataset builder (genesis + tx generation) ───────
@@ -444,6 +460,7 @@ fn run_mptdb_bench(
         let trace_iters = bench_trace_iters();
         let use_provider_reads = bench_use_provider_reads();
         let enable_sc_prewarm = bench_enable_sc_prewarm();
+        let enable_sc_profile = bench_sc_profile_enabled();
         let mut exec_total = Duration::ZERO;
         let mut wall_total = Duration::ZERO;
         let mut setup_total = Duration::ZERO;
@@ -452,6 +469,20 @@ fn run_mptdb_bench(
         let mut sc_write_total = Duration::ZERO;
         let mut write_total = Duration::ZERO; // wall of parallel SC+MDBX
         let mut prepop_total = Duration::ZERO;
+        let mut sc_apply_total = Duration::ZERO;
+        let mut sc_collect_dirty_total = Duration::ZERO;
+        let mut sc_sparse_factory_build_total = Duration::ZERO;
+        let mut sc_sparse_account_proof_total = Duration::ZERO;
+        let mut sc_sparse_apply_changes_total = Duration::ZERO;
+        let mut sc_trie_load_total = Duration::ZERO;
+        let mut sc_slot_updates_total = Duration::ZERO;
+        let mut sc_storage_roots_total = Duration::ZERO;
+        let mut sc_account_updates_total = Duration::ZERO;
+        let mut sc_account_root_total = Duration::ZERO;
+        let mut sc_wal_total = Duration::ZERO;
+        let mut sc_commit_total = Duration::ZERO;
+        let mut outcome_accounts_total: u64 = 0;
+        let mut outcome_storage_accounts_total: u64 = 0;
 
         for iter_idx in 0..iters {
             let iter_start = Instant::now();
@@ -462,6 +493,20 @@ fn run_mptdb_bench(
             let mut write_phase = Duration::ZERO; // wall of parallel SC+MDBX
             let mut drop_phase = Duration::ZERO;
             let mut tmp_drop = Duration::ZERO;
+            let mut sc_apply_phase = Duration::ZERO;
+            let mut sc_collect_dirty_phase = Duration::ZERO;
+            let mut sc_sparse_factory_build_phase = Duration::ZERO;
+            let mut sc_sparse_account_proof_phase = Duration::ZERO;
+            let mut sc_sparse_apply_changes_phase = Duration::ZERO;
+            let mut sc_trie_load_phase = Duration::ZERO;
+            let mut sc_slot_updates_phase = Duration::ZERO;
+            let mut sc_storage_roots_phase = Duration::ZERO;
+            let mut sc_account_updates_phase = Duration::ZERO;
+            let mut sc_account_root_phase = Duration::ZERO;
+            let mut sc_wal_phase = Duration::ZERO;
+            let mut sc_commit_phase = Duration::ZERO;
+            let mut outcome_accounts_phase: u64 = 0;
+            let mut outcome_storage_accounts_phase: u64 = 0;
 
             let iter_dir = TempDir::new().unwrap();
 
@@ -594,17 +639,45 @@ fn run_mptdb_bench(
                 // without any large-object clone.
                 let t_wr = Instant::now();
                 let outcome = Arc::new(make_outcome(bundle, blk_idx as u64 + 1));
+                let (changed_accounts, storage_accounts) = {
+                    let state = outcome.state().state();
+                    let changed = state.len() as u64;
+                    let storage = state.values().filter(|acc| !acc.storage.is_empty()).count() as u64;
+                    (changed, storage)
+                };
+                outcome_accounts_phase += changed_accounts;
+                outcome_storage_accounts_phase += storage_accounts;
                 job_tx.send(Arc::clone(&outcome)).expect("send to mdbx worker");
 
                 // SC commit on main thread (uses rayon internally).
                 let t_sc = Instant::now();
-                sc_writer
-                    .write_state(
-                        outcome.as_ref(),
-                        OriginalValuesKnown::Yes,
-                        bench_state_write_config(),
-                    )
-                    .expect("sc write_state");
+                if enable_sc_profile {
+                    sc_writer
+                        .apply_execution_outcome(outcome.as_ref())
+                        .expect("sc apply_execution_outcome");
+                    let ((_version, _root), profile) =
+                        sc.lock().commit_with_profile().expect("sc commit_with_profile");
+                    sc_apply_phase += profile.apply_bundle_state;
+                    sc_collect_dirty_phase += profile.apply_collect_dirty_accounts;
+                    sc_sparse_factory_build_phase += profile.sparse_apply_factory_build;
+                    sc_sparse_account_proof_phase += profile.sparse_apply_account_proof;
+                    sc_sparse_apply_changes_phase += profile.sparse_apply_apply_changes;
+                    sc_trie_load_phase += profile.apply_get_or_load_storage_tries;
+                    sc_slot_updates_phase += profile.apply_storage_slot_updates;
+                    sc_storage_roots_phase += profile.storage_roots;
+                    sc_account_updates_phase += profile.account_updates;
+                    sc_account_root_phase += profile.account_root_and_blobs;
+                    sc_wal_phase += profile.wal_append;
+                    sc_commit_phase += profile.total_commit;
+                } else {
+                    sc_writer
+                        .write_state(
+                            outcome.as_ref(),
+                            OriginalValuesKnown::Yes,
+                            bench_state_write_config(),
+                        )
+                        .expect("sc write_state");
+                }
                 sc_write_phase += t_sc.elapsed();
 
                 // Wait for MDBX worker to finish before next block's EVM reads.
@@ -650,6 +723,20 @@ fn run_mptdb_bench(
             write_total += write_phase;
             teardown_total += drop_phase + tmp_drop;
             wall_total += iter_start.elapsed();
+            sc_apply_total += sc_apply_phase;
+            sc_collect_dirty_total += sc_collect_dirty_phase;
+            sc_sparse_factory_build_total += sc_sparse_factory_build_phase;
+            sc_sparse_account_proof_total += sc_sparse_account_proof_phase;
+            sc_sparse_apply_changes_total += sc_sparse_apply_changes_phase;
+            sc_trie_load_total += sc_trie_load_phase;
+            sc_slot_updates_total += sc_slot_updates_phase;
+            sc_storage_roots_total += sc_storage_roots_phase;
+            sc_account_updates_total += sc_account_updates_phase;
+            sc_account_root_total += sc_account_root_phase;
+            sc_wal_total += sc_wal_phase;
+            sc_commit_total += sc_commit_phase;
+            outcome_accounts_total += outcome_accounts_phase;
+            outcome_storage_accounts_total += outcome_storage_accounts_phase;
 
             if trace && (iter_idx as usize) < trace_iters {
                 eprintln!(
@@ -666,6 +753,27 @@ fn run_mptdb_bench(
                     tmp_drop,
                     iter_start.elapsed()
                 );
+                if enable_sc_profile {
+                    eprintln!(
+                        "[trace][{}][iter {}] sc_profile(apply={:.2?}, collect_dirty={:.2?}, sparse_factory_build={:.2?}, sparse_account_proof={:.2?}, sparse_apply_changes={:.2?}, trie_load={:.2?}, slot_updates={:.2?}, storage_roots={:.2?}, account_updates={:.2?}, account_root={:.2?}, wal={:.2?}, total_commit={:.2?}, changed_accounts={}, storage_accounts={})",
+                        label,
+                        iter_idx + 1,
+                        sc_apply_phase,
+                        sc_collect_dirty_phase,
+                        sc_sparse_factory_build_phase,
+                        sc_sparse_account_proof_phase,
+                        sc_sparse_apply_changes_phase,
+                        sc_trie_load_phase,
+                        sc_slot_updates_phase,
+                        sc_storage_roots_phase,
+                        sc_account_updates_phase,
+                        sc_account_root_phase,
+                        sc_wal_phase,
+                        sc_commit_phase,
+                        outcome_accounts_phase,
+                        outcome_storage_accounts_phase,
+                    );
+                }
             }
         }
         eprintln!(
@@ -688,6 +796,27 @@ fn run_mptdb_bench(
             "[{}] read_mode: provider_reads={} sc_prewarm={}",
             label, use_provider_reads, enable_sc_prewarm
         );
+        if enable_sc_profile {
+            let total_blocks = (iters * block_txs.len() as u64) as u32;
+            eprintln!(
+                "[{}] avg/sc_profile per-block: apply={:.2?} collect_dirty={:.2?} sparse_factory_build={:.2?} sparse_account_proof={:.2?} sparse_apply_changes={:.2?} trie_load={:.2?} slot_updates={:.2?} storage_roots={:.2?} account_updates={:.2?} account_root={:.2?} wal={:.2?} total_commit={:.2?} changed_accounts={} storage_accounts={}",
+                label,
+                sc_apply_total / total_blocks,
+                sc_collect_dirty_total / total_blocks,
+                sc_sparse_factory_build_total / total_blocks,
+                sc_sparse_account_proof_total / total_blocks,
+                sc_sparse_apply_changes_total / total_blocks,
+                sc_trie_load_total / total_blocks,
+                sc_slot_updates_total / total_blocks,
+                sc_storage_roots_total / total_blocks,
+                sc_account_updates_total / total_blocks,
+                sc_account_root_total / total_blocks,
+                sc_wal_total / total_blocks,
+                sc_commit_total / total_blocks,
+                outcome_accounts_total / total_blocks as u64,
+                outcome_storage_accounts_total / total_blocks as u64,
+            );
+        }
         eprintln!("[{}] criterion measure mode: {:?}", label, measure_mode);
         if matches!(measure_mode, BenchMeasureMode::EndToEnd) {
             wall_total

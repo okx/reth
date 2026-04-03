@@ -15,6 +15,12 @@ pub(crate) struct FinalizedNode {
     pub hash: B256,
 }
 
+#[derive(Clone)]
+struct FinalizedHashNode {
+    idx: u32,
+    hash: B256,
+}
+
 struct ChildArtifacts {
     embed: Vec<u8>,
     finalized_nodes: Vec<FinalizedNode>,
@@ -239,7 +245,7 @@ fn compute_node_artifacts(arena: &MutableTrieArena, idx: u32) -> NodeArtifacts {
 fn encode_child_for_parent_hash_only(
     arena: &MutableTrieArena,
     child: &ChildRef,
-) -> (Vec<u8>, Vec<FinalizedNode>) {
+) -> (Vec<u8>, Vec<FinalizedHashNode>) {
     match child {
         ChildRef::Arena(idx) => {
             let idx = *idx;
@@ -250,12 +256,10 @@ fn encode_child_for_parent_hash_only(
                 if let Some(rlp) = arena.get_rlp(idx) {
                     let hash = hash::hash_rlp(rlp);
                     let embed = if rlp.len() < 32 { rlp.clone() } else { hash.to_vec() };
-                    return (embed, vec![FinalizedNode { idx, rlp: rlp.clone(), hash }]);
+                    return (embed, vec![FinalizedHashNode { idx, hash }]);
                 }
             }
-            let (hash, finalized) = compute_node_hash_only(arena, idx);
-            let node_rlp = finalized.first().expect("root must exist").rlp.clone();
-            let embed = if node_rlp.len() < 32 { node_rlp } else { hash.to_vec() };
+            let (_hash, embed, finalized) = compute_node_hash_only_inner(arena, idx);
             (embed, finalized)
         }
         ChildRef::Inline(rlp) => (rlp.clone(), Vec::new()),
@@ -263,7 +267,15 @@ fn encode_child_for_parent_hash_only(
     }
 }
 
-fn compute_node_hash_only(arena: &MutableTrieArena, idx: u32) -> (B256, Vec<FinalizedNode>) {
+fn compute_node_hash_only(arena: &MutableTrieArena, idx: u32) -> (B256, Vec<FinalizedHashNode>) {
+    let (hash, _embed, finalized) = compute_node_hash_only_inner(arena, idx);
+    (hash, finalized)
+}
+
+fn compute_node_hash_only_inner(
+    arena: &MutableTrieArena,
+    idx: u32,
+) -> (B256, Vec<u8>, Vec<FinalizedHashNode>) {
     let mut finalized = Vec::new();
 
     let rlp = match arena.get(idx) {
@@ -287,14 +299,15 @@ fn compute_node_hash_only(arena: &MutableTrieArena, idx: u32) -> (B256, Vec<Fina
     };
 
     let node_hash = arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
-    finalized.insert(0, FinalizedNode { idx, rlp, hash: node_hash });
-    (node_hash, finalized)
+    finalized.insert(0, FinalizedHashNode { idx, hash: node_hash });
+    let embed = if rlp.len() < 32 { rlp } else { node_hash.to_vec() };
+    (node_hash, embed, finalized)
 }
 
 fn compute_node_hash_only_parallel_root(
     arena: &MutableTrieArena,
     idx: u32,
-) -> (B256, Vec<FinalizedNode>) {
+) -> (B256, Vec<FinalizedHashNode>) {
     match arena.get(idx) {
         MptNode::Branch(branch) => {
             let child_slots: Vec<(usize, &ChildRef)> = branch
@@ -304,7 +317,7 @@ fn compute_node_hash_only_parallel_root(
                 .filter_map(|(slot, child)| child.as_ref().map(|c| (slot, c)))
                 .collect();
 
-            let child_results: Vec<(usize, Vec<u8>, Vec<FinalizedNode>)> = child_slots
+            let child_results: Vec<(usize, Vec<u8>, Vec<FinalizedHashNode>)> = child_slots
                 .into_par_iter()
                 .map(|(slot, child)| {
                     let (embed, finalized) = encode_child_for_parent_hash_only(arena, child);
@@ -321,7 +334,7 @@ fn compute_node_hash_only_parallel_root(
 
             let rlp = encode_branch(&children_bytes, branch.value.as_deref());
             let node_hash = arena.get_hash(idx).unwrap_or_else(|| hash::hash_rlp(&rlp));
-            finalized.insert(0, FinalizedNode { idx, rlp, hash: node_hash });
+            finalized.insert(0, FinalizedHashNode { idx, hash: node_hash });
             (node_hash, finalized)
         }
         _ => compute_node_hash_only(arena, idx),
