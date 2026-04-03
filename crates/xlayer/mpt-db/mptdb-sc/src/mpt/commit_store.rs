@@ -4797,38 +4797,6 @@ impl MptCommitStore {
                 continue;
             }
 
-            // Try published segment first (O(1)).
-            let segment_ok = if let Some(store) = &self.published_store {
-                stats.segment_lookups += 1;
-                match store.open_trie_page(&dirty.hashed_address, root) {
-                    Ok(Some(loaded)) => {
-                        stats.segment_hits += 1;
-                        factory.storage_segments.insert(dirty.hashed_address, loaded.lease);
-                        true
-                    }
-                    _ => {
-                        stats.segment_miss += 1;
-                        if Self::sparse_l3_trace_enabled() {
-                            if let Ok(Some(entry_root)) =
-                                store.lookup_trie_root(&dirty.hashed_address)
-                            {
-                                if entry_root != root {
-                                    stats.segment_root_mismatch += 1;
-                                }
-                            }
-                        }
-                        false
-                    }
-                }
-            } else {
-                stats.segment_miss_no_store += 1;
-                false
-            };
-            if segment_ok {
-                continue;
-            }
-
-            // No valid segment.
             let dirty_keys: Vec<Nibbles> =
                 dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
 
@@ -4863,6 +4831,16 @@ impl MptCommitStore {
                     factory.no_reveal_accounts.insert(dirty.hashed_address);
                     continue;
                 }
+                // This account still needs provider-assisted reveal/proof.
+                // Try segment first; only fall back to proof build on miss.
+                if self.try_segment_lookup_for_sparse_factory(
+                    dirty.hashed_address,
+                    root,
+                    &mut factory,
+                    stats,
+                ) {
+                    continue;
+                }
                 // Only build tier-3 proof for newly-touched slots.
                 let before = factory.pre_built_storage_proofs.len();
                 self.try_build_l2_proof_tier3_only(
@@ -4881,6 +4859,15 @@ impl MptCommitStore {
                     self.try_build_l2_proof(&dirty.hashed_address, root, &proof_keys, &mut factory);
                 }
             } else {
+                // Non-cross-reuse path keeps segment-first behavior.
+                if self.try_segment_lookup_for_sparse_factory(
+                    dirty.hashed_address,
+                    root,
+                    &mut factory,
+                    stats,
+                ) {
+                    continue;
+                }
                 // Account not yet in cross-block trie:
                 // prefer tier-3 dirty-path proof first to avoid full-arena DFS.
                 let before = factory.pre_built_storage_proofs.len();
@@ -4898,6 +4885,39 @@ impl MptCommitStore {
             }
         }
         factory
+    }
+
+    fn try_segment_lookup_for_sparse_factory(
+        &self,
+        hashed_addr: B256,
+        root: B256,
+        factory: &mut SegmentTrieNodeProviderFactory,
+        stats: &mut SparseFactoryStats,
+    ) -> bool {
+        if let Some(store) = &self.published_store {
+            stats.segment_lookups += 1;
+            match store.open_trie_page(&hashed_addr, root) {
+                Ok(Some(loaded)) => {
+                    stats.segment_hits += 1;
+                    factory.storage_segments.insert(hashed_addr, loaded.lease);
+                    true
+                }
+                _ => {
+                    stats.segment_miss += 1;
+                    if Self::sparse_l3_trace_enabled() {
+                        if let Ok(Some(entry_root)) = store.lookup_trie_root(&hashed_addr) {
+                            if entry_root != root {
+                                stats.segment_root_mismatch += 1;
+                            }
+                        }
+                    }
+                    false
+                }
+            }
+        } else {
+            stats.segment_miss_no_store += 1;
+            false
+        }
     }
 
     /// Tier-3-only variant of `try_build_l2_proof`: loads ONLY the dirty-key

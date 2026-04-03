@@ -5,7 +5,8 @@ use mptdb_traits::{
     types::{IterOptions, WriteOptions},
 };
 use rocksdb::{
-    BlockBasedOptions, Cache, DBCompressionType, Options, WriteOptions as RocksWriteOptions,
+    BlockBasedIndexType, BlockBasedOptions, Cache, DBCompressionType, Options,
+    WriteOptions as RocksWriteOptions,
 };
 use std::{cmp::Ordering, path::Path, sync::Arc};
 
@@ -13,12 +14,20 @@ use std::{cmp::Ordering, path::Path, sync::Arc};
 pub type ComparatorFn = (String, Box<dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync>);
 
 /// RocksDB engine wrapper implementing `KvEngine` + `Checkpointable`.
-/// Used for both MVCC (32 MB cache) and non-MVCC (512 MB cache) configurations.
+/// Used for both MVCC and non-MVCC configurations.
 pub struct RocksDbEngine {
     db: Arc<rocksdb::DB>,
 }
 
 impl RocksDbEngine {
+    const COMPACTION_MEM_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+    const BLOCK_SIZE_BYTES: usize = 32 * 1024;
+    const METADATA_BLOCK_SIZE_BYTES: usize = 256 * 1024;
+    const BLOOM_EQ_BITS_PER_KEY: f64 = 9.9;
+    const BLOOM_BEFORE_LEVEL: i32 = 1;
+    const MVCC_BLOCK_CACHE_MB: usize = 32;
+    const PLAIN_BLOCK_CACHE_MB: usize = 1024;
+
     /// Internal constructor wrapping an already-opened DB.
     fn new(db: rocksdb::DB) -> Self {
         Self { db: Arc::new(db) }
@@ -35,15 +44,14 @@ impl RocksDbEngine {
     /// a custom comparator for MVCC key ordering.
     pub fn open_mvcc(data_dir: &Path, comparator_fn: Option<ComparatorFn>) -> Result<Self> {
         let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_compression_type(DBCompressionType::Zstd);
+        Self::configure_common_opts(&mut opts);
         opts.set_level_zero_file_num_compaction_trigger(2);
 
         if let Some((name, cmp_fn)) = comparator_fn {
             opts.set_comparator(&name, Box::new(move |a: &[u8], b: &[u8]| cmp_fn(a, b)));
         }
 
-        let block_opts = Self::configure_block_opts(32);
+        let block_opts = Self::configure_block_opts(Self::MVCC_BLOCK_CACHE_MB);
         opts.set_block_based_table_factory(&block_opts);
 
         let db =
@@ -53,14 +61,13 @@ impl RocksDbEngine {
 
     /// Open a RocksDB instance configured for plain (non-MVCC) storage.
     ///
-    /// Uses a 512 MB block cache and L0 compaction trigger of 4.
+    /// Uses a 1 GB block cache and L0 compaction trigger of 4.
     pub fn open_plain(data_dir: &Path) -> Result<Self> {
         let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_compression_type(DBCompressionType::Zstd);
+        Self::configure_common_opts(&mut opts);
         opts.set_level_zero_file_num_compaction_trigger(4);
 
-        let block_opts = Self::configure_block_opts(512);
+        let block_opts = Self::configure_block_opts(Self::PLAIN_BLOCK_CACHE_MB);
         opts.set_block_based_table_factory(&block_opts);
 
         let db =
@@ -69,15 +76,33 @@ impl RocksDbEngine {
     }
 
     /// Configure block-based table options shared by both MVCC and plain modes.
-    ///
+    fn configure_common_opts(opts: &mut Options) {
+        opts.create_if_missing(true);
+        opts.set_compression_type(DBCompressionType::Zstd);
+
+        let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get() as i32);
+        opts.increase_parallelism(parallelism);
+        opts.optimize_level_style_compaction(Self::COMPACTION_MEM_BUDGET_BYTES);
+        opts.set_target_file_size_multiplier(2);
+        opts.set_level_compaction_dynamic_level_bytes(true);
+
+        // Follow sei-chain style compression tuning for better SST creation throughput.
+        opts.set_compression_options_parallel_threads(4);
+        opts.set_bottommost_compression_type(DBCompressionType::Zstd);
+        opts.set_bottommost_compression_options(0, 12, 0, 112_640, true);
+        opts.set_bottommost_zstd_max_train_bytes(11_264_000, true);
+    }
+
     /// - Block size: 32 KB
     /// - Index (metadata) block size: 256 KB
-    /// - Bloom filter: 10 bits per key
+    /// - Hybrid ribbon filter: bloom-equivalent 9.9 bits/key with bloom before level 1
     fn configure_block_opts(cache_size_mb: usize) -> BlockBasedOptions {
         let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_size(32 * 1024); // 32 KB
-        block_opts.set_metadata_block_size(256 * 1024); // 256 KB
-        block_opts.set_bloom_filter(10.0, false);
+        block_opts.set_block_size(Self::BLOCK_SIZE_BYTES);
+        block_opts.set_metadata_block_size(Self::METADATA_BLOCK_SIZE_BYTES);
+        block_opts.set_hybrid_ribbon_filter(Self::BLOOM_EQ_BITS_PER_KEY, Self::BLOOM_BEFORE_LEVEL);
+        block_opts.set_index_type(BlockBasedIndexType::BinarySearch);
+        block_opts.set_optimize_filters_for_memory(true);
 
         let cache = Cache::new_lru_cache(cache_size_mb * 1024 * 1024);
         block_opts.set_block_cache(&cache);

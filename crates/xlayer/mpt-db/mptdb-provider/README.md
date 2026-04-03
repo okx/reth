@@ -878,3 +878,61 @@ Same workload, first trace diagnostics:
 - `reth_mdbx`: `~1.21-1.23s/blk`
 
 So mptdb now holds a clearer lead in provider integration mode under this workload.
+
+### 9.12 P1.2 Follow-up: Skip Segment Lookup for No-Reveal Accounts (April 3, 2026)
+
+Observation:
+
+- In cross-reuse path, many accounts already had `proof_keys.is_empty()` and were marked
+  `no_reveal_accounts`.
+- But segment lookup was still executed before this decision, adding unnecessary Step-1 overhead.
+
+Code change:
+
+- `mptdb-sc/src/mpt/commit_store.rs`
+  - Reordered cross-reuse flow:
+    - first compute `missing_count` + `proof_keys`
+    - if `proof_keys.is_empty()`, mark `no_reveal_accounts` and skip account immediately
+    - only then try segment lookup / proof fallback for accounts that actually need reveal
+  - Refactored segment lookup into
+    `try_segment_lookup_for_sparse_factory(...)` for clearer borrow/lifetime boundaries.
+
+Verification (same provider workload and bench mode):
+
+- target: `erc20_transfer_10pct_contract_pool/mptdb`
+- criterion result after this patch:
+  - `time: [2.4743 s 2.4966 s 2.5231 s]`
+  - `change: [-9.2061% -8.1427% -6.9834%] (p = 0.00)`
+  - `Performance has improved.`
+
+Interpretation:
+
+- This is a pure sparse-factory planning reduction; it removes work that was provably unnecessary
+  for no-reveal accounts.
+- `cross_missing_proof_slots` remains `~0`, and sparse-factory counters stay consistent.
+
+### 9.13 RocksDB Tuning Check Against sei-chain Parameters (April 3, 2026)
+
+We also tested a parameter set aligned with local `sei-chain` RocksDB style:
+
+- enabled in `mptdb-engine/src/engine.rs`
+  - `increase_parallelism(available_parallelism)`
+  - `optimize_level_style_compaction(512MB)`
+  - `set_target_file_size_multiplier(2)`
+  - `set_level_compaction_dynamic_level_bytes(true)`
+  - `set_compression_options_parallel_threads(4)`
+  - bottommost zstd + dictionary train options
+  - block table: hybrid ribbon filter + binary-search index + filter-memory optimization
+  - plain DB block cache increased to `1GB`
+
+Result on the same provider workload:
+
+- criterion:
+  - `time: [2.4862 s 2.5148 s 2.5442 s]`
+  - `change: [-0.8212% +0.7317% +2.2738%] (p = 0.38)`
+  - `No change in performance detected.`
+
+Conclusion:
+
+- Current bottleneck is still SC-side apply/commit CPU path under wal-first integration, not a
+  dominant RocksDB option miss in this benchmark profile.
