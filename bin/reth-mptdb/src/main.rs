@@ -15,6 +15,8 @@
 //!
 //! Environment variables:
 //! - `MPTDB_SC_PATH`: override SC data directory (default: datadir/mptdb/sc)
+//! - `MPTDB_ASYNC_PLAIN_MATERIALIZATION`: when set, persist block structure+receipts inline and
+//!   materialize MDBX plain state asynchronously from canonical callbacks.
 
 #![allow(missing_docs)]
 
@@ -29,12 +31,13 @@ use mptdb_sc::mpt::{MptCommitStore, MptCommitter as _};
 use parking_lot::Mutex;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_ethereum_primitives::Receipt as EthReceipt;
+use reth_execution_types::ExecutionOutcome;
 use reth_node_builder::{DebugNodeLauncher, EngineNodeLauncher, NodeHandle};
 use reth_node_ethereum::EthereumNode;
-use reth_storage_api::StateWriter;
+use reth_storage_api::{DBProvider, DatabaseProviderFactory, StateWriteConfig, StateWriter};
 use revm_database::{states::StorageSlot, AccountStatus, BundleAccount, BundleState};
 use revm_state::AccountInfo;
-use std::sync::Arc;
+use std::sync::{mpsc::Sender, Arc};
 use tracing::info;
 
 /// No extra CLI args for reth-mptdb (all config via env vars).
@@ -181,6 +184,19 @@ fn main() {
             // cost (WAL write is fast; segment build is deferred to a background
             // worker), but the apply+root phase still blocks inline.
             let sc_for_commit = sc.clone();
+            let async_plain_materialization =
+                std::env::var_os("MPTDB_ASYNC_PLAIN_MATERIALIZATION").is_some();
+            #[derive(Debug)]
+            enum PlainMaterializeTask {
+                Rollback { to_block: alloy_primitives::BlockNumber },
+                Apply { block_number: alloy_primitives::BlockNumber, bundle: BundleState },
+            }
+            let (plain_tx, plain_rx) = if async_plain_materialization {
+                let (tx, rx) = std::sync::mpsc::channel::<PlainMaterializeTask>();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
             // Tracks latest block committed into SC; used to detect reorgs and
             // execute rollback before applying replacement canonical blocks.
             let last_sc_committed_block = Arc::new(Mutex::new({
@@ -207,6 +223,8 @@ fn main() {
 
             let latest_sc_hash_for_commit = latest_sc_hash.clone();
             let last_sc_committed_block_for_commit = last_sc_committed_block.clone();
+            let plain_tx_for_commit: Option<Sender<PlainMaterializeTask>> =
+                plain_tx.as_ref().map(|tx| tx.clone());
 
             let on_canonical_commit = Box::new(
                 move |
@@ -217,17 +235,25 @@ fn main() {
 
                 // Reorg handling: if new canonical block number is <= last committed
                 // SC block, rollback SC to (new_first - 1) before applying.
-                if let Some(last_committed) = *last_sc_committed_block_for_commit.lock() {
-                    if block_number <= last_committed {
-                        let rollback_to = block_number.saturating_sub(1);
-                        writer.remove_state_above(rollback_to).unwrap_or_else(|e| {
-                            panic!(
-                                "mptdb: SC rollback failed at reorg (target block {rollback_to}): {e}"
-                            )
-                        });
-                    } else {
-                        let expected_next = last_committed.saturating_add(1);
-                        if block_number != expected_next {
+                    if let Some(last_committed) = *last_sc_committed_block_for_commit.lock() {
+                        if block_number <= last_committed {
+                            let rollback_to = block_number.saturating_sub(1);
+                            writer.remove_state_above(rollback_to).unwrap_or_else(|e| {
+                                panic!(
+                                    "mptdb: SC rollback failed at reorg (target block {rollback_to}): {e}"
+                                )
+                            });
+                            if let Some(ref tx) = plain_tx_for_commit {
+                                tx.send(PlainMaterializeTask::Rollback { to_block: rollback_to })
+                                    .unwrap_or_else(|e| {
+                                        panic!(
+                                            "mptdb: enqueue plain rollback failed (target block {rollback_to}): {e}"
+                                        )
+                                    });
+                            }
+                        } else {
+                            let expected_next = last_committed.saturating_add(1);
+                            if block_number != expected_next {
                             panic!(
                                 "mptdb: non-contiguous canonical callback: expected block {expected_next}, got {block_number}"
                             );
@@ -258,6 +284,15 @@ fn main() {
                     });
                 *last_sc_committed_block_for_commit.lock() = Some(block_number);
                 *latest_sc_hash_for_commit.lock() = Some(block_hash);
+                if let Some(ref tx) = plain_tx_for_commit {
+                    tx.send(PlainMaterializeTask::Apply {
+                        block_number,
+                        bundle: bundle.clone(),
+                    })
+                    .unwrap_or_else(|e| {
+                        panic!("mptdb: enqueue async plain apply failed (block {block_number}): {e}")
+                    });
+                }
 
                 // Enqueue accounts with storage changes for background SC prewarm.
                 // Only accounts with storage.is_empty() == false are enqueued to
@@ -330,22 +365,86 @@ fn main() {
 
             let task_executor = builder.task_executor().clone();
             let data_dir = builder.config().datadir();
+            let persistence_save_mode = if async_plain_materialization {
+                reth_provider::SaveBlocksMode::BlocksAndReceiptsOnly
+            } else {
+                reth_provider::SaveBlocksMode::StateOnlyNoTrie
+            };
 
             let launcher = EngineNodeLauncher::new(task_executor, data_dir, engine_tree_config)
                 .with_on_canonical_commit(on_canonical_commit)
-                .with_persistence_save_mode(reth_provider::SaveBlocksMode::StateOnlyNoTrie)
+                .with_persistence_save_mode(persistence_save_mode)
                 .with_state_provider_override(state_override);
 
             // ── Launch ─────────────────────────────────────────────────────
-            let NodeHandle { node: _node, node_exit_future } = builder
+            let NodeHandle { node, node_exit_future } = builder
                 .with_types::<EthereumNode>()
                 .with_components(EthereumNode::components())
                 .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
                 .launch_with(DebugNodeLauncher::new(launcher))
                 .await?;
 
+            let plain_worker_handle = if let Some(rx) = plain_rx {
+                let provider_factory = node.provider.clone();
+                Some(
+                    std::thread::Builder::new()
+                        .name("mptdb-plain-materializer".to_string())
+                        .spawn(move || {
+                            while let Ok(task) = rx.recv() {
+                                let provider = provider_factory
+                                    .database_provider_rw()
+                                    .unwrap_or_else(|e| panic!("mptdb: open provider_rw failed: {e}"));
+                                match task {
+                                    PlainMaterializeTask::Rollback { to_block } => {
+                                        provider.remove_state_above(to_block).unwrap_or_else(|e| {
+                                            panic!(
+                                                "mptdb: async plain rollback failed (to block {to_block}): {e}"
+                                            )
+                                        });
+                                    }
+                                    PlainMaterializeTask::Apply { block_number, bundle } => {
+                                        let outcome = ExecutionOutcome::<EthReceipt>::new(
+                                            bundle,
+                                            Default::default(),
+                                            block_number,
+                                            Default::default(),
+                                        );
+                                        provider
+                                            .write_state(
+                                                &outcome,
+                                                revm_database::OriginalValuesKnown::Yes,
+                                                StateWriteConfig {
+                                                    // Receipts are persisted by save_blocks mode.
+                                                    write_receipts: false,
+                                                    // Keep account changesets so async rollback can unwind.
+                                                    write_account_changesets: true,
+                                                },
+                                            )
+                                            .unwrap_or_else(|e| {
+                                                panic!(
+                                                    "mptdb: async plain apply failed (block {block_number}): {e}"
+                                                )
+                                            });
+                                    }
+                                }
+                                provider.commit().unwrap_or_else(|e| {
+                                    panic!("mptdb: async plain commit failed: {e}")
+                                });
+                            }
+                        })
+                        .map_err(|e| eyre::eyre!("failed to spawn async plain worker: {e}"))?,
+                )
+            } else {
+                None
+            };
+
             info!(target: "reth::cli", "mptdb node launched");
-            node_exit_future.await
+            let exit = node_exit_future.await;
+            drop(plain_tx);
+            if let Some(handle) = plain_worker_handle {
+                let _ = handle.join();
+            }
+            exit
         },
     ) {
         eprintln!("Error: {err:?}");

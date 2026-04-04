@@ -5,7 +5,9 @@
 //! For each block:
 //! - **mptdb lane**: default EVM reads from MDBX directly; set
 //!   `MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS=1` to route reads through `MptDbStateProvider`. SC
-//!   commit (apply + WAL + state root) and MDBX PlainState write run in parallel.
+//!   commit (apply + WAL + state root) and MDBX PlainState write run in parallel. Set
+//!   `MPTDB_PROVIDER_BENCH_ASYNC_PLAIN_MATERIALIZATION=1` to defer MDBX plain-write waiting to
+//!   iteration end (wal-first style), so block hot-path does not wait per block.
 //! - **reth-mdbx lane**: EVM reads from MDBX, MDBX write + overlay_root_with_updates
 //!   + write_trie_updates + commit (full reth persistence path).
 //!
@@ -281,6 +283,11 @@ fn bench_parallel_mdbx_write() -> bool {
         Ok(v) if matches!(v.trim(), "0" | "false" | "False" | "FALSE") => false,
         _ => true,
     }
+}
+
+fn bench_async_plain_materialization() -> bool {
+    bench_flag("MPTDB_PROVIDER_BENCH_ASYNC_PLAIN_MATERIALIZATION") ||
+        bench_flag("MPTDB_ASYNC_PLAIN_MATERIALIZATION")
 }
 
 fn bench_flush_after_prepop() -> bool {
@@ -630,6 +637,7 @@ fn run_mptdb_bench(
         let enable_sc_profile = bench_sc_profile_enabled();
         let sync_prewarm_after_block = bench_sync_prewarm_after_block();
         let parallel_mdbx_write = bench_parallel_mdbx_write();
+        let async_plain_materialization = bench_async_plain_materialization();
         let mdbx_write_mode = bench_mdbx_write_mode();
         let sc_storage_trie_cache_capacity = bench_sc_storage_trie_cache_capacity();
         let sc_persisted_node_cache_capacity = bench_sc_persisted_node_cache_capacity();
@@ -673,6 +681,11 @@ fn run_mptdb_bench(
         let mut outcome_storage_slots_total: u64 = 0;
 
         for iter_idx in 0..iters {
+            let use_provider_reads_effective = if async_plain_materialization {
+                true
+            } else {
+                use_provider_reads
+            };
             let iter_start = Instant::now();
             let mut open_sc = Duration::ZERO;
             let mut pre_pop = Duration::ZERO;
@@ -793,12 +806,19 @@ fn run_mptdb_bench(
             // A/B mode (MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=0):
             // run MDBX write serially after SC commit to test contention impact.
             type JobOutcome = Arc<Outcome>;
+            if async_plain_materialization && !parallel_mdbx_write {
+                panic!(
+                    "MPTDB_PROVIDER_BENCH_ASYNC_PLAIN_MATERIALIZATION=1 requires \
+MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=1"
+                );
+            }
             let mut job_tx: Option<std::sync::mpsc::SyncSender<JobOutcome>> = None;
             let mut done_rx: Option<std::sync::mpsc::Receiver<()>> = None;
             let mut mdbx_worker: Option<std::thread::JoinHandle<()>> = None;
+            let mut pending_mdbx_jobs: usize = 0;
             if parallel_mdbx_write {
                 let (tx, job_rx) = std::sync::mpsc::sync_channel::<JobOutcome>(1);
-                let (done_tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+                let (done_tx, rx) = std::sync::mpsc::channel::<()>();
                 let factory = mdbx_factory.clone();
                 let write_mode = mdbx_write_mode;
                 let worker = std::thread::spawn(move || {
@@ -837,7 +857,7 @@ fn run_mptdb_bench(
             let exec_start = Instant::now();
             for (blk_idx, txs) in block_txs.iter().enumerate() {
                 let t_evm = Instant::now();
-                let bundle = if use_provider_reads {
+                let bundle = if use_provider_reads_effective {
                     let version = sc.lock().version().max(0);
                     let fallback: Arc<dyn StateProvider + Send + Sync> =
                         SyncProvider::new(mdbx_factory.latest().expect("mdbx latest"));
@@ -873,6 +893,7 @@ fn run_mptdb_bench(
                 outcome_storage_slots_phase += storage_slots;
                 if let Some(tx) = job_tx.as_ref() {
                     tx.send(Arc::clone(&outcome)).expect("send to mdbx worker");
+                    pending_mdbx_jobs = pending_mdbx_jobs.saturating_add(1);
                 }
 
                 // SC commit on main thread (uses rayon internally).
@@ -925,10 +946,15 @@ fn run_mptdb_bench(
                 }
                 sc_write_phase += t_sc.elapsed();
 
-                // In parallel mode, wait MDBX worker before next block's EVM read.
+                // In parallel mode, sync mode waits MDBX per block.
+                // Async mode defers waiting to iteration end to model WAL-first
+                // plain-state materialization outside block hot path.
                 // In serial mode, write MDBX after SC commit.
                 if let Some(rx) = done_rx.as_ref() {
-                    rx.recv().expect("mdbx done");
+                    if !async_plain_materialization {
+                        rx.recv().expect("mdbx done");
+                        pending_mdbx_jobs = pending_mdbx_jobs.saturating_sub(1);
+                    }
                 } else {
                     let rw = mdbx_factory.provider_rw().expect("mdbx rw");
                     match mdbx_write_mode {
@@ -979,6 +1005,13 @@ fn run_mptdb_bench(
             }
             exec_total += exec_start.elapsed();
 
+            if async_plain_materialization {
+                if let Some(rx) = done_rx.as_ref() {
+                    for _ in 0..pending_mdbx_jobs {
+                        rx.recv().expect("mdbx done (async drain)");
+                    }
+                }
+            }
             drop(job_tx); // signal MDBX worker to exit
             if let Some(worker) = mdbx_worker.take() {
                 worker.join().expect("mdbx worker");
@@ -1114,9 +1147,11 @@ fn run_mptdb_bench(
         );
         eprintln!("[{}] avg/iter(end-to-end): {:.2?}", label, wall_total / iters as u32);
         eprintln!(
-            "[{}] read_mode: provider_reads={} sc_prewarm={} sync_prewarm_after_block={} parallel_mdbx_write={} mdbx_write_mode={:?} sc_storage_cache={} sc_persisted_cache={} sc_cross_lag={}",
+            "[{}] read_mode: provider_reads(req={},effective={}) async_plain_materialization={} sc_prewarm={} sync_prewarm_after_block={} parallel_mdbx_write={} mdbx_write_mode={:?} sc_storage_cache={} sc_persisted_cache={} sc_cross_lag={}",
             label,
             use_provider_reads,
+            if async_plain_materialization { true } else { use_provider_reads },
+            async_plain_materialization,
             enable_sc_prewarm,
             sync_prewarm_after_block,
             parallel_mdbx_write,

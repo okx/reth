@@ -158,6 +158,12 @@ pub enum SaveBlocksMode {
     /// Used when another component (e.g. mptdb-sc) owns trie persistence and
     /// root calculation, and MDBX is kept for PlainState/read-path data.
     StateOnlyNoTrie,
+    /// Blocks + receipts only:
+    /// write block structure and receipts, but skip MDBX state/history/trie.
+    ///
+    /// Used by wal-first integrations that commit state root externally on the
+    /// critical path and materialize plain state asynchronously.
+    BlocksAndReceiptsOnly,
     /// Blocks only: write block structure (headers, txs, senders, indices).
     /// Receipts/state/trie are skipped - they may come later via separate calls.
     /// Used by `insert_block`.
@@ -168,6 +174,11 @@ impl SaveBlocksMode {
     /// Returns `true` if state/changset tables should be written.
     pub const fn with_state(self) -> bool {
         matches!(self, Self::Full | Self::StateOnlyNoTrie)
+    }
+
+    /// Returns `true` if receipts should be written.
+    pub const fn with_receipts(self) -> bool {
+        matches!(self, Self::Full | Self::StateOnlyNoTrie | Self::BlocksAndReceiptsOnly)
     }
 
     /// Returns `true` if hashed-state tables should be written.
@@ -403,7 +414,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         Ok(StaticFileWriteCtx {
             write_senders: EitherWriterDestination::senders(self).is_static_file() &&
                 self.prune_modes.sender_recovery.is_none_or(|m| !m.is_full()),
-            write_receipts: save_mode.with_state() &&
+            write_receipts: save_mode.with_receipts() &&
                 EitherWriter::receipts_destination(self).is_static_file(),
             write_account_changesets: save_mode.with_state() &&
                 EitherWriterDestination::account_changesets(self).is_static_file(),
@@ -439,6 +450,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
     /// Use [`SaveBlocksMode::Full`] for production (includes receipts, state, trie).
     /// Use [`SaveBlocksMode::StateOnlyNoTrie`] for external trie/root backends
     /// that keep MDBX PlainState but own trie persistence elsewhere.
+    /// Use [`SaveBlocksMode::BlocksAndReceiptsOnly`] for wal-first pipelines
+    /// that persist blocks/receipts inline and materialize plain state async.
     /// Use [`SaveBlocksMode::BlocksOnly`] for block structure only (used by `insert_block`).
     #[instrument(level = "debug", target = "providers::db", skip_all, fields(block_count = blocks.len()))]
     pub fn save_blocks(
@@ -578,6 +591,14 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                         self.write_hashed_state(&trie_data.hashed_state)?;
                         timings.write_hashed_state += start.elapsed();
                     }
+                } else if save_mode.with_receipts() && !sf_ctx.write_receipts {
+                    let start = Instant::now();
+                    self.write_receipts_for_blocks(
+                        recovered_block.number(),
+                        1,
+                        std::iter::once(&block.execution_outcome().receipts),
+                    )?;
+                    timings.write_state += start.elapsed();
                 }
             }
 
@@ -659,6 +680,102 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
 
             Ok(())
         })
+    }
+
+    /// Writes receipts without touching state tables.
+    fn write_receipts_for_blocks<'a, I>(
+        &self,
+        first_block: BlockNumber,
+        block_count: usize,
+        receipts_by_block: I,
+    ) -> ProviderResult<()>
+    where
+        I: Iterator<Item = &'a Vec<ReceiptTy<N>>>,
+    {
+        if block_count == 0 {
+            return Ok(());
+        }
+
+        let block_count = block_count as u64;
+        let last_block = first_block + (block_count - 1);
+        let block_range = first_block..=last_block;
+        let tip = self.last_block_number()?.max(last_block);
+
+        // Fetch the first transaction number for each block in the range.
+        let block_indices: Vec<_> = self
+            .block_body_indices_range(block_range)?
+            .into_iter()
+            .map(|b| b.first_tx_num)
+            .collect();
+
+        // Ensure all expected blocks are present.
+        if block_indices.len() < block_count as usize {
+            let missing_blocks = block_count - block_indices.len() as u64;
+            return Err(ProviderError::BlockBodyIndicesNotFound(
+                last_block.saturating_sub(missing_blocks - 1),
+            ));
+        }
+
+        let mut receipts_writer = EitherWriter::new_receipts(self, first_block)?;
+
+        let has_contract_log_filter = !self.prune_modes.receipts_log_filter.is_empty();
+        let contract_log_pruner = self.prune_modes.receipts_log_filter.group_by_block(tip, None)?;
+
+        // All receipts from the last 128 blocks are required for blockchain tree, even with
+        // [`PruneSegment::ContractLogs`].
+        //
+        // Receipts can only be skipped if we're dealing with legacy nodes that write them to
+        // Database, OR if receipts_in_static_files is enabled but no receipts exist in static
+        // files yet. Once receipts exist in static files, we must continue writing to maintain
+        // continuity and have no gaps.
+        let prunable_receipts = (EitherWriter::receipts_destination(self).is_database() ||
+            self.static_file_provider()
+                .get_highest_static_file_tx(StaticFileSegment::Receipts)
+                .is_none()) &&
+            PruneMode::Distance(self.minimum_pruning_distance).should_prune(first_block, tip);
+
+        // Prepare set of addresses which logs should not be pruned.
+        let mut allowed_addresses: HashSet<Address, _> = HashSet::new();
+        for (_, addresses) in contract_log_pruner.range(..first_block) {
+            allowed_addresses.extend(addresses.iter().copied());
+        }
+
+        for (idx, (receipts, first_tx_index)) in receipts_by_block.zip(block_indices).enumerate() {
+            let block_number = first_block + idx as u64;
+
+            // Increment block number for receipts static file writer.
+            receipts_writer.increment_block(block_number)?;
+
+            // Skip writing receipts if pruning configuration requires us to.
+            if prunable_receipts &&
+                self.prune_modes
+                    .receipts
+                    .is_some_and(|mode| mode.should_prune(block_number, tip))
+            {
+                continue
+            }
+
+            // If there are new addresses to retain after this block number, track them.
+            if let Some(new_addresses) = contract_log_pruner.get(&block_number) {
+                allowed_addresses.extend(new_addresses.iter().copied());
+            }
+
+            for (idx, receipt) in receipts.iter().enumerate() {
+                let receipt_idx = first_tx_index + idx as u64;
+                // Skip writing receipt if log filter is active and it does not have any logs to
+                // retain.
+                if prunable_receipts &&
+                    has_contract_log_filter &&
+                    !receipt.logs().iter().any(|log| allowed_addresses.contains(&log.address))
+                {
+                    continue
+                }
+
+                receipts_writer.append_receipt(receipt_idx, receipt)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Writes MDBX-only data for a block (indices, lookups, and senders if configured for MDBX).
@@ -2104,90 +2221,11 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         if !config.write_receipts {
             return Ok(());
         }
-
-        let block_count = execution_outcome.len() as u64;
-        let last_block = execution_outcome.last_block();
-        let block_range = first_block..=last_block;
-
-        let tip = self.last_block_number()?.max(last_block);
-
-        // Fetch the first transaction number for each block in the range
-        let block_indices: Vec<_> = self
-            .block_body_indices_range(block_range)?
-            .into_iter()
-            .map(|b| b.first_tx_num)
-            .collect();
-
-        // Ensure all expected blocks are present.
-        if block_indices.len() < block_count as usize {
-            let missing_blocks = block_count - block_indices.len() as u64;
-            return Err(ProviderError::BlockBodyIndicesNotFound(
-                last_block.saturating_sub(missing_blocks - 1),
-            ));
-        }
-
-        let mut receipts_writer = EitherWriter::new_receipts(self, first_block)?;
-
-        let has_contract_log_filter = !self.prune_modes.receipts_log_filter.is_empty();
-        let contract_log_pruner = self.prune_modes.receipts_log_filter.group_by_block(tip, None)?;
-
-        // All receipts from the last 128 blocks are required for blockchain tree, even with
-        // [`PruneSegment::ContractLogs`].
-        //
-        // Receipts can only be skipped if we're dealing with legacy nodes that write them to
-        // Database, OR if receipts_in_static_files is enabled but no receipts exist in static
-        // files yet. Once receipts exist in static files, we must continue writing to maintain
-        // continuity and have no gaps.
-        let prunable_receipts = (EitherWriter::receipts_destination(self).is_database() ||
-            self.static_file_provider()
-                .get_highest_static_file_tx(StaticFileSegment::Receipts)
-                .is_none()) &&
-            PruneMode::Distance(self.minimum_pruning_distance).should_prune(first_block, tip);
-
-        // Prepare set of addresses which logs should not be pruned.
-        let mut allowed_addresses: HashSet<Address, _> = HashSet::new();
-        for (_, addresses) in contract_log_pruner.range(..first_block) {
-            allowed_addresses.extend(addresses.iter().copied());
-        }
-
-        for (idx, (receipts, first_tx_index)) in
-            execution_outcome.receipts().zip(block_indices).enumerate()
-        {
-            let block_number = first_block + idx as u64;
-
-            // Increment block number for receipts static file writer
-            receipts_writer.increment_block(block_number)?;
-
-            // Skip writing receipts if pruning configuration requires us to.
-            if prunable_receipts &&
-                self.prune_modes
-                    .receipts
-                    .is_some_and(|mode| mode.should_prune(block_number, tip))
-            {
-                continue
-            }
-
-            // If there are new addresses to retain after this block number, track them
-            if let Some(new_addresses) = contract_log_pruner.get(&block_number) {
-                allowed_addresses.extend(new_addresses.iter().copied());
-            }
-
-            for (idx, receipt) in receipts.iter().enumerate() {
-                let receipt_idx = first_tx_index + idx as u64;
-                // Skip writing receipt if log filter is active and it does not have any logs to
-                // retain
-                if prunable_receipts &&
-                    has_contract_log_filter &&
-                    !receipt.logs().iter().any(|log| allowed_addresses.contains(&log.address))
-                {
-                    continue
-                }
-
-                receipts_writer.append_receipt(receipt_idx, receipt)?;
-            }
-        }
-
-        Ok(())
+        self.write_receipts_for_blocks(
+            first_block,
+            execution_outcome.len(),
+            execution_outcome.receipts(),
+        )
     }
 
     fn write_state_reverts(
