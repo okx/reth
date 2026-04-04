@@ -3,7 +3,7 @@
 //! EVM reads are served by reth's PlainState (MDBX) via `StateProviderOverride`.
 //! This writer only commits to SC (MPT state root) — SS writes are removed.
 
-use alloy_primitives::B256;
+use alloy_primitives::{map::HashMap as PrimitivesHashMap, Address, B256};
 use mptdb_common::error::MptDbError;
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
 use parking_lot::Mutex;
@@ -18,6 +18,8 @@ use revm_database::{
     OriginalValuesKnown,
 };
 use std::sync::Arc;
+
+const PREPOP_CHUNK_SIZE: usize = 10_000;
 
 fn map_err(e: MptDbError) -> ProviderError {
     ProviderError::Database(reth_storage_api::errors::db::DatabaseError::Other(e.to_string()))
@@ -40,9 +42,27 @@ impl<R> MptDbStateWriter<R> {
         bundle: &revm_database::BundleState,
         _block_number: u64,
     ) -> ProviderResult<()> {
+        let mut ordered_accounts: Vec<(Address, &revm_database::BundleAccount)> =
+            bundle.state.iter().map(|(addr, account)| (*addr, account)).collect();
+        ordered_accounts.sort_unstable_by_key(|(addr, _)| *addr);
+
         let mut sc = self.sc.lock();
-        sc.apply_bundle_state(bundle).map_err(map_err)?;
-        sc.commit().map_err(map_err)?;
+        for chunk in ordered_accounts.chunks(PREPOP_CHUNK_SIZE) {
+            let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+                PrimitivesHashMap::default();
+            for (addr, account) in chunk {
+                state.insert(*addr, (*account).clone());
+            }
+            let chunk_bundle = revm_database::BundleState {
+                state,
+                contracts: Default::default(),
+                reverts: Default::default(),
+                state_size: 0,
+                reverts_size: 0,
+            };
+            sc.apply_bundle_state(&chunk_bundle).map_err(map_err)?;
+            sc.commit().map_err(map_err)?;
+        }
         Ok(())
     }
 }

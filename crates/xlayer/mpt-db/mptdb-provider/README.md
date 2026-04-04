@@ -2,18 +2,20 @@
 
 This directory contains the reth integration adapter for mpt-db SC (state-commit engine).
 
-Goal: keep reth execution/read path stable on MDBX PlainState, while replacing reth MPT root/storage path with mptdb-sc.
+Goal: keep reth integration stable while moving root/proof to `mptdb-sc`, and progressively moving account/storage hot reads+writes to `mptdb-ss`.
 
 ## 1. Architecture in one page
 
 Plan C split:
 
 - EVM reads (`basic_account`, `storage`, `bytecode`, `block_hash`):
-  - from reth fallback provider (MDBX PlainState path)
+  - default: from reth fallback provider (MDBX PlainState path)
+  - optional primary-state mode: account/storage from `mptdb-ss`
 - State root + account/storage proof:
   - from `MptCommitStore` (SC)
 - State writes:
   - `MptDbStateWriter` writes SC
+  - optional mirror: `MptDbStateWriter` writes SS changeset per committed version
   - reth native writer still writes MDBX PlainState tables in its own pipeline
 
 Code entry points:
@@ -27,13 +29,17 @@ Code entry points:
 
 Read ownership:
 
-- `basic_account` / `storage` delegate to `fallback` provider
+- `basic_account` / `storage`:
+  - default: delegate to `fallback` provider
+  - primary-state mode: read SS first, fallback only when SS version is unavailable
 - `state_root` delegates to SC
 - `proof` / `storage_proof` / `storage_root` delegate to SC
 
 Write ownership:
 
 - `MptDbStateWriter::write_state` -> `sc.apply_bundle_state()` + `sc.commit()`
+- optional primary-state mirror: write SS `bundle_to_ss_changeset` at committed SC version
+- `remove_state_above` in primary-state mode also aligns SS `latest_version` to rollback target
 - MDBX writes (PlainState + history tables) are done by reth provider path
 - Target architecture: MDBX does **not** maintain trie tables in mptdb lane
   (`overlay_root_with_updates + write_trie_updates` is not in the hot path)
@@ -70,6 +76,10 @@ Two lanes:
 - `mptdb` lane:
   - EVM reads default: direct MDBX provider
   - optional provider-read mode: wrap reads through `MptDbStateProvider` (`MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS=1`)
+  - primary-state mode: `MPTDB_PROVIDER_BENCH_PRIMARY_STATE=1`
+    - forces provider-read path
+    - `basic_account/storage` prefer SS
+    - SC commit mirrors SS changeset write
   - per block: EVM -> parallel { SC `write_state` (apply+commit/root), MDBX `write_state+commit` } -> wait MDBX done
 - `reth_mdbx` lane:
   - EVM reads from MDBX
@@ -79,6 +89,8 @@ Key env knobs:
 
 - `MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle|end_to_end`
 - `MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS=1` (measure wrapper/lock overhead)
+- `MPTDB_PROVIDER_BENCH_PRIMARY_STATE=1` (enable SS primary-state read/write path in mptdb lane)
+- `MPTDB_PROVIDER_BENCH_PRIMARY_STATE_READS=0|1` (only when primary-state is on; `0` keeps SS mirror writes but routes EVM reads to fallback for diagnosis)
 - `MPTDB_PROVIDER_BENCH_ENABLE_SC_PREWARM=1`
 - `MPTDB_BENCH_LEGACY_SC=1` (force legacy non-wal-first path)
 - `MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=0|1` (diagnostic A/B: serial vs parallel MDBX writer)
@@ -160,7 +172,43 @@ Optional overrides for this workload only:
 Then run A/B toggles on top of the same workload:
 
 - `MPTDB_PROVIDER_BENCH_ENABLE_SC_PREWARM=0|1`
-- `MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS=0|1`
+- `MPTDB_PROVIDER_BENCH_SYNC_PREWARM_AFTER_BLOCK=0|1`
+
+Fixed integration-mode constraints (April 4, 2026 update):
+
+- `mptdb` lane EVM reads are fixed to MDBX plain-state reads.
+- `mptdb` lane MDBX writes are fixed to plain-state tables only
+  (`PlainAccountState` + `PlainStorageState`).
+- `MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS` and `MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE`
+  are no longer benchmark switches.
+
+## 5.4 B5.0 Peak Integration Stress (provider benchmark only)
+
+To stress integration-path throughput at a larger scale, `block_execution.rs` now includes:
+
+- benchmark group: `b5_0_peak_integration_10x`
+- lanes: `mptdb` and `reth_mdbx` (same provider integration lifecycle path)
+
+Run:
+
+```bash
+MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle \
+cargo bench --bench block_execution -p mptdb-provider -- "b5_0_peak_integration_10x"
+```
+
+B5.0-specific knobs:
+
+- `MPTDB_PROVIDER_BENCH_B5_0_PREPOP_ACCOUNTS` (default: `1_000_000`)
+- `MPTDB_PROVIDER_BENCH_B5_0_NUM_BLOCKS` (default: `100`)
+- `MPTDB_PROVIDER_BENCH_B5_0_TXS_PER_BLOCK` (default: `20_000`)
+- `MPTDB_PROVIDER_BENCH_B5_0_CONTRACT_RATIO` (default: `0.30`)
+- `MPTDB_PROVIDER_BENCH_B5_0_CONTRACT_KV_PER_CONTRACT` (default: `64`)
+- `MPTDB_PROVIDER_BENCH_B5_0_ACTIVE_CONTRACT_POOL_RATIO` (default: `0.10`)
+
+Notes:
+
+- This is an integration benchmark in `mptdb-provider`; it is not an SC-only micro-profile.
+- For quick smoke checks, reduce the B5.0 knobs and keep the same benchmark group name/filter.
 
 ## 6. API boundaries and current limitations
 
@@ -181,7 +229,11 @@ In `MptDbStateWriter`:
 ## 7. Test map
 
 - Acceptance tests: `src/tests.rs`
-  - validates Plan C separation: fallback serves reads, SC serves root/proof, writer updates SC
+  - validates default Plan C separation: fallback serves reads, SC serves root/proof, writer updates SC
+  - validates primary-state mode:
+    - SS account/storage reads when `prefer_ss_reads = true`
+    - fallback-on-unavailable-version behavior
+    - rollback updates SS `latest_version`
 - Integration benchmark: `benches/block_execution.rs`
 
 Related but different (SC micro profile, not full provider integration):
@@ -258,6 +310,67 @@ All numbers below are Criterion median converted to `ms/block` (reported `time` 
 
 | `USE_PROVIDER_READS` | `ENABLE_SC_PREWARM` | mptdb ms/block | reth_mdbx ms/block | mptdb/reth |
 |---|---|---:|---:|---:|
+
+## 9.3 Primary-state quick A/B (April 4, 2026)
+
+Scope:
+
+- Workload: `erc20_transfer_10pct_contract_pool`
+- Dataset: current bench defaults (`100000acc_20000tx_10blk_30c_32kv_pool3000`)
+- Mode: `MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle`
+- This is a short trace run (`WARMUP_SECS=1`, `MEASUREMENT_SECS=2`) and uses repeated
+  `avg/blk(block-lifecycle)` log lines (not final long Criterion convergence).
+
+Commands:
+
+```bash
+# mptdb baseline (provider reads on, primary-state off)
+MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle \
+MPTDB_PROVIDER_BENCH_WARMUP_SECS=1 \
+MPTDB_PROVIDER_BENCH_MEASUREMENT_SECS=2 \
+MPTDB_PROVIDER_BENCH_TRACE=1 \
+MPTDB_PROVIDER_BENCH_TRACE_ITERS=1 \
+MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS=1 \
+MPTDB_PROVIDER_BENCH_PRIMARY_STATE=0 \
+MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE=full \
+cargo bench --bench block_execution -p mptdb-provider -- "erc20_transfer_10pct_contract_pool/mptdb"
+
+# mptdb primary-state on
+MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle \
+MPTDB_PROVIDER_BENCH_WARMUP_SECS=1 \
+MPTDB_PROVIDER_BENCH_MEASUREMENT_SECS=2 \
+MPTDB_PROVIDER_BENCH_TRACE=1 \
+MPTDB_PROVIDER_BENCH_TRACE_ITERS=1 \
+MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS=1 \
+MPTDB_PROVIDER_BENCH_PRIMARY_STATE=1 \
+MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE=full \
+cargo bench --bench block_execution -p mptdb-provider -- "erc20_transfer_10pct_contract_pool/mptdb"
+
+# reth baseline
+MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle \
+MPTDB_PROVIDER_BENCH_WARMUP_SECS=1 \
+MPTDB_PROVIDER_BENCH_MEASUREMENT_SECS=2 \
+MPTDB_PROVIDER_BENCH_TRACE=1 \
+MPTDB_PROVIDER_BENCH_TRACE_ITERS=1 \
+cargo bench --bench block_execution -p mptdb-provider -- "erc20_transfer_10pct_contract_pool/reth_mdbx"
+```
+
+Observed summary (from trace averages):
+
+| lane | avg/blk | evm | write/commit wall |
+|---|---:|---:|---:|
+| `mptdb` (`provider_reads=1`, `primary_state=0`) | `~192 ms` | `~113 ms` | `~78 ms` |
+| `mptdb` (`provider_reads=1`, `primary_state=1`) | `~372 ms` | `~266 ms` | `~106 ms` |
+| `mptdb` (`provider_reads=1`, `primary_state=1`, `primary_state_reads=0`) | `~215 ms` | `~108 ms` | `~107 ms` |
+| `reth_mdbx` | `~245 ms` | `~106 ms` | `~138 ms` (`write + root+commit`) |
+
+Quick conclusion:
+
+- With current implementation, enabling `primary_state` with SS reads on makes the
+  mptdb lane significantly slower than both `mptdb primary_state=0` and `reth_mdbx`.
+- When `primary_state=1` but `primary_state_reads=0` (SS writes on, SS reads off),
+  performance returns close to baseline. This isolates the dominant regression to
+  the SS read path (not SC+SS write path).
 | 0 | 0 | 256.36 | 257.24 | 1.00x |
 | 0 | 1 | 250.59 | 251.34 | 1.00x |
 | 1 | 0 | 248.62 | 248.97 | 1.00x |
@@ -734,7 +847,7 @@ So for this benchmark, “align cache size with reth+mdbx” means:
 - `MPTDB_PROVIDER_BENCH_SC_PERSISTED_NODE_CACHE_CAPACITY`
 - `MPTDB_PROVIDER_BENCH_SC_CROSS_BLOCK_SPARSE_MAX_LAG`
 
-Benchmark defaults are increased to:
+At that time, benchmark defaults were increased to:
 
 - `sc_storage_cache = 200000` (was effectively `50000`)
 - `sc_persisted_cache = 2000000` (was `500000`)
@@ -750,7 +863,7 @@ Old cache profile (`50k / 500k / 8`) on same code:
 - `sc_write ~12.3-12.5s/iter`
 - `apply ~741-753ms/blk`
 
-New default cache profile (`200k / 2M / 64`):
+Then-default cache profile (`200k / 2M / 64`):
 
 - `sc_write ~10.3s/iter`
 - `apply ~532-537ms/blk`
@@ -760,6 +873,12 @@ Effect:
 - `sc_write` reduced by roughly `~17%`
 - `apply` reduced by roughly `~28-30%`
 - `sparse_factory` miss/t12 counters were largely unchanged, so the gain is mainly from cache-hit/memory locality improvements in SC internals.
+
+Current default profile (April 4, 2026) is reverted to:
+
+- `sc_storage_cache = 50000`
+- `sc_persisted_cache = 500000`
+- `sc_cross_lag = 8`
 
 ### 9.10 P1 Fix Landed: Cross-Missing Proof Gating (April 3, 2026)
 
@@ -1036,3 +1155,229 @@ Regression guard (SC micro-profiles):
   - per-block `~38.4ms`, commit `~9.4ms`
 - `profile_b4_8_integration_scale_mpt_only`: pass
   - per-block `~233.0ms`, commit `~84.3ms`
+
+### 9.16 Re-confirmed Root Cause of `write_wall` (April 3, 2026)
+
+Goal:
+
+- Explain why `block_lifecycle ~189ms/blk` can still look "too high" even after SC root optimization.
+- Pin down whether the remaining non-EVM time is SC root/commit or MDBX write overlap.
+
+Method:
+
+- Same decision workload: `erc20_transfer_10pct_contract_pool/mptdb`
+  (`100000acc_20000tx_10blk_30c_32kv_pool3000` in this run window).
+- Same measure mode: `MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle`.
+- Added fine-grained trace fields in benchmark:
+  - `write_breakdown(prepare, enqueue, mdbx_wait, mdbx_worker, mdbx_serial, residual)`
+  - and inside MDBX worker: `mdbx_worker(write, commit)`.
+- Ran A/B with:
+  - `MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE=full|plain|noop`
+  - `MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=1|0`.
+
+Key evidence (`full` mode, parallel MDBX write):
+
+- Representative ranges (10 blocks per iter):
+  - `evm ~1.12-1.15s/iter` (`~112-115ms/blk`)
+  - `sc_write ~0.63-0.65s/iter` (`~63-65ms/blk`)
+  - `write_wall ~0.76-0.79s/iter` (`~76-79ms/blk`)
+  - `mdbx_worker ~0.75-0.78s/iter`
+    - `write_state ~0.49-0.51s/iter`
+    - `commit ~0.25-0.27s/iter`
+  - `mdbx_wait ~0.12-0.15s/iter`
+  - `prepare ~1.2-1.3ms/iter`, `enqueue ~45-60us/iter`, `residual ~few us`
+- SC internal profile in the same runs:
+  - `total_commit ~18-19ms/blk`
+  - `account_root ~9-10ms/blk`
+
+Control (`noop` mode, parallel MDBX write):
+
+- `write_wall` collapses to almost `sc_write`:
+  - `sc_write ~0.61-0.64s/iter`
+  - `write_wall ~0.62-0.64s/iter`
+- MDBX side is near-zero:
+  - `mdbx_worker ~0.25ms-1.08ms/iter`
+  - `mdbx_wait ~30-50us/iter`
+
+Control (`full` mode, serial MDBX write):
+
+- `write_wall` jumps to `~1.33-1.37s/iter` (`~133-137ms/blk`), much worse than parallel mode.
+- This validates that parallel overlap is already helping; serial is not a fix.
+
+Interpretation:
+
+- In current provider benchmark semantics, `write_wall` includes waiting for MDBX side completion.
+- After P1.4, SC root path is no longer the dominant residual (`account_root ~9-10ms/blk`).
+- The dominant non-EVM remainder is MDBX full write path under overlap:
+  - first-order cost = `MDBX write_state + MDBX commit`
+  - not SC root hash.
+- This supersedes the earlier coarse inference in `9.7.3` that MDBX overlap was not first-order;
+  finer breakdown shows MDBX full-write is now the largest remaining block-lifecycle component.
+
+Practical conclusion for architecture discussion:
+
+- mptdb (SC/RocksDB) write+root path itself is fast in this workload window.
+- Remaining `write_wall` inflation mainly comes from dual-write integration shape
+  (SC write + MDBX full write in the same block lifecycle).
+- If provider moves PlainState ownership to mptdb (or minimizes MDBX full-write responsibility),
+  current `write_wall` ceiling can drop materially without touching EVM logic.
+
+### 9.17 Migration Plan: `mptdb-primary-state` (Draft, April 3, 2026)
+
+Objective:
+
+- Remove MDBX Full-write from hot block lifecycle while preserving correctness and reorg behavior.
+- Make mptdb the primary owner of state read/write on provider path.
+
+#### 9.17.1 Phase 1: `mptdb-primary-state` switch (functional cut-in)
+
+Proposed switches:
+
+- `MPTDB_PROVIDER_PRIMARY_STATE=0|1` (default `0`)
+  - `0`: current behavior (MDBX primary read/write + SC root path).
+  - `1`: provider read/write prefers mptdb primary state path.
+- `MPTDB_PROVIDER_MDBX_SHADOW_MODE=full|plain|noop` (default `full` in shadow stage)
+  - `full`: keep existing MDBX write for safe rollout.
+  - `plain`: minimal PlainState shadow write.
+  - `noop`: no MDBX state write (target mode after full cutover).
+
+Execution semantics when `PRIMARY_STATE=1`:
+
+- EVM reads prioritize mptdb state provider (MDBX only as fallback path during rollout).
+- Post-EVM state writes go to mptdb primary state tables and SC root pipeline first.
+- MDBX write lane is controlled only by `MDBX_SHADOW_MODE` (for migration safety, not correctness source).
+
+Acceptance criteria (Phase 1):
+
+- Existing integration tests all pass.
+- `erc20_transfer_10pct_contract_pool` keeps or improves current `block_lifecycle`.
+- No correctness mismatch in baseline sanity checks.
+
+#### 9.17.2 Phase 2: Shadow accounting window (dual-write + sampled reconciliation)
+
+Purpose:
+
+- Keep migration safety while reducing blast radius before final MDBX cut.
+
+Proposed reconciliation strategy:
+
+- Continue dual-write for a defined burn-in window.
+- Per block, sample and compare:
+  - touched accounts: nonce/balance/code_hash
+  - touched storage slots
+  - random global accounts/slots (fixed seed for reproducibility)
+- Keep strict mismatch logs with block number and key identity.
+
+Policy:
+
+- Benchmark/test mode: mismatch is hard-fail.
+- Runtime rollout mode: mismatch is hard-fail by default; optional temporary warn-only gate can exist behind explicit flag.
+
+Exit criteria (Phase 2):
+
+- Zero mismatch for agreed burn-in window.
+- Stable perf under `PRIMARY_STATE=1` with `MDBX_SHADOW_MODE=plain|noop` A/B.
+
+#### 9.17.3 Phase 3: Reorg/history parity via SC WAL
+
+Purpose:
+
+- Ensure removing MDBX primary state writes does not break rollback semantics.
+
+Required capabilities:
+
+- WAL carries enough pre-image/change data to reconstruct per-block revert.
+- Implement and validate rollback API semantics equivalent to current provider expectations.
+- Define retention/pruning policy so WAL rollback horizon is explicit and testable.
+
+Validation:
+
+- Deterministic reorg tests (single-step and multi-step rollback/replay).
+- History query parity checks for supported range.
+
+Exit criteria (Phase 3):
+
+- Reorg/history tests pass under `PRIMARY_STATE=1` and `MDBX_SHADOW_MODE=noop`.
+- No behavior regression against current provider contract.
+
+#### 9.17.4 Phase 4: Final cutover
+
+Actions:
+
+- Default `PRIMARY_STATE=1`.
+- Default `MDBX_SHADOW_MODE=noop`.
+- Remove/retire MDBX primary responsibility for `PlainAccountState` and `PlainStorageState`.
+
+Success metric (integration focus):
+
+- On `erc20_transfer_10pct_contract_pool`, `write_wall` should materially drop from current
+  dual-write baseline (where `mdbx_worker(write+commit)` is dominant).
+- Keep B4.6/B4.7/B4.8 profile guardrails green.
+
+Risk control:
+
+- Keep fast rollback path: one-flag fallback to legacy behavior for emergency release recovery.
+
+### 9.18 Decision Update: Shift Focus to WAL-first Plain Materialization (April 4, 2026)
+
+Latest observations on `erc20_transfer_10pct_contract_pool`:
+
+- With `PRIMARY_STATE=1` and `PRIMARY_STATE_READS=0`, mptdb lane is currently faster than
+  reth_mdbx in block lifecycle runs (same benchmark window/settings).
+- With `PRIMARY_STATE_READS=1`, total time regresses mainly in EVM read path (SS read mode),
+  while SC commit/root itself is not the dominant contributor.
+- In SC profile runs, `total_commit` is around `~18-19ms/blk` in this dataset window.
+
+Important measurement caveat:
+
+- `MPTDB_PROVIDER_BENCH_SC_PROFILE=1` currently uses
+  `apply_execution_outcome + commit_with_profile` in the bench loop.
+- That path is SC-focused and does not represent full end-to-end SS mirror write cost.
+- Use non-profile `write_state` runs for final block lifecycle decisions.
+
+Conclusion:
+
+- Further SS read-path tuning is currently lower ROI for integration throughput.
+- Primary optimization target should shift to reducing synchronized plain-state persistence cost
+  in the hot block lifecycle.
+
+Next implementation direction (P-next):
+
+1. Introduce WAL-first plain state journal in provider path:
+   - append per-block plain-state delta to sequential WAL first (durable boundary at block level).
+2. Async plain materialization worker:
+   - replay WAL deltas to MDBX plain tables out of hot path, in strict block-number order.
+3. Keep correctness guardrails during migration:
+   - maintain `applied_block` watermark for replay progress,
+   - sampled shadow reconciliation for touched accounts/slots,
+   - explicit rollback/reorg semantics driven by WAL horizon policy.
+4. Benchmark target:
+   - materially reduce `write_wall` under `PRIMARY_STATE=1`,
+   - keep B4.6/B4.7/B4.8 profile guardrails green.
+
+### 9.19 Prefill Alignment Finding (April 4, 2026)
+
+Current diagnosis:
+
+- The main instability is now in integration prefill path alignment, not in the normal
+  `erc20_transfer_10pct_contract_pool` write pipeline itself.
+- Under extreme B5.0 scale (`1,000,000` prefill accounts, `100` blocks), mptdb lane hit:
+  `update_storage_leaf ... attempted to update blind node ...` during SC `write_state`.
+- The same code path is stable on:
+  - `erc20_transfer_10pct_contract_pool` default size (`100k/20k/10blk`),
+  - reduced `erc20_transfer_10pct_contract_pool` (`20k/5k/5blk`),
+  - reduced B5.0 (`100k/20k/10blk`).
+
+Interpretation:
+
+- Integration benchmark prefill semantics are currently not fully aligned with the SC-side
+  prefill expectations under extreme scale.
+- The practical next step is to align provider prefill behavior with SC canonical prefill
+  semantics (chunking/order/reveal readiness/flush boundary), then re-run B5.0 and
+  `erc20_transfer_10pct_contract_pool` as the decision workload.
+
+Action item:
+
+- Treat prefill alignment as P0 before further throughput tuning conclusions.
+- Only compare mptdb vs reth_mdbx after prefill alignment is fixed and B5.0 no longer
+  triggers blind-node updates.

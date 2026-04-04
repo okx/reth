@@ -70,6 +70,13 @@ const DEFAULT_MEASUREMENT_SECS: u64 = 120;
 const DEFAULT_CONTRACT_RATIO: f64 = 0.30;
 const DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 32;
 const ERC20_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
+const B5_0_DEFAULT_PRE_POP_ACCOUNTS: usize = 1_000_000;
+const B5_0_DEFAULT_NUM_BLOCKS: usize = 100;
+const B5_0_DEFAULT_TXS_PER_BLOCK: usize = 20_000;
+const B5_0_DEFAULT_CONTRACT_RATIO: f64 = 0.30;
+const B5_0_DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 64;
+const B5_0_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
+const PREPOP_CHUNK_SIZE: usize = 10_000;
 const DEFAULT_SC_STORAGE_TRIE_CACHE_CAPACITY: usize = 200_000;
 const DEFAULT_SC_PERSISTED_NODE_CACHE_CAPACITY: usize = 2_000_000;
 const DEFAULT_SC_CROSS_BLOCK_SPARSE_MAX_LAG: i64 = 64;
@@ -114,6 +121,10 @@ fn contract_kv_per_contract() -> usize {
         .unwrap_or(DEFAULT_CONTRACT_KV_PER_CONTRACT)
 }
 
+fn bench_parse_f64(name: &str) -> Option<f64> {
+    std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok())
+}
+
 fn bench_parse_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0)
 }
@@ -135,6 +146,37 @@ fn bench_sc_persisted_node_cache_capacity() -> usize {
 fn bench_sc_cross_block_sparse_max_lag() -> i64 {
     bench_parse_i64("MPTDB_PROVIDER_BENCH_SC_CROSS_BLOCK_SPARSE_MAX_LAG")
         .unwrap_or(DEFAULT_SC_CROSS_BLOCK_SPARSE_MAX_LAG)
+}
+
+fn b5_0_pre_pop_accounts() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_0_PREPOP_ACCOUNTS")
+        .unwrap_or(B5_0_DEFAULT_PRE_POP_ACCOUNTS)
+}
+
+fn b5_0_num_blocks() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_0_NUM_BLOCKS").unwrap_or(B5_0_DEFAULT_NUM_BLOCKS)
+}
+
+fn b5_0_txs_per_block() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_0_TXS_PER_BLOCK")
+        .unwrap_or(B5_0_DEFAULT_TXS_PER_BLOCK)
+}
+
+fn b5_0_contract_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B5_0_CONTRACT_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B5_0_DEFAULT_CONTRACT_RATIO)
+}
+
+fn b5_0_contract_kv_per_contract() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_0_CONTRACT_KV_PER_CONTRACT")
+        .unwrap_or(B5_0_DEFAULT_CONTRACT_KV_PER_CONTRACT)
+}
+
+fn b5_0_active_contract_pool_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B5_0_ACTIVE_CONTRACT_POOL_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B5_0_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO)
 }
 
 fn bench_sample_size() -> usize {
@@ -369,6 +411,49 @@ fn cache_to_bundle(cache: &InMemoryCache) -> BundleState {
     BundleState { state, contracts, reverts: Default::default(), state_size: 0, reverts_size: 0 }
 }
 
+fn cache_to_bundle_chunk(cache: &InMemoryCache, addresses: &[Address]) -> BundleState {
+    use alloy_primitives::map::HashMap as PrimitivesHashMap;
+    use revm_database::{states::StorageSlot, AccountStatus, StorageWithOriginalValues};
+
+    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
+        PrimitivesHashMap::default();
+    let mut contracts: PrimitivesHashMap<B256, revm::bytecode::Bytecode> =
+        PrimitivesHashMap::default();
+
+    for &addr in addresses {
+        let Some(info) = cache.accounts.get(&addr) else { continue };
+        let mut storage = StorageWithOriginalValues::default();
+        if let Some(slots) = cache.storage.get(&addr) {
+            for (&slot_key, &value) in slots {
+                let slot_b256 = B256::from(slot_key.to_be_bytes::<32>());
+                storage.insert(slot_b256.into(), StorageSlot::new_changed(U256::ZERO, value));
+            }
+        }
+        if info.code_hash != KECCAK_EMPTY {
+            if let Some(code) = cache.code_by_hash.get(&info.code_hash) {
+                contracts.insert(info.code_hash, code.clone());
+            }
+        }
+        state.insert(
+            addr,
+            revm_database::BundleAccount {
+                info: Some(info.clone()),
+                original_info: None,
+                status: AccountStatus::Changed,
+                storage,
+            },
+        );
+    }
+
+    BundleState { state, contracts, reverts: Default::default(), state_size: 0, reverts_size: 0 }
+}
+
+fn sorted_prefill_addresses(cache: &InMemoryCache) -> Vec<Address> {
+    let mut addrs: Vec<Address> = cache.accounts.keys().copied().collect();
+    addrs.sort_unstable();
+    addrs
+}
+
 // ── EVM execution ─────────────────────────────────────────────────────────────
 
 fn execute_block_evm(
@@ -406,9 +491,26 @@ struct PrefillDataset {
 }
 
 fn setup_mixed_state(cache: &mut InMemoryCache, rng: &mut StdRng) -> PrefillDataset {
-    let total = pre_pop_accounts();
-    let min_eoa = txs_per_block().max(1).min(total);
-    let requested_contracts = ((total as f64) * contract_ratio()).round() as usize;
+    setup_mixed_state_with_config(
+        cache,
+        rng,
+        pre_pop_accounts(),
+        txs_per_block(),
+        contract_ratio(),
+        contract_kv_per_contract(),
+    )
+}
+
+fn setup_mixed_state_with_config(
+    cache: &mut InMemoryCache,
+    rng: &mut StdRng,
+    total: usize,
+    min_eoa_target: usize,
+    contract_ratio: f64,
+    kv_per_contract_target: usize,
+) -> PrefillDataset {
+    let min_eoa = min_eoa_target.max(1).min(total);
+    let requested_contracts = ((total as f64) * contract_ratio).round() as usize;
     let max_contracts = total.saturating_sub(min_eoa);
     let contract_count = requested_contracts.min(max_contracts);
     let eoa_count = total.saturating_sub(contract_count);
@@ -438,7 +540,7 @@ fn setup_mixed_state(cache: &mut InMemoryCache, rng: &mut StdRng) -> PrefillData
 
     // Populate contract storage as ERC20-like balance mapping:
     // key = keccak256(abi.encode(holder, 0)).
-    let kv_per_contract = contract_kv_per_contract().min(eoa_addresses.len().max(1));
+    let kv_per_contract = kv_per_contract_target.min(eoa_addresses.len().max(1));
     for (i, &contract) in contract_addresses.iter().enumerate() {
         let slots = cache.storage.entry(contract).or_default();
         for j in 0..kv_per_contract {
@@ -655,19 +757,22 @@ fn run_mptdb_bench(
             let mdbx_factory = create_test_provider_factory();
 
             let genesis = cache_to_bundle(cache);
+            let prefill_addresses = sorted_prefill_addresses(cache);
             let t = Instant::now();
-            // Genesis → MDBX (PlainState + trie for initial root)
-            {
+            // Genesis → MDBX (chunked prefill, aligned with B4.x-style prefill semantics)
+            for chunk in prefill_addresses.chunks(PREPOP_CHUNK_SIZE) {
                 let provider = mdbx_factory.provider_rw().expect("genesis rw");
+                let chunk_bundle = cache_to_bundle_chunk(cache, chunk);
+                let chunk_outcome = make_outcome(chunk_bundle, 0);
                 provider
                     .write_state(
-                        &make_outcome(genesis.clone(), 0),
+                        &chunk_outcome,
                         OriginalValuesKnown::Yes,
                         bench_state_write_config(),
                     )
                     .expect("genesis mdbx write_state");
                 let hashed = HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(
-                    genesis.state(),
+                    chunk_outcome.state().state(),
                 );
                 let (_, trie_updates) = reth_trie::StateRoot::overlay_root_with_updates(
                     provider.tx_ref(),
@@ -1109,28 +1214,32 @@ fn run_reth_mdbx_bench(
             setup += t.elapsed();
 
             // Pre-populate genesis state + compute genesis trie root
-            let genesis_bundle = cache_to_bundle(cache);
+            let prefill_addresses = sorted_prefill_addresses(cache);
             {
                 let t = Instant::now();
-                let provider = factory.provider_rw().expect("provider_rw");
-                provider
-                    .write_state(
-                        &make_outcome(genesis_bundle.clone(), 0),
-                        OriginalValuesKnown::Yes,
-                        bench_state_write_config(),
+                for chunk in prefill_addresses.chunks(PREPOP_CHUNK_SIZE) {
+                    let provider = factory.provider_rw().expect("provider_rw");
+                    let chunk_bundle = cache_to_bundle_chunk(cache, chunk);
+                    let chunk_outcome = make_outcome(chunk_bundle, 0);
+                    provider
+                        .write_state(
+                            &chunk_outcome,
+                            OriginalValuesKnown::Yes,
+                            bench_state_write_config(),
+                        )
+                        .expect("genesis write_state");
+                    // Engine mode: compute state root using DatabaseStateRoot on MDBX tx
+                    let hashed = HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(
+                        chunk_outcome.state().state.par_iter(),
+                    );
+                    let (_root, trie_updates) = reth_trie::StateRoot::overlay_root_with_updates(
+                        provider.tx_ref(),
+                        &hashed.into_sorted(),
                     )
-                    .expect("genesis write_state");
-                // Engine mode: compute state root using DatabaseStateRoot on MDBX tx
-                let hashed = HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(
-                    genesis_bundle.state.par_iter(),
-                );
-                let (_root, trie_updates) = reth_trie::StateRoot::overlay_root_with_updates(
-                    provider.tx_ref(),
-                    &hashed.into_sorted(),
-                )
-                .expect("genesis state_root");
-                provider.write_trie_updates(trie_updates).expect("trie_updates");
-                provider.commit().expect("genesis commit");
+                    .expect("genesis state_root");
+                    provider.write_trie_updates(trie_updates).expect("trie_updates");
+                    provider.commit().expect("genesis commit");
+                }
                 genesis += t.elapsed();
             }
 
@@ -1361,11 +1470,17 @@ fn generate_erc20_block_txs(
 }
 
 fn select_active_erc20_contracts(contract_addresses: &[Address]) -> Vec<Address> {
+    select_active_erc20_contracts_with_ratio(contract_addresses, ERC20_ACTIVE_CONTRACT_POOL_RATIO)
+}
+
+fn select_active_erc20_contracts_with_ratio(
+    contract_addresses: &[Address],
+    ratio: f64,
+) -> Vec<Address> {
     if contract_addresses.is_empty() {
         return vec![FALLBACK_ERC20_CONTRACT];
     }
-    let active_count =
-        ((contract_addresses.len() as f64) * ERC20_ACTIVE_CONTRACT_POOL_RATIO).ceil() as usize;
+    let active_count = ((contract_addresses.len() as f64) * ratio.clamp(0.0, 1.0)).ceil() as usize;
     let active_count = active_count.max(1).min(contract_addresses.len());
     contract_addresses[..active_count].to_vec()
 }
@@ -1376,10 +1491,26 @@ fn generate_erc20_block_txs_contract_pool(
     cache: &InMemoryCache,
     rng: &mut StdRng,
 ) -> Vec<Vec<TxEnv>> {
-    let blocks_n = num_blocks();
-    let txs_n = txs_per_block();
-    let kv_per_contract = contract_kv_per_contract();
+    generate_erc20_block_txs_contract_pool_with_config(
+        eoa_addresses,
+        contract_pool,
+        cache,
+        rng,
+        num_blocks(),
+        txs_per_block(),
+        contract_kv_per_contract(),
+    )
+}
 
+fn generate_erc20_block_txs_contract_pool_with_config(
+    eoa_addresses: &[Address],
+    contract_pool: &[Address],
+    cache: &InMemoryCache,
+    rng: &mut StdRng,
+    blocks_n: usize,
+    txs_n: usize,
+    kv_per_contract: usize,
+) -> Vec<Vec<TxEnv>> {
     let mut nonces: HashMap<Address, u64> = eoa_addresses
         .iter()
         .map(|&addr| (addr, cache.accounts.get(&addr).map(|i| i.nonce).unwrap_or(0)))
@@ -1503,10 +1634,68 @@ fn bench_erc20_transfer_10pct_contract_pool(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_b5_0_peak_integration_10x(c: &mut Criterion) {
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut cache = InMemoryCache::new();
+
+    let pre_pop = b5_0_pre_pop_accounts();
+    let blocks = b5_0_num_blocks();
+    let txs = b5_0_txs_per_block();
+    let c_ratio = b5_0_contract_ratio();
+    let kv_per_contract = b5_0_contract_kv_per_contract();
+    let active_pool_ratio = b5_0_active_contract_pool_ratio();
+
+    let dataset =
+        setup_mixed_state_with_config(&mut cache, &mut rng, pre_pop, txs, c_ratio, kv_per_contract);
+    let contract_pool =
+        select_active_erc20_contracts_with_ratio(&dataset.contract_addresses, active_pool_ratio);
+    if dataset.contract_addresses.is_empty() {
+        let _ = setup_erc20(&mut cache, &contract_pool, &dataset.eoa_addresses);
+    }
+    let block_txs = generate_erc20_block_txs_contract_pool_with_config(
+        &dataset.eoa_addresses,
+        &contract_pool,
+        &cache,
+        &mut rng,
+        blocks,
+        txs,
+        kv_per_contract,
+    );
+
+    let id = format!(
+        "{}acc_{}tx_{}blk_{}c_{}kv_pool{}",
+        pre_pop,
+        txs,
+        blocks,
+        (c_ratio * 100.0).round() as u32,
+        kv_per_contract,
+        contract_pool.len()
+    );
+    let sample_size = bench_sample_size();
+    let warmup_secs = bench_warmup_secs();
+    let measurement_secs = bench_measurement_secs();
+
+    let mut group = c.benchmark_group("b5_0_peak_integration_10x");
+    group.sample_size(sample_size);
+    group.warm_up_time(std::time::Duration::from_secs(warmup_secs));
+    group.measurement_time(std::time::Duration::from_secs(measurement_secs));
+
+    group.bench_with_input(BenchmarkId::new("mptdb", &id), &(), |b, _| {
+        run_mptdb_bench(b, &cache, &block_txs, "mptdb/b5_0_pool10x");
+    });
+
+    group.bench_with_input(BenchmarkId::new("reth_mdbx", &id), &(), |b, _| {
+        run_reth_mdbx_bench(b, &cache, &block_txs, "reth_mdbx/b5_0_pool10x");
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_eth_transfer,
     bench_erc20_transfer,
-    bench_erc20_transfer_10pct_contract_pool
+    bench_erc20_transfer_10pct_contract_pool,
+    bench_b5_0_peak_integration_10x
 );
 criterion_main!(benches);
