@@ -25,7 +25,7 @@ use reth_trie_common::{
 };
 use reth_trie_sparse::{
     provider::{RevealedNode, TrieNodeProvider, TrieNodeProviderFactory},
-    SerialSparseTrie, SparseNode, SparseStateTrie,
+    SerialSparseTrie, SparseNode, SparseStateTrie, SparseTrie,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -1522,6 +1522,7 @@ pub(crate) fn apply_all_storage_changes_sparse(
     let mut accounts_no_reveal_shortcut = 0usize;
     let mut accounts_empty_reveal = 0usize;
     let mut pre_extract_skip_wiped_or_empty = 0usize;
+    let mut pre_extract_skip_no_reveal = 0usize;
     let mut pre_extract_skip_reused = 0usize;
     let mut pre_extract_skip_prebuilt = 0usize;
     let mut pre_extract_skip_missing_segment = 0usize;
@@ -1567,6 +1568,13 @@ pub(crate) fn apply_all_storage_changes_sparse(
     for (dirty_idx, dirty) in dirty_accounts.iter().enumerate() {
         if dirty.storage_wiped || dirty.storage_changes.is_empty() {
             pre_extract_skip_wiped_or_empty += 1;
+            continue;
+        }
+        // Cross-block fast-path account: factory has already proven that all
+        // missing slots can be inserted on revealed in-memory paths, so Step-1
+        // storage reveal will skip this account.  Avoid any pre-extract work.
+        if provider_factory.no_reveal_accounts.contains(&dirty.hashed_address) {
+            pre_extract_skip_no_reveal += 1;
             continue;
         }
         if skip_already_revealed_storage && trie.storage_trie_ref(&dirty.hashed_address).is_some() {
@@ -1681,6 +1689,10 @@ pub(crate) fn apply_all_storage_changes_sparse(
         if storage_change_len == 0 {
             continue;
         }
+        if provider_factory.no_reveal_accounts.contains(&hashed_addr) {
+            accounts_no_reveal_shortcut += 1;
+            continue;
+        }
         if skip_already_revealed_storage && trie.storage_trie_ref(&hashed_addr).is_some() {
             let all_slots_already_revealed = dirty
                 .storage_changes
@@ -1689,10 +1701,6 @@ pub(crate) fn apply_all_storage_changes_sparse(
             if all_slots_already_revealed {
                 continue;
             }
-        }
-        if provider_factory.no_reveal_accounts.contains(&hashed_addr) {
-            accounts_no_reveal_shortcut += 1;
-            continue;
         }
         if let Some(proof) = pre_extracted_segment_proofs.remove(&hashed_addr) {
             accounts_segment_reveal += 1;
@@ -1800,46 +1808,104 @@ pub(crate) fn apply_all_storage_changes_sparse(
         }
     }
 
-    // ── Per-account loop ──────────────────────────────────────────────────────
-    for dirty in dirty_accounts {
+    // ── Step 2: apply storage changes ────────────────────────────────────────
+    //
+    // Storage tries are account-isolated. Take touched tries out, apply slot
+    // mutations per-account (parallel for larger batches), then insert back.
+    let mut storage_apply_indices: Vec<usize> = Vec::with_capacity(dirty_accounts.len());
+    for (dirty_idx, dirty) in dirty_accounts.iter().enumerate() {
         let hashed_addr = dirty.hashed_address;
         storage_change_total += dirty.storage_changes.len();
-        // ── Step 2: apply storage changes ────────────────────────────────────
-        let storage_apply_start = trace_enabled.then(std::time::Instant::now);
-        for change in &dirty.storage_changes {
-            if change.value.is_zero() {
-                storage_delete_ops += 1;
-                trie.remove_storage_leaf(hashed_addr, &change.slot_key, provider_factory).map_err(
-                    |e| {
-                        MptDbError::Other(format!(
-                            "remove_storage_leaf {hashed_addr}/{:?}: {e}",
-                            change.slot_key
-                        ))
-                    },
-                )?;
-            } else {
-                storage_update_ops += 1;
-                let encoded = change.encoded_value.clone().unwrap_or_default();
-                trie.update_storage_leaf(
-                    hashed_addr,
-                    change.slot_key.clone(),
-                    encoded,
-                    provider_factory,
-                )
-                .map_err(|e| {
-                    MptDbError::Other(format!(
-                        "update_storage_leaf {hashed_addr}/{:?}: {e}",
-                        change.slot_key
-                    ))
-                })?;
-            }
-        }
-        if let Some(start) = storage_apply_start {
-            t_storage_updates += start.elapsed();
-        }
         if dirty.storage_wiped || !dirty.storage_changes.is_empty() {
             storage_root_accounts.push(hashed_addr);
         }
+        if !dirty.storage_changes.is_empty() {
+            storage_apply_indices.push(dirty_idx);
+        }
+    }
+
+    let storage_apply_start = trace_enabled.then(std::time::Instant::now);
+    if !storage_apply_indices.is_empty() {
+        let mut storage_apply_tasks: Vec<(usize, B256, SparseTrie<SerialSparseTrie>)> =
+            Vec::with_capacity(storage_apply_indices.len());
+        for dirty_idx in storage_apply_indices {
+            let dirty = &dirty_accounts[dirty_idx];
+            let hashed_addr = dirty.hashed_address;
+            let storage_trie = trie.take_storage_trie(&hashed_addr).ok_or_else(|| {
+                MptDbError::Other(format!(
+                    "storage trie missing for account {hashed_addr} before Step-2 apply"
+                ))
+            })?;
+            storage_apply_tasks.push((dirty_idx, hashed_addr, storage_trie));
+        }
+
+        let process_one = |(dirty_idx, hashed_addr, mut storage_trie): (
+            usize,
+            B256,
+            SparseTrie<SerialSparseTrie>,
+        )| {
+            let apply_result: MptResult<(usize, usize)> = (|| {
+                let mut local_storage_update_ops = 0usize;
+                let mut local_storage_delete_ops = 0usize;
+                let dirty = &dirty_accounts[dirty_idx];
+                let storage_provider = provider_factory.storage_node_provider(hashed_addr);
+                for change in &dirty.storage_changes {
+                    if change.value.is_zero() {
+                        local_storage_delete_ops += 1;
+                        storage_trie.remove_leaf(&change.slot_key, &storage_provider).map_err(
+                            |e| {
+                                MptDbError::Other(format!(
+                                    "remove_storage_leaf {hashed_addr}/{:?}: {e}",
+                                    change.slot_key
+                                ))
+                            },
+                        )?;
+                    } else {
+                        local_storage_update_ops += 1;
+                        let encoded = change.encoded_value.clone().unwrap_or_default();
+                        storage_trie
+                            .update_leaf(change.slot_key.clone(), encoded, &storage_provider)
+                            .map_err(|e| {
+                                MptDbError::Other(format!(
+                                    "update_storage_leaf {hashed_addr}/{:?}: {e}",
+                                    change.slot_key
+                                ))
+                            })?;
+                    }
+                }
+                Ok((local_storage_update_ops, local_storage_delete_ops))
+            })();
+            (dirty_idx, hashed_addr, storage_trie, apply_result)
+        };
+
+        let processed: Vec<(usize, B256, SparseTrie<SerialSparseTrie>, MptResult<(usize, usize)>)> =
+            if storage_apply_tasks.len() >= 64 {
+                storage_apply_tasks.into_par_iter().map(process_one).collect()
+            } else {
+                storage_apply_tasks.into_iter().map(process_one).collect()
+            };
+
+        let mut apply_err: Option<MptDbError> = None;
+        for (_dirty_idx, hashed_addr, storage_trie, apply_result) in processed {
+            trie.insert_storage_trie(hashed_addr, storage_trie);
+            match apply_result {
+                Ok((local_storage_update_ops, local_storage_delete_ops)) => {
+                    storage_update_ops += local_storage_update_ops;
+                    storage_delete_ops += local_storage_delete_ops;
+                }
+                Err(err) => {
+                    if apply_err.is_none() {
+                        apply_err = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = apply_err {
+            return Err(err);
+        }
+    }
+    if let Some(start) = storage_apply_start {
+        t_storage_updates += start.elapsed();
     }
 
     let storage_root_compute_start = trace_enabled.then(std::time::Instant::now);
@@ -1925,9 +1991,10 @@ pub(crate) fn apply_all_storage_changes_sparse(
         );
         if trace_verbose {
             eprintln!(
-                "[mptsparse:detail] pre_extract(candidates={},skip_wiped_or_empty={},skip_reused={},skip_prebuilt={},skip_missing_seg={},plan={:.1}ms,exec={:.1}ms) step1(plan={:.1}ms,reveal={:.1}ms,wipe={:.1}ms,seg_pre_extracted={},seg_reader={},prebuilt={},no_reveal={},known_empty={},wiped={}) step2(storage_updates={},storage_deletes={},root_accounts={}) step3(account_updates={},account_remove_empty={},account_remove_deleted={})",
+                "[mptsparse:detail] pre_extract(candidates={},skip_wiped_or_empty={},skip_no_reveal={},skip_reused={},skip_prebuilt={},skip_missing_seg={},plan={:.1}ms,exec={:.1}ms) step1(plan={:.1}ms,reveal={:.1}ms,wipe={:.1}ms,seg_pre_extracted={},seg_reader={},prebuilt={},no_reveal={},known_empty={},wiped={}) step2(storage_updates={},storage_deletes={},root_accounts={}) step3(account_updates={},account_remove_empty={},account_remove_deleted={})",
                 segment_extract_candidate_count,
                 pre_extract_skip_wiped_or_empty,
+                pre_extract_skip_no_reveal,
                 pre_extract_skip_reused,
                 pre_extract_skip_prebuilt,
                 pre_extract_skip_missing_segment,

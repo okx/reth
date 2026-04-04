@@ -4884,6 +4884,10 @@ impl MptCommitStore {
                 stats.cross_missing_slots += missing_count as u64;
                 stats.cross_missing_proof_slots += proof_keys.len() as u64;
                 if missing_count == 0 {
+                    // All touched slots are already revealed in the reused trie.
+                    // Mark as no-reveal so sparse_apply Step-1 can short-circuit
+                    // before scanning per-slot revealed state again.
+                    factory.no_reveal_accounts.insert(dirty.hashed_address);
                     continue;
                 }
                 if proof_keys.is_empty() {
@@ -6242,7 +6246,7 @@ impl MptCommitStore {
             // Empty bundle (no pending sparse state) or non-sparse path.
             // Compute root from the working account trie without collecting blobs.
             let (root, cow) = account_trie
-                .root_hash_only_parallel_account(&self.persisted)
+                .root_hash_only_parallel(&self.persisted)
                 .map_err(|err| MptDbError::Other(format!("account trie root hash: {err}")))?;
             (root, Vec::<(B256, Vec<u8>)>::new(), cow)
         } else {

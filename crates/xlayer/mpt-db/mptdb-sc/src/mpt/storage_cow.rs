@@ -709,12 +709,23 @@ impl StorageTrieCow {
         Ok((root, blobs, StorageTrieCow::from_tree(tree)))
     }
 
-    /// Parallel variant — delegates to serial.
+    /// Parallel variant of [`Self::root_hash_and_dirty_blobs`].
+    ///
+    /// For sufficiently large materialized tries we route through
+    /// `MptTree::root_hash_and_dirty_blobs_parallel` to parallelize wide frontier
+    /// hashing + dirty blob collection. For small tries we keep serial execution
+    /// to avoid parallel overhead.
     pub fn root_hash_and_dirty_blobs_parallel(
         self,
         store: &PersistedTrieStore,
     ) -> Result<(B256, Vec<(alloy_primitives::B256, Vec<u8>)>, StorageTrieCow)> {
-        self.root_hash_and_dirty_blobs(store)
+        let mut tree = self.into_materialized_tree(store)?;
+        let (root, blobs) = if tree.arena_len() >= Self::ROOT_HASH_ONLY_PARALLEL_MIN_ARENA_NODES {
+            tree.root_hash_and_dirty_blobs_parallel(&ParallelismThresholds::default())
+        } else {
+            tree.root_hash_and_dirty_blobs()
+        };
+        Ok((root, blobs, StorageTrieCow::from_tree(tree)))
     }
 
     pub fn into_overlay_materialized(

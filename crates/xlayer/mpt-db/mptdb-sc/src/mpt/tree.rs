@@ -577,9 +577,9 @@ impl MptTree {
         };
 
         let frontier_width = self.parallel_frontier_width();
-        if !self.arena.is_dirty(root_idx) ||
-            !thresholds.should_parallelize_account_frontier(frontier_width)
-        {
+        let root_dirty = self.arena.is_dirty(root_idx);
+        let should_parallel = thresholds.should_parallelize_account_frontier(frontier_width);
+        if !root_dirty || !should_parallel {
             return self.root_hash_and_dirty_blobs();
         }
 

@@ -5,9 +5,10 @@
 //! For each block:
 //! - **mptdb lane**: default EVM reads from MDBX directly; set
 //!   `MPTDB_PROVIDER_BENCH_USE_PROVIDER_READS=1` to route reads through `MptDbStateProvider`. SC
-//!   commit (apply + WAL + state root) and MDBX PlainState write run in parallel. Set
-//!   `MPTDB_PROVIDER_BENCH_ASYNC_PLAIN_MATERIALIZATION=1` to defer MDBX plain-write waiting to
-//!   iteration end (wal-first style), so block hot-path does not wait per block.
+//!   commit (apply + WAL + state root) and MDBX PlainState write run in parallel. Set By default
+//!   this benchmark enables async plain materialization (wal-first style), so block hot-path does
+//!   not wait MDBX plain writes per block. Set `MPTDB_PROVIDER_BENCH_ASYNC_PLAIN_MATERIALIZATION=0`
+//!   to disable for A/B comparison.
 //! - **reth-mdbx lane**: EVM reads from MDBX, MDBX write + overlay_root_with_updates
 //!   + write_trie_updates + commit (full reth persistence path).
 //!
@@ -82,6 +83,7 @@ const PREPOP_CHUNK_SIZE: usize = 10_000;
 const DEFAULT_SC_STORAGE_TRIE_CACHE_CAPACITY: usize = 200_000;
 const DEFAULT_SC_PERSISTED_NODE_CACHE_CAPACITY: usize = 2_000_000;
 const DEFAULT_SC_CROSS_BLOCK_SPARSE_MAX_LAG: i64 = 64;
+const DEFAULT_ASYNC_PLAIN_QUEUE_CAPACITY: usize = 4;
 
 fn pre_pop_accounts() -> usize {
     std::env::var("MPTDB_PROVIDER_BENCH_PREPOP_ACCOUNTS")
@@ -286,8 +288,20 @@ fn bench_parallel_mdbx_write() -> bool {
 }
 
 fn bench_async_plain_materialization() -> bool {
-    bench_flag("MPTDB_PROVIDER_BENCH_ASYNC_PLAIN_MATERIALIZATION") ||
-        bench_flag("MPTDB_ASYNC_PLAIN_MATERIALIZATION")
+    let parse = |v: &str| !matches!(v.trim(), "0" | "false" | "False" | "FALSE");
+    if let Ok(v) = std::env::var("MPTDB_PROVIDER_BENCH_ASYNC_PLAIN_MATERIALIZATION") {
+        return parse(&v);
+    }
+    if let Ok(v) = std::env::var("MPTDB_ASYNC_PLAIN_MATERIALIZATION") {
+        return parse(&v);
+    }
+    true
+}
+
+fn bench_async_plain_queue_capacity() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_ASYNC_PLAIN_QUEUE_CAPACITY")
+        .or_else(|| bench_parse_usize("MPTDB_ASYNC_PLAIN_QUEUE_CAPACITY"))
+        .unwrap_or(DEFAULT_ASYNC_PLAIN_QUEUE_CAPACITY)
 }
 
 fn bench_flush_after_prepop() -> bool {
@@ -638,6 +652,8 @@ fn run_mptdb_bench(
         let sync_prewarm_after_block = bench_sync_prewarm_after_block();
         let parallel_mdbx_write = bench_parallel_mdbx_write();
         let async_plain_materialization = bench_async_plain_materialization();
+        let async_plain_queue_capacity =
+            if async_plain_materialization { bench_async_plain_queue_capacity() } else { 1 };
         let mdbx_write_mode = bench_mdbx_write_mode();
         let sc_storage_trie_cache_capacity = bench_sc_storage_trie_cache_capacity();
         let sc_persisted_node_cache_capacity = bench_sc_persisted_node_cache_capacity();
@@ -650,6 +666,9 @@ fn run_mptdb_bench(
         let mut sc_write_total = Duration::ZERO;
         let mut write_total = Duration::ZERO; // wall of SC+MDBX phase
         let mut prepop_total = Duration::ZERO;
+        let mut mdbx_send_wait_total = Duration::ZERO;
+        let mut mdbx_send_wait_max_total = Duration::ZERO;
+        let mut mdbx_pending_max_total: usize = 0;
         let mut sc_apply_total = Duration::ZERO;
         let mut sc_collect_dirty_total = Duration::ZERO;
         let mut sc_account_checkout_total = Duration::ZERO;
@@ -692,6 +711,9 @@ fn run_mptdb_bench(
             let mut evm_phase = Duration::ZERO;
             let mut sc_write_phase = Duration::ZERO;
             let mut write_phase = Duration::ZERO; // wall of SC+MDBX phase
+            let mut mdbx_send_wait_phase = Duration::ZERO;
+            let mut mdbx_send_wait_max_phase = Duration::ZERO;
+            let mut pending_mdbx_jobs_max: usize = 0;
             let mut drop_phase = Duration::ZERO;
             let mut tmp_drop = Duration::ZERO;
             let mut sc_apply_phase = Duration::ZERO;
@@ -817,7 +839,8 @@ MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=1"
             let mut mdbx_worker: Option<std::thread::JoinHandle<()>> = None;
             let mut pending_mdbx_jobs: usize = 0;
             if parallel_mdbx_write {
-                let (tx, job_rx) = std::sync::mpsc::sync_channel::<JobOutcome>(1);
+                let (tx, job_rx) =
+                    std::sync::mpsc::sync_channel::<JobOutcome>(async_plain_queue_capacity);
                 let (done_tx, rx) = std::sync::mpsc::channel::<()>();
                 let factory = mdbx_factory.clone();
                 let write_mode = mdbx_write_mode;
@@ -892,8 +915,13 @@ MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=1"
                 outcome_storage_accounts_phase += storage_accounts;
                 outcome_storage_slots_phase += storage_slots;
                 if let Some(tx) = job_tx.as_ref() {
+                    let send_start = Instant::now();
                     tx.send(Arc::clone(&outcome)).expect("send to mdbx worker");
+                    let send_wait = send_start.elapsed();
+                    mdbx_send_wait_phase += send_wait;
+                    mdbx_send_wait_max_phase = mdbx_send_wait_max_phase.max(send_wait);
                     pending_mdbx_jobs = pending_mdbx_jobs.saturating_add(1);
+                    pending_mdbx_jobs_max = pending_mdbx_jobs_max.max(pending_mdbx_jobs);
                 }
 
                 // SC commit on main thread (uses rayon internally).
@@ -1009,6 +1037,7 @@ MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=1"
                 if let Some(rx) = done_rx.as_ref() {
                     for _ in 0..pending_mdbx_jobs {
                         rx.recv().expect("mdbx done (async drain)");
+                        pending_mdbx_jobs = pending_mdbx_jobs.saturating_sub(1);
                     }
                 }
             }
@@ -1032,6 +1061,9 @@ MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=1"
 
             setup_total += open_sc + pre_pop;
             prepop_total += pre_pop;
+            mdbx_send_wait_total += mdbx_send_wait_phase;
+            mdbx_send_wait_max_total = mdbx_send_wait_max_total.max(mdbx_send_wait_max_phase);
+            mdbx_pending_max_total += pending_mdbx_jobs_max;
             evm_total += evm_phase;
             sc_write_total += sc_write_phase;
             write_total += write_phase;
@@ -1087,6 +1119,17 @@ MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=1"
                     tmp_drop,
                     iter_start.elapsed()
                 );
+                if parallel_mdbx_write {
+                    eprintln!(
+                        "[trace][{}][iter {}] mdbx_queue(capacity={}, pending_max={}, send_wait_total={:.2?}, send_wait_max={:.2?})",
+                        label,
+                        iter_idx + 1,
+                        async_plain_queue_capacity,
+                        pending_mdbx_jobs_max,
+                        mdbx_send_wait_phase,
+                        mdbx_send_wait_max_phase,
+                    );
+                }
                 if enable_sc_profile {
                     eprintln!(
                         "[trace][{}][iter {}] sc_profile(apply={:.2?}, collect_dirty={:.2?}, account_checkout={:.2?}, sparse_factory_build={:.2?}, sparse_account_proof={:.2?}, sparse_apply_changes={:.2?}, trie_load={:.2?}, slot_updates={:.2?}, storage_roots={:.2?}, account_updates={:.2?}, account_root={:.2?}, wal={:.2?}, total_commit={:.2?}, changed_accounts={}, storage_accounts={}, storage_slots={})",
@@ -1145,13 +1188,24 @@ MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=1"
             write_total / iters as u32,
             teardown_total / iters as u32,
         );
+        if parallel_mdbx_write {
+            eprintln!(
+                "[{}] avg/mdbx_queue per-iter: capacity={} pending_max={} send_wait_total={:.2?} send_wait_max={:.2?}",
+                label,
+                async_plain_queue_capacity,
+                mdbx_pending_max_total / iters as usize,
+                mdbx_send_wait_total / iters as u32,
+                mdbx_send_wait_max_total,
+            );
+        }
         eprintln!("[{}] avg/iter(end-to-end): {:.2?}", label, wall_total / iters as u32);
         eprintln!(
-            "[{}] read_mode: provider_reads(req={},effective={}) async_plain_materialization={} sc_prewarm={} sync_prewarm_after_block={} parallel_mdbx_write={} mdbx_write_mode={:?} sc_storage_cache={} sc_persisted_cache={} sc_cross_lag={}",
+            "[{}] read_mode: provider_reads(req={},effective={}) async_plain_materialization={} async_plain_queue_capacity={} sc_prewarm={} sync_prewarm_after_block={} parallel_mdbx_write={} mdbx_write_mode={:?} sc_storage_cache={} sc_persisted_cache={} sc_cross_lag={}",
             label,
             use_provider_reads,
             if async_plain_materialization { true } else { use_provider_reads },
             async_plain_materialization,
+            async_plain_queue_capacity,
             enable_sc_prewarm,
             sync_prewarm_after_block,
             parallel_mdbx_write,
