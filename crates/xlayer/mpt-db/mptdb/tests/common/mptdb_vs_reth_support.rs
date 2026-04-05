@@ -165,7 +165,6 @@ pub struct BenchRun {
 
 fn wal_first_config() -> mptdb_sc::mpt::MptConfig {
     let mut config = mptdb_sc::mpt::MptConfig::default();
-    config.wal_first_commit = true;
     config.checkpoint_max_account_trie_nodes = 0;
     // BENCHMARK NOTE: use_sparse_storage defaults to true (sparse path).
     // For baseline comparison, set use_sparse_storage=false via env var:

@@ -67,6 +67,7 @@ const L2_FREQ_SKETCH_AGE_INTERVAL: u64 = 65_536;
 const SPARSE_DEFERRED_MATERIALIZE_INTERVAL_LARGE_DEFAULT: i64 = 4;
 const SPARSE_DEFERRED_MATERIALIZE_MIN_PENDING_TARGETS: usize = 2_048;
 const SPARSE_DEFERRED_MATERIALIZE_MAX_PENDING_TARGETS: usize = 20_000;
+const SPARSE_DEFERRED_MATERIALIZE_MAX_TARGETS_PER_ROUND_DEFAULT: usize = 2_048;
 const L2_FREQ_SEEDS: [u32; L2_FREQ_SKETCH_ROWS] =
     [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
 
@@ -3897,6 +3898,15 @@ impl MptCommitStore {
         (next_version % interval == 0, interval)
     }
 
+    fn sparse_deferred_materialize_round_budget(&self) -> usize {
+        if let Some(raw) = std::env::var_os("MPT_WAL_SPARSE_MATERIALIZE_ROUND_BUDGET") {
+            if let Ok(parsed) = raw.to_string_lossy().parse::<usize>() {
+                return parsed.max(1);
+            }
+        }
+        SPARSE_DEFERRED_MATERIALIZE_MAX_TARGETS_PER_ROUND_DEFAULT
+    }
+
     fn default_commit_mode(&self) -> CommitExecutionMode {
         if self.replay_materializer {
             CommitExecutionMode {
@@ -6198,9 +6208,11 @@ impl MptCommitStore {
                 account_root_sparse_materialize_interval = interval;
 
                 if materialize_now && !self.sparse_deferred_publish_roots.is_empty() {
+                    let round_budget = self.sparse_deferred_materialize_round_budget();
                     let snapshot_targets: Vec<(B256, B256)> = self
                         .sparse_deferred_publish_roots
                         .iter()
+                        .take(round_budget)
                         .map(|(addr, root)| (*addr, *root))
                         .collect();
                     account_root_sparse_snapshot_targets = snapshot_targets.len();
