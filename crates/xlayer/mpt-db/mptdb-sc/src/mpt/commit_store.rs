@@ -67,7 +67,10 @@ const L2_FREQ_SKETCH_AGE_INTERVAL: u64 = 65_536;
 const SPARSE_DEFERRED_MATERIALIZE_INTERVAL_LARGE_DEFAULT: i64 = 4;
 const SPARSE_DEFERRED_MATERIALIZE_MIN_PENDING_TARGETS: usize = 2_048;
 const SPARSE_DEFERRED_MATERIALIZE_MAX_PENDING_TARGETS: usize = 20_000;
-const SPARSE_DEFERRED_MATERIALIZE_MAX_TARGETS_PER_ROUND_DEFAULT: usize = 2_048;
+const SPARSE_DEFERRED_MATERIALIZE_ROUND_BUDGET_SMALL_DEFAULT: usize = 512;
+const SPARSE_DEFERRED_MATERIALIZE_ROUND_BUDGET_MID_DEFAULT: usize = 768;
+const SPARSE_DEFERRED_MATERIALIZE_ROUND_BUDGET_LARGE_DEFAULT: usize = 1_024;
+const SPARSE_DEFERRED_MATERIALIZE_ROUND_BUDGET_HIGH_WATERMARK: usize = 8_192;
 const L2_FREQ_SEEDS: [u32; L2_FREQ_SKETCH_ROWS] =
     [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
 
@@ -3687,6 +3690,7 @@ impl MptCommitStore {
     }
 
     /// Try to extract storage_root from an existing account leaf in the trie.
+    /// Try to extract storage_root from an existing account leaf in the trie.
     fn get_existing_storage_root(&self, hashed_address: &B256) -> B256 {
         let key = Nibbles::unpack(hashed_address);
         match self
@@ -3898,13 +3902,19 @@ impl MptCommitStore {
         (next_version % interval == 0, interval)
     }
 
-    fn sparse_deferred_materialize_round_budget(&self) -> usize {
+    fn sparse_deferred_materialize_round_budget(&self, pending_targets: usize) -> usize {
         if let Some(raw) = std::env::var_os("MPT_WAL_SPARSE_MATERIALIZE_ROUND_BUDGET") {
             if let Ok(parsed) = raw.to_string_lossy().parse::<usize>() {
                 return parsed.max(1);
             }
         }
-        SPARSE_DEFERRED_MATERIALIZE_MAX_TARGETS_PER_ROUND_DEFAULT
+        if pending_targets >= SPARSE_DEFERRED_MATERIALIZE_MAX_PENDING_TARGETS {
+            SPARSE_DEFERRED_MATERIALIZE_ROUND_BUDGET_SMALL_DEFAULT
+        } else if pending_targets >= SPARSE_DEFERRED_MATERIALIZE_ROUND_BUDGET_HIGH_WATERMARK {
+            SPARSE_DEFERRED_MATERIALIZE_ROUND_BUDGET_MID_DEFAULT
+        } else {
+            SPARSE_DEFERRED_MATERIALIZE_ROUND_BUDGET_LARGE_DEFAULT
+        }
     }
 
     fn default_commit_mode(&self) -> CommitExecutionMode {
@@ -4886,17 +4896,25 @@ impl MptCommitStore {
             }
             stats.storage_accounts += 1;
 
-            let root = self.get_existing_storage_root(&dirty.hashed_address);
-            if root == EMPTY_ROOT_HASH {
-                factory.known_empty_accounts.insert(dirty.hashed_address);
-                continue;
-            }
-
             let dirty_keys: Vec<Nibbles> =
                 dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
 
             if let Some(storage_trie) = cross_trie.storage_trie_ref(&dirty.hashed_address) {
                 // Account is already revealed in the cross-block trie.
+                let mut root = self.get_existing_storage_root(&dirty.hashed_address);
+                if root == EMPTY_ROOT_HASH {
+                    // In wal_first+sparse mode account_trie may lag; when the
+                    // account is already in cross_trie, trust sparse account leaf
+                    // for storage_root hint to keep reuse path active.
+                    if let Some(value) = cross_trie.get_account_value(&dirty.hashed_address) {
+                        if let Ok(trie_account) =
+                            alloy_rlp::Decodable::decode(&mut value.as_slice())
+                        {
+                            let ta: alloy_trie::TrieAccount = trie_account;
+                            root = ta.storage_root;
+                        }
+                    }
+                }
                 stats.cross_reuse_accounts += 1;
                 // For slots already revealed in previous blocks, no proof work is needed.
                 // For newly-touched slots, only a subset requires fallback proof:
@@ -4958,6 +4976,11 @@ impl MptCommitStore {
                     self.try_build_l2_proof(&dirty.hashed_address, root, &proof_keys, &mut factory);
                 }
             } else {
+                let root = self.get_existing_storage_root(&dirty.hashed_address);
+                if root == EMPTY_ROOT_HASH {
+                    factory.known_empty_accounts.insert(dirty.hashed_address);
+                    continue;
+                }
                 // Non-cross-reuse path keeps segment-first behavior.
                 if self.try_segment_lookup_for_sparse_factory(
                     dirty.hashed_address,
@@ -5628,30 +5651,34 @@ impl MptCommitStore {
         let mut storage_roots_precomputed_handles = 0u64;
         let mut storage_roots_rehashed_handles = 0u64;
 
-        // Pre-fill DELETE and REUSE cases (no trie computation needed)
+        // Single pass:
+        // 1) pre-fill DELETE/REUSE roots (no trie hashing),
+        // 2) collect RECOMPUTE candidates for handle checkout.
         let storage_prefill_start = std::time::Instant::now();
+        let mut dirty_working_addresses: Vec<B256> = Vec::new();
+        let mut seen_working_accounts: HashSet<B256> = HashSet::default();
         for dirty in &self.dirty_accounts {
+            let hashed_address = dirty.hashed_address;
+            if self.contains_working_trie(&hashed_address) {
+                if seen_working_accounts.insert(hashed_address) {
+                    dirty_working_addresses.push(hashed_address);
+                }
+                continue;
+            }
             if dirty.info.is_none() && dirty.storage_wiped {
                 // DELETE case
-                storage_roots.insert(dirty.hashed_address, EMPTY_ROOT_HASH);
-            } else if !self.contains_working_trie(&dirty.hashed_address) {
+                storage_roots.insert(hashed_address, EMPTY_ROOT_HASH);
+            } else {
                 // REUSE case: get from existing account leaf
-                let root = self.get_existing_storage_root(&dirty.hashed_address);
-                storage_roots.insert(dirty.hashed_address, root);
+                let root = self.get_existing_storage_root(&hashed_address);
+                storage_roots.insert(hashed_address, root);
             }
-            // RECOMPUTE case handled below via parallel/serial path
         }
         let storage_roots_prefill_elapsed = storage_prefill_start.elapsed();
 
         let working_version = self.current_working_version();
         let take_handles_start = std::time::Instant::now();
-        let dirty_working_addresses: Vec<B256> = self
-            .dirty_accounts
-            .iter()
-            .filter(|dirty| self.contains_working_trie(&dirty.hashed_address))
-            .map(|dirty| dirty.hashed_address)
-            .collect();
-        let dirty_handles = self.take_working_handles(dirty_working_addresses.clone());
+        let dirty_handles = self.take_working_handles(dirty_working_addresses);
         let storage_roots_take_handles_elapsed = take_handles_start.elapsed();
         let storage_roots_working_handles = dirty_handles.len() as u64;
         let should_parallel =
@@ -6208,7 +6235,9 @@ impl MptCommitStore {
                 account_root_sparse_materialize_interval = interval;
 
                 if materialize_now && !self.sparse_deferred_publish_roots.is_empty() {
-                    let round_budget = self.sparse_deferred_materialize_round_budget();
+                    let round_budget = self.sparse_deferred_materialize_round_budget(
+                        account_root_sparse_pending_targets,
+                    );
                     let snapshot_targets: Vec<(B256, B256)> = self
                         .sparse_deferred_publish_roots
                         .iter()
