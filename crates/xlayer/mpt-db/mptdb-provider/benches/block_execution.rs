@@ -74,7 +74,7 @@ const DEFAULT_CONTRACT_RATIO: f64 = 0.30;
 const DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 32;
 const ERC20_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
 const B5_0_DEFAULT_PRE_POP_ACCOUNTS: usize = 1_000_000;
-const B5_0_DEFAULT_NUM_BLOCKS: usize = 100;
+const B5_0_DEFAULT_NUM_BLOCKS: usize = 10;
 const B5_0_DEFAULT_TXS_PER_BLOCK: usize = 20_000;
 const B5_0_DEFAULT_CONTRACT_RATIO: f64 = 0.30;
 const B5_0_DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 64;
@@ -750,12 +750,6 @@ fn run_mptdb_bench(
 
             // Open mptdb
             let mut sc_config = MptConfig::default();
-            // Benchmark default: measure the wal_first commit path used by
-            // mpt-db high-performance mode. Set MPTDB_BENCH_LEGACY_SC=1 to
-            // force legacy (non-wal-first) commits for A/B comparison.
-            if std::env::var_os("MPTDB_BENCH_LEGACY_SC").is_none() {
-                sc_config.wal_first_commit = true;
-            }
             sc_config.storage_trie_cache_capacity = sc_storage_trie_cache_capacity;
             sc_config.persisted_node_cache_capacity = sc_persisted_node_cache_capacity;
             sc_config.cross_block_sparse_max_lag = sc_cross_block_sparse_max_lag;

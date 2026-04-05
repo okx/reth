@@ -450,6 +450,9 @@ struct CrossBlockSparseState {
 struct PersistJob {
     barrier_only: bool,
     replay_from_wal: bool,
+    /// Optional WAL entry to append in the background worker before
+    /// manifest/publish persistence.
+    wal_entry: Option<CommitWalEntry>,
     blobs: Vec<(B256, Vec<u8>)>,
     published_puts: Vec<(B256, StorageTrieSegment)>,
     deferred_published_roots: Vec<(B256, B256)>,
@@ -458,8 +461,7 @@ struct PersistJob {
     state_root: B256,
     manifest: VersionManifest,
     manifest_path: PathBuf,
-    /// If true, the worker saves the manifest after persist_batch.
-    /// WAL-first jobs skip this because the frontend already saved.
+    /// If true, the worker saves the manifest after WAL/persist work.
     save_manifest: bool,
     /// The version this persist job makes durable. Used to update `durable_version`.
     version: i64,
@@ -1030,7 +1032,7 @@ impl MptCommitStore {
 
         // Drain deferred evictions whose wal_first guard has now cleared.
         // Queue is ordered by insertion time, so stop at the first still-blocked entry.
-        if self.config.wal_first_commit && !self.deferred_evictions.is_empty() {
+        if !self.deferred_evictions.is_empty() {
             let published = self.published_version.load(Ordering::Acquire);
             while let Some(front) = self.deferred_evictions.front().copied() {
                 match self.storage_trie_handles.get(&front) {
@@ -1067,15 +1069,13 @@ impl MptCommitStore {
                         // has caught up to this handle's version.  Otherwise the
                         // trie data only exists in memory — evicting would lose it
                         // since RocksDB has no nodes in wal_first mode.
-                        (!self.config.wal_first_commit || published >= handle.base_version)
+                        (published >= handle.base_version)
                 });
                 if can_evict {
                     if let Some(handle) = self.storage_trie_handles.remove(&evicted) {
                         self.pending_drops.push(handle);
                     }
-                } else if self.config.wal_first_commit &&
-                    self.storage_trie_handles.contains_key(&evicted)
-                {
+                } else if true && self.storage_trie_handles.contains_key(&evicted) {
                     // Guard blocked removal: defer until published_version catches up.
                     // The handle stays in storage_trie_handles; we track the address
                     // here so it gets cleaned up once the segment is published.
@@ -1333,7 +1333,7 @@ impl MptCommitStore {
         }
 
         if !candidates.is_empty() {
-            if self.config.wal_first_commit {
+            if true {
                 // In wal_first mode, RocksDB has no trie nodes — the persisted
                 // fallback will fail.  This should not happen if the eviction
                 // guard in touch_cached_storage_trie works correctly.
@@ -1475,6 +1475,7 @@ impl MptCommitStore {
     fn save_storage_version(
         &mut self,
         prepared: PreparedStorageVersion,
+        wal_entry: Option<CommitWalEntry>,
         all_blobs: Vec<(B256, Vec<u8>)>,
         storage_roots: &HashMap<B256, B256>,
         storage_cache_candidates: &mut [(B256, StorageTrieCow)],
@@ -1548,6 +1549,7 @@ impl MptCommitStore {
             let job = PersistJob {
                 barrier_only: false,
                 replay_from_wal: false,
+                wal_entry,
                 blobs: job_blobs,
                 published_puts: worker_published_puts,
                 deferred_published_roots: job_deferred_roots,
@@ -2199,7 +2201,7 @@ impl MptCommitStore {
         // In wal_first mode, always save checkpoint so cold starts can avoid
         // RocksDB materialization. The account trie is fully resident in memory,
         // so serialization is a fast in-memory copy + bincode encode.
-        if self.config.wal_first_commit {
+        if true {
             return self.checkpoint_account_trie_nodes.is_some();
         }
         let Some(node_count) = self.checkpoint_account_trie_nodes else {
@@ -2370,10 +2372,39 @@ impl MptCommitStore {
                         // replay_from_wal is no longer used in normal operation.
                         // WAL-first commits send pre-computed blobs directly.
                         // This flag is kept only for backward compatibility.
+                        //
+                        // Append WAL in background so wal_first frontend commit
+                        // can return after enqueue (root computed), matching
+                        // one-step async commit semantics.
+                        let wal_result = if let Some(entry) = job.wal_entry.as_ref() {
+                            if let Some(wal_store) = wal_store_clone.as_ref() {
+                                let mut wal = wal_store.lock();
+                                wal.append_entry(entry).and_then(|_| {
+                                    if worker_config.wal_shadow_validate {
+                                        let stored = wal.load_entry(entry.version)?;
+                                        if stored.as_ref() != Some(entry) {
+                                            return Err(MptDbError::Other(format!(
+                                                "wal shadow validation failed at version {}",
+                                                entry.version
+                                            )));
+                                        }
+                                    }
+                                    Ok(())
+                                })
+                            } else {
+                                Err(MptDbError::Other(
+                                    "wal-first persist job missing wal store".to_string(),
+                                ))
+                            }
+                        } else {
+                            Ok(())
+                        };
 
                         let result = if let Some(err) = forced_error {
                             Err(err)
-                        } else if worker_config.wal_first_commit {
+                        } else if let Err(err) = wal_result {
+                            Err(err)
+                        } else if true {
                             // wal_first: skip RocksDB persist_batch — WAL +
                             // published segments provide full durability.
                             // Only save the manifest.
@@ -2600,7 +2631,7 @@ impl MptCommitStore {
                                         }
                                     }
                                 }
-                                if worker_config.wal_first_commit {
+                                if true {
                                     // In wal_first mode, incremental publish_generation
                                     // keeps segments up to date on every block.
                                     // Auto-consolidation at REWRITE_INTERVAL depth
@@ -2616,7 +2647,7 @@ impl MptCommitStore {
                                         // in wal_first mode. Incremental publish provides
                                         // equivalent coverage.
                                     }
-                                } else if !worker_config.wal_first_commit {
+                                } else if false {
                                     // Legacy path: schedule full rewrites from RocksDB.
                                     if let Some(rewrite_tx) = published_rewrite_tx_clone.as_ref() {
                                         let should_schedule = if pending_rewrite.is_some() {
@@ -2842,7 +2873,7 @@ impl MptCommitStore {
         manifest: &VersionManifest,
         target_version: i64,
     ) -> (i64, bool) {
-        let durable_version = if self.config.wal_first_commit {
+        let durable_version = if true {
             self.wal_recovery_base_version(manifest.latest_version)
         } else {
             manifest.latest_version
@@ -2905,14 +2936,14 @@ impl MptCommitStore {
             match Self::load_account_trie_snapshot(&self.dir, &self.persisted, target_version, root)
             {
                 Ok((account_trie, loaded_from_checkpoint)) => {
-                    let durable_version = if self.config.wal_first_commit {
+                    let durable_version = if true {
                         self.wal_recovery_base_version(manifest.latest_version)
                     } else {
                         manifest.latest_version
                     };
                     Ok((account_trie, loaded_from_checkpoint, durable_version))
                 }
-                Err(e) if self.config.wal_first_commit => {
+                Err(e) if true => {
                     // wal_first: RocksDB may not have account trie nodes.
                     // Fall back to full WAL replay from the earliest version.
                     let wal_store = self.wal_store.as_ref().map(Arc::clone).ok_or_else(|| {
@@ -3011,7 +3042,7 @@ impl MptCommitStore {
             // wal_first mode where RocksDB may have no account trie nodes.
             match Self::load_account_trie_snapshot(dir, &persisted, version, root) {
                 Ok(result) => result,
-                Err(_) if config.wal_first_commit => (StorageTrieCow::empty(), false),
+                Err(_) if true => (StorageTrieCow::empty(), false),
                 Err(e) => return Err(e),
             }
         };
@@ -3023,7 +3054,6 @@ impl MptCommitStore {
         let published_version = published_meta.as_ref().map(|meta| meta.version).unwrap_or(0);
 
         let mut replay_config = config;
-        replay_config.wal_first_commit = false;
         replay_config.wal_shadow_validate = false;
         replay_config.async_blob_threshold = 0;
         // Aggressive parallelism for replay materializer.
@@ -3180,7 +3210,7 @@ impl MptCommitStore {
         // durable watermark (e.g. durable_version manually rewound, checkpoint
         // only exists at latest). Replaying from that empty base would diverge;
         // restart from version 0 and replay full WAL chain instead.
-        if self.config.wal_first_commit && base_version > 0 {
+        if base_version > 0 {
             let base_root = committed_manifest.get_root(base_version).unwrap_or(EMPTY_ROOT_HASH);
             let missing_base_snapshot = base_root != EMPTY_ROOT_HASH &&
                 matches!(self.account_trie.committed().root_ref(), CowRootRef::Empty);
@@ -3201,7 +3231,6 @@ impl MptCommitStore {
         // overhead for small blocks, but replay processes many versions
         // sequentially so every bit of per-version parallelism helps.
         let mut replay_config = original_config.clone();
-        replay_config.wal_first_commit = false;
         replay_config.wal_shadow_validate = false;
         replay_config.async_blob_threshold = 0;
         replay_config.parallel_storage_tries_min = 4;
@@ -3378,17 +3407,14 @@ impl MptCommitStore {
 
         let manifest_path = dir.join("manifest.json");
         let mut manifest = VersionManifest::load(&manifest_path)?;
-        let wal_store = if config.wal_first_commit {
-            Some(Arc::new(Mutex::new(CommitWalStore::open(dir)?)))
-        } else {
-            None
-        };
+        let wal_store =
+            if true { Some(Arc::new(Mutex::new(CommitWalStore::open(dir)?))) } else { None };
 
         // In wal_first mode, the WAL may contain entries beyond the manifest
         // (committed to WAL but the persist worker hadn't saved the manifest
         // before crash). Extend the manifest with those WAL entries so they
         // are included in the replay range, recovering all committed work.
-        if config.wal_first_commit {
+        if true {
             if let Some(ref wal_store) = wal_store {
                 let wal = wal_store.lock();
                 let wal_latest = wal.latest_version();
@@ -3438,7 +3464,7 @@ impl MptCommitStore {
         let (account_trie, account_loaded_from_checkpoint) =
             match Self::load_account_trie_snapshot(dir, &persisted, version, root) {
                 Ok(result) => result,
-                Err(_) if config.wal_first_commit && root != EMPTY_ROOT_HASH => {
+                Err(_) if root != EMPTY_ROOT_HASH => {
                     // wal_first: RocksDB may not have account trie nodes.
                     // Start with empty trie; WAL replay will reconstruct it.
                     (StorageTrieCow::empty(), false)
@@ -3575,7 +3601,7 @@ impl MptCommitStore {
             sparse_deferred_publish_roots: HashMap::default(),
         };
 
-        if store.config.wal_first_commit && version < committed_version {
+        if version < committed_version {
             store.replay_wal_catchup_to(&manifest, committed_version)?;
         }
 
@@ -3613,7 +3639,7 @@ impl MptCommitStore {
             //   2. Truncate manifest after target
             //   3. Prune published beyond target
             //   4. Open at the (now truncated) latest version
-            Self::truncate_to_version_on_disk(dir, target_version, &config)?;
+            Self::truncate_to_version_on_disk(dir, target_version)?;
             Self::open_with_config(dir, read_only, config)
         } else {
             let mut store = Self::open_with_config(dir, read_only, config)?;
@@ -3632,11 +3658,7 @@ impl MptCommitStore {
     ///   - downgrades current symlink
     ///   - truncates WAL
     ///   - prunes newer snapshots
-    fn truncate_to_version_on_disk(
-        dir: &Path,
-        target_version: i64,
-        config: &MptConfig,
-    ) -> Result<()> {
+    fn truncate_to_version_on_disk(dir: &Path, target_version: i64) -> Result<()> {
         // Truncate manifest.
         let manifest_path = dir.join("manifest.json");
         if manifest_path.exists() {
@@ -3648,7 +3670,7 @@ impl MptCommitStore {
         }
 
         // Truncate WAL.
-        if config.wal_first_commit {
+        if true {
             let mut wal_store = CommitWalStore::open(dir)?;
             wal_store.truncate_after(target_version)?;
         }
@@ -3885,8 +3907,8 @@ impl MptCommitStore {
             }
         } else {
             CommitExecutionMode {
-                wal_first: self.config.wal_first_commit,
-                allow_async: !self.config.wal_first_commit,
+                wal_first: true,
+                allow_async: false,
                 save_manifest: true,
                 // Always publish segments so the mmap-backed published store
                 // stays current. In wal_first mode, segment generation defaults
@@ -3904,7 +3926,7 @@ impl MptCommitStore {
     /// itself does not perform any extra RocksDB or manifest writes.
     pub fn flush_persist(&self) -> Result<()> {
         if let Err(err) = self.check_async_error() {
-            if self.config.wal_first_commit {
+            if true {
                 self.durable_version.store(self.wal_durable_version(), Ordering::Release);
             }
             return Err(err);
@@ -3915,6 +3937,7 @@ impl MptCommitStore {
                 let job = PersistJob {
                     barrier_only: true,
                     replay_from_wal: false,
+                    wal_entry: None,
                     blobs: vec![],
                     published_puts: vec![],
                     deferred_published_roots: vec![],
@@ -3933,7 +3956,7 @@ impl MptCommitStore {
                     match done_rx.recv() {
                         Ok(result) => {
                             if let Err(err) = result {
-                                if self.config.wal_first_commit {
+                                if true {
                                     self.durable_version
                                         .store(self.wal_durable_version(), Ordering::Release);
                                 }
@@ -3941,7 +3964,7 @@ impl MptCommitStore {
                             }
                         }
                         Err(_) => {
-                            if self.config.wal_first_commit {
+                            if true {
                                 self.durable_version
                                     .store(self.wal_durable_version(), Ordering::Release);
                             }
@@ -3964,7 +3987,7 @@ impl MptCommitStore {
                 match done_rx.recv() {
                     Ok(result) => {
                         if let Err(err) = result {
-                            if self.config.wal_first_commit {
+                            if true {
                                 self.durable_version
                                     .store(self.wal_durable_version(), Ordering::Release);
                             }
@@ -3972,7 +3995,7 @@ impl MptCommitStore {
                         }
                     }
                     Err(_) => {
-                        if self.config.wal_first_commit {
+                        if true {
                             self.durable_version
                                 .store(self.wal_durable_version(), Ordering::Release);
                         }
@@ -3981,7 +4004,7 @@ impl MptCommitStore {
                 }
             }
         }
-        if self.config.wal_first_commit {
+        if true {
             self.durable_version.store(self.wal_durable_version(), Ordering::Release);
         }
         self.check_async_error()
@@ -4042,7 +4065,7 @@ impl MptCommitStore {
 
         // In wal_first mode, avoid persisted fallback for prewarm reads; nodes
         // may not exist in persisted store yet. Keep this best-effort.
-        if !self.config.wal_first_commit {
+        if false {
             self.cache_storage_trie(
                 hashed_address,
                 StorageTrieCow::from_persisted_root(storage_root),
@@ -5133,8 +5156,7 @@ impl MptCommitStore {
         let account_proof = self.extract_account_proof_from_keys(&account_keys)?;
         self.last_sparse_apply_account_proof = account_proof_start.elapsed();
 
-        let mut sparse_trie =
-            SparseStateTrie::default().with_updates(!self.config.wal_first_commit);
+        let mut sparse_trie = SparseStateTrie::default().with_updates(false);
         let apply_changes_start = std::time::Instant::now();
         apply_all_storage_changes_sparse(
             &mut sparse_trie,
@@ -5263,10 +5285,8 @@ impl MptCommitStore {
             // Build pending from the reused trie (factory already updated above).
             // We take the trie out of cross_block_sparse temporarily;
             // commit_inner_with_mode will put it back.
-            let trie_for_pending = std::mem::replace(
-                &mut cross.trie,
-                SparseStateTrie::default().with_updates(!self.config.wal_first_commit),
-            );
+            let trie_for_pending =
+                std::mem::replace(&mut cross.trie, SparseStateTrie::default().with_updates(false));
             let factory_clone = SegmentTrieNodeProviderFactory {
                 account_segment: cross.factory.account_segment.clone(),
                 storage_segments: cross.factory.storage_segments.clone(),
@@ -5281,8 +5301,7 @@ impl MptCommitStore {
         } else {
             // ── First block: initialise cross-block state ─────────────────────
             // factory and account_proof were built in Phase A above.
-            let mut sparse_trie =
-                SparseStateTrie::default().with_updates(!self.config.wal_first_commit);
+            let mut sparse_trie = SparseStateTrie::default().with_updates(false);
             let apply_changes_start = std::time::Instant::now();
             apply_all_storage_changes_sparse(
                 &mut sparse_trie,
@@ -5312,7 +5331,7 @@ impl MptCommitStore {
                 known_empty_accounts: factory.known_empty_accounts.clone(),
             };
             self.cross_block_sparse = Some(Box::new(CrossBlockSparseState {
-                trie: SparseStateTrie::default().with_updates(!self.config.wal_first_commit), /* placeholder */
+                trie: SparseStateTrie::default().with_updates(false), /* placeholder */
                 factory: factory_clone,
                 storage_last_block,
             }));
@@ -5385,7 +5404,7 @@ impl MptCommitStore {
         // When wal_first, merge slot updates + root hash into a single rayon
         // pass so trie data stays cache-hot.  This eliminates the second cache
         // load that the separate storage_roots phase would incur.
-        let merge_hash = self.config.wal_first_commit;
+        let merge_hash = true;
         let persisted_ref = &self.persisted;
         let apply_stolen = std::sync::atomic::AtomicU64::new(0);
         let apply_fresh = std::sync::atomic::AtomicU64::new(0);
@@ -5818,15 +5837,8 @@ impl MptCommitStore {
         // Phase 2: precompute account writes in parallel, then apply to the
         // single shared account trie serially.
         let account_updates_start = std::time::Instant::now();
-        let wal_sparse_root_enabled =
-            mode.wal_first && std::env::var_os("MPT_WAL_DISABLE_SPARSE_ROOT").is_none();
-        let force_account_trie_updates =
-            std::env::var_os("MPT_WAL_FORCE_ACCOUNT_TRIE_UPDATES").is_some();
-        let diag_skip_account_trie_updates =
-            std::env::var_os("MPT_WAL_SKIP_ACCOUNT_TRIE_UPDATES").is_some();
-        let skip_account_trie_updates = wal_sparse_root_enabled &&
-            self.config.use_sparse_storage &&
-            (diag_skip_account_trie_updates || !force_account_trie_updates);
+        let wal_sparse_root_enabled = mode.wal_first;
+        let skip_account_trie_updates = wal_sparse_root_enabled && self.config.use_sparse_storage;
         let encode_account = |dirty: &DirtyAccount| {
             let storage_root = storage_roots[&dirty.hashed_address];
             match &dirty.info {
@@ -6017,13 +6029,8 @@ impl MptCommitStore {
             } else if mode.wal_first {
                 let verify_sparse_root =
                     std::env::var_os("MPT_VERIFY_WAL_SPARSE_ACCOUNT_ROOT").is_some();
-                // Default to sparse-root in wal_first mode to avoid duplicate
-                // account-trie hash computation on the commit hot path.
-                // Set MPT_WAL_DISABLE_SPARSE_ROOT=1 to force legacy account-trie
-                // root hashing for diagnostics.
-                //
-                // Keep MPT_WAL_USE_SPARSE_ROOT for backward compatibility with
-                // existing scripts (it is effectively a no-op when default is on).
+                // In wal_first mode we always use sparse-root on hot path to
+                // avoid duplicate account-trie hash computation.
                 let use_sparse_root = wal_sparse_root_enabled;
                 let sparse_root = if use_sparse_root || verify_sparse_root {
                     let sparse_root_start = std::time::Instant::now();
@@ -6328,7 +6335,6 @@ impl MptCommitStore {
             None
         };
         let cache_publish_elapsed = cache_publish_start.elapsed();
-        let mut wal_append_elapsed = Duration::ZERO;
         self.last_wal_append_lock_wait = Duration::ZERO;
         self.last_wal_append_write = Duration::ZERO;
         self.last_wal_serialize = Duration::ZERO;
@@ -6341,17 +6347,9 @@ impl MptCommitStore {
             return Err(MptDbError::Other("failpoint: ManifestSave".to_string()));
         }
 
-        if let Some(ref wal_entry) = wal_entry {
-            let wal_append_start = std::time::Instant::now();
-            if let Err(err) = self.append_shadow_wal_entry(wal_entry) {
-                let _ = self.rollback_shadow_wal_to(self.version);
-                return Err(err);
-            }
-            wal_append_elapsed = wal_append_start.elapsed();
-        }
-
-        let mut saved = match self.save_storage_version(
+        let saved = self.save_storage_version(
             prepared,
+            wal_entry,
             all_blobs,
             &storage_roots,
             &mut storage_cache_candidates,
@@ -6360,16 +6358,7 @@ impl MptCommitStore {
             sparse_committed_tries,
             mode,
             &mut storage_segment_build_elapsed,
-        ) {
-            Ok(saved) => saved,
-            Err(err) => {
-                if wal_entry.is_some() {
-                    self.rollback_shadow_wal_to(self.version)?;
-                }
-                return Err(err);
-            }
-        };
-        saved.wal_append_elapsed = wal_append_elapsed;
+        )?;
 
         // Commit succeeded: update internal state
         self.manifest = saved.manifest;
@@ -6468,16 +6457,13 @@ impl MptCommitStore {
             if !self.storage_trie_cache.contains(&addr) {
                 let published = self.published_version.load(Ordering::Acquire);
                 let can_remove = self.storage_trie_handles.get(&addr).is_some_and(|handle| {
-                    !handle.has_working() &&
-                        (!self.config.wal_first_commit || published >= handle.base_version)
+                    !handle.has_working() && (published >= handle.base_version)
                 });
                 if can_remove {
                     if let Some(handle) = self.storage_trie_handles.remove(&addr) {
                         self.pending_drops.push(handle);
                     }
-                } else if self.config.wal_first_commit &&
-                    self.storage_trie_handles.contains_key(&addr)
-                {
+                } else if true && self.storage_trie_handles.contains_key(&addr) {
                     // Reuse the same deferred queue/guard used by regular LRU evictions:
                     // once published_version catches up, touch_cached_storage_trie will drain
                     // and retire these handles safely.
@@ -6599,7 +6585,7 @@ impl MptCommitStore {
         // In wal_first mode, periodically save the account trie checkpoint
         // so cold starts can load directly from the checkpoint file instead
         // of materializing the entire trie from RocksDB.
-        if self.config.wal_first_commit &&
+        if true &&
             self.bulk_load.is_none() &&
             saved.new_version > 0 &&
             (saved.new_version as usize) % self.config.published_snapshot_interval == 0
@@ -6783,7 +6769,6 @@ mod tests {
 
         let bulk_dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let mut bulk = MptCommitStore::open_with_config(bulk_dir.path(), false, config).unwrap();
         bulk.begin_bulk_load(BulkLoadOptions { retain_only_latest: true }).unwrap();
         bulk.bulk_ingest_bundle_chunk(&chunk1).unwrap();
@@ -6808,7 +6793,6 @@ mod tests {
     fn bulk_load_can_continue_with_normal_commits_and_reopen() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let mut store =
             MptCommitStore::open_with_config(dir.path(), false, config.clone()).unwrap();
 
@@ -6845,7 +6829,6 @@ mod tests {
     fn bulk_load_resets_stale_derived_state() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
         let checkpoint =
@@ -6922,7 +6905,6 @@ mod tests {
             MptCommitStore::open_with_config(legacy_dir.path(), false, legacy_config).unwrap();
         let wal_dir = TempDir::new().unwrap();
         let mut wal_config = MptConfig::default();
-        wal_config.wal_first_commit = true;
         wal_config.wal_shadow_validate = true;
         wal_config.checkpoint_max_account_trie_nodes = 0;
         // Shadow validation requires WAL replay to have storage proofs.
@@ -6988,7 +6970,6 @@ mod tests {
     fn shadow_wal_commit_writes_version_entry() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         config.wal_shadow_validate = true;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
@@ -7001,6 +6982,7 @@ mod tests {
         )]);
         store.apply_bundle_state(&bundle).unwrap();
         let (version, root) = store.commit().unwrap();
+        store.flush_persist().unwrap();
 
         let wal = CommitWalStore::open(dir.path()).unwrap();
         let entry = wal.load_entry(version).unwrap().unwrap();
@@ -7015,7 +6997,6 @@ mod tests {
     fn shadow_wal_validate_allows_multi_block_commits() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         config.wal_shadow_validate = true;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
@@ -7049,6 +7030,7 @@ mod tests {
         store.apply_bundle_state(&bundle2).unwrap();
         let (version2, _) = store.commit().unwrap();
         assert_eq!(version2, 2);
+        store.flush_persist().unwrap();
 
         let wal = CommitWalStore::open(dir.path()).unwrap();
         assert_eq!(wal.latest_version(), 2);
@@ -7060,7 +7042,6 @@ mod tests {
     fn shadow_wal_rollback_truncates_newer_entries() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
         let addr = Address::repeat_byte(0x12);
@@ -7095,7 +7076,6 @@ mod tests {
     fn shadow_wal_prune_before_advances_floor() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         config.published_snapshot_interval = 1;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
@@ -7126,7 +7106,6 @@ mod tests {
     fn wal_prune_respects_retained_published_snapshot_floor() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         config.published_snapshot_interval = 1;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
         let addr = Address::repeat_byte(0x52);
@@ -7190,7 +7169,6 @@ mod tests {
     fn wal_replay_reproduces_committed_roots() {
         let src_dir = TempDir::new().unwrap();
         let mut src_config = MptConfig::default();
-        src_config.wal_first_commit = true;
         src_config.wal_shadow_validate = true;
         let mut src = MptCommitStore::open_with_config(src_dir.path(), false, src_config).unwrap();
 
@@ -7222,6 +7200,7 @@ mod tests {
         ]);
         src.apply_bundle_state(&bundle2).unwrap();
         let (version2, root2) = src.commit().unwrap();
+        src.flush_persist().unwrap();
 
         let wal = CommitWalStore::open(src_dir.path()).unwrap();
 
@@ -7247,7 +7226,6 @@ mod tests {
     fn wal_first_commit_can_lead_durable_frontier() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
         store.set_async_fail_mode(1);
 
@@ -7273,7 +7251,6 @@ mod tests {
         let expected_root;
         {
             let mut config = MptConfig::default();
-            config.wal_first_commit = true;
             let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
             store.set_async_fail_mode(1);
 
@@ -7290,7 +7267,6 @@ mod tests {
         }
 
         let mut reopen_config = MptConfig::default();
-        reopen_config.wal_first_commit = true;
         let reopened = MptCommitStore::open_with_config(dir.path(), false, reopen_config).unwrap();
         assert_eq!(reopened.version(), 1);
         assert_eq!(reopened.frontier().durable_version, 1);
@@ -7304,7 +7280,6 @@ mod tests {
         let root_v2;
         {
             let mut config = MptConfig::default();
-            config.wal_first_commit = true;
             let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
             let addr = Address::repeat_byte(0x27);
@@ -7335,7 +7310,6 @@ mod tests {
         fs::write(&wal_meta_path, serde_json::to_vec_pretty(&wal_meta).unwrap()).unwrap();
 
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let mut reopened = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
         reopened.load_version_target(1).unwrap();
@@ -7353,7 +7327,6 @@ mod tests {
     fn wal_first_committed_account_trie_materializes_before_flush() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
         let addr = Address::repeat_byte(0x28);
@@ -7377,7 +7350,6 @@ mod tests {
     fn bulk_then_wal_first_committed_account_trie_materializes_before_flush() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
         let prepop = make_bundle(vec![
@@ -7418,7 +7390,6 @@ mod tests {
     fn bulk_then_wal_first_flush_persist_succeeds() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         config.published_snapshot_interval = 1;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
@@ -7455,7 +7426,6 @@ mod tests {
     fn wal_first_committed_account_trie_stays_materializable_across_lagged_commits() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         config.published_snapshot_interval = 1;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
@@ -7501,7 +7471,6 @@ mod tests {
     fn wal_first_publish_failure_is_nonfatal() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
         store.set_async_fail_mode(3);
 
@@ -7527,7 +7496,6 @@ mod tests {
     fn wal_first_commit_triggers_background_rewrite_publish() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         config.published_snapshot_interval = 64;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
@@ -7556,7 +7524,6 @@ mod tests {
     fn wal_first_default_defers_sparse_segment_build_to_background() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
         let bundle = make_bundle(vec![
@@ -7593,7 +7560,6 @@ mod tests {
     fn wal_first_can_force_foreground_sparse_segment_build() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         config.wal_first_defer_segment_build = false;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
@@ -7630,7 +7596,6 @@ mod tests {
     fn wal_first_rewrite_does_not_rollback_newer_published_meta() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         config.published_snapshot_interval = 64;
         let mut store = MptCommitStore::open_with_config(dir.path(), false, config).unwrap();
 
@@ -9008,7 +8973,6 @@ mod tests {
     fn t6_5c6_open_at_version_overwrite_truncates_future_history() {
         let dir = TempDir::new().unwrap();
         let mut config = MptConfig::default();
-        config.wal_first_commit = true;
         let addr = Address::repeat_byte(0x3d);
 
         {

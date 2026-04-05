@@ -92,7 +92,6 @@ Key env knobs:
 - `MPTDB_PROVIDER_BENCH_PRIMARY_STATE=1` (enable SS primary-state read/write path in mptdb lane)
 - `MPTDB_PROVIDER_BENCH_PRIMARY_STATE_READS=0|1` (only when primary-state is on; `0` keeps SS mirror writes but routes EVM reads to fallback for diagnosis)
 - `MPTDB_PROVIDER_BENCH_ENABLE_SC_PREWARM=1`
-- `MPTDB_BENCH_LEGACY_SC=1` (force legacy non-wal-first path)
 - `MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=0|1` (diagnostic A/B: serial vs parallel MDBX writer)
 - `MPTDB_PROVIDER_BENCH_MDBX_WRITE_MODE=full|plain|noop` (diagnostic isolation of MDBX write path)
 - `MPTDB_PROVIDER_BENCH_SYNC_PREWARM_AFTER_BLOCK=1` (diagnostic only: force per-block sync prewarm+flush)
@@ -100,7 +99,6 @@ Key env knobs:
 - `MPTDB_PROVIDER_BENCH_SC_STORAGE_TRIE_CACHE_CAPACITY` (SC L2 storage-trie cache capacity)
 - `MPTDB_PROVIDER_BENCH_SC_PERSISTED_NODE_CACHE_CAPACITY` (SC persisted-node cache capacity)
 - `MPTDB_PROVIDER_BENCH_SC_CROSS_BLOCK_SPARSE_MAX_LAG` (cross-block sparse trie eviction lag)
-- `MPT_WAL_DISABLE_SPARSE_ROOT=1` (diagnostic fallback: force wal_first to use legacy account-trie root hash path)
 - `MPT_VERIFY_WAL_SPARSE_ACCOUNT_ROOT=1` (diagnostic parity check: compute both sparse-root and account-trie root)
 
 Interpretation caveat:
@@ -1070,8 +1068,6 @@ Code change:
 
 - `mptdb-sc/src/mpt/commit_store.rs`
   - In wal_first branch, default `use_sparse_root=true`.
-  - Added fallback knob:
-    - `MPT_WAL_DISABLE_SPARSE_ROOT=1` => force legacy account-trie hash path.
   - Kept `MPT_VERIFY_WAL_SPARSE_ACCOUNT_ROOT=1` for strict parity diagnostics.
 
 Verification (provider workload):
@@ -1316,7 +1312,7 @@ Success metric (integration focus):
 
 Risk control:
 
-- Keep fast rollback path: one-flag fallback to legacy behavior for emergency release recovery.
+- Keep parity diagnostics and rollback tooling, but do not re-enable legacy commit mode.
 
 ### 9.18 Decision Update: Shift Focus to WAL-first Plain Materialization (April 4, 2026)
 
