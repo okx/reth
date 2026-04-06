@@ -129,7 +129,8 @@ The profile output includes granular sub-timers for commit hot spots:
 All benchmarks use **chunked incremental pre-population** for both reth and mpt-db, matching real blockchain state accumulation (one block at a time, no batch shortcuts).
 
 Machine: Apple M-series, 32GB RAM, SSD.
-Latest refresh: April 3, 2026 (`USE_SPARSE=1`, default allocator, `MPT_BENCH_ITERS=1` for B4.2-B4.5 benchmarks; one-shot profile for B4.6-B4.8).
+Latest refresh: April 6, 2026 (`USE_SPARSE=1`, default allocator, `MPT_BENCH_ITERS=1` for B4.2-B4.5 benchmarks; one-shot profile for B4.6-B4.8; provider integration stress for B5.0/B6.0).
+Note: this refresh reran mpt-db for B4.2-B4.8; reth values in the table remain the last recorded baseline.
 
 ### Summary
 
@@ -139,13 +140,13 @@ B4.8 is different: it is tx-style ERC20 pool traffic (provider-aligned), so writ
 | Test | Pre-pop accounts | Storage slots per account | Accounts updated per block | Blocks | reth per-block | mpt-db per-block | Speedup |
 |------|-----------------|--------------------------|---------------------------|--------|---------------|-----------------|---------|
 | B4.1 | 0 (fresh) | 10 | 100 | 1 | 1.26 ms | 1.31 ms | 1.0x |
-| B4.2 | 1K | 10 | 200 | 1 | 5.73 ms | 3.0 ms | **1.9x** |
-| B4.3 | 1K | 10 | 200 | 10 | 5.39 ms | 3.1 ms | **1.7x** |
-| B4.4 | 200K | 10 | 2K | 10 | 285 ms | 42.5 ms | **6.7x** |
-| B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 104.7 ms | **11.6x** |
-| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 390.2 ms | **21.8x** |
-| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 51.0 ms | **38.9x** |
-| B4.8 | 500K mixed | 128 (30% contracts, active pool 10%) | 50K tx-style updates | 10 | 12,172.2 ms | 729.9 ms | **16.7x** |
+| B4.2 | 1K | 10 | 200 | 1 | 5.73 ms | 2.9 ms | **2.0x** |
+| B4.3 | 1K | 10 | 200 | 10 | 5.39 ms | 1.7 ms | **3.2x** |
+| B4.4 | 200K | 10 | 2K | 10 | 285 ms | 21.2 ms | **13.4x** |
+| B4.5 | 1M | 10 | 5K | 10 | 1,211 ms | 41.8 ms | **29.0x** |
+| B4.6 | 1M | 30 | 10K | 10 | 8,512 ms | 104.9 ms | **81.1x** |
+| B4.7 | 500K mixed | 200 (30% contracts) | 1K mixed | 10 | 1,984 ms | 15.2 ms | **130.5x** |
+| B4.8 | 500K mixed | 128 (30% contracts, active pool 10%) | 50K tx-style updates | 10 | 12,172.2 ms | 136.9 ms | **88.9x** |
 
 ### Workload vs real-world comparison
 
@@ -159,34 +160,52 @@ B4.8 is different: it is tx-style ERC20 pool traffic (provider-aligned), so writ
 
 Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4-B4.5 are the most representative of current mainnet workloads. B4.6 targets future high-throughput scenarios (increased gas limit, L2 sequencers). B4.8 is the provider-aligned integration workload (`erc20_transfer_10pct_contract_pool` style).
 
+### Provider integration stress (B5.0/B6.0)
+
+These are from `mptdb-provider/benches/block_execution.rs` (full provider integration lifecycle, not SC-only micro profile).
+
+Per-block transaction type for both B5.0 and B6.0:
+
+- ERC20 `transfer(address,uint256)` contract call (`TxKind::Call`)
+- `value = 0`, `gas_limit = 100_000`, `amount = 100`
+- contract selected from active pool; sender selected from prefilled holder set
+
+Command examples:
+
+```bash
+# B5.0
+MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle \
+cargo bench --bench block_execution -p mptdb-provider -- "b5_0_peak_integration_10x"
+
+# B6.0
+MPTDB_PROVIDER_BENCH_MEASURE=block_lifecycle \
+cargo bench --bench block_execution -p mptdb-provider -- "b6_0_peak_integration_20x"
+```
+
+Latest run snapshot (April 6, 2026):
+
+| Test | Pre-pop accounts | Tx/block | Blocks | Contract ratio | KV/contract | Active contract pool | Tx type | reth per-block | mpt-db per-block | Speedup |
+|------|------------------|----------|--------|----------------|------------|----------------------|---------|----------------|------------------|---------|
+| B5.0 | 1,000,000 mixed | 20,000 | 10 | 30% | 64 | 10% (pool 30,000) | ERC20 transfer pool | 815–826 ms | 320–332 ms | **~2.5x** |
+| B6.0 | 2,000,000 mixed | 50,000 | 10 | 30% | 64 | 10% (pool 60,000) | ERC20 transfer pool | 10.73–12.43 s | 3.12–3.64 s | **~3.4x** |
+
 ### Analysis
 
 - **Small datasets (B4.1–B4.3)**: reth's MDBX keeps everything in page cache, so both systems are fast. mpt-db's advantage is modest (1–2x) because the WAL append overhead is a significant fraction of the per-block time.
 - **Large datasets (B4.4–B4.6)**: reth's MDBX page cache becomes cold as the dataset exceeds cache capacity. Random reads from disk dominate reth's `overlay_root_with_updates` and `write_trie_updates`. mpt-db's in-memory tries are unaffected by dataset size, giving **10–15x** speedup for B4.4/B4.5.
-- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each. mpt-db completes in ~390ms. The SparseStateTrie migration replaced full-trie loading with dirty-path-only witness reveal; parallel pre-extraction of segment multiproofs and batch parallel storage reveal keep `sp_ch` around ~169ms. Account root uses the fast `root_hash_only_parallel` path on the legacy arena trie (~49.5ms).
-- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). mpt-db completes in ~51ms. The full-trie materialization path (`extract_full_decoded_multiproof`) replaces per-key path tracing for dense 200-slot updates, and cross-block SparseStateTrie reuse keeps storage tries revealed across blocks; `account_root` is ~9.4ms.
-- **Provider-aligned ERC20 pool (B4.8)**: 500K mixed accounts (30% contracts, 128 pre-pop holders per contract, active contract pool 10%), 50K tx-style updates per block. mpt-db completes in ~730ms while reth is ~12.17s (~16.7x). A blind-node regression in cross-block sparse reveal was fixed by forcing full reveal on first-touch accounts and only skipping reveal when all dirty slots are already revealed.
+- **Storage-heavy workload (B4.6)**: 1M accounts × 30 storage slots each. latest mpt-db run is ~104.9ms/block (`apply_bundle_state` ~72.9ms, `commit` ~32.1ms, `account_root` ~10.7ms).
+- **Mainnet-realistic (B4.7)**: 500K mixed accounts (30% contracts with 200 slots, 70% EOA). latest mpt-db run is ~15.2ms/block (`account_root` ~1.5ms).
+- **Provider-aligned ERC20 pool (B4.8)**: 500K mixed accounts (30% contracts, 128 pre-pop holders per contract, active contract pool 10%), 50K tx-style updates per block. latest mpt-db run is ~136.9ms/block (`apply_bundle_state` ~85.6ms, `commit` ~51.3ms, `account_root` ~26.1ms).
 
-### B4.6 detailed breakdown
+### B4.6 detailed breakdown (latest mpt-db profile)
 
-**reth (8,512 ms/block):**
+**mpt-db (104.9 ms/block):**
 
 | Phase | Time |
 |-------|------|
-| `overlay_root_with_updates` | 3,195 ms |
-| `write_trie_updates` | 4,176 ms |
-| `write_hashed_state` | 844 ms |
-| `commit` | 276 ms |
-
-**mpt-db (~390 ms/block, SparseStateTrie path):**
-
-| Phase | Time | Notes |
-|-------|------|-------|
-| `apply_bundle_state` | ~262 ms | |
-| `sp_ch` (parallel extract + batch reveal + storage roots) | ~169 ms | 10K × 30 slots, full-scan for 16–64 slot accounts |
-| `account_root` (arena parallel hash) | ~49.5 ms | `root_hash_only_parallel` on legacy account trie |
-| `segment_build` | ~0 ms | background-deferred in wal_first mode |
-| `wal_append` | ~15.7 ms | |
-
-Primary bottleneck is `sp_ch`: parallel segment multiproof extraction and batch reveal for 10K accounts.
-Account root uses the fast arena path (`root_hash_only_parallel`) rather than `SerialSparseTrie::root()`.
+| `apply_bundle_state` | 72.9 ms |
+| `commit` | 32.1 ms |
+| `storage_roots` | 8.8 ms |
+| `account_updates` | 6.5 ms |
+| `account_root` | 10.7 ms |
+| `cache_publish` | 0.3 ms |

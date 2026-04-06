@@ -4896,9 +4896,6 @@ impl MptCommitStore {
             }
             stats.storage_accounts += 1;
 
-            let dirty_keys: Vec<Nibbles> =
-                dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
-
             if let Some(storage_trie) = cross_trie.storage_trie_ref(&dirty.hashed_address) {
                 // Account is already revealed in the cross-block trie.
                 let mut root = self.get_existing_storage_root(&dirty.hashed_address);
@@ -4981,6 +4978,8 @@ impl MptCommitStore {
                     factory.known_empty_accounts.insert(dirty.hashed_address);
                     continue;
                 }
+                let dirty_keys: Vec<Nibbles> =
+                    dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
                 // Non-cross-reuse path keeps segment-first behavior.
                 if self.try_segment_lookup_for_sparse_factory(
                     dirty.hashed_address,
@@ -5320,16 +5319,14 @@ impl MptCommitStore {
             // commit_inner_with_mode will put it back.
             let trie_for_pending =
                 std::mem::replace(&mut cross.trie, SparseStateTrie::default().with_updates(false));
-            let factory_clone = SegmentTrieNodeProviderFactory {
-                account_segment: cross.factory.account_segment.clone(),
-                storage_segments: cross.factory.storage_segments.clone(),
-                pre_built_storage_proofs: cross.factory.pre_built_storage_proofs.clone(),
-                no_reveal_accounts: cross.factory.no_reveal_accounts.clone(),
-                known_empty_accounts: cross.factory.known_empty_accounts.clone(),
-            };
+            // Avoid per-block full clone of factory maps: after apply, `cross.factory`
+            // is not needed until next block (where it gets overwritten), so move it
+            // directly into pending state for commit/root.
+            let factory_for_pending =
+                std::mem::replace(&mut cross.factory, SegmentTrieNodeProviderFactory::new());
             self.pending_sparse_state = Some(Box::new(PendingSparseState {
                 trie: trie_for_pending,
-                factory: factory_clone,
+                factory: factory_for_pending,
             }));
         } else {
             // ── First block: initialise cross-block state ─────────────────────
@@ -5356,16 +5353,11 @@ impl MptCommitStore {
             // Store cross-block state with a placeholder trie (real one goes
             // to pending_sparse_state).  The trie is returned from commit to
             // cross_block_sparse via commit_inner_with_mode.
-            let factory_clone = SegmentTrieNodeProviderFactory {
-                account_segment: factory.account_segment.clone(),
-                storage_segments: factory.storage_segments.clone(),
-                pre_built_storage_proofs: factory.pre_built_storage_proofs.clone(),
-                no_reveal_accounts: factory.no_reveal_accounts.clone(),
-                known_empty_accounts: factory.known_empty_accounts.clone(),
-            };
+            // First block: keep cross-block holder with an empty factory.
+            // The next block rebuilds and overwrites it before use.
             self.cross_block_sparse = Some(Box::new(CrossBlockSparseState {
                 trie: SparseStateTrie::default().with_updates(false), /* placeholder */
-                factory: factory_clone,
+                factory: SegmentTrieNodeProviderFactory::new(),
                 storage_last_block,
             }));
             self.pending_sparse_state =

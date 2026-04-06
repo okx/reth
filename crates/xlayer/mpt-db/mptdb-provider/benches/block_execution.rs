@@ -79,6 +79,12 @@ const B5_0_DEFAULT_TXS_PER_BLOCK: usize = 20_000;
 const B5_0_DEFAULT_CONTRACT_RATIO: f64 = 0.30;
 const B5_0_DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 64;
 const B5_0_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
+const B6_0_DEFAULT_PRE_POP_ACCOUNTS: usize = 2_000_000;
+const B6_0_DEFAULT_NUM_BLOCKS: usize = 10;
+const B6_0_DEFAULT_TXS_PER_BLOCK: usize = 50_000;
+const B6_0_DEFAULT_CONTRACT_RATIO: f64 = 0.30;
+const B6_0_DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 64;
+const B6_0_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
 const PREPOP_CHUNK_SIZE: usize = 10_000;
 const DEFAULT_SC_STORAGE_TRIE_CACHE_CAPACITY: usize = 200_000;
 const DEFAULT_SC_PERSISTED_NODE_CACHE_CAPACITY: usize = 2_000_000;
@@ -181,6 +187,37 @@ fn b5_0_active_contract_pool_ratio() -> f64 {
     bench_parse_f64("MPTDB_PROVIDER_BENCH_B5_0_ACTIVE_CONTRACT_POOL_RATIO")
         .map(|v| v.clamp(0.0, 1.0))
         .unwrap_or(B5_0_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO)
+}
+
+fn b6_0_pre_pop_accounts() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B6_0_PREPOP_ACCOUNTS")
+        .unwrap_or(B6_0_DEFAULT_PRE_POP_ACCOUNTS)
+}
+
+fn b6_0_num_blocks() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B6_0_NUM_BLOCKS").unwrap_or(B6_0_DEFAULT_NUM_BLOCKS)
+}
+
+fn b6_0_txs_per_block() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B6_0_TXS_PER_BLOCK")
+        .unwrap_or(B6_0_DEFAULT_TXS_PER_BLOCK)
+}
+
+fn b6_0_contract_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B6_0_CONTRACT_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B6_0_DEFAULT_CONTRACT_RATIO)
+}
+
+fn b6_0_contract_kv_per_contract() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B6_0_CONTRACT_KV_PER_CONTRACT")
+        .unwrap_or(B6_0_DEFAULT_CONTRACT_KV_PER_CONTRACT)
+}
+
+fn b6_0_active_contract_pool_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B6_0_ACTIVE_CONTRACT_POOL_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B6_0_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO)
 }
 
 fn bench_sample_size() -> usize {
@@ -1774,11 +1811,69 @@ fn bench_b5_0_peak_integration_10x(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_b6_0_peak_integration_20x(c: &mut Criterion) {
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut cache = InMemoryCache::new();
+
+    let pre_pop = b6_0_pre_pop_accounts();
+    let blocks = b6_0_num_blocks();
+    let txs = b6_0_txs_per_block();
+    let c_ratio = b6_0_contract_ratio();
+    let kv_per_contract = b6_0_contract_kv_per_contract();
+    let active_pool_ratio = b6_0_active_contract_pool_ratio();
+
+    let dataset =
+        setup_mixed_state_with_config(&mut cache, &mut rng, pre_pop, txs, c_ratio, kv_per_contract);
+    let contract_pool =
+        select_active_erc20_contracts_with_ratio(&dataset.contract_addresses, active_pool_ratio);
+    if dataset.contract_addresses.is_empty() {
+        let _ = setup_erc20(&mut cache, &contract_pool, &dataset.eoa_addresses);
+    }
+    let block_txs = generate_erc20_block_txs_contract_pool_with_config(
+        &dataset.eoa_addresses,
+        &contract_pool,
+        &cache,
+        &mut rng,
+        blocks,
+        txs,
+        kv_per_contract,
+    );
+
+    let id = format!(
+        "{}acc_{}tx_{}blk_{}c_{}kv_pool{}",
+        pre_pop,
+        txs,
+        blocks,
+        (c_ratio * 100.0).round() as u32,
+        kv_per_contract,
+        contract_pool.len()
+    );
+    let sample_size = bench_sample_size();
+    let warmup_secs = bench_warmup_secs();
+    let measurement_secs = bench_measurement_secs();
+
+    let mut group = c.benchmark_group("b6_0_peak_integration_20x");
+    group.sample_size(sample_size);
+    group.warm_up_time(std::time::Duration::from_secs(warmup_secs));
+    group.measurement_time(std::time::Duration::from_secs(measurement_secs));
+
+    group.bench_with_input(BenchmarkId::new("mptdb", &id), &(), |b, _| {
+        run_mptdb_bench(b, &cache, &block_txs, "mptdb/b6_0_pool20x");
+    });
+
+    group.bench_with_input(BenchmarkId::new("reth_mdbx", &id), &(), |b, _| {
+        run_reth_mdbx_bench(b, &cache, &block_txs, "reth_mdbx/b6_0_pool20x");
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_eth_transfer,
     bench_erc20_transfer,
     bench_erc20_transfer_10pct_contract_pool,
-    bench_b5_0_peak_integration_10x
+    bench_b5_0_peak_integration_10x,
+    bench_b6_0_peak_integration_20x
 );
 criterion_main!(benches);
