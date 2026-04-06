@@ -160,11 +160,11 @@ B4.8 is different: it is tx-style ERC20 pool traffic (provider-aligned), so writ
 
 Ethereum L1 mainnet: ~150–300 txns/block, ~5K–20K storage slot changes. B4.4-B4.5 are the most representative of current mainnet workloads. B4.6 targets future high-throughput scenarios (increased gas limit, L2 sequencers). B4.8 is the provider-aligned integration workload (`erc20_transfer_10pct_contract_pool` style).
 
-### Provider integration stress (B5.0/B6.0)
+### Provider integration stress (B5.0/B5.1/B5.2/B6.0)
 
 These are from `mptdb-provider/benches/block_execution.rs` (full provider integration lifecycle, not SC-only micro profile).
 
-Per-block transaction type for both B5.0 and B6.0:
+Per-block transaction type for B5.0/B5.1/B5.2/B6.0:
 
 - ERC20 `transfer(address,uint256)` contract call (`TxKind::Call`)
 - `value = 0`, `gas_limit = 100_000`, `amount = 100`
@@ -187,6 +187,8 @@ Latest run snapshot (April 6, 2026):
 | Test | Pre-pop accounts | Tx/block | Blocks | Contract ratio | KV/contract | Active contract pool | Tx type | reth per-block | mpt-db per-block | Speedup |
 |------|------------------|----------|--------|----------------|------------|----------------------|---------|----------------|------------------|---------|
 | B5.0 | 1,000,000 mixed | 20,000 | 10 | 30% | 64 | 10% (pool 30,000) | ERC20 transfer pool | 815–826 ms | 320–332 ms | **~2.5x** |
+| B5.1 | 1,000,000 mixed | 10,000 | 10 | 30% | 64 | 10% (pool 30,000) | ERC20 transfer pool | 550.92–556.13 ms | 170.58–173.88 ms | **~3.2x** |
+| B5.2 | 1,000,000 mixed | 50,000 | 10 | 30% | 64 | 10% (pool 30,000) | ERC20 transfer pool | 1.2967–1.3262 s | 671.74–684.60 ms | **~1.9x** |
 | B6.0 | 2,000,000 mixed | 50,000 | 10 | 30% | 64 | 10% (pool 60,000) | ERC20 transfer pool | 10.73–12.43 s | 3.12–3.64 s | **~3.4x** |
 
 ### Analysis

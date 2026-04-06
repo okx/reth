@@ -79,12 +79,31 @@ const B5_0_DEFAULT_TXS_PER_BLOCK: usize = 20_000;
 const B5_0_DEFAULT_CONTRACT_RATIO: f64 = 0.30;
 const B5_0_DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 64;
 const B5_0_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
+const B5_1_DEFAULT_PRE_POP_ACCOUNTS: usize = 1_000_000;
+const B5_1_DEFAULT_NUM_BLOCKS: usize = 10;
+const B5_1_DEFAULT_TXS_PER_BLOCK: usize = 10_000;
+const B5_1_DEFAULT_CONTRACT_RATIO: f64 = 0.30;
+const B5_1_DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 64;
+const B5_1_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
+const B5_2_DEFAULT_PRE_POP_ACCOUNTS: usize = 1_000_000;
+const B5_2_DEFAULT_NUM_BLOCKS: usize = 10;
+const B5_2_DEFAULT_TXS_PER_BLOCK: usize = 50_000;
+const B5_2_DEFAULT_CONTRACT_RATIO: f64 = 0.30;
+const B5_2_DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 64;
+const B5_2_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
 const B6_0_DEFAULT_PRE_POP_ACCOUNTS: usize = 2_000_000;
 const B6_0_DEFAULT_NUM_BLOCKS: usize = 10;
 const B6_0_DEFAULT_TXS_PER_BLOCK: usize = 50_000;
 const B6_0_DEFAULT_CONTRACT_RATIO: f64 = 0.30;
 const B6_0_DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 64;
 const B6_0_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.10;
+const B6_1_DEFAULT_PRE_POP_ACCOUNTS: usize = 2_000_000;
+const B6_1_DEFAULT_NUM_BLOCKS: usize = 10;
+const B6_1_DEFAULT_TXS_PER_BLOCK: usize = 10_000;
+const B6_1_DEFAULT_CONTRACT_RATIO: f64 = 0.35;
+const B6_1_DEFAULT_CONTRACT_KV_PER_CONTRACT: usize = 128;
+const B6_1_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO: f64 = 0.20;
+const B6_1_DEFAULT_RECEIVER_FROM_CONTRACT_HOLDERS_RATIO: f64 = 0.95;
 const PREPOP_CHUNK_SIZE: usize = 10_000;
 const DEFAULT_SC_STORAGE_TRIE_CACHE_CAPACITY: usize = 200_000;
 const DEFAULT_SC_PERSISTED_NODE_CACHE_CAPACITY: usize = 2_000_000;
@@ -189,6 +208,68 @@ fn b5_0_active_contract_pool_ratio() -> f64 {
         .unwrap_or(B5_0_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO)
 }
 
+fn b5_1_pre_pop_accounts() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_1_PREPOP_ACCOUNTS")
+        .unwrap_or(B5_1_DEFAULT_PRE_POP_ACCOUNTS)
+}
+
+fn b5_1_num_blocks() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_1_NUM_BLOCKS").unwrap_or(B5_1_DEFAULT_NUM_BLOCKS)
+}
+
+fn b5_1_txs_per_block() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_1_TXS_PER_BLOCK")
+        .unwrap_or(B5_1_DEFAULT_TXS_PER_BLOCK)
+}
+
+fn b5_1_contract_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B5_1_CONTRACT_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B5_1_DEFAULT_CONTRACT_RATIO)
+}
+
+fn b5_1_contract_kv_per_contract() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_1_CONTRACT_KV_PER_CONTRACT")
+        .unwrap_or(B5_1_DEFAULT_CONTRACT_KV_PER_CONTRACT)
+}
+
+fn b5_1_active_contract_pool_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B5_1_ACTIVE_CONTRACT_POOL_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B5_1_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO)
+}
+
+fn b5_2_pre_pop_accounts() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_2_PREPOP_ACCOUNTS")
+        .unwrap_or(B5_2_DEFAULT_PRE_POP_ACCOUNTS)
+}
+
+fn b5_2_num_blocks() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_2_NUM_BLOCKS").unwrap_or(B5_2_DEFAULT_NUM_BLOCKS)
+}
+
+fn b5_2_txs_per_block() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_2_TXS_PER_BLOCK")
+        .unwrap_or(B5_2_DEFAULT_TXS_PER_BLOCK)
+}
+
+fn b5_2_contract_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B5_2_CONTRACT_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B5_2_DEFAULT_CONTRACT_RATIO)
+}
+
+fn b5_2_contract_kv_per_contract() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B5_2_CONTRACT_KV_PER_CONTRACT")
+        .unwrap_or(B5_2_DEFAULT_CONTRACT_KV_PER_CONTRACT)
+}
+
+fn b5_2_active_contract_pool_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B5_2_ACTIVE_CONTRACT_POOL_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B5_2_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO)
+}
+
 fn b6_0_pre_pop_accounts() -> usize {
     bench_parse_usize("MPTDB_PROVIDER_BENCH_B6_0_PREPOP_ACCOUNTS")
         .unwrap_or(B6_0_DEFAULT_PRE_POP_ACCOUNTS)
@@ -218,6 +299,43 @@ fn b6_0_active_contract_pool_ratio() -> f64 {
     bench_parse_f64("MPTDB_PROVIDER_BENCH_B6_0_ACTIVE_CONTRACT_POOL_RATIO")
         .map(|v| v.clamp(0.0, 1.0))
         .unwrap_or(B6_0_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO)
+}
+
+fn b6_1_pre_pop_accounts() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B6_1_PREPOP_ACCOUNTS")
+        .unwrap_or(B6_1_DEFAULT_PRE_POP_ACCOUNTS)
+}
+
+fn b6_1_num_blocks() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B6_1_NUM_BLOCKS").unwrap_or(B6_1_DEFAULT_NUM_BLOCKS)
+}
+
+fn b6_1_txs_per_block() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B6_1_TXS_PER_BLOCK")
+        .unwrap_or(B6_1_DEFAULT_TXS_PER_BLOCK)
+}
+
+fn b6_1_contract_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B6_1_CONTRACT_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B6_1_DEFAULT_CONTRACT_RATIO)
+}
+
+fn b6_1_contract_kv_per_contract() -> usize {
+    bench_parse_usize("MPTDB_PROVIDER_BENCH_B6_1_CONTRACT_KV_PER_CONTRACT")
+        .unwrap_or(B6_1_DEFAULT_CONTRACT_KV_PER_CONTRACT)
+}
+
+fn b6_1_active_contract_pool_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B6_1_ACTIVE_CONTRACT_POOL_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B6_1_DEFAULT_ACTIVE_CONTRACT_POOL_RATIO)
+}
+
+fn b6_1_receiver_from_contract_holders_ratio() -> f64 {
+    bench_parse_f64("MPTDB_PROVIDER_BENCH_B6_1_RECEIVER_FROM_CONTRACT_HOLDERS_RATIO")
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(B6_1_DEFAULT_RECEIVER_FROM_CONTRACT_HOLDERS_RATIO)
 }
 
 fn bench_sample_size() -> usize {
@@ -737,11 +855,7 @@ fn run_mptdb_bench(
         let mut outcome_storage_slots_total: u64 = 0;
 
         for iter_idx in 0..iters {
-            let use_provider_reads_effective = if async_plain_materialization {
-                true
-            } else {
-                use_provider_reads
-            };
+            let use_provider_reads_effective = use_provider_reads;
             let iter_start = Instant::now();
             let mut open_sc = Duration::ZERO;
             let mut pre_pop = Duration::ZERO;
@@ -1234,7 +1348,7 @@ MPTDB_PROVIDER_BENCH_PARALLEL_MDBX_WRITE=1"
             "[{}] read_mode: provider_reads(req={},effective={}) async_plain_materialization={} async_plain_queue_capacity={} sc_prewarm={} sync_prewarm_after_block={} parallel_mdbx_write={} mdbx_write_mode={:?} sc_storage_cache={} sc_persisted_cache={} sc_cross_lag={}",
             label,
             use_provider_reads,
-            if async_plain_materialization { true } else { use_provider_reads },
+            use_provider_reads,
             async_plain_materialization,
             async_plain_queue_capacity,
             enable_sc_prewarm,
@@ -1619,6 +1733,7 @@ fn generate_erc20_block_txs_contract_pool(
         num_blocks(),
         txs_per_block(),
         contract_kv_per_contract(),
+        0.0,
     )
 }
 
@@ -1630,6 +1745,7 @@ fn generate_erc20_block_txs_contract_pool_with_config(
     blocks_n: usize,
     txs_n: usize,
     kv_per_contract: usize,
+    receiver_from_contract_holders_ratio: f64,
 ) -> Vec<Vec<TxEnv>> {
     let mut nonces: HashMap<Address, u64> = eoa_addresses
         .iter()
@@ -1653,7 +1769,11 @@ fn generate_erc20_block_txs_contract_pool_with_config(
             let contract_idx = rng.random_range(0..contract_pool.len());
             let sender_holders = &holders_by_contract[contract_idx];
             let sender = sender_holders[rng.random_range(0..sender_holders.len())];
-            let receiver = eoa_addresses[rng.random_range(0..eoa_addresses.len())];
+            let receiver = if rng.random_bool(receiver_from_contract_holders_ratio) {
+                sender_holders[rng.random_range(0..sender_holders.len())]
+            } else {
+                eoa_addresses[rng.random_range(0..eoa_addresses.len())]
+            };
             let nonce = nonces.get(&sender).copied().unwrap_or(0);
             txs.push(TxEnv {
                 caller: sender,
@@ -1780,6 +1900,7 @@ fn bench_b5_0_peak_integration_10x(c: &mut Criterion) {
         blocks,
         txs,
         kv_per_contract,
+        0.0,
     );
 
     let id = format!(
@@ -1811,6 +1932,122 @@ fn bench_b5_0_peak_integration_10x(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_b5_1_peak_integration_10x(c: &mut Criterion) {
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut cache = InMemoryCache::new();
+
+    let pre_pop = b5_1_pre_pop_accounts();
+    let blocks = b5_1_num_blocks();
+    let txs = b5_1_txs_per_block();
+    let c_ratio = b5_1_contract_ratio();
+    let kv_per_contract = b5_1_contract_kv_per_contract();
+    let active_pool_ratio = b5_1_active_contract_pool_ratio();
+
+    let dataset =
+        setup_mixed_state_with_config(&mut cache, &mut rng, pre_pop, txs, c_ratio, kv_per_contract);
+    let contract_pool =
+        select_active_erc20_contracts_with_ratio(&dataset.contract_addresses, active_pool_ratio);
+    if dataset.contract_addresses.is_empty() {
+        let _ = setup_erc20(&mut cache, &contract_pool, &dataset.eoa_addresses);
+    }
+    let block_txs = generate_erc20_block_txs_contract_pool_with_config(
+        &dataset.eoa_addresses,
+        &contract_pool,
+        &cache,
+        &mut rng,
+        blocks,
+        txs,
+        kv_per_contract,
+        0.0,
+    );
+
+    let id = format!(
+        "{}acc_{}tx_{}blk_{}c_{}kv_pool{}",
+        pre_pop,
+        txs,
+        blocks,
+        (c_ratio * 100.0).round() as u32,
+        kv_per_contract,
+        contract_pool.len()
+    );
+    let sample_size = bench_sample_size();
+    let warmup_secs = bench_warmup_secs();
+    let measurement_secs = bench_measurement_secs();
+
+    let mut group = c.benchmark_group("b5_1_peak_integration_10x");
+    group.sample_size(sample_size);
+    group.warm_up_time(std::time::Duration::from_secs(warmup_secs));
+    group.measurement_time(std::time::Duration::from_secs(measurement_secs));
+
+    group.bench_with_input(BenchmarkId::new("mptdb", &id), &(), |b, _| {
+        run_mptdb_bench(b, &cache, &block_txs, "mptdb/b5_1_pool10x");
+    });
+
+    group.bench_with_input(BenchmarkId::new("reth_mdbx", &id), &(), |b, _| {
+        run_reth_mdbx_bench(b, &cache, &block_txs, "reth_mdbx/b5_1_pool10x");
+    });
+
+    group.finish();
+}
+
+fn bench_b5_2_peak_integration_10x(c: &mut Criterion) {
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut cache = InMemoryCache::new();
+
+    let pre_pop = b5_2_pre_pop_accounts();
+    let blocks = b5_2_num_blocks();
+    let txs = b5_2_txs_per_block();
+    let c_ratio = b5_2_contract_ratio();
+    let kv_per_contract = b5_2_contract_kv_per_contract();
+    let active_pool_ratio = b5_2_active_contract_pool_ratio();
+
+    let dataset =
+        setup_mixed_state_with_config(&mut cache, &mut rng, pre_pop, txs, c_ratio, kv_per_contract);
+    let contract_pool =
+        select_active_erc20_contracts_with_ratio(&dataset.contract_addresses, active_pool_ratio);
+    if dataset.contract_addresses.is_empty() {
+        let _ = setup_erc20(&mut cache, &contract_pool, &dataset.eoa_addresses);
+    }
+    let block_txs = generate_erc20_block_txs_contract_pool_with_config(
+        &dataset.eoa_addresses,
+        &contract_pool,
+        &cache,
+        &mut rng,
+        blocks,
+        txs,
+        kv_per_contract,
+        0.0,
+    );
+
+    let id = format!(
+        "{}acc_{}tx_{}blk_{}c_{}kv_pool{}",
+        pre_pop,
+        txs,
+        blocks,
+        (c_ratio * 100.0).round() as u32,
+        kv_per_contract,
+        contract_pool.len()
+    );
+    let sample_size = bench_sample_size();
+    let warmup_secs = bench_warmup_secs();
+    let measurement_secs = bench_measurement_secs();
+
+    let mut group = c.benchmark_group("b5_2_peak_integration_10x");
+    group.sample_size(sample_size);
+    group.warm_up_time(std::time::Duration::from_secs(warmup_secs));
+    group.measurement_time(std::time::Duration::from_secs(measurement_secs));
+
+    group.bench_with_input(BenchmarkId::new("mptdb", &id), &(), |b, _| {
+        run_mptdb_bench(b, &cache, &block_txs, "mptdb/b5_2_pool10x");
+    });
+
+    group.bench_with_input(BenchmarkId::new("reth_mdbx", &id), &(), |b, _| {
+        run_reth_mdbx_bench(b, &cache, &block_txs, "reth_mdbx/b5_2_pool10x");
+    });
+
+    group.finish();
+}
+
 fn bench_b6_0_peak_integration_20x(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(42);
     let mut cache = InMemoryCache::new();
@@ -1837,6 +2074,7 @@ fn bench_b6_0_peak_integration_20x(c: &mut Criterion) {
         blocks,
         txs,
         kv_per_contract,
+        0.0,
     );
 
     let id = format!(
@@ -1868,12 +2106,75 @@ fn bench_b6_0_peak_integration_20x(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_b6_1_contract_heavy(c: &mut Criterion) {
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut cache = InMemoryCache::new();
+
+    let pre_pop = b6_1_pre_pop_accounts();
+    let blocks = b6_1_num_blocks();
+    let txs = b6_1_txs_per_block();
+    let c_ratio = b6_1_contract_ratio();
+    let kv_per_contract = b6_1_contract_kv_per_contract();
+    let active_pool_ratio = b6_1_active_contract_pool_ratio();
+    let receiver_in_pool_ratio = b6_1_receiver_from_contract_holders_ratio();
+
+    let dataset =
+        setup_mixed_state_with_config(&mut cache, &mut rng, pre_pop, txs, c_ratio, kv_per_contract);
+    let contract_pool =
+        select_active_erc20_contracts_with_ratio(&dataset.contract_addresses, active_pool_ratio);
+    if dataset.contract_addresses.is_empty() {
+        let _ = setup_erc20(&mut cache, &contract_pool, &dataset.eoa_addresses);
+    }
+    let block_txs = generate_erc20_block_txs_contract_pool_with_config(
+        &dataset.eoa_addresses,
+        &contract_pool,
+        &cache,
+        &mut rng,
+        blocks,
+        txs,
+        kv_per_contract,
+        receiver_in_pool_ratio,
+    );
+
+    let id = format!(
+        "{}acc_{}tx_{}blk_{}c_{}kv_pool{}_rhp{}",
+        pre_pop,
+        txs,
+        blocks,
+        (c_ratio * 100.0).round() as u32,
+        kv_per_contract,
+        contract_pool.len(),
+        (receiver_in_pool_ratio * 100.0).round() as u32
+    );
+    let sample_size = bench_sample_size();
+    let warmup_secs = bench_warmup_secs();
+    let measurement_secs = bench_measurement_secs();
+
+    let mut group = c.benchmark_group("b6_1_contract_heavy");
+    group.sample_size(sample_size);
+    group.warm_up_time(std::time::Duration::from_secs(warmup_secs));
+    group.measurement_time(std::time::Duration::from_secs(measurement_secs));
+
+    group.bench_with_input(BenchmarkId::new("mptdb", &id), &(), |b, _| {
+        run_mptdb_bench(b, &cache, &block_txs, "mptdb/b6_1_contract_heavy");
+    });
+
+    group.bench_with_input(BenchmarkId::new("reth_mdbx", &id), &(), |b, _| {
+        run_reth_mdbx_bench(b, &cache, &block_txs, "reth_mdbx/b6_1_contract_heavy");
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_eth_transfer,
     bench_erc20_transfer,
     bench_erc20_transfer_10pct_contract_pool,
     bench_b5_0_peak_integration_10x,
-    bench_b6_0_peak_integration_20x
+    bench_b5_1_peak_integration_10x,
+    bench_b5_2_peak_integration_10x,
+    bench_b6_0_peak_integration_20x,
+    bench_b6_1_contract_heavy
 );
 criterion_main!(benches);
