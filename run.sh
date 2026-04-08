@@ -45,4 +45,4 @@ reth node \
     --txpool.max-account-slots 10000000 \
     --http \
     --http.api eth,debug,net,web3,txpool \
-    --log.stdout.filter "info,engine::tree::payload_validator=debug,engine::persistence=debug" | tee reth.log
+    --log.stdout.filter "info,engine::tree::payload_validator=debug" | tee reth.log
