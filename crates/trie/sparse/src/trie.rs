@@ -943,16 +943,21 @@ impl SparseTrieInterface for SerialSparseTrie {
     fn root(&mut self) -> B256 {
         // Take the current prefix set
         let mut prefix_set = core::mem::take(&mut self.prefix_set).freeze();
+        #[cfg(feature = "std")]
         let prefix_len_before = prefix_set.len();
+        #[cfg(feature = "std")]
         let root_trace_min_prefix = std::env::var("MPT_SPARSE_ROOT_TRACE_MIN_PREFIX")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(SPARSE_ROOT_TRACE_MIN_PREFIX_DEFAULT);
+        #[cfg(feature = "std")]
         let root_trace = std::env::var_os("MPT_SPARSE_ROOT_TRACE").is_some() &&
             prefix_len_before >= root_trace_min_prefix;
+        #[cfg(feature = "std")]
         let root_total_start = root_trace.then(std::time::Instant::now);
         #[cfg(feature = "std")]
         let mut prehash_stats: Option<ParallelPrehashStats> = None;
+        #[cfg(feature = "std")]
         let prehash_start = root_trace.then(std::time::Instant::now);
         // Fast path for wal_first-like callers (updates disabled): pre-hash
         // independent subtries in parallel, then let `rlp_node_allocate` merge
@@ -961,64 +966,31 @@ impl SparseTrieInterface for SerialSparseTrie {
         if self.updates.is_none() {
             prehash_stats = self.parallel_prehash_subtries_no_updates(&mut prefix_set);
         }
+        #[cfg(feature = "std")]
         let prehash_elapsed = prehash_start.map(|s| s.elapsed());
+        #[cfg(feature = "std")]
         let merge_start = root_trace.then(std::time::Instant::now);
         let rlp_node = self.rlp_node_allocate(&mut prefix_set);
+        #[cfg(feature = "std")]
         let merge_elapsed = merge_start.map(|s| s.elapsed());
-        if let Some(root_hash) = rlp_node.as_hash() {
-            if let Some(total_start) = root_total_start {
-                let total_elapsed = total_start.elapsed();
-                #[cfg(feature = "std")]
-                eprintln!(
-                    "[mptsparse:root] prefix_before={} prehash_used={} prehash_ms={:.3} prehash_depth={} prehash_targets={} prefix_after={} merge_ms={:.3} total_ms={:.3}",
-                    prefix_len_before,
-                    prehash_stats.is_some(),
-                    prehash_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
-                    prehash_stats.map_or(0, |s| s.depth),
-                    prehash_stats.map_or(0, |s| s.target_count),
-                    prehash_stats.map_or(prefix_set.len(), |s| s.prefix_len_after),
-                    merge_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
-                    total_elapsed.as_secs_f64() * 1000.0
-                );
-                #[cfg(not(feature = "std"))]
-                eprintln!(
-                    "[mptsparse:root] prefix_before={} prehash_used=false prehash_ms={:.3} prehash_depth=0 prehash_targets=0 prefix_after={} merge_ms={:.3} total_ms={:.3}",
-                    prefix_len_before,
-                    prehash_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
-                    prefix_set.len(),
-                    merge_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
-                    total_elapsed.as_secs_f64() * 1000.0
-                );
-            }
-            root_hash
-        } else {
-            let out = keccak256(rlp_node);
-            if let Some(total_start) = root_total_start {
-                let total_elapsed = total_start.elapsed();
-                #[cfg(feature = "std")]
-                eprintln!(
-                    "[mptsparse:root] prefix_before={} prehash_used={} prehash_ms={:.3} prehash_depth={} prehash_targets={} prefix_after={} merge_ms={:.3} total_ms={:.3}",
-                    prefix_len_before,
-                    prehash_stats.is_some(),
-                    prehash_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
-                    prehash_stats.map_or(0, |s| s.depth),
-                    prehash_stats.map_or(0, |s| s.target_count),
-                    prehash_stats.map_or(prefix_set.len(), |s| s.prefix_len_after),
-                    merge_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
-                    total_elapsed.as_secs_f64() * 1000.0
-                );
-                #[cfg(not(feature = "std"))]
-                eprintln!(
-                    "[mptsparse:root] prefix_before={} prehash_used=false prehash_ms={:.3} prehash_depth=0 prehash_targets=0 prefix_after={} merge_ms={:.3} total_ms={:.3}",
-                    prefix_len_before,
-                    prehash_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
-                    prefix_set.len(),
-                    merge_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
-                    total_elapsed.as_secs_f64() * 1000.0
-                );
-            }
-            out
+        let out =
+            if let Some(root_hash) = rlp_node.as_hash() { root_hash } else { keccak256(rlp_node) };
+        #[cfg(feature = "std")]
+        if let Some(total_start) = root_total_start {
+            let total_elapsed = total_start.elapsed();
+            eprintln!(
+                "[mptsparse:root] prefix_before={} prehash_used={} prehash_ms={:.3} prehash_depth={} prehash_targets={} prefix_after={} merge_ms={:.3} total_ms={:.3}",
+                prefix_len_before,
+                prehash_stats.is_some(),
+                prehash_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                prehash_stats.map_or(0, |s| s.depth),
+                prehash_stats.map_or(0, |s| s.target_count),
+                prehash_stats.map_or(prefix_set.len(), |s| s.prefix_len_after),
+                merge_elapsed.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                total_elapsed.as_secs_f64() * 1000.0
+            );
         }
+        out
     }
 
     fn update_subtrie_hashes(&mut self) {
