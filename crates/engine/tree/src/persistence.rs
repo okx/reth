@@ -173,7 +173,7 @@ where
             provider_rw.commit()?;
         }
 
-        debug!(target: "engine::persistence", first=?first_block, last=?last_block, "Saved range of blocks");
+        debug!(target: "engine::persistence", first=?first_block, last=?last_block, elapsed=?start_time.elapsed(), "Saved range of blocks");
 
         self.metrics.save_blocks_batch_size.record(block_count as f64);
         self.metrics.save_blocks_duration_seconds.record(start_time.elapsed());
