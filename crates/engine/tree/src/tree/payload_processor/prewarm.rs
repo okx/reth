@@ -68,8 +68,8 @@ where
     execution_cache: PayloadExecutionCache,
     /// Context provided to execution tasks
     ctx: PrewarmContext<N, P, Evm>,
-    /// Sender to emit evm state outcome messages, if any.
-    to_multi_proof: Option<CrossbeamSender<StateRootMessage>>,
+    /// Sender to emit evm state outcome messages to the sparse trie task, if any.
+    to_sparse_trie_task: Option<CrossbeamSender<StateRootMessage>>,
     /// Receiver for events produced by tx execution
     actions_rx: Receiver<PrewarmTaskEvent<N::Receipt>>,
     /// Parent span for tracing
@@ -87,7 +87,7 @@ where
         executor: Runtime,
         execution_cache: PayloadExecutionCache,
         ctx: PrewarmContext<N, P, Evm>,
-        to_multi_proof: Option<CrossbeamSender<StateRootMessage>>,
+        to_sparse_trie_task: Option<CrossbeamSender<StateRootMessage>>,
     ) -> (Self, Sender<PrewarmTaskEvent<N::Receipt>>) {
         let (actions_tx, actions_rx) = channel();
 
@@ -103,7 +103,7 @@ where
                 executor,
                 execution_cache,
                 ctx,
-                to_multi_proof,
+                to_sparse_trie_task,
                 actions_rx,
                 parent_span: Span::current(),
             },
@@ -121,7 +121,7 @@ where
         &self,
         pending: mpsc::Receiver<(usize, Tx)>,
         actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>,
-        to_multi_proof: Option<CrossbeamSender<StateRootMessage>>,
+        to_sparse_trie_task: Option<CrossbeamSender<StateRootMessage>>,
     ) where
         Tx: ExecutableTxFor<Evm> + Send + 'static,
     {
@@ -141,7 +141,7 @@ where
             let pool = executor.prewarming_pool();
 
             let mut tx_count = 0usize;
-            let to_multi_proof = to_multi_proof.as_ref();
+            let to_sparse_trie_task = to_sparse_trie_task.as_ref();
             pool.in_place_scope(|s| {
                 s.spawn(|_| {
                     pool.init::<PrewarmEvmState<Evm>>(|_| ctx.evm_for_ctx());
@@ -171,17 +171,17 @@ where
                             i = index,
                         )
                         .entered();
-                        Self::transact_worker(ctx, index, tx, to_multi_proof);
+                        Self::transact_worker(ctx, index, tx, to_sparse_trie_task);
                     });
                 }
 
                 // Send withdrawal prefetch targets after all transactions dispatched
-                if let Some(to_multi_proof) = to_multi_proof &&
+                if let Some(to_sparse_trie_task) = to_sparse_trie_task &&
                     let Some(withdrawals) = &ctx.env.withdrawals &&
                     !withdrawals.is_empty()
                 {
                     let targets = multiproof_targets_from_withdrawals(withdrawals);
-                    let _ = to_multi_proof.send(StateRootMessage::PrefetchProofs(targets));
+                    let _ = to_sparse_trie_task.send(StateRootMessage::PrefetchProofs(targets));
                 }
             });
 
@@ -201,7 +201,7 @@ where
         ctx: &PrewarmContext<N, P, Evm>,
         index: usize,
         tx: Tx,
-        to_multi_proof: Option<&CrossbeamSender<StateRootMessage>>,
+        to_sparse_trie_task: Option<&CrossbeamSender<StateRootMessage>>,
     ) where
         Tx: ExecutableTxFor<Evm>,
     {
@@ -247,8 +247,8 @@ where
             if index > 0 {
                 let (targets, storage_targets) = multiproof_targets_from_state(res.state);
                 ctx.metrics.prefetch_storage_targets.record(storage_targets as f64);
-                if let Some(to_multi_proof) = to_multi_proof {
-                    let _ = to_multi_proof.send(StateRootMessage::PrefetchProofs(targets));
+                if let Some(to_sparse_trie_task) = to_sparse_trie_task {
+                    let _ = to_sparse_trie_task.send(StateRootMessage::PrefetchProofs(targets));
                 }
             }
 
@@ -370,7 +370,7 @@ where
             "All BAL prewarm accounts completed"
         );
 
-        // Convert BAL to HashedPostState and send to multiproof task
+        // Convert BAL to HashedPostState and send to sparse trie task
         self.send_bal_hashed_state(&bal);
 
         // Signal that execution has finished
@@ -378,9 +378,9 @@ where
     }
 
     /// Converts the BAL to [`HashedPostState`](reth_trie::HashedPostState) and sends it to the
-    /// multiproof task.
+    /// sparse trie task.
     fn send_bal_hashed_state(&self, bal: &BlockAccessList) {
-        let Some(to_multi_proof) = &self.to_multi_proof else { return };
+        let Some(to_sparse_trie_task) = &self.to_sparse_trie_task else { return };
 
         let provider = match self.ctx.provider.build() {
             Ok(provider) => provider,
@@ -402,8 +402,8 @@ where
                     storages = hashed_state.storages.len(),
                     "Converted BAL to hashed post state"
                 );
-                let _ = to_multi_proof.send(StateRootMessage::HashedStateUpdate(hashed_state));
-                let _ = to_multi_proof.send(StateRootMessage::FinishedStateUpdates);
+                let _ = to_sparse_trie_task.send(StateRootMessage::HashedStateUpdate(hashed_state));
+                let _ = to_sparse_trie_task.send(StateRootMessage::FinishedStateUpdates);
             }
             Err(err) => {
                 warn!(
@@ -433,7 +433,7 @@ where
         // Spawn execution tasks based on mode
         match mode {
             PrewarmMode::Transactions(pending) => {
-                self.spawn_txs_prewarm(pending, actions_tx, self.to_multi_proof.clone());
+                self.spawn_txs_prewarm(pending, actions_tx, self.to_sparse_trie_task.clone());
             }
             PrewarmMode::BlockAccessList(bal) => {
                 self.run_bal_prewarm(bal, actions_tx);

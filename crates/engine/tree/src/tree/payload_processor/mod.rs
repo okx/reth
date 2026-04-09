@@ -593,7 +593,7 @@ where
         (prewarm_rx, execute_rx)
     }
 
-    /// Spawn prewarming optionally wired to the multiproof task for target updates.
+    /// Spawn prewarming optionally wired to the sparse trie task for target updates.
     #[instrument(
         level = "debug",
         target = "engine::tree::payload_processor",
@@ -605,7 +605,7 @@ where
         env: ExecutionEnv<Evm>,
         transactions: mpsc::Receiver<(usize, impl ExecutableTxFor<Evm> + Clone + Send + 'static)>,
         provider_builder: StateProviderBuilder<N, P>,
-        to_multi_proof: Option<CrossbeamSender<StateRootMessage>>,
+        to_sparse_trie_task: Option<CrossbeamSender<StateRootMessage>>,
         bal: Option<Arc<BlockAccessList>>,
     ) -> CacheTaskHandle<N::Receipt>
     where
@@ -635,7 +635,7 @@ where
             self.executor.clone(),
             self.execution_cache.clone(),
             prewarm_ctx,
-            to_multi_proof,
+            to_sparse_trie_task,
         );
 
         {
