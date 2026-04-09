@@ -490,6 +490,7 @@ where
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
+        let sr_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
         let (state_root, trie_updates) = match state_root_precomputed {
             Some(precomputed) => precomputed,
@@ -497,7 +498,9 @@ where
                 .state_root_with_updates(hashed_state.clone())
                 .map_err(BlockExecutionError::other)?,
         };
+        let sr_elapsed = sr_start.elapsed();
 
+        let asm_start = std::time::Instant::now();
         let (transactions, senders) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 
@@ -513,6 +516,14 @@ where
         })?;
 
         let block = RecoveredBlock::new_unhashed(block, senders);
+        let asm_elapsed = asm_start.elapsed();
+
+        tracing::info!(
+            target: "payload_builder",
+            state_root_ms = sr_elapsed.as_secs_f64() * 1000.0,
+            assemble_ms = asm_elapsed.as_secs_f64() * 1000.0,
+            "block builder finish timing"
+        );
 
         Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
     }
