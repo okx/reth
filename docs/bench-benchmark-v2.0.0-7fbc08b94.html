@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Bench — benchmark-v2.0.0 @ 7fbc08b94</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; color: #1e293b; padding: 32px; max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+  .subtitle { color: #64748b; font-size: 14px; margin-bottom: 28px; }
+  .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 32px; }
+  .meta-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; }
+  .meta-card .label { font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .meta-card .value { font-size: 16px; font-weight: 600; }
+  .hero { background: linear-gradient(135deg, #1e40af, #3b82f6); color: #fff; border-radius: 12px; padding: 28px 32px; margin-bottom: 32px; display: flex; align-items: center; gap: 40px; flex-wrap: wrap; }
+  .hero-item .label { font-size: 13px; opacity: 0.8; margin-bottom: 2px; }
+  .hero-item .value { font-size: 36px; font-weight: 800; }
+  .hero-item .value small { font-size: 18px; font-weight: 400; }
+  .hero-item.secondary .value { font-size: 24px; }
+  section { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 24px; margin-bottom: 24px; }
+  section h2 { font-size: 16px; font-weight: 700; margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 8px 12px; border-bottom: 2px solid #e2e8f0; color: #64748b; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  td { padding: 7px 12px; border-bottom: 1px solid #f1f5f9; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: 'SF Mono', Menlo, monospace; font-size: 13px; }
+  td.note { color: #94a3b8; font-size: 12px; }
+  td.dim { color: #b0bec5; font-size: 12px; }
+  th.dim { color: #b0bec5; }
+  td.bar-cell { width: 160px; padding-right: 16px; }
+  .bar { height: 14px; border-radius: 3px; min-width: 2px; }
+  .stacked-bar { display: flex; height: 22px; border-radius: 6px; overflow: hidden; margin-bottom: 0; }
+  .stacked-bar > div { height: 100%; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; font-size: 12px; color: #64748b; }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+  tr:hover { background: #f8fafc; }
+</style>
+</head>
+<body>
+
+<h1>Benchmark Report</h1>
+<div class="subtitle">2026-04-09 19:34 &middot; <code>benchmark-v2.0.0</code> @ <code>7fbc08b94</code> &middot; feat: add block builder finish timing logs and perf analysis scripts</div>
+
+<div class="meta">
+  <div class="meta-card"><div class="label">Branch</div><div class="value">benchmark-v2.0.0</div></div>
+  <div class="meta-card"><div class="label">Commit</div><div class="value">7fbc08b94</div></div>
+  <div class="meta-card"><div class="label">Gas Limit</div><div class="value">2.5B</div></div>
+  <div class="meta-card"><div class="label">Sample Blocks</div><div class="value">154</div></div>
+  <div class="meta-card"><div class="label">Gas Utilization</div><div class="value">~76%</div></div>
+  <div class="meta-card"><div class="label">Persistence</div><div class="value">~417ms</div></div>
+</div>
+
+<div class="hero">
+  <div class="hero-item"><div class="label">TPS (avg)</div><div class="value">52,891</div></div>
+  <div class="hero-item secondary"><div class="label">Txs / Block</div><div class="value">54,179</div></div>
+  <div class="hero-item secondary"><div class="label">Gas Throughput</div><div class="value">1.9 <small>Ggas/s</small></div></div>
+  <div class="hero-item secondary"><div class="label">Block Interval</div><div class="value">1024 <small>ms</small></div></div>
+</div>
+
+<section>
+  <h2>Phase Breakdown</h2>
+  <div class="stacked-bar">
+    <div style="width:15.2%;background:#94a3b8" title="idle: ~155ms (15.2%)"></div>
+<div style="width:68.8%;background:#3b82f6" title="payload_build: ~704ms (68.8%)"></div>
+<div style="width:7.4%;background:#f59e0b" title="new_payload: ~75ms (7.4%)"></div>
+<div style="width:2.7%;background:#a3a3a3" title="fcu + commit: ~27ms (2.7%)"></div>
+
+  </div>
+  <div class="legend">
+    <span><i style="background:#94a3b8"></i>idle</span><span><i style="background:#3b82f6"></i>payload_build</span><span><i style="background:#f59e0b"></i>new_payload</span><span><i style="background:#a3a3a3"></i>fcu + commit</span>
+  </div>
+  <br>
+  <table>
+    <thead>
+      <tr><th>Phase</th><th style="text-align:right">Avg</th><th style="text-align:right">%</th><th class="dim" style="text-align:right">P50</th><th class="dim" style="text-align:right">P95</th><th class="dim" style="text-align:right">P99</th><th></th><th>Note</th></tr>
+    </thead>
+    <tbody>
+      <tr style="font-weight:700;">
+        <td style="padding-left:20px;">Total Block Interval</td>
+        <td class="num">~1024ms</td><td class="num">100%</td>
+        <td class="num dim">994ms</td><td class="num dim">1381ms</td><td class="num dim">1469ms</td>
+        <td></td><td></td>
+      </tr>
+      <tr>
+  <td style="padding-left:20px;font-weight:600;">
+    <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#94a3b8;margin-right:8px;"></span>idle
+  </td>
+  <td class="num">~155ms</td>
+  <td class="num">15.2%</td>
+  <td class="num dim">141ms</td>
+  <td class="num dim">364ms</td>
+  <td class="num dim">732ms</td>
+  <td class="bar-cell"><div class="bar" style="width:15.2%;background:#94a3b8;"></div></td>
+  <td class="note">waiting for block trigger</td>
+</tr>
+<tr>
+  <td style="padding-left:20px;font-weight:600;">
+    <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#3b82f6;margin-right:8px;"></span>payload_build
+  </td>
+  <td class="num">~705ms</td>
+  <td class="num">68.8%</td>
+  <td class="num dim">707ms</td>
+  <td class="num dim">881ms</td>
+  <td class="num dim">896ms</td>
+  <td class="bar-cell"><div class="bar" style="width:68.8%;background:#3b82f6;"></div></td>
+  <td class="note">build block</td>
+</tr>
+<tr>
+  <td style="padding-left:44px;">
+    <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#60a5fa;margin-right:8px;"></span>→ txpool_next
+  </td>
+  <td class="num">~55ms</td>
+  <td class="num">5.4%</td>
+  <td class="num dim">53ms</td>
+  <td class="num dim">84ms</td>
+  <td class="num dim">108ms</td>
+  <td class="bar-cell"><div class="bar" style="width:5.4%;background:#60a5fa;"></div></td>
+  <td class="note">fetch txs from pool</td>
+</tr>
+<tr>
+  <td style="padding-left:44px;">
+    <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#2563eb;margin-right:8px;"></span>→ tx_execute
+  </td>
+  <td class="num">~293ms</td>
+  <td class="num">28.6%</td>
+  <td class="num dim">292ms</td>
+  <td class="num dim">384ms</td>
+  <td class="num dim">389ms</td>
+  <td class="bar-cell"><div class="bar" style="width:28.6%;background:#2563eb;"></div></td>
+  <td class="note">execute txs</td>
+</tr>
+<tr>
+  <td style="padding-left:44px;">
+    <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#7c3aed;margin-right:8px;"></span>→ state_root
+  </td>
+  <td class="num">~124ms</td>
+  <td class="num">12.1%</td>
+  <td class="num dim">123ms</td>
+  <td class="num dim">135ms</td>
+  <td class="num dim">143ms</td>
+  <td class="bar-cell"><div class="bar" style="width:12.1%;background:#7c3aed;"></div></td>
+  <td class="note">compute state root</td>
+</tr>
+<tr>
+  <td style="padding-left:44px;">
+    <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#1d4ed8;margin-right:8px;"></span>→ assemble
+  </td>
+  <td class="num">~196ms</td>
+  <td class="num">19.1%</td>
+  <td class="num dim">194ms</td>
+  <td class="num dim">256ms</td>
+  <td class="num dim">269ms</td>
+  <td class="bar-cell"><div class="bar" style="width:19.1%;background:#1d4ed8;"></div></td>
+  <td class="note">assemble block</td>
+</tr>
+<tr>
+  <td style="padding-left:20px;font-weight:600;">
+    <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#f59e0b;margin-right:8px;"></span>new_payload
+  </td>
+  <td class="num">~76ms</td>
+  <td class="num">7.4%</td>
+  <td class="num dim">74ms</td>
+  <td class="num dim">102ms</td>
+  <td class="num dim">114ms</td>
+  <td class="bar-cell"><div class="bar" style="width:7.4%;background:#f59e0b;"></div></td>
+  <td class="note">validate block</td>
+</tr>
+<tr>
+  <td style="padding-left:20px;font-weight:600;">
+    <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#a3a3a3;margin-right:8px;"></span>fcu + commit
+  </td>
+  <td class="num">~28ms</td>
+  <td class="num">2.7%</td>
+  <td class="num dim">0ms</td>
+  <td class="num dim">0ms</td>
+  <td class="num dim">0ms</td>
+  <td class="bar-cell"><div class="bar" style="width:2.7%;background:#a3a3a3;"></div></td>
+  <td class="note">other overhead</td>
+</tr>
+
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>TPS Distribution</h2>
+  <table>
+    <thead><tr><th style="text-align:right">P50</th><th style="text-align:right">P75</th><th style="text-align:right">P90</th><th style="text-align:right">P95</th><th style="text-align:right">P99</th></tr></thead>
+    <tbody><tr>
+      <td class="num">52,978</td>
+      <td class="num">55,007</td>
+      <td class="num">57,413</td>
+      <td class="num">59,869</td>
+      <td class="num">61,414</td>
+    </tr></tbody>
+  </table>
+</section>
+
+</body>
+</html>
