@@ -41,6 +41,8 @@ use reth_ethereum_forks::{
 };
 use reth_network_peers::{holesky_nodes, hoodi_nodes, mainnet_nodes, sepolia_nodes, NodeRecord};
 use reth_primitives_traits::{sync::LazyLock, BlockHeader, SealedHeader};
+#[cfg(feature = "std")]
+use std::env;
 
 /// Helper method building a [`Header`] given [`Genesis`] and [`ChainHardforks`].
 pub fn make_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header {
@@ -230,21 +232,57 @@ pub static HOODI: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
 /// Includes 20 prefunded accounts with `10_000` ETH each derived from mnemonic "test test test test
 /// test test test test test test test junk".
 pub static DEV: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
-    let genesis = serde_json::from_str(include_str!("../res/genesis/dev.json"))
+    let mut genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/dev.json"))
         .expect("Can't deserialize Dev testnet genesis json");
     let hardforks = DEV_HARDFORKS.clone();
+    let mut base_fee_params = BaseFeeParams::ethereum();
+    apply_dev_env_overrides(&mut genesis, &mut base_fee_params);
     ChainSpec {
         chain: Chain::dev(),
         genesis_header: SealedHeader::seal_slow(make_genesis_header(&genesis, &hardforks)),
         genesis,
         paris_block_and_final_difficulty: Some((0, U256::from(0))),
         hardforks,
-        base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::ethereum()),
+        base_fee_params: BaseFeeParamsKind::Constant(base_fee_params),
         deposit_contract: None, // TODO: do we even have?
         ..Default::default()
     }
     .into()
 });
+
+/// Applies environment variable overrides for the dev chainspec.
+///
+/// Supported variables:
+/// - `RETH_DEV_GAS_LIMIT`
+/// - `RETH_DEV_BASE_FEE_MAX_CHANGE_DENOMINATOR`
+/// - `RETH_DEV_BASE_FEE_ELASTICITY_MULTIPLIER`
+fn apply_dev_env_overrides(genesis: &mut Genesis, base_fee_params: &mut BaseFeeParams) {
+    #[cfg(feature = "std")]
+    {
+        fn parse_env<T: core::str::FromStr>(key: &str) -> Option<T> {
+            let value = env::var(key).ok()?;
+            let raw = value.trim();
+            if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+                // Try hex parse via u128 intermediate for numeric types
+                u128::from_str_radix(hex, 16).ok().and_then(|v| {
+                    // Convert string representation to target type
+                    format!("{v}").parse::<T>().ok()
+                })
+            } else {
+                raw.parse::<T>().ok()
+            }
+        }
+
+        if let Some(gas_limit) = parse_env::<u64>("RETH_DEV_GAS_LIMIT") {
+            genesis.gas_limit = gas_limit;
+        }
+        let max_change_denominator = parse_env::<u128>("RETH_DEV_BASE_FEE_MAX_CHANGE_DENOMINATOR")
+            .unwrap_or(base_fee_params.max_change_denominator);
+        let elasticity_multiplier = parse_env::<u128>("RETH_DEV_BASE_FEE_ELASTICITY_MULTIPLIER")
+            .unwrap_or(base_fee_params.elasticity_multiplier);
+        *base_fee_params = BaseFeeParams::new(max_change_denominator, elasticity_multiplier);
+    }
+}
 
 /// Creates a [`ChainConfig`] from the given chain, hardforks, deposit contract address, and blob
 /// schedule.

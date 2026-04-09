@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, info, instrument};
 
 /// Unified result of any persistence operation.
 #[derive(Debug)]
@@ -178,7 +178,7 @@ where
             }
 
             provider_rw.commit()?;
-            debug!(target: "engine::persistence", first=?first_block, last=?last_block, "Saved range of blocks");
+            info!(target: "engine::persistence", first=?first_block, last=?last_block, elapsed=?start_time.elapsed(), "Saved range of blocks");
 
             // Run the pruner in a separate provider so it reads committed RocksDB state
             // that includes the history entries written by save_blocks above.

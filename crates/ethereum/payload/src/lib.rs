@@ -28,7 +28,7 @@ use reth_evm_ethereum::EthEvmConfig;
 use reth_execution_cache::CachedStateProvider;
 use reth_payload_builder::{BlobSidecars, EthBuiltPayload};
 use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_payload_primitives::PayloadAttributes;
+use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadAttributes};
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::StateProviderFactory;
@@ -37,9 +37,14 @@ use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
     ValidPoolTransaction,
 };
+use either::Either;
+use reth_execution_types::BlockExecutionOutput;
 use revm::context_interface::Block as _;
-use std::sync::Arc;
-use tracing::{debug, trace, warn};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tracing::{debug, info, trace, warn};
 
 mod config;
 pub use config::*;
@@ -207,6 +212,11 @@ where
         builder.evm_mut().block().blob_gasprice().map(|gasprice| gasprice as u64),
     ));
     let mut total_fees = U256::ZERO;
+    let payload_build_start = Instant::now();
+    let mut txpool_next_total = Duration::ZERO;
+    let mut execute_total = Duration::ZERO;
+    let mut txs_considered = 0usize;
+    let mut txs_executed = 0usize;
 
     // If we have a sparse trie handle, wire a state hook that streams per-tx state diffs
     // to the background trie pipeline for incremental state root computation.
@@ -242,7 +252,13 @@ where
     let withdrawals_rlp_length =
         attributes.withdrawals.as_ref().map(|withdrawals| withdrawals.length()).unwrap_or(0);
 
-    while let Some(pool_tx) = best_txs.next() {
+    loop {
+        let next_start = Instant::now();
+        let maybe_pool_tx = best_txs.next();
+        txpool_next_total += next_start.elapsed();
+        let Some(pool_tx) = maybe_pool_tx else { break };
+        txs_considered += 1;
+
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
             // we can't fit this transaction into the block, so we need to mark it as invalid
@@ -335,11 +351,16 @@ where
         let miner_fee = tx.effective_tip_per_gas(base_fee);
         let tx_hash = *tx.tx_hash();
 
+        let exec_start = Instant::now();
         let gas_used = match builder.execute_transaction(tx) {
-            Ok(gas_used) => gas_used,
+            Ok(gas_used) => {
+                execute_total += exec_start.elapsed();
+                gas_used
+            }
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                 error, ..
             })) => {
+                execute_total += exec_start.elapsed();
                 if error.is_nonce_too_low() {
                     // if the nonce is too low, we can skip this transaction
                     trace!(target: "payload_builder", %error, ?tx_hash, "skipping nonce too low transaction");
@@ -357,8 +378,12 @@ where
                 continue
             }
             // this is an error that we should treat as fatal for this attempt
-            Err(err) => return Err(PayloadBuilderError::evm(err)),
+            Err(err) => {
+                execute_total += exec_start.elapsed();
+                return Err(PayloadBuilderError::evm(err))
+            }
         };
+        txs_executed += 1;
 
         // add to the total blob gas used if the transaction successfully executed
         if let Some(blob_count) = tx_blob_count {
@@ -391,7 +416,8 @@ where
         return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
     }
 
-    let BlockBuilderOutcome { execution_result, block, .. } = if let Some(mut handle) = trie_handle
+    let finish_start = Instant::now();
+    let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = if let Some(mut handle) = trie_handle
     {
         // Drop the state hook, which drops the StateHookSender and triggers
         // FinishedStateUpdates via its Drop impl, signaling the trie task to finalize.
@@ -417,11 +443,18 @@ where
         builder.finish(state_provider.as_ref(), None)?
     };
 
+    let finish_total = finish_start.elapsed();
+
+    // Take bundle_state for the executed block before dropping db
+    let bundle_state = std::mem::take(&mut db.bundle_state);
+    drop(db);
+
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
-        .then_some(execution_result.requests);
+        .then(|| execution_result.requests.clone());
 
-    let sealed_block = Arc::new(block.into_sealed_block());
+    let recovered_block = Arc::new(block);
+    let sealed_block = Arc::new(recovered_block.sealed_block().clone());
     debug!(target: "payload_builder", id=%payload_id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");
 
     if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {
@@ -431,9 +464,31 @@ where
         }));
     }
 
+    let executed = BuiltPayloadExecutedBlock {
+        recovered_block,
+        execution_output: Arc::new(BlockExecutionOutput {
+            result: execution_result,
+            state: bundle_state,
+        }),
+        hashed_state: Either::Left(Arc::new(hashed_state)),
+        trie_updates: Either::Left(Arc::new(trie_updates)),
+    };
+
     let payload = EthBuiltPayload::new(sealed_block, total_fees, requests)
-        // add blob sidecars from the executed txs
-        .with_sidecars(blob_sidecars);
+        .with_sidecars(blob_sidecars)
+        .with_executed_block(executed);
+
+    info!(
+        target: "payload_builder",
+        id = %payload_id,
+        txs_considered,
+        txs_executed,
+        txpool_next_ms = txpool_next_total.as_secs_f64() * 1000.0,
+        tx_execute_ms = execute_total.as_secs_f64() * 1000.0,
+        finish_ms = finish_total.as_secs_f64() * 1000.0,
+        payload_build_total_ms = payload_build_start.elapsed().as_secs_f64() * 1000.0,
+        "payload build stage timing"
+    );
 
     Ok(BuildOutcome::Better { payload, cached_reads })
 }
