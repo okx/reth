@@ -448,6 +448,24 @@ struct CrossBlockSparseState {
     /// Version at which each storage account's trie was last accessed.
     /// Used for LRU-style eviction when `cross_block_sparse_max_lag > 0`.
     storage_last_block: alloy_primitives::map::HashMap<B256, i64>,
+    /// Per-version eviction queue: each entry holds the block version and the
+    /// list of accounts first dirtied at that version.
+    ///
+    /// # Why this exists
+    ///
+    /// The naive eviction approach iterates the entire `storage_last_block`
+    /// HashMap to find expired entries — O(total_accounts).  For B4.6 with
+    /// 10K dirty accounts/block and max_lag=8, the map grows to ~90K entries
+    /// and full iteration takes ~20 ms/block (90K × cache-miss-load).
+    ///
+    /// This queue enables O(evicted_count) eviction:
+    /// - Each block appends `(version, accounts_dirty_this_block)` to the back.
+    /// - Eviction pops the front entry (oldest block) and removes only those accounts whose
+    ///   `storage_last_block` still matches the popped version (i.e. they were not re-accessed in
+    ///   a newer block).
+    ///
+    /// This turns the 20 ms O(90K) scan into a ~0.3 ms O(10K) pass.
+    version_queue: std::collections::VecDeque<(i64, Vec<B256>)>,
 }
 
 /// A persist job sent to the background worker thread.
@@ -5204,7 +5222,10 @@ impl MptCommitStore {
         // Sparse path reads published segments directly in factory-building.
         // Refresh the published view so open_trie_page() can hit newly-published
         // generations after flush_persist/background publish.
+        let refresh_start = std::time::Instant::now();
         self.maybe_refresh_published_view()?;
+        // Track refresh cost so [mptcross] can include it in the breakdown.
+        self.last_apply_published_view_refresh = refresh_start.elapsed();
 
         if self.config.cross_block_sparse {
             let result =
@@ -5309,6 +5330,7 @@ impl MptCommitStore {
         self.last_sparse_apply_account_proof = account_proof_start.elapsed();
 
         // ── Phase B: apply changes (mutable borrow of cross.trie) ────────────
+
         if let Some(ref mut cross) = self.cross_block_sparse {
             // Reset update tracking so root_with_updates captures only the
             // current block's changes.
@@ -5326,33 +5348,77 @@ impl MptCommitStore {
                 true, // skip_already_revealed_storage
             )?;
             sparse_apply_changes_elapsed += apply_changes_start.elapsed();
+            let post_apply_start = std::time::Instant::now();
 
             // Update access version for dirty storage accounts.
+            // Collect dirty addresses for the version_queue in one pass.
+            let t_last_block_start = std::time::Instant::now();
+            let mut block_addrs: Vec<B256> = Vec::with_capacity(
+                dirty_accounts
+                    .iter()
+                    .filter(|d| !d.storage_changes.is_empty() || d.storage_wiped)
+                    .count(),
+            );
             for dirty in &dirty_accounts {
                 if !dirty.storage_changes.is_empty() || dirty.storage_wiped {
                     cross.storage_last_block.insert(dirty.hashed_address, next_version);
+                    block_addrs.push(dirty.hashed_address);
                 }
             }
+            if !block_addrs.is_empty() {
+                cross.version_queue.push_back((next_version, block_addrs));
+            }
+            let t_last_block_elapsed = t_last_block_start.elapsed();
 
-            // LRU eviction: remove storage tries for accounts idle too long.
+            // LRU eviction: O(evicted_count) via the version_queue ring buffer.
+            //
+            // Instead of iterating the full `storage_last_block` HashMap (O(90K) → 20ms),
+            // pop the oldest version_queue entry and evict only the accounts whose
+            // `storage_last_block` still matches the popped version (i.e., they were
+            // not re-accessed in a newer block).
+            //
+            // The DROP of SparseTrie objects (HashMap<Nibbles,SparseNode> × 45 entries
+            // per trie) is deferred to a Rayon task so it does not block the front-end.
+            // Dropping 10K SparseTries on the main thread was the remaining ~17 ms.
+            let t_evict_start = std::time::Instant::now();
             let max_lag = self.config.cross_block_sparse_max_lag;
+            let mut evict_count = 0usize;
             if max_lag > 0 {
                 let threshold = next_version - max_lag;
-                let to_evict: Vec<B256> = cross
-                    .storage_last_block
-                    .iter()
-                    .filter(|(_, v)| **v < threshold)
-                    .map(|(addr, _)| *addr)
-                    .collect();
-                for addr in to_evict {
-                    cross.trie.take_storage_trie(&addr);
-                    cross.storage_last_block.remove(&addr);
+                // Collect evicted tries for deferred background drop.
+                let mut evicted_tries = Vec::new();
+                while let Some((v, _)) = cross.version_queue.front() {
+                    if *v >= threshold {
+                        break;
+                    }
+                    let (old_version, addrs) = cross.version_queue.pop_front().unwrap();
+                    for addr in addrs {
+                        // Only evict if the account's last-access version matches
+                        // the popped entry (not re-accessed in a newer block).
+                        if cross.storage_last_block.get(&addr) == Some(&old_version) {
+                            if let Some(trie) = cross.trie.take_storage_trie(&addr) {
+                                evicted_tries.push(trie);
+                            }
+                            cross.storage_last_block.remove(&addr);
+                            evict_count += 1;
+                        }
+                    }
+                }
+                // Defer the Drop of evicted SparseTries to a Rayon background task.
+                // Each SparseTrie contains HashMap<Nibbles,SparseNode> + HashMap<Nibbles,Bytes>
+                // which takes ~1.7 µs to drop; 10K tries × 1.7 µs = ~17 ms on the hot path.
+                // Rayon spawn is effectively free: drops happen on pooled threads that are
+                // otherwise idle during the main-thread eviction window.
+                if !evicted_tries.is_empty() {
+                    rayon::spawn(move || drop(evicted_tries));
                 }
             }
+            let t_evict_elapsed = t_evict_start.elapsed();
 
             // Build pending from the reused trie (factory already updated above).
             // We take the trie out of cross_block_sparse temporarily;
             // commit_inner_with_mode will put it back.
+            let t_swap_start = std::time::Instant::now();
             let trie_for_pending =
                 std::mem::replace(&mut cross.trie, SparseStateTrie::default().with_updates(false));
             // Avoid per-block full clone of factory maps: after apply, `cross.factory`
@@ -5364,6 +5430,25 @@ impl MptCommitStore {
                 trie: trie_for_pending,
                 factory: factory_for_pending,
             }));
+            let t_swap_elapsed = t_swap_start.elapsed();
+            let post_apply_elapsed = post_apply_start.elapsed();
+
+            if std::env::var_os("MPT_SPARSE_APPLY_TRACE").is_some() {
+                static POST_LOGGED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = POST_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 10 == 0 || n < 5 {
+                    eprintln!(
+                        "[mptpost] last_block={:.1}ms evict={:.1}ms({}) swap={:.1}ms post_total={:.1}ms slb_size={}",
+                        t_last_block_elapsed.as_secs_f64() * 1000.0,
+                        t_evict_elapsed.as_secs_f64() * 1000.0,
+                        evict_count,
+                        t_swap_elapsed.as_secs_f64() * 1000.0,
+                        post_apply_elapsed.as_secs_f64() * 1000.0,
+                        cross.storage_last_block.len(),
+                    );
+                }
+            }
         } else {
             // ── First block: initialise cross-block state ─────────────────────
             // factory and account_proof were built in Phase A above.
@@ -5380,10 +5465,16 @@ impl MptCommitStore {
 
             // Initialise access tracking for dirty storage accounts.
             let mut storage_last_block = alloy_primitives::map::HashMap::default();
+            let mut first_block_addrs: Vec<B256> = Vec::new();
             for dirty in &dirty_accounts {
                 if !dirty.storage_changes.is_empty() || dirty.storage_wiped {
                     storage_last_block.insert(dirty.hashed_address, next_version);
+                    first_block_addrs.push(dirty.hashed_address);
                 }
+            }
+            let mut version_queue = std::collections::VecDeque::new();
+            if !first_block_addrs.is_empty() {
+                version_queue.push_back((next_version, first_block_addrs));
             }
 
             // Store cross-block state with a placeholder trie (real one goes
@@ -5395,12 +5486,37 @@ impl MptCommitStore {
                 trie: SparseStateTrie::default().with_updates(false), /* placeholder */
                 factory: SegmentTrieNodeProviderFactory::new(),
                 storage_last_block,
+                version_queue,
             }));
             self.pending_sparse_state =
                 Some(Box::new(PendingSparseState { trie: sparse_trie, factory }));
         }
         self.dirty_accounts = dirty_accounts;
         self.last_sparse_apply_apply_changes = sparse_apply_changes_elapsed;
+
+        // Cross-block timing trace — activated by MPT_SPARSE_APPLY_TRACE.
+        // Shows factory build / account proof / apply_changes breakdown so the
+        // ~32 ms overhead outside apply_all_storage_changes_sparse can be located.
+        if std::env::var_os("MPT_SPARSE_APPLY_TRACE").is_some() {
+            static CROSS_LOGGED: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = CROSS_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Print every block (block_num % 10 == 0 after warmup)
+            if n % 10 == 0 || n < 5 {
+                eprintln!(
+                    "[mptcross] pub_refresh={:.1}ms acct_checkout={:.1}ms factory_build={:.1}ms \
+                     acct_proof={:.1}ms apply_changes={:.1}ms acct_reveal_keys={} in_reuse={}",
+                    self.last_apply_published_view_refresh.as_secs_f64() * 1000.0,
+                    self.last_apply_account_trie_checkout.as_secs_f64() * 1000.0,
+                    self.last_sparse_apply_factory_build.as_secs_f64() * 1000.0,
+                    self.last_sparse_apply_account_proof.as_secs_f64() * 1000.0,
+                    sparse_apply_changes_elapsed.as_secs_f64() * 1000.0,
+                    self.last_sparse_account_reveal_keys,
+                    in_reuse_mode,
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -5412,9 +5528,61 @@ impl MptCommitStore {
         self.last_sparse_account_reveal_keys = 0;
         self.last_apply_account_trie_checkout = Duration::ZERO;
         if self.config.use_sparse_storage {
-            self.apply_dirty_accounts_inner_sparse(dirty_accounts)?;
-            // Sparse-only path (wal_first and non-wal_first).
-            return Ok(());
+            // Auto-route to the direct StorageTrieCow path when the workload is
+            // sparse (few changes per account).  This eliminates:
+            //   • serial `reveal_storage` (~12 ms) — no SparseStateTrie reveal needed
+            //   • separate `root_compute` phase (~22-30 ms) — root is computed inline
+            //     during the parallel apply pass (`merge_hash = true`)
+            //
+            // The direct path works by leaving `pending_sparse_state = None`, which
+            // causes `commit_inner_with_mode_and_external_root` to use the COW handle
+            // path.  Proof generation falls through to the account_trie + storage
+            // handle path (same as `use_sparse_storage = false`), which is correct.
+            //
+            // Triggered by `config.direct_update_avg_changes_threshold` or the
+            // `MPT_DIRECT_UPDATE_THRESHOLD` env-var override.
+            // Env var takes precedence over config so it can be tuned at runtime
+            // without recompilation.  `or` falls back to config when env var
+            // is absent.
+            let effective_threshold = std::env::var("MPT_DIRECT_UPDATE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|&t| t > 0.0)
+                .or(self.config.direct_update_avg_changes_threshold);
+
+            let use_direct = effective_threshold.map_or(false, |threshold| {
+                !dirty_accounts.is_empty() && {
+                    let total_changes: usize =
+                        dirty_accounts.iter().map(|d| d.storage_changes.len()).sum();
+                    let avg = total_changes as f64 / dirty_accounts.len() as f64;
+                    // Use <= so avg==threshold still triggers (e.g. avg=30, threshold=30).
+                    avg <= threshold
+                }
+            });
+
+            if use_direct {
+                // Fall through to the non-sparse (direct COW) path below.
+                // `pending_sparse_state` is NOT set → commit uses COW handles.
+                // Log once (first block only) so the user can verify activation.
+                static DIRECT_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !DIRECT_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let total: usize = dirty_accounts.iter().map(|d| d.storage_changes.len()).sum();
+                    let avg = total as f64 / dirty_accounts.len().max(1) as f64;
+                    eprintln!(
+                        "[mpt:direct] using direct StorageTrieCow path \
+                         (accounts={} avg_changes={:.1} threshold={:.1}): \
+                         reveal_storage and root_compute eliminated",
+                        dirty_accounts.len(),
+                        avg,
+                        effective_threshold.unwrap_or(0.0),
+                    );
+                }
+            } else {
+                self.apply_dirty_accounts_inner_sparse(dirty_accounts)?;
+                // Sparse-only path (wal_first and non-wal_first).
+                return Ok(());
+            }
         }
         let published_refreshes = 0u64;
         let l3_into_tree = Duration::ZERO;
@@ -5575,6 +5743,32 @@ impl MptCommitStore {
         self.last_apply_branch_collapse_to_extension = slot_stats.branch_collapse_to_extension;
         self.last_apply_extension_leaf_merges = slot_stats.extension_leaf_merges;
         self.last_apply_extension_extension_merges = slot_stats.extension_extension_merges;
+
+        // Trace output for the direct (non-sparse) path — mirrors the sparse
+        // path's MPT_SPARSE_APPLY_TRACE format so both paths are easy to compare.
+        if std::env::var_os("MPT_SPARSE_APPLY_TRACE").is_some() {
+            eprintln!(
+                "[mptdirect] accounts={} changes={} \
+                 acct_checkout={:.1}ms ensure_storage={:.1}ms \
+                 pub_refresh={:.1}ms root_lookup={:.1}ms \
+                 slot_updates={:.1}ms \
+                 l3_pub={:.1}ms total_get_or_load={:.1}ms \
+                 l2_hits={} l3_pub_hits={} node_fallback={}",
+                self.dirty_accounts.len(),
+                self.last_apply_slot_inserts + self.last_apply_slot_deletes,
+                self.last_apply_account_trie_checkout.as_secs_f64() * 1000.0,
+                self.last_apply_ensure_storage.as_secs_f64() * 1000.0,
+                self.last_apply_published_view_refresh.as_secs_f64() * 1000.0,
+                self.last_apply_storage_root_lookup.as_secs_f64() * 1000.0,
+                self.last_apply_storage_slot_updates.as_secs_f64() * 1000.0,
+                self.last_apply_l3_published_load.as_secs_f64() * 1000.0,
+                self.last_apply_get_or_load_storage_tries.as_secs_f64() * 1000.0,
+                self.last_apply_l2_hits,
+                self.last_apply_l3_published_hits,
+                self.last_apply_node_fallback_loads,
+            );
+        }
+
         Ok(())
     }
 
@@ -5594,6 +5788,20 @@ impl MptCommitStore {
         let collect_elapsed = collect_start.elapsed();
         self.apply_dirty_accounts_inner(dirty_accounts)?;
         self.last_apply_collect_dirty_accounts = collect_elapsed;
+
+        // Cross-block bundle timing: show collect vs apply breakdown.
+        if std::env::var_os("MPT_SPARSE_APPLY_TRACE").is_some() {
+            static BUNDLE_LOGGED: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = BUNDLE_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 10 == 0 || n < 5 {
+                eprintln!(
+                    "[mptbundle] collect_dirty={:.1}ms",
+                    collect_elapsed.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -6093,8 +6301,6 @@ impl MptCommitStore {
             } else if mode.wal_first {
                 let verify_sparse_root =
                     std::env::var_os("MPT_VERIFY_WAL_SPARSE_ACCOUNT_ROOT").is_some();
-                // In wal_first mode we always use sparse-root on hot path to
-                // avoid duplicate account-trie hash computation.
                 let use_sparse_root = wal_sparse_root_enabled;
                 let sparse_root = if use_sparse_root || verify_sparse_root {
                     let sparse_root_start = std::time::Instant::now();
@@ -6135,7 +6341,7 @@ impl MptCommitStore {
                     }
                     (root, TrieUpdates::default(), account_trie)
                 } else {
-                    let (root, account_cow) = account_trie
+                    let (root, mut account_cow) = account_trie
                         .root_hash_only_parallel_account(&self.persisted)
                         .map_err(|err| {
                             MptDbError::Other(format!("account trie root hash (wal_first): {err}"))

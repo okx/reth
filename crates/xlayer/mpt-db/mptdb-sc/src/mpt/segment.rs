@@ -601,39 +601,32 @@ impl<'a> StorageTrieSegmentReader<'a> {
                         }
                     }
                 }
-                SegmentNodeKind::Branch { children, .. } => {
+                SegmentNodeKind::Branch { child_bitmap, children, .. } => {
                     let nibble = path.get_unchecked(offset) as u8;
-                    let mut next: Option<Result<(u32, usize)>> = None;
-                    for child_result in children.iter() {
-                        let child = child_result?;
-                        if child.slot == nibble {
-                            match child.target_idx {
-                                Some(idx) => {
-                                    next = Some(Ok((idx, offset + 1)));
-                                }
-                                None => {
-                                    if matches!(child.embed, SegmentChildEmbedRef::Hash(_)) {
-                                        next = Some(Err(MptDbError::Other(format!(
-                                            "hash boundary at path {:?} nibble {}: \
-                                             branch child is a cross-segment hash \
-                                             reference; Phase 1 eager witness did \
-                                             not cover this node",
-                                            path, nibble
-                                        ))));
-                                    }
-                                    // else: inline child — Ok(None) below
-                                }
-                            }
-                            break;
-                        }
+                    // O(1) existence check via bitmask, then O(1) dense index via popcount.
+                    // Children are stored in ascending slot order during encode_segment.
+                    if (child_bitmap >> nibble) & 1 == 0 {
+                        return Ok(None); // nibble absent
                     }
-                    match next {
-                        None => return Ok(None), // nibble absent or inline child
-                        Some(Ok((next_idx, new_offset))) => {
-                            seg_idx = next_idx;
-                            offset = new_offset;
+                    let child = children.get(child_dense_index(child_bitmap, nibble))?;
+                    match child.target_idx {
+                        Some(idx) => {
+                            seg_idx = idx;
+                            offset += 1;
                         }
-                        Some(Err(e)) => return Err(e),
+                        None => {
+                            if matches!(child.embed, SegmentChildEmbedRef::Hash(_)) {
+                                return Err(MptDbError::Other(format!(
+                                    "hash boundary at path {:?} nibble {}: \
+                                     branch child is a cross-segment hash \
+                                     reference; Phase 1 eager witness did \
+                                     not cover this node",
+                                    path, nibble
+                                )));
+                            }
+                            // Inline child — path goes beyond what this segment can serve.
+                            return Ok(None);
+                        }
                     }
                 }
             }
@@ -748,14 +741,16 @@ impl<'a> StorageTrieSegmentReader<'a> {
         let use_full_scan = allow_full_scan &&
             keys.len() >= STORAGE_PROOF_FULL_SCAN_MIN_KEYS &&
             self.node_count() <= STORAGE_PROOF_FULL_SCAN_MAX_NODES;
-        let (arena, root_idx, _lazy_siblings) = if use_full_scan {
-            self.trace_full_trie_for_proof()?.into_parts()
+        if use_full_scan {
+            let (arena, root_idx, _lazy_siblings) = self.trace_full_trie_for_proof()?.into_parts();
+            super::sparse_storage::convert_arena_to_decoded_storage_multiproof(
+                &arena, root_idx, self.root,
+            )
         } else {
-            self.trace_touched_paths_inner(keys, false)?.into_parts()
-        };
-        super::sparse_storage::convert_arena_to_decoded_storage_multiproof(
-            &arena, root_idx, self.root,
-        )
+            // Zero-copy path: traverse directly via view_node without building an arena.
+            // Avoids O(keys × depth) heap allocations from decode_node + arena.alloc_clean.
+            self.extract_multi_key_decoded_multiproof_zero_copy(keys)
+        }
     }
 
     /// Extracts a full decoded storage multiproof by materializing the whole trie.
@@ -1067,7 +1062,11 @@ impl<'a> StorageTrieSegmentReader<'a> {
                     }
                 }
 
-                if let Some(child) = children.iter().find(|child| child.slot == nibble as u8) {
+                // O(1) child lookup: child_bitmap check above guarantees nibble exists.
+                // Children are stored in ascending slot order during encode_segment,
+                // so popcount of lower bits gives the dense array index directly.
+                {
+                    let child = &children[child_dense_index(child_bitmap, nibble as u8)];
                     if let Some(target_idx) = child.target_idx {
                         let child_arena = self.materialize_for_key(
                             target_idx,
@@ -1309,6 +1308,203 @@ impl<'a> StorageTrieSegmentReader<'a> {
             .get(start..end)
             .ok_or_else(|| MptDbError::Other("segment blob slice out of bounds".to_string()))
     }
+
+    // -------------------------------------------------------------------------
+    // Zero-copy multi-key proof extraction
+    // -------------------------------------------------------------------------
+
+    /// Build a `DecodedStorageMultiProof` for `keys` without constructing an arena.
+    ///
+    /// Uses `view_node` (zero-copy borrowed slice views) throughout instead of
+    /// `decode_node` (which allocates `MptNode` + `Vec<SegmentChildMeta>` per node).
+    ///
+    /// # Why this is faster than the arena path
+    ///
+    /// The arena path (`trace_touched_paths_inner` → `convert_arena_to_decoded_storage_multiproof`)
+    /// does, for each traversed node:
+    ///   1. `decode_node(seg_idx)` — parses binary → owned `MptNode` + heap `Vec`
+    ///   2. `arena.alloc_clean(node.clone())` — clone + heap push
+    ///   3. `convert_arena_to_decoded_storage_multiproof` — second pass re-encoding to RLP
+    ///
+    /// This path does, for each traversed node:
+    ///   1. `view_node(seg_idx)` — borrowed slice view, zero allocation
+    ///   2. Directly encode children to RLP in one pass
+    ///
+    /// For B4.6 (300 K slot changes, ~50 K accounts × avg 10-node paths),
+    /// this eliminates O(500 K) heap allocations from the hot path.
+    fn extract_multi_key_decoded_multiproof_zero_copy(
+        &self,
+        keys: &[Nibbles],
+    ) -> Result<DecodedStorageMultiProof> {
+        // Empty trie sentinel: no nodes to include in proof.
+        if self.root_idx == u32::MAX {
+            return Ok(DecodedStorageMultiProof {
+                root: self.root,
+                subtree: DecodedProofNodes::from_iter(std::iter::empty::<(
+                    Nibbles,
+                    alloy_trie::nodes::TrieNode,
+                )>()),
+                branch_node_masks: BranchNodeMasksMap::default(),
+            });
+        }
+
+        let mut pairs: Vec<(Nibbles, alloy_trie::nodes::TrieNode)> = Vec::new();
+        let mut branch_masks = BranchNodeMasksMap::default();
+        // Vec<bool> indexed by seg_idx: O(1) array access, no hashing overhead.
+        // node_count is bounded and known upfront; the Vec is stack-hot after the
+        // first key traverses it (L1/L2 cache resident for typical storage tries).
+        let mut visited: Vec<bool> = vec![false; self.node_count as usize];
+
+        for key in keys {
+            self.traverse_for_proof(
+                self.root_idx,
+                key,
+                0,
+                &mut pairs,
+                &mut branch_masks,
+                &mut visited,
+            )?;
+        }
+
+        Ok(DecodedStorageMultiProof {
+            root: self.root,
+            subtree: DecodedProofNodes::from_iter(pairs),
+            branch_node_masks: branch_masks,
+        })
+    }
+
+    /// Recursive zero-copy path traversal for `extract_multi_key_decoded_multiproof_zero_copy`.
+    ///
+    /// # Design decisions vs. the previous version
+    ///
+    /// **No `path: Nibbles` parameter.**
+    /// The previous version passed `path` by value, cloning it at every branch
+    /// before recursing (`O(depth)` per level × N keys = `O(N × depth²)` total).
+    /// Instead, when a node is first visited we derive the path lazily:
+    /// `key.slice(..offset)`.  This is safe because any two keys that reach the
+    /// same `seg_idx` share the same prefix (trie structure guarantee), so
+    /// `key.slice(..offset)` is identical for all keys through that node.
+    ///
+    /// **`Vec<bool>` instead of `HashMap<u32, ()>`.**
+    /// `seg_idx` values are dense `0..node_count`, so a pre-allocated `Vec<bool>`
+    /// gives O(1) reads and writes with a single array-bounds check — no SipHash.
+    ///
+    /// Branch child lookup uses O(1) popcount indexing (`child_dense_index`).
+    fn traverse_for_proof(
+        &self,
+        seg_idx: u32,
+        key: &Nibbles,
+        offset: usize,
+        pairs: &mut Vec<(Nibbles, alloy_trie::nodes::TrieNode)>,
+        branch_masks: &mut BranchNodeMasksMap,
+        visited: &mut Vec<bool>,
+    ) -> Result<()> {
+        let node = self.view_node(seg_idx)?;
+        // Mark visited; O(1) array write.  The cast is safe: seg_idx < node_count
+        // which is what `visited` was sized to.
+        let is_new = !std::mem::replace(&mut visited[seg_idx as usize], true);
+
+        match node.kind {
+            SegmentNodeKind::Leaf { nibbles, value } => {
+                if is_new {
+                    // Derive path lazily — no clone needed at any earlier level.
+                    let path = key.slice(..offset);
+                    pairs.push((
+                        path,
+                        alloy_trie::nodes::TrieNode::Leaf(alloy_trie::nodes::LeafNode::new(
+                            Nibbles::from_nibbles(nibbles),
+                            value.to_vec(),
+                        )),
+                    ));
+                }
+                // Leaf: no children to descend into.
+            }
+            SegmentNodeKind::Extension { nibbles, child } => {
+                let ext_nibbles = Nibbles::from_nibbles(nibbles);
+                if is_new {
+                    let path = key.slice(..offset); // lazy path, no prior clones
+                    let child_rlp = segment_child_embed_to_rlp_node(&child)?;
+                    pairs.push((
+                        path,
+                        alloy_trie::nodes::TrieNode::Extension(
+                            alloy_trie::nodes::ExtensionNode::new(ext_nibbles.clone(), child_rlp),
+                        ),
+                    ));
+                }
+                // Continue traversal even if already visited (another key may use the child).
+                let remaining = key.slice(offset..);
+                if remaining.len() >= ext_nibbles.len() &&
+                    remaining.slice(..ext_nibbles.len()) == ext_nibbles
+                {
+                    if let Some(next_idx) = child.target_idx {
+                        // offset advances by extension length; no path clone needed.
+                        self.traverse_for_proof(
+                            next_idx,
+                            key,
+                            offset + ext_nibbles.len(),
+                            pairs,
+                            branch_masks,
+                            visited,
+                        )?;
+                    }
+                }
+            }
+            SegmentNodeKind::Branch { child_bitmap, children, value: _ } => {
+                if is_new {
+                    // Build the branch proof node on first visit only.
+                    // Iterates ALL children once to collect sibling hashes — unavoidable
+                    // for proof correctness; no heap allocation per child (view only).
+                    let path = key.slice(..offset); // lazy path
+                    let mut rlp_stack: Vec<alloy_trie::nodes::RlpNode> = Vec::new();
+                    let mut state_mask = TrieMask::default();
+                    let mut tree_mask = TrieMask::default();
+                    let mut hash_mask = TrieMask::default();
+                    for child_result in children.iter() {
+                        let child = child_result?;
+                        state_mask.set_bit(child.slot);
+                        if child.target_idx.is_some() {
+                            tree_mask.set_bit(child.slot);
+                        }
+                        if matches!(child.embed, SegmentChildEmbedRef::Hash(_)) {
+                            hash_mask.set_bit(child.slot);
+                        }
+                        rlp_stack.push(segment_child_embed_to_rlp_node(&child)?);
+                    }
+                    // `path` is consumed by one of the two inserts below.
+                    // We only need a clone when both pairs AND branch_masks need it.
+                    let need_masks = tree_mask.get() != 0 || hash_mask.get() != 0;
+                    let path_for_masks = if need_masks { Some(path.clone()) } else { None };
+                    pairs.push((
+                        path,
+                        alloy_trie::nodes::TrieNode::Branch(alloy_trie::nodes::BranchNode::new(
+                            rlp_stack, state_mask,
+                        )),
+                    ));
+                    if let Some(p) = path_for_masks {
+                        branch_masks.insert(p, BranchNodeMasks { tree_mask, hash_mask });
+                    }
+                }
+                // Descend to the relevant child — O(1) popcount lookup, no path clone.
+                if offset < key.len() {
+                    let nibble = key.get_unchecked(offset) as u8;
+                    if (child_bitmap >> nibble) & 1 != 0 {
+                        let child = children.get(child_dense_index(child_bitmap, nibble))?;
+                        if let Some(next_idx) = child.target_idx {
+                            self.traverse_for_proof(
+                                next_idx,
+                                key,
+                                offset + 1,
+                                pairs,
+                                branch_masks,
+                                visited,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn segment_child_embed_to_rlp_node(
@@ -1329,6 +1525,20 @@ fn segment_child_embed_to_rlp_node(
             child.slot
         ))),
     }
+}
+
+/// O(1) slot → dense-array index using popcount.
+///
+/// Branch children are stored in ascending slot order during `encode_segment`.
+/// Given `child_bitmap`, the position of `slot` in the children array equals
+/// the number of set bits *below* `slot` in the bitmap.
+///
+/// Caller must ensure `slot` is set in `child_bitmap` (i.e. `(child_bitmap >> slot) & 1 != 0`).
+/// This mirrors MonadDB's `bitmask_index` (`category/mpt/util.hpp`).
+#[inline(always)]
+fn child_dense_index(child_bitmap: u16, slot: u8) -> usize {
+    // Mask out all bits at position >= slot, then count the remaining ones.
+    (child_bitmap & ((1u16 << slot) - 1)).count_ones() as usize
 }
 
 fn nibbles_extend(base: &Nibbles, extra: &Nibbles) -> Nibbles {

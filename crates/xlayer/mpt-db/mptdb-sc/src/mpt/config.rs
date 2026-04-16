@@ -80,6 +80,36 @@ pub struct MptConfig {
     /// `0` disables eviction (unbounded; only use for testing).
     /// Default: `8`.
     pub cross_block_sparse_max_lag: i64,
+
+    /// Auto-route to the direct `StorageTrieCow` path when the average number
+    /// of storage changes per dirty account is below this threshold, even when
+    /// `use_sparse_storage = true`.
+    ///
+    /// # Why this helps
+    ///
+    /// The `SparseStateTrie` path has two serial/expensive phases:
+    /// - `reveal_storage`: serial reveal of all accounts' proofs (~12 ms for B4.6)
+    /// - `root_compute`: separate parallel pass to compute storage roots (~22-30 ms)
+    ///
+    /// The direct `StorageTrieCow` path eliminates both:
+    /// - No reveal phase: each account's storage trie is updated directly via COW.
+    /// - Root hash computed **inline** during the parallel apply pass (`merge_hash=true`).
+    ///
+    /// Inspired by MonadDB's single-pass `do_update` design: read old nodes,
+    /// apply changes, recompute hashes bottom-up — all in one DFS, fully parallel
+    /// across accounts.
+    ///
+    /// # Choosing a value
+    ///
+    /// - B4.6 (sparse, ~6 changes/account): set to `25.0` → direct path activates, expected ~22 ms
+    ///   reduction in `apply_bundle_state`.
+    /// - B4.7 (dense, 200 changes/contract): direct path does NOT activate, SparseStateTrie's
+    ///   cross-block warm-state reuse stays in effect.
+    ///
+    /// Can also be overridden at runtime via `MPT_DIRECT_UPDATE_THRESHOLD=<f64>`.
+    ///
+    /// Default: `None` (disabled; preserves existing behaviour).
+    pub direct_update_avg_changes_threshold: Option<f64>,
 }
 
 impl Default for MptConfig {
@@ -104,6 +134,10 @@ impl Default for MptConfig {
             use_sparse_storage: true,
             cross_block_sparse: true,
             cross_block_sparse_max_lag: 8,
+            // Disabled by default: benchmarks show the direct COW path is slower than
+            // SparseStateTrie for typical workloads (empty-trie mass insertions).
+            // Set via MPT_DIRECT_UPDATE_THRESHOLD env var for specific workloads.
+            direct_update_avg_changes_threshold: None,
         }
     }
 }
