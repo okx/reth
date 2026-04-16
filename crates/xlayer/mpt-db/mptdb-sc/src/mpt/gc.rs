@@ -9,6 +9,7 @@ use super::{
     node::{ChildRef, MptNode},
     persisted::PersistedTrieStore,
     r#trait::MptGcStats,
+    stale_index::StaleRootIndex,
 };
 
 /// Collect all node hashes reachable from the given roots via BFS.
@@ -70,8 +71,216 @@ pub(crate) fn collect_reachable_hashes(
     Ok(live)
 }
 
+/// Incremental GC: delete nodes reachable from stale roots but not from live roots.
+///
+/// # How it works
+///
+/// 1. Best-effort BFS from all roots in `stale_index` → candidate set. Missing nodes are skipped
+///    (they may have been inlined, never persisted, or already cleaned by a previous GC).
+/// 2. BFS from all current live roots → live set.
+/// 3. Delete `candidates ∖ live`.
+/// 4. Remove processed stale index entries before `prune_watermark`.
+///
+/// This avoids the O(total_nodes) full-scan of `gc_unreachable_nodes` and
+/// replaces it with O(stale_path_nodes + live_path_nodes), which is bounded
+/// by the current trie size rather than historical accumulated node count.
+///
+/// Returns `None` if the stale index is empty (nothing to do).
+pub(crate) fn gc_incremental(
+    store: &PersistedTrieStore,
+    stale_index: &StaleRootIndex,
+    live_roots: impl IntoIterator<Item = B256>,
+    prune_watermark: i64,
+) -> Result<Option<MptGcStats>> {
+    if stale_index.is_empty()? {
+        return Ok(None);
+    }
+
+    // Step 1: Best-effort BFS from stale roots → candidates.
+    // Missing nodes are tolerated: they were inline, never persisted (WAL-first
+    // mode), or already deleted by a previous GC cycle.
+    let stale_roots = stale_index.collect_stale_roots()?;
+    let candidates = collect_reachable_hashes_tolerant(store, stale_roots)?;
+
+    if candidates.is_empty() {
+        // Stale roots had no persisted nodes (e.g. all inline, or WAL-first
+        // mode where nodes haven't been written to RocksDB yet).
+        stale_index.remove_entries_before(prune_watermark)?;
+        return Ok(Some(MptGcStats { scanned_nodes: 0, retained_nodes: 0, deleted_nodes: 0 }));
+    }
+
+    // Step 2: BFS from live roots → live set.
+    // Missing nodes (None) are tolerated: in WAL-first mode, a live node may not
+    // yet be in RocksDB (it's in the segment / WAL).  We conservatively treat it
+    // as "live but unresolvable" — we will never delete such a node because it
+    // won't appear in `candidates` either (the stale BFS would also skip it).
+    //
+    // IMPORTANT: decode failures are NOT tolerated here.  A corrupt live node
+    // could cause its subtree to be missed from the live set, making intact
+    // reachable nodes look like candidates and causing incorrect deletion.
+    // A decode error on the live path is a hard error that aborts the GC.
+    let live = collect_reachable_hashes_skip_missing(store, live_roots)?;
+
+    // Step 3: stale = candidates - live
+    let to_delete: Vec<B256> = candidates.difference(&live).copied().collect();
+    let scanned = candidates.len() as u64;
+    let deleted = to_delete.len() as u64;
+    store.delete_batch_durable(&to_delete)?;
+
+    // Step 4: clean up processed stale index entries
+    stale_index.remove_entries_before(prune_watermark)?;
+
+    // If incremental GC found nothing to delete, signal the caller to run a
+    // full scan as a safety net.  This covers orphans from rollbacks or other
+    // code paths that don't write to the stale index.  When we deleted nodes,
+    // the incremental result is authoritative and we skip the full scan.
+    if deleted == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(MptGcStats {
+        scanned_nodes: scanned,
+        retained_nodes: scanned - deleted,
+        deleted_nodes: deleted,
+    }))
+}
+
+/// BFS for the **live** set — WAL-first compatible.
+///
+/// Tolerates nodes that are absent from the persisted store (`get_node` returns
+/// `None`): in WAL-first mode a live node may not yet be flushed to RocksDB.
+/// An absent live node cannot appear in the candidate set either (stale BFS
+/// also skips missing nodes), so there is no risk of incorrect deletion.
+///
+/// Decode failures are **not** tolerated: a corrupt live node would omit its
+/// subtree from the live set, potentially mis-classifying reachable nodes as
+/// garbage.  A decode error returns `Err` and aborts the GC.
+///
+/// Used by both `gc_incremental` (live BFS step) and the legacy full-scan
+/// fallback — both need WAL-first compatibility.
+pub(crate) fn collect_reachable_hashes_skip_missing(
+    store: &PersistedTrieStore,
+    roots: impl IntoIterator<Item = B256>,
+) -> Result<HashSet<B256>> {
+    let mut live = HashSet::new();
+    let mut queue = VecDeque::new();
+
+    for root in roots {
+        if root != EMPTY_ROOT_HASH && live.insert(root) {
+            queue.push_back(root);
+        }
+    }
+
+    while let Some(hash) = queue.pop_front() {
+        let rlp = match store.get_node(hash)? {
+            Some(r) => r,
+            None => continue, // not in RocksDB (WAL-first mode) — skip, not an error
+        };
+        // Decode failures on live nodes are hard errors: abort GC.
+        let node = decode_node(&rlp)
+            .map_err(|e| MptDbError::Other(format!("gc: decode live node {hash}: {e}")))?;
+
+        match node {
+            MptNode::Leaf(ref leaf) => {
+                if let Ok(trie_account) = alloy_trie::TrieAccount::decode(&mut &leaf.value[..]) {
+                    let sr = trie_account.storage_root;
+                    if sr != EMPTY_ROOT_HASH && live.insert(sr) {
+                        queue.push_back(sr);
+                    }
+                }
+            }
+            MptNode::Extension(ext) => {
+                if let ChildRef::Hash(h) = ext.child &&
+                    live.insert(h)
+                {
+                    queue.push_back(h);
+                }
+            }
+            MptNode::Branch(branch) => {
+                for child in &branch.children {
+                    if let Some(ChildRef::Hash(h)) = child &&
+                        live.insert(*h)
+                    {
+                        queue.push_back(*h);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(live)
+}
+
+/// Like `collect_reachable_hashes` but tolerates missing nodes.
+///
+/// When a node hash is present in a parent's child reference but the node
+/// itself is not in the store, the BFS simply skips that branch instead of
+/// returning an error.  This is safe for GC's stale-root BFS because:
+///
+/// - The missing node was inline (not stored separately) and its hash was embedded in the parent's
+///   RLP — it has nothing to delete.
+/// - The missing node was never persisted (WAL-first mode, still in memory cache only) — it will
+///   never be a target for deletion.
+/// - The missing node was already deleted by a previous GC cycle — no harm.
+fn collect_reachable_hashes_tolerant(
+    store: &PersistedTrieStore,
+    roots: impl IntoIterator<Item = B256>,
+) -> Result<HashSet<B256>> {
+    let mut live = HashSet::new();
+    let mut queue = VecDeque::new();
+
+    for root in roots {
+        if root != EMPTY_ROOT_HASH && live.insert(root) {
+            queue.push_back(root);
+        }
+    }
+
+    while let Some(hash) = queue.pop_front() {
+        let rlp = match store.get_node(hash)? {
+            Some(r) => r,
+            None => continue, // tolerate missing nodes
+        };
+        let node = match decode_node(&rlp) {
+            Ok(n) => n,
+            Err(_) => continue, // tolerate corrupt nodes
+        };
+
+        match node {
+            MptNode::Leaf(ref leaf) => {
+                if let Ok(trie_account) = alloy_trie::TrieAccount::decode(&mut &leaf.value[..]) {
+                    let sr = trie_account.storage_root;
+                    if sr != EMPTY_ROOT_HASH && live.insert(sr) {
+                        queue.push_back(sr);
+                    }
+                }
+            }
+            MptNode::Extension(ext) => {
+                if let ChildRef::Hash(h) = ext.child &&
+                    live.insert(h)
+                {
+                    queue.push_back(h);
+                }
+            }
+            MptNode::Branch(branch) => {
+                for child in &branch.children {
+                    if let Some(ChildRef::Hash(h)) = child &&
+                        live.insert(*h)
+                    {
+                        queue.push_back(*h);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(live)
+}
+
 /// Delete all persisted nodes whose hash is not in `live`.
 /// Returns GC statistics.
+///
+/// This is the legacy O(total_nodes) full-scan fallback used when the stale
+/// index is unavailable.  Prefer `gc_incremental` for production use.
 pub(crate) fn gc_unreachable_nodes(
     store: &PersistedTrieStore,
     live: &HashSet<B256>,

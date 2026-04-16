@@ -59,6 +59,27 @@ impl RocksDbEngine {
         Ok(Self::new(db))
     }
 
+    /// Open a RocksDB instance configured for plain (non-MVCC) storage
+    /// with a custom block cache size (MB).
+    ///
+    /// All other parameters (compression, compaction, Bloom filter) are
+    /// identical to `open_plain`.  Use this when you need the same tuning
+    /// profile but a smaller cache — e.g. for auxiliary index databases that
+    /// do not benefit from a large cache and should not compete with the main
+    /// trie_nodes DB for memory.
+    pub fn open_plain_with_cache_mb(data_dir: &Path, cache_size_mb: usize) -> Result<Self> {
+        let mut opts = Options::default();
+        Self::configure_common_opts(&mut opts);
+        opts.set_level_zero_file_num_compaction_trigger(4);
+
+        let block_opts = Self::configure_block_opts(cache_size_mb);
+        opts.set_block_based_table_factory(&block_opts);
+
+        let db =
+            rocksdb::DB::open(&opts, data_dir).map_err(|e| MptDbError::RocksDb(e.to_string()))?;
+        Ok(Self::new(db))
+    }
+
     /// Open a RocksDB instance configured for plain (non-MVCC) storage.
     ///
     /// Uses a 1 GB block cache and L0 compaction trigger of 4.
@@ -93,9 +114,16 @@ impl RocksDbEngine {
         opts.set_bottommost_zstd_max_train_bytes(11_264_000, true);
     }
 
+    /// Configure block-based table options.
+    ///
     /// - Block size: 32 KB
     /// - Index (metadata) block size: 256 KB
-    /// - Hybrid ribbon filter: bloom-equivalent 9.9 bits/key with bloom before level 1
+    /// - **Hybrid Ribbon Filter: bloom-equivalent 9.9 bits/key, applied before level 1** Ribbon
+    ///   filters reduce false-positive rates vs. standard Bloom filters at the same bits/key, and
+    ///   `optimize_filters_for_memory(true)` ensures filters are stored in the block cache rather
+    ///   than heap, respecting the overall memory budget. This filter applies to BOTH `open_mvcc`
+    ///   and `open_plain` (i.e. `trie_nodes`), so negative lookups for cold MPT node hashes avoid
+    ///   disk reads entirely.
     fn configure_block_opts(cache_size_mb: usize) -> BlockBasedOptions {
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_size(Self::BLOCK_SIZE_BYTES);

@@ -728,6 +728,9 @@ pub struct MptCommitStore {
     dirty_accounts: Vec<DirtyAccount>,
 
     persisted: Arc<PersistedTrieStore>,
+    /// Stale root index for incremental GC.  Populated by `prune_before`;
+    /// consumed (and cleaned) by `gc`.  `None` only when opened read-only.
+    stale_index: Option<Arc<super::stale_index::StaleRootIndex>>,
     published_baseline: Arc<PublishedBaselineManager>,
     published_meta: Option<PublishedBaselineMeta>,
     published_store: Option<PublishedBaselineReader>,
@@ -2764,6 +2767,10 @@ impl MptCommitStore {
             }
         }
 
+        // Drop stale index to release RocksDB lock before the file lock, so
+        // a subsequent re-open in the same process can acquire the lock cleanly.
+        self.stale_index.take();
+
         self.file_lock = None;
         self.shutdown_complete = true;
 
@@ -3048,6 +3055,7 @@ impl MptCommitStore {
             last_overlay_reuse_capacity_entries: 0,
 
             persisted,
+            stale_index: None, // replay materializer is internal; stale index not needed
             published_baseline,
             published_meta,
             published_store,
@@ -3398,6 +3406,14 @@ impl MptCommitStore {
             config.persisted_node_cache_capacity,
         )?);
 
+        // Stale index: writer-only, skip for read-only opens.
+        let stale_index = if !read_only {
+            let stale_index_dir = dir.join("stale_index");
+            Some(Arc::new(super::stale_index::StaleRootIndex::open(&stale_index_dir)?))
+        } else {
+            None
+        };
+
         let published_baseline =
             Arc::new(PublishedBaselineManager::open(&Self::fast_storage_root(dir))?);
         let mut published_meta = None;
@@ -3480,6 +3496,7 @@ impl MptCommitStore {
             last_overlay_shrink_events: 0,
             last_overlay_reuse_capacity_entries: 0,
             persisted,
+            stale_index,
             published_baseline,
             published_meta,
             published_store,
@@ -4372,6 +4389,17 @@ impl MptCommitter for MptCommitStore {
             .copied()
             .filter(|v| *v >= new_manifest.earliest_version && *v < version)
             .collect();
+
+        // Record stale roots BEFORE removing them from the manifest, so the
+        // next gc() call can BFS from them and delete their orphaned nodes.
+        if let Some(ref stale_idx) = self.stale_index {
+            for v in &to_remove {
+                if let Some(&root) = new_manifest.versions.get(v) {
+                    stale_idx.record_stale_root(*v, root)?;
+                }
+            }
+        }
+
         for v in to_remove {
             new_manifest.versions.remove(&v);
         }
@@ -4393,7 +4421,30 @@ impl MptCommitter for MptCommitStore {
         self.flush_persist()?;
 
         let live_roots: Vec<B256> = self.manifest.versions.values().copied().collect();
-        let live = gc::collect_reachable_hashes(&self.persisted, live_roots)?;
+
+        // Prefer incremental GC (O(stale_nodes)) over full-scan (O(total_nodes)).
+        // The stale index is populated by `prune_before`; if it is empty we
+        // fall back to the legacy full-scan so a first-time gc() still works.
+        if let Some(ref stale_idx) = self.stale_index {
+            let prune_watermark = self.manifest.earliest_version;
+            if let Some(stats) = gc::gc_incremental(
+                &self.persisted,
+                stale_idx,
+                live_roots.iter().copied(),
+                prune_watermark,
+            )? {
+                return Ok(stats);
+            }
+            // Stale index was empty — fall through to full-scan below.
+        }
+
+        // Legacy full-scan fallback (read-only stores, first gc before any prune,
+        // or incremental GC that found nothing to delete → safety net for rollback orphans).
+        //
+        // Uses skip_missing BFS for WAL-first compatibility: live nodes not yet
+        // flushed to RocksDB are absent from the store, but also cannot appear in
+        // the full-scan result set, so skipping them is safe — nothing to delete.
+        let live = gc::collect_reachable_hashes_skip_missing(&self.persisted, live_roots)?;
         gc::gc_unreachable_nodes(&self.persisted, &live)
     }
 

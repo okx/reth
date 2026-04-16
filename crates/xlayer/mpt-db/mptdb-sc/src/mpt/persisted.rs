@@ -7,7 +7,8 @@ use mptdb_traits::{
     types::{IterOptions, WriteOptions},
 };
 use parking_lot::Mutex;
-use std::{collections::HashMap, path::Path};
+use schnellru::{ByLength, LruMap};
+use std::path::Path;
 
 use super::{
     arena::MutableTrieArena,
@@ -16,7 +17,7 @@ use super::{
     tree::MptTree,
 };
 
-/// Default maximum number of entries in the node cache before it is cleared.
+/// Default maximum number of entries in the node cache before LRU eviction kicks in.
 const DEFAULT_NODE_CACHE_CAPACITY: usize = 100_000;
 /// Large sync persist batches are usually cold bulk writes. Cloning every node
 /// back into the in-memory cache adds CPU and memory traffic without helping the
@@ -28,14 +29,16 @@ const MAX_SYNC_BATCH_CACHE_POPULATE: usize = 8_192;
 /// Key: node_hash (B256, 32 bytes)
 /// Value: RLP-encoded node bytes
 ///
-/// An application-level LRU-style cache sits in front of RocksDB to avoid
-/// repeated reads for hot nodes (top-level account trie nodes, frequently
-/// accessed storage trie roots). The cache uses a simple clear-on-overflow
-/// eviction strategy.
+/// A `schnellru::LruMap` sits in front of RocksDB to avoid repeated reads for
+/// hot nodes (top-level account trie nodes, frequently accessed storage trie
+/// roots). Entries are evicted least-recently-used once `cache_capacity` is
+/// reached, eliminating the previous `clear()`-on-overflow thundering herd.
+///
+/// Pass `cache_capacity = 0` to **completely disable** the in-memory cache.
 pub struct PersistedTrieStore {
     engine: Option<RocksDbEngine>,
-    cache: Mutex<HashMap<B256, Vec<u8>>>,
-    cache_capacity: usize,
+    /// LRU node cache.  `None` when `cache_capacity == 0` (cache disabled).
+    cache: Mutex<Option<LruMap<B256, Vec<u8>, ByLength>>>,
 }
 
 impl PersistedTrieStore {
@@ -45,40 +48,50 @@ impl PersistedTrieStore {
     }
 
     /// Open a persisted trie store with a custom node cache capacity.
+    ///
+    /// Pass `cache_capacity = 0` to disable the in-memory cache entirely.
     pub fn open_with_capacity(path: &Path, cache_capacity: usize) -> Result<Self> {
         std::fs::create_dir_all(path)
             .map_err(|e| MptDbError::Other(format!("create trie_nodes dir: {e}")))?;
         let engine = RocksDbEngine::open_plain(path)?;
-        Ok(Self { engine: Some(engine), cache: Mutex::new(HashMap::new()), cache_capacity })
+        let lru = if cache_capacity == 0 {
+            None
+        } else {
+            Some(LruMap::new(ByLength::new(cache_capacity as u32)))
+        };
+        Ok(Self { engine: Some(engine), cache: Mutex::new(lru) })
     }
 
     /// Get a node's RLP bytes by its hash.
     ///
-    /// Checks the in-memory cache first; on miss, reads from RocksDB and
-    /// populates the cache for subsequent lookups.
+    /// Checks the LRU cache first (promoting the entry to MRU position on hit);
+    /// on miss, reads from RocksDB and inserts into the cache.  The LRU limiter
+    /// evicts the oldest entry automatically — no thundering `clear()`.
+    /// If the cache is disabled (`cache_capacity == 0`) reads go directly to RocksDB.
     pub fn get_node(&self, hash: B256) -> Result<Option<Vec<u8>>> {
-        // Fast path: cache hit
+        // Fast path: LRU cache hit (promotes to MRU)
         {
-            let cache = self.cache.lock();
-            if let Some(data) = cache.get(&hash) {
-                return Ok(Some(data.clone()));
+            let mut cache = self.cache.lock();
+            if let Some(lru) = cache.as_mut() {
+                if let Some(data) = lru.get(&hash) {
+                    return Ok(Some(data.clone()));
+                }
             }
         }
 
-        // Slow path: read from RocksDB
+        // Slow path: read from RocksDB (lock NOT held during IO)
         let engine = self
             .engine
             .as_ref()
             .ok_or_else(|| MptDbError::Other("PersistedTrieStore is closed".to_string()))?;
         let result = engine.get(hash.as_slice())?;
 
-        // Populate cache on hit
+        // Insert into LRU cache on hit; LruMap evicts LRU entry if at capacity.
         if let Some(ref data) = result {
             let mut cache = self.cache.lock();
-            if cache.len() >= self.cache_capacity {
-                cache.clear();
+            if let Some(lru) = cache.as_mut() {
+                lru.insert(hash, data.clone());
             }
-            cache.insert(hash, data.clone());
         }
 
         Ok(result)
@@ -106,24 +119,22 @@ impl PersistedTrieStore {
         }
         batch.commit(&WriteOptions { sync: durable })?;
 
-        // Large sync batches are bulk durability work; avoid cloning the whole
-        // batch back into the cache when the entries are unlikely to be reused
-        // before snapshot-backed readers take over.
+        // Large sync batches are bulk durability work (e.g. WAL replay, snapshot
+        // import).  Skip cache population: these nodes are unlikely to be
+        // immediately re-read, and inserting thousands of entries would evict
+        // genuinely hot nodes from the LRU.
+        if nodes.len() > MAX_SYNC_BATCH_CACHE_POPULATE {
+            return Ok(());
+        }
+
+        // Insert all nodes; LruMap evicts LRU entries automatically as needed.
+        // No-op when cache is disabled (lru is None).
         {
             let mut cache = self.cache.lock();
-            if self.cache_capacity == 0 {
-                cache.clear();
-                return Ok(());
-            }
-            if nodes.len() > MAX_SYNC_BATCH_CACHE_POPULATE {
-                cache.clear();
-                return Ok(());
-            }
-            if cache.len() + nodes.len() > self.cache_capacity {
-                cache.clear();
-            }
-            for (hash, rlp) in nodes {
-                cache.insert(*hash, rlp.clone());
+            if let Some(lru) = cache.as_mut() {
+                for (hash, rlp) in nodes {
+                    lru.insert(*hash, rlp.clone());
+                }
             }
         }
 
@@ -135,13 +146,13 @@ impl PersistedTrieStore {
     /// Used by the async persist path: nodes are cached in memory immediately
     /// so subsequent reads (e.g., `load_tree_from_root`) can find them without
     /// waiting for the background disk write to complete.
+    /// No-op when cache is disabled (`cache_capacity == 0`).
     pub fn populate_cache(&self, nodes: &[(B256, Vec<u8>)]) {
         let mut cache = self.cache.lock();
-        for (hash, rlp) in nodes {
-            if cache.len() >= self.cache_capacity {
-                cache.clear();
+        if let Some(lru) = cache.as_mut() {
+            for (hash, rlp) in nodes {
+                lru.insert(*hash, rlp.clone());
             }
-            cache.insert(*hash, rlp.clone());
         }
     }
 
@@ -178,11 +189,13 @@ impl PersistedTrieStore {
         }
         batch.commit(&WriteOptions { sync: true })?;
 
-        // Evict deleted nodes from cache
+        // Evict deleted nodes from LRU cache (no-op if cache disabled)
         {
             let mut cache = self.cache.lock();
-            for hash in hashes {
-                cache.remove(hash);
+            if let Some(lru) = cache.as_mut() {
+                for hash in hashes {
+                    lru.remove(hash);
+                }
             }
         }
 
@@ -190,14 +203,18 @@ impl PersistedTrieStore {
     }
 
     /// Clear the in-memory node cache. Useful for testing or forced reset.
+    /// No-op when cache is disabled.
     pub fn clear_cache(&self) {
-        self.cache.lock().clear();
+        let mut cache = self.cache.lock();
+        if let Some(lru) = cache.as_mut() {
+            lru.clear();
+        }
     }
 
     /// Return the current number of entries in the node cache.
     #[cfg(test)]
     fn cache_len(&self) -> usize {
-        self.cache.lock().len()
+        self.cache.lock().as_ref().map_or(0, |lru| lru.len())
     }
 
     /// Check if the store contains no nodes.
@@ -675,14 +692,14 @@ mod tests {
         assert_eq!(store.cache_len(), 1);
     }
 
-    /// Cache is cleared when it exceeds capacity
+    /// LRU evicts oldest entry instead of clearing the entire cache on overflow.
     #[test]
-    fn cache_cleared_on_overflow() {
+    fn cache_lru_evicts_on_overflow() {
         let dir = TempDir::new().unwrap();
-        // Use a small capacity to make the test fast
+        // Capacity = 10 entries
         let store = PersistedTrieStore::open_with_capacity(dir.path(), 10).unwrap();
 
-        // Fill cache to capacity via persist_batch
+        // Fill cache to capacity
         let mut nodes: Vec<(B256, Vec<u8>)> = Vec::with_capacity(10);
         for i in 0..10u64 {
             let mut hash_bytes = [0u8; 32];
@@ -692,12 +709,21 @@ mod tests {
         store.persist_batch(&nodes, false).unwrap();
         assert_eq!(store.cache_len(), 10);
 
-        // One more persist should trigger clear + insert the new node
+        // Insert one more — LRU evicts the oldest (i=0), cache stays at 10
         let overflow_hash = B256::repeat_byte(0xff);
         store.persist_batch(&[(overflow_hash, vec![0x80])], false).unwrap();
-        // Cache was cleared then 1 entry inserted
-        assert_eq!(store.cache_len(), 1);
+        // Still at capacity (LRU evicted one, not cleared everything)
+        assert_eq!(store.cache_len(), 10);
+        // New entry is present
         assert_eq!(store.get_node(overflow_hash).unwrap(), Some(vec![0x80]));
+        // Some old entries still in cache (not all wiped)
+        let still_present = (1..10u64).any(|i| {
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[0..8].copy_from_slice(&i.to_le_bytes());
+            let h = B256::from(hash_bytes);
+            store.cache.lock().as_ref().and_then(|lru| lru.peek(&h)).is_some()
+        });
+        assert!(still_present, "LRU should keep recently-used entries");
     }
 
     /// Large sync persist batches should not repopulate the entire cache.

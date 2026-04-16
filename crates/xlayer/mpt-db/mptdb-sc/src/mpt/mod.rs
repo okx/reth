@@ -17,6 +17,7 @@ pub mod segment;
 pub mod snapshot;
 pub mod sparse_storage;
 pub mod ss_changeset;
+pub mod stale_index;
 pub mod state;
 pub mod storage_cow;
 pub(crate) mod storage_recompute;
