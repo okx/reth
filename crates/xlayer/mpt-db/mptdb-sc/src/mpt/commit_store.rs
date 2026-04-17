@@ -4945,18 +4945,13 @@ impl MptCommitStore {
                 continue;
             }
             if dirty.storage_changes.is_empty() {
-                // Balance/nonce-only change: no storage reveal needed.
                 continue;
             }
             stats.storage_accounts += 1;
 
             if let Some(storage_trie) = cross_trie.storage_trie_ref(&dirty.hashed_address) {
-                // Account is already revealed in the cross-block trie.
                 let mut root = self.get_existing_storage_root(&dirty.hashed_address);
                 if root == EMPTY_ROOT_HASH {
-                    // In wal_first+sparse mode account_trie may lag; when the
-                    // account is already in cross_trie, trust sparse account leaf
-                    // for storage_root hint to keep reuse path active.
                     if let Some(value) = cross_trie.get_account_value(&dirty.hashed_address) {
                         if let Ok(trie_account) =
                             alloy_rlp::Decodable::decode(&mut value.as_slice())
@@ -4967,10 +4962,6 @@ impl MptCommitStore {
                     }
                 }
                 stats.cross_reuse_accounts += 1;
-                // For slots already revealed in previous blocks, no proof work is needed.
-                // For newly-touched slots, only a subset requires fallback proof:
-                // branch-miss inserts on fully-revealed paths can update in-memory
-                // without touching the provider.
                 let mut missing_count = 0usize;
                 let mut proof_keys: Vec<Nibbles> = Vec::new();
                 for change in &dirty.storage_changes {
@@ -4986,21 +4977,13 @@ impl MptCommitStore {
                 stats.cross_missing_slots += missing_count as u64;
                 stats.cross_missing_proof_slots += proof_keys.len() as u64;
                 if missing_count == 0 {
-                    // All touched slots are already revealed in the reused trie.
-                    // Mark as no-reveal so sparse_apply Step-1 can short-circuit
-                    // before scanning per-slot revealed state again.
                     factory.no_reveal_accounts.insert(dirty.hashed_address);
                     continue;
                 }
                 if proof_keys.is_empty() {
-                    // All missing slots can be inserted on already-revealed
-                    // in-memory paths; skip Step-1 storage reveal for this
-                    // account entirely.
                     factory.no_reveal_accounts.insert(dirty.hashed_address);
                     continue;
                 }
-                // This account still needs provider-assisted reveal/proof.
-                // Try segment first; only fall back to proof build on miss.
                 if self.try_segment_lookup_for_sparse_factory(
                     dirty.hashed_address,
                     root,
@@ -5009,7 +4992,6 @@ impl MptCommitStore {
                 ) {
                     continue;
                 }
-                // Only build tier-3 proof for newly-touched slots.
                 let before = factory.pre_built_storage_proofs.len();
                 self.try_build_l2_proof_tier3_only(
                     &dirty.hashed_address,
@@ -5019,10 +5001,6 @@ impl MptCommitStore {
                     stats,
                 );
                 if factory.pre_built_storage_proofs.len() == before {
-                    // Tier-3 can fail in wal_first mode when the needed paths
-                    // are not yet persisted/published. Fall back to tier-1/2
-                    // sources (previous sparse trie / L2 cache) to avoid
-                    // missing-proof errors in sparse apply.
                     stats.tier12_attempts += 1;
                     self.try_build_l2_proof(&dirty.hashed_address, root, &proof_keys, &mut factory);
                 }
@@ -5034,7 +5012,6 @@ impl MptCommitStore {
                 }
                 let dirty_keys: Vec<Nibbles> =
                     dirty.storage_changes.iter().map(|c| c.slot_key.clone()).collect();
-                // Non-cross-reuse path keeps segment-first behavior.
                 if self.try_segment_lookup_for_sparse_factory(
                     dirty.hashed_address,
                     root,
@@ -5043,8 +5020,6 @@ impl MptCommitStore {
                 ) {
                     continue;
                 }
-                // Account not yet in cross-block trie:
-                // prefer tier-3 dirty-path proof first to avoid full-arena DFS.
                 let before = factory.pre_built_storage_proofs.len();
                 self.try_build_l2_proof_tier3_only(
                     &dirty.hashed_address,

@@ -111,8 +111,10 @@ fn collect_accounts(bundle: &BundleState, mode: CollectMode) -> Result<Vec<Dirty
         })
         .collect::<Result<_>>()?;
 
-    // Sort by hashed_address for deterministic ordering
-    accounts.sort_by(|a, b| a.hashed_address.cmp(&b.hashed_address));
+    // Sort by hashed_address for deterministic ordering.
+    // par_sort_unstable_by uses rayon to sort in parallel; safe because
+    // DirtyAccount: Send and the comparator is pure.
+    accounts.par_sort_unstable_by(|a, b| a.hashed_address.cmp(&b.hashed_address));
     // Dedup (shouldn't happen with HashMap input, but enforce contract)
     accounts.dedup_by(|a, b| a.hashed_address == b.hashed_address);
 
