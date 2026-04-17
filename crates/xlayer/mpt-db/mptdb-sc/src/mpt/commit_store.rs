@@ -5889,6 +5889,12 @@ impl MptCommitStore {
         // Single pass:
         // 1) pre-fill DELETE/REUSE roots (no trie hashing),
         // 2) collect RECOMPUTE candidates for handle checkout.
+        //
+        // Opt: in wal_first+sparse mode, accounts with storage changes or
+        // wiped storage are overridden by the sparse correction step (below).
+        // Skipping the COW trie navigation for those ~24K accounts saves ~10ms
+        // of redundant O(depth) reads that would be immediately overwritten.
+        let sparse_will_correct = self.pending_sparse_state.is_some();
         let storage_prefill_start = std::time::Instant::now();
         let mut dirty_working_addresses: Vec<B256> = Vec::new();
         let mut seen_working_accounts: HashSet<B256> = HashSet::default();
@@ -5901,10 +5907,15 @@ impl MptCommitStore {
                 continue;
             }
             if dirty.info.is_none() && dirty.storage_wiped {
-                // DELETE case
+                // DELETE case: always EMPTY_ROOT_HASH
                 storage_roots.insert(hashed_address, EMPTY_ROOT_HASH);
+            } else if sparse_will_correct &&
+                (!dirty.storage_changes.is_empty() || dirty.storage_wiped)
+            {
+                // Sparse correction step will insert the correct new root —
+                // skip the COW trie read to avoid ~24K redundant navigations.
             } else {
-                // REUSE case: get from existing account leaf
+                // REUSE case: account-only change, storage root unchanged.
                 let root = self.get_existing_storage_root(&hashed_address);
                 storage_roots.insert(hashed_address, root);
             }
