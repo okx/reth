@@ -470,12 +470,14 @@ pub fn build_local_enr(
 ) -> (Enr<SecretKey>, NodeRecord, Option<&'static [u8]>, IpMode) {
     let mut builder = discv5::enr::Enr::builder();
 
-    let Config { discv5_config, fork, tcp_socket, other_enr_kv_pairs, .. } = config;
+    let Config { discv5_config, fork, tcp_socket, other_enr_kv_pairs, external_ip, .. } = config;
 
     let socket = match discv5_config.listen_config {
         ListenConfig::Ipv4 { ip, port } => {
             if ip != Ipv4Addr::UNSPECIFIED {
                 builder.ip4(ip);
+            } else if let Some(ext_ip) = external_ip {
+                builder.ip4(*ext_ip);
             }
             builder.udp4(port);
             builder.tcp4(tcp_socket.port());
@@ -494,6 +496,8 @@ pub fn build_local_enr(
         ListenConfig::DualStack { ipv4, ipv4_port, ipv6, ipv6_port } => {
             if ipv4 != Ipv4Addr::UNSPECIFIED {
                 builder.ip4(ipv4);
+            } else if let Some(ext_ip) = external_ip {
+                builder.ip4(*ext_ip);
             }
             builder.udp4(ipv4_port);
             builder.tcp4(tcp_socket.port());
@@ -984,5 +988,76 @@ mod test {
             discv5.get_fork_id(&enr_without_network_stack_id),
             Err(Error::NetworkStackIdNotConfigured)
         ));
+    }
+
+    /// Regression test: when RLPx binds to 0.0.0.0 (all interfaces) and the user configures
+    /// `--nat extip:<IP>`, the discv5 ENR must contain the NAT-resolved external IPv4 address.
+    ///
+    /// Previously, the NAT external IP was never propagated into the discv5 Config, so
+    /// `build_local_enr` saw an UNSPECIFIED (0.0.0.0) listen address and skipped setting any
+    /// IPv4 in the ENR. This made the node undiscoverable via discv5.
+    #[test]
+    fn build_enr_includes_external_ip_when_listen_addr_is_unspecified() {
+        let nat_external_ip = Ipv4Addr::new(1, 2, 3, 4);
+        let tcp_port: u16 = 30303;
+        let udp_port: u16 = 9200;
+
+        // Simulate: --addr 0.0.0.0 --nat extip:1.2.3.4
+        // RLPx binds to 0.0.0.0:30303, discv5 listens on 0.0.0.0:9200
+        let rlpx_tcp_socket: SocketAddr = (Ipv4Addr::UNSPECIFIED, tcp_port).into();
+        let discv5_listen_config =
+            ListenConfig::Ipv4 { ip: Ipv4Addr::UNSPECIFIED, port: udp_port };
+
+        let config = Config::builder(rlpx_tcp_socket)
+            .discv5_config(discv5::ConfigBuilder::new(discv5_listen_config).build())
+            .external_ip(nat_external_ip)
+            .build();
+
+        let sk = SecretKey::new(&mut thread_rng());
+        let (enr, _, _, _) = build_local_enr(&sk, &config);
+
+        // The ENR MUST contain the external IPv4 address so that other nodes can discover us.
+        // Without the fix, enr.ip4() returns None because build_local_enr skips setting the IP
+        // when the listen address is 0.0.0.0 and there was no mechanism to pass the NAT IP.
+        assert_eq!(
+            enr.ip4(),
+            Some(nat_external_ip),
+            "discv5 ENR must advertise the NAT-resolved external IP ({nat_external_ip}) \
+             when listen address is 0.0.0.0, but got {:?}",
+            enr.ip4()
+        );
+    }
+
+    /// Regression test: dual-stack variant of the external IP bug.
+    #[test]
+    fn build_enr_includes_external_ip_when_listen_addr_is_unspecified_dual_stack() {
+        let nat_external_ip = Ipv4Addr::new(5, 6, 7, 8);
+        let tcp_port: u16 = 30303;
+        let udp_port_v4: u16 = 9200;
+        let udp_port_v6: u16 = 9201;
+
+        let rlpx_tcp_socket: SocketAddr = (Ipv4Addr::UNSPECIFIED, tcp_port).into();
+        let discv5_listen_config = ListenConfig::DualStack {
+            ipv4: Ipv4Addr::UNSPECIFIED,
+            ipv4_port: udp_port_v4,
+            ipv6: Ipv6Addr::UNSPECIFIED,
+            ipv6_port: udp_port_v6,
+        };
+
+        let config = Config::builder(rlpx_tcp_socket)
+            .discv5_config(discv5::ConfigBuilder::new(discv5_listen_config).build())
+            .external_ip(nat_external_ip)
+            .build();
+
+        let sk = SecretKey::new(&mut thread_rng());
+        let (enr, _, _, _) = build_local_enr(&sk, &config);
+
+        assert_eq!(
+            enr.ip4(),
+            Some(nat_external_ip),
+            "discv5 ENR must advertise the NAT-resolved external IP ({nat_external_ip}) \
+             in dual-stack mode when IPv4 listen address is 0.0.0.0, but got {:?}",
+            enr.ip4()
+        );
     }
 }

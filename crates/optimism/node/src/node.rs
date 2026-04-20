@@ -1204,6 +1204,7 @@ impl OpNetworkBuilder {
                                 .resolved_bootnodes()
                                 .or_else(|| ctx.chain_spec().bootnodes())
                                 .unwrap_or_default(),
+                            &args.nat,
                         ),
                     );
                 }
