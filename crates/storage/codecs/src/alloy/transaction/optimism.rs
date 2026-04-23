@@ -13,8 +13,12 @@ use alloy_consensus::{
     constants::EIP7702_TX_TYPE_ID, Signed, TxEip1559, TxEip2930, TxEip7702, TxLegacy,
 };
 use alloy_primitives::{Address, Bytes, Sealed, Signature, TxKind, B256, U256};
+use alloy_rlp::{Decodable, Encodable};
 use bytes::BufMut;
-use op_alloy_consensus::{OpTxEnvelope, OpTxType, OpTypedTransaction, TxDeposit as AlloyTxDeposit};
+use op_alloy_consensus::{
+    eip8130::{TxEip8130, AA_TX_TYPE_ID},
+    OpTxEnvelope, OpTxType, OpTypedTransaction, TxDeposit as AlloyTxDeposit,
+};
 use reth_codecs_derive::add_arbitrary_tests;
 
 /// Deposit transactions, also known as deposits are initiated on L1, and executed on L2.
@@ -82,6 +86,32 @@ impl Compact for AlloyTxDeposit {
     }
 }
 
+/// Compact encoding for [`TxEip8130`].
+///
+/// The inner shape is complex (nested `Vec<Vec<Call>>`, multiple optional
+/// fields, variable-length auth blobs), so we use the RLP encoding as the
+/// on-disk compact representation rather than deriving a bespoke bitfield
+/// layout. `TxEip8130` already implements `alloy_rlp::{Encodable, Decodable}`
+/// with a stable wire format, and we own the only call-site that stores it,
+/// so this choice is future-proof as long as the RLP layout stays stable
+/// (which it must, since it is the P2P/tx-pool format).
+impl Compact for TxEip8130 {
+    fn to_compact<B>(&self, buf: &mut B) -> usize
+    where
+        B: bytes::BufMut + AsMut<[u8]>,
+    {
+        let len = self.length();
+        self.encode(buf);
+        len
+    }
+
+    fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
+        let mut slice = &buf[..len];
+        let tx = Self::decode(&mut slice).expect("valid TxEip8130 RLP in compact storage");
+        (tx, &buf[len..])
+    }
+}
+
 impl crate::Compact for OpTxType {
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
@@ -95,6 +125,10 @@ impl crate::Compact for OpTxType {
             Self::Eip1559 => COMPACT_IDENTIFIER_EIP1559,
             Self::Eip7702 => {
                 buf.put_u8(EIP7702_TX_TYPE_ID);
+                COMPACT_EXTENDED_IDENTIFIER_FLAG
+            }
+            Self::Eip8130 => {
+                buf.put_u8(AA_TX_TYPE_ID);
                 COMPACT_EXTENDED_IDENTIFIER_FLAG
             }
             Self::Deposit => {
@@ -118,6 +152,7 @@ impl crate::Compact for OpTxType {
                     let extended_identifier = buf.get_u8();
                     match extended_identifier {
                         EIP7702_TX_TYPE_ID => Self::Eip7702,
+                        AA_TX_TYPE_ID => Self::Eip8130,
                         op_alloy_consensus::DEPOSIT_TX_TYPE_ID => Self::Deposit,
                         _ => panic!("Unsupported OpTxType identifier: {extended_identifier}"),
                     }
@@ -140,6 +175,7 @@ impl Compact for OpTypedTransaction {
             Self::Eip2930(tx) => tx.to_compact(out),
             Self::Eip1559(tx) => tx.to_compact(out),
             Self::Eip7702(tx) => tx.to_compact(out),
+            Self::Eip8130(tx) => tx.to_compact(out),
             Self::Deposit(tx) => tx.to_compact(out),
         };
         identifier
@@ -164,6 +200,10 @@ impl Compact for OpTypedTransaction {
                 let (tx, buf) = Compact::from_compact(buf, buf.len());
                 (Self::Eip7702(tx), buf)
             }
+            OpTxType::Eip8130 => {
+                let (tx, buf) = TxEip8130::from_compact(buf, buf.len());
+                (Self::Eip8130(tx), buf)
+            }
             OpTxType::Deposit => {
                 let (tx, buf) = Compact::from_compact(buf, buf.len());
                 (Self::Deposit(tx), buf)
@@ -179,6 +219,7 @@ impl ToTxCompact for OpTxEnvelope {
             Self::Eip2930(tx) => tx.tx().to_compact(buf),
             Self::Eip1559(tx) => tx.tx().to_compact(buf),
             Self::Eip7702(tx) => tx.tx().to_compact(buf),
+            Self::Eip8130(tx) => tx.inner().to_compact(buf),
             Self::Deposit(tx) => tx.to_compact(buf),
         };
     }
@@ -209,6 +250,11 @@ impl FromTxCompact for OpTxEnvelope {
                 let tx = Signed::new_unhashed(tx, signature);
                 (Self::Eip7702(tx), buf)
             }
+            OpTxType::Eip8130 => {
+                let (tx, buf) = TxEip8130::from_compact(buf, buf.len());
+                let tx = Sealed::new(tx);
+                (Self::Eip8130(tx), buf)
+            }
             OpTxType::Deposit => {
                 let (tx, buf) = op_alloy_consensus::TxDeposit::from_compact(buf, buf.len());
                 let tx = Sealed::new(tx);
@@ -219,6 +265,7 @@ impl FromTxCompact for OpTxEnvelope {
 }
 
 const DEPOSIT_SIGNATURE: Signature = Signature::new(U256::ZERO, U256::ZERO, false);
+const EIP8130_SIGNATURE: Signature = Signature::new(U256::ZERO, U256::ZERO, false);
 
 impl Envelope for OpTxEnvelope {
     fn signature(&self) -> &Signature {
@@ -227,6 +274,7 @@ impl Envelope for OpTxEnvelope {
             Self::Eip2930(tx) => tx.signature(),
             Self::Eip1559(tx) => tx.signature(),
             Self::Eip7702(tx) => tx.signature(),
+            Self::Eip8130(_) => &EIP8130_SIGNATURE,
             Self::Deposit(_) => &DEPOSIT_SIGNATURE,
         }
     }

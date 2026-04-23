@@ -24,6 +24,7 @@ alloy-trie = { workspace = true, optional = true }
 
 # op
 op-alloy-consensus = { workspace = true, optional = true }
+alloy-rlp = { workspace = true, optional = true }
 
 # misc
 bytes.workspace = true
@@ -65,7 +66,7 @@ alloy = [
     "dep:alloy-trie",
     "dep:reth-zstd-compressors",
 ]
-op = ["alloy", "dep:op-alloy-consensus"]
+op = ["alloy", "dep:op-alloy-consensus", "dep:alloy-rlp"]
 test-utils = [
     "std",
     "alloy",

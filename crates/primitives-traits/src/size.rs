@@ -148,13 +148,27 @@ mod op {
         }
     }
 
+    impl InMemorySize for op_alloy_consensus::eip8130::TxEip8130 {
+        fn size(&self) -> usize {
+            // Base struct footprint + variable-length field contents.
+            core::mem::size_of::<Self>() +
+                self.sender_auth.len() +
+                self.payer_auth.len() +
+                self.account_changes.capacity() *
+                    core::mem::size_of::<op_alloy_consensus::eip8130::AccountChangeEntry>() +
+                self.calls.iter().map(|phase| phase.capacity() *
+                    core::mem::size_of::<op_alloy_consensus::eip8130::Call>()).sum::<usize>()
+        }
+    }
+
     impl InMemorySize for op_alloy_consensus::OpReceipt {
         fn size(&self) -> usize {
             match self {
                 Self::Legacy(receipt) |
                 Self::Eip2930(receipt) |
                 Self::Eip1559(receipt) |
-                Self::Eip7702(receipt) => receipt.size(),
+                Self::Eip7702(receipt) |
+                Self::Eip8130(receipt) => receipt.size(),
                 Self::Deposit(receipt) => receipt.size(),
             }
         }
@@ -167,6 +181,7 @@ mod op {
                 Self::Eip2930(tx) => tx.size(),
                 Self::Eip1559(tx) => tx.size(),
                 Self::Eip7702(tx) => tx.size(),
+                Self::Eip8130(tx) => tx.size(),
                 Self::Deposit(tx) => tx.size(),
             }
         }
@@ -179,6 +194,7 @@ mod op {
                 Self::Eip2930(tx) => tx.size(),
                 Self::Eip1559(tx) => tx.size(),
                 Self::Eip7702(tx) => tx.size(),
+                Self::Eip8130(tx) => tx.inner().size(),
             }
         }
     }
@@ -190,6 +206,7 @@ mod op {
                 Self::Eip2930(tx) => tx.size(),
                 Self::Eip1559(tx) => tx.size(),
                 Self::Eip7702(tx) => tx.size(),
+                Self::Eip8130(tx) => tx.inner().size(),
                 Self::Deposit(tx) => tx.size(),
             }
         }
