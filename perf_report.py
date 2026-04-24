@@ -127,6 +127,40 @@ def avg(values):
     return sum(values) / len(values) if values else 0
 
 
+def downsample(values, max_points=60):
+    """Reduce a series to at most max_points via bucket averaging, preserving trend."""
+    n = len(values)
+    if n <= max_points:
+        return list(values)
+    result = []
+    for i in range(max_points):
+        start = i * n // max_points
+        end = (i + 1) * n // max_points
+        chunk = values[start:end] if end > start else [values[start]]
+        result.append(sum(chunk) / len(chunk))
+    return result
+
+
+def mermaid_line_chart(title, values, y_label="ms", max_points=60):
+    """Render a mermaid xychart-beta line chart for a time-ordered series."""
+    if not values:
+        return ""
+    sampled = downsample(values, max_points)
+    n = len(sampled)
+    peak = max(sampled) if sampled else 1
+    y_max = max(1, int(peak * 1.1) + 1)
+    values_str = ", ".join(f"{v:.0f}" for v in sampled)
+    return (
+        "```mermaid\n"
+        "xychart-beta\n"
+        f'    title "{title}"\n'
+        f"    x-axis 1 --> {n}\n"
+        f'    y-axis "{y_label}" 0 --> {y_max}\n'
+        f"    line [{values_str}]\n"
+        "```\n"
+    )
+
+
 def git_info():
     def run(cmd):
         try:
@@ -328,6 +362,33 @@ def generate_report(data, git):
     w(f"| | {pct(tps_list, 50):,.0f} | {pct(tps_list, 75):,.0f} | {pct(tps_list, 90):,.0f} | {pct(tps_list, 95):,.0f} | {pct(tps_list, 99):,.0f} |")
 
     w("")
+
+    # === Phase timing over time (one chart per phase) ===
+    w("## Phase Timing Over Time")
+    w("")
+    w(f"Series ordered by block; downsampled to ≤60 points. Payload series: {len(high)} blocks, miner series: {len(hm)} blocks.")
+    w("")
+
+    phase_series = [
+        ("Total Block Interval (ms)", ivs),
+        ("idle (ms)", idles),
+        ("payload_build (ms)", builds),
+        ("txpool_next (ms)", txpools),
+        ("tx_execute (ms)", executes),
+        ("state_root (ms)", state_roots),
+        ("assemble (ms)", assembles),
+        ("new_payload (ms)", new_payloads),
+        ("fcu + commit (ms)", [a + b for a, b in zip(fcus, fcu_others)]),
+        ("TPS", tps_list),
+    ]
+    for title, series in phase_series:
+        if not series:
+            continue
+        w(f"### {title}")
+        w("")
+        w(mermaid_line_chart(title, series, y_label=("tps" if title == "TPS" else "ms")))
+        w("")
+
     return "\n".join(lines)
 
 
