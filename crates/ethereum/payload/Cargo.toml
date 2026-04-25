@@ -29,6 +29,8 @@ reth-errors.workspace = true
 reth-chainspec.workspace = true
 reth-payload-validator.workspace = true
 reth-node-metrics.workspace = true
+reth-metrics.workspace = true
+metrics.workspace = true
 
 # ethereum
 alloy-rlp.workspace = true

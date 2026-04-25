@@ -513,12 +513,19 @@ where
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
-        // calculate the state root
+        // OKX timing: state_root phase
+        #[cfg(feature = "std")]
+        let sr_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
         let (state_root, trie_updates) = state
             .state_root_with_updates(hashed_state.clone())
             .map_err(BlockExecutionError::other)?;
+        #[cfg(feature = "std")]
+        let sr_elapsed = sr_start.elapsed();
 
+        // OKX timing: assemble phase
+        #[cfg(feature = "std")]
+        let asm_start = std::time::Instant::now();
         let (transactions, senders) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 
@@ -534,6 +541,15 @@ where
         })?;
 
         let block = RecoveredBlock::new_unhashed(block, senders);
+        #[cfg(feature = "std")]
+        {
+            let asm_elapsed = asm_start.elapsed();
+            crate::okx_timing::record_finish_timing(
+                block.header().number(),
+                sr_elapsed,
+                asm_elapsed,
+            );
+        }
 
         Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
     }

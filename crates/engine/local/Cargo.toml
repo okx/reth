@@ -13,6 +13,8 @@ exclude.workspace = true
 reth-chainspec.workspace = true
 reth-engine-primitives = { workspace = true, features = ["std"] }
 reth-ethereum-engine-primitives.workspace = true
+reth-metrics.workspace = true
+metrics.workspace = true
 reth-payload-builder.workspace = true
 reth-payload-primitives.workspace = true
 reth-primitives-traits.workspace = true

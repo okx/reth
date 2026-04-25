@@ -1,5 +1,7 @@
 //! Contains the implementation of the mining mode for the local engine.
 
+use crate::okx_timing::MinerCycleTimer;
+use alloy_consensus::BlockHeader;
 use alloy_primitives::{TxHash, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use eyre::OptionExt;
@@ -17,7 +19,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::time::Interval;
 use tokio_stream::wrappers::ReceiverStream;
@@ -110,6 +112,9 @@ pub struct LocalMiner<T: PayloadTypes, B, Pool: TransactionPool + Unpin> {
     last_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
     /// Stores latest mined blocks.
     last_block_hashes: VecDeque<B256>,
+    /// OKX timing: instant the previous cycle's `advance()` finished. Used to
+    /// derive the `idle` portion of the next cycle.
+    last_block_added_at: Instant,
 }
 
 impl<T, B, Pool> LocalMiner<T, B, Pool>
@@ -139,6 +144,7 @@ where
             payload_builder,
             last_block_hashes: VecDeque::from([last_header.hash()]),
             last_header,
+            last_block_added_at: Instant::now(),
         }
     }
 
@@ -196,6 +202,9 @@ where
     /// Generates payload attributes for a new block, passes them to FCU and inserts built payload
     /// through newPayload.
     async fn advance(&mut self) -> eyre::Result<()> {
+        let mut okx_timer = MinerCycleTimer::start(self.last_block_added_at);
+
+        let fcu_start = Instant::now();
         let res = self
             .to_engine
             .fork_choice_updated(
@@ -204,6 +213,7 @@ where
                 EngineApiMessageVersion::default(),
             )
             .await?;
+        okx_timer.record_fcu(fcu_start.elapsed());
 
         if !res.is_valid() {
             eyre::bail!("Invalid payload status")
@@ -211,26 +221,35 @@ where
 
         let payload_id = res.payload_id.ok_or_eyre("No payload id")?;
 
+        let resolve_start = Instant::now();
         let Some(Ok(payload)) =
             self.payload_builder.resolve_kind(payload_id, PayloadKind::WaitForPending).await
         else {
             eyre::bail!("No payload")
         };
+        okx_timer.record_payload_build(resolve_start.elapsed());
 
         let header = payload.block().sealed_header().clone();
         let payload = T::block_to_payload(payload.block().clone());
+
+        let new_payload_start = Instant::now();
         let res = self.to_engine.new_payload(payload).await?;
+        okx_timer.record_new_payload(new_payload_start.elapsed());
 
         if !res.is_valid() {
             eyre::bail!("Invalid payload")
         }
 
         self.last_block_hashes.push_back(header.hash());
+        let block_number = header.number();
+        let block_hash = header.hash();
         self.last_header = header;
         // ensure we keep at most 64 blocks
         if self.last_block_hashes.len() > 64 {
             self.last_block_hashes.pop_front();
         }
+
+        self.last_block_added_at = okx_timer.finish(block_number, block_hash);
 
         Ok(())
     }

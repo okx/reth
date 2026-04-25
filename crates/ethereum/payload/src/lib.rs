@@ -43,6 +43,8 @@ use tracing::{debug, trace, warn};
 mod config;
 pub use config::*;
 
+mod okx_timing;
+
 pub mod validator;
 pub use validator::EthereumExecutionPayloadValidator;
 
@@ -191,6 +193,10 @@ where
         PayloadBuilderError::Internal(err.into())
     })?;
 
+    // OKX timing tracker for txpool/tx-execute/total phases — scoped to the
+    // transaction-selection loop and post-loop finalization.
+    let mut okx_timer = okx_timing::PayloadBuildTimer::start(attributes.id);
+
     // initialize empty blob sidecars at first. If cancun is active then this will be populated by
     // blob sidecars if any.
     let mut blob_sidecars = BlobSidecars::Empty;
@@ -213,7 +219,14 @@ where
 
     let withdrawals_rlp_length = attributes.withdrawals().length();
 
-    while let Some(pool_tx) = best_txs.next() {
+    loop {
+        // OKX timing: txpool_next phase
+        let next_start = std::time::Instant::now();
+        let maybe_pool_tx = best_txs.next();
+        okx_timer.txpool_next_total += next_start.elapsed();
+        let Some(pool_tx) = maybe_pool_tx else { break };
+        okx_timer.txs_considered += 1;
+
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
             // we can't fit this transaction into the block, so we need to mark it as invalid
@@ -228,6 +241,7 @@ where
 
         // check if the job was cancelled, if so we can exit early
         if cancel.is_cancelled() {
+            okx_timer.finish(okx_timing::BuildOutcomeLabel::Cancelled);
             return Ok(BuildOutcome::Cancelled)
         }
 
@@ -275,9 +289,14 @@ where
             }
 
             let blob_sidecar_result = 'sidecar: {
-                let Some(sidecar) =
-                    pool.get_blob(*tx.hash()).map_err(PayloadBuilderError::other)?
-                else {
+                let blob = match pool.get_blob(*tx.hash()) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        okx_timer.finish(okx_timing::BuildOutcomeLabel::Error);
+                        return Err(PayloadBuilderError::other(err))
+                    }
+                };
+                let Some(sidecar) = blob else {
                     break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar)
                 };
 
@@ -303,11 +322,17 @@ where
             };
         }
 
+        // OKX timing: tx_execute phase
+        let exec_start = std::time::Instant::now();
         let gas_used = match builder.execute_transaction(tx.clone()) {
-            Ok(gas_used) => gas_used,
+            Ok(gas_used) => {
+                okx_timer.tx_execute_total += exec_start.elapsed();
+                gas_used
+            }
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                 error, ..
             })) => {
+                okx_timer.tx_execute_total += exec_start.elapsed();
                 if error.is_nonce_too_low() {
                     // if the nonce is too low, we can skip this transaction
                     trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
@@ -325,8 +350,13 @@ where
                 continue
             }
             // this is an error that we should treat as fatal for this attempt
-            Err(err) => return Err(PayloadBuilderError::evm(err)),
+            Err(err) => {
+                okx_timer.tx_execute_total += exec_start.elapsed();
+                okx_timer.finish(okx_timing::BuildOutcomeLabel::Error);
+                return Err(PayloadBuilderError::evm(err))
+            }
         };
+        okx_timer.txs_executed += 1;
 
         // add to the total blob gas used if the transaction successfully executed
         if let Some(blob_tx) = tx.as_eip4844() {
@@ -356,12 +386,19 @@ where
     if !is_better_payload(best_payload.as_ref(), total_fees) {
         // Release db
         drop(builder);
+        okx_timer.finish(okx_timing::BuildOutcomeLabel::Aborted);
         // can skip building the block
         return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
     }
 
     let BlockBuilderOutcome { execution_result, block, .. } =
-        builder.finish(state_provider.as_ref())?;
+        match builder.finish(state_provider.as_ref()) {
+            Ok(v) => v,
+            Err(err) => {
+                okx_timer.finish(okx_timing::BuildOutcomeLabel::Error);
+                return Err(err.into())
+            }
+        };
 
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
@@ -371,6 +408,7 @@ where
     debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");
 
     if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {
+        okx_timer.finish(okx_timing::BuildOutcomeLabel::Error);
         return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
             rlp_length: sealed_block.rlp_length(),
             max_rlp_length: MAX_RLP_BLOCK_SIZE,
@@ -380,6 +418,8 @@ where
     let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
         // add blob sidecars from the executed txs
         .with_sidecars(blob_sidecars);
+
+    okx_timer.finish(okx_timing::BuildOutcomeLabel::Better);
 
     Ok(BuildOutcome::Better { payload, cached_reads })
 }

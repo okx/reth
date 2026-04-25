@@ -9,6 +9,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod miner;
+mod okx_timing;
 pub mod payload;
 
 pub use miner::{LocalMiner, MiningMode};
