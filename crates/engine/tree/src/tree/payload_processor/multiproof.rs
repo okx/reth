@@ -870,6 +870,19 @@ impl MultiProofTask {
         source: Source,
         hashed_state_update: HashedPostState,
     ) -> u64 {
+        // DEBUG: log every hashed-state update funneled into the multiproof pipeline,
+        // tagged by source (BlockAccessList / Transaction / PreBlock / PostBlock) and digest.
+        // Both MultiProofMessage::HashedStateUpdate and MultiProofMessage::StateUpdate
+        // (via on_state_update -> evm_state_to_hashed_post_state) reach this entry.
+        tracing::info!(
+            target: "engine::bal_diff",
+            ?source,
+            accounts = hashed_state_update.accounts.len(),
+            storages = hashed_state_update.storages.len(),
+            digest = ?crate::tree::payload_processor::bal::hashed_post_state_digest(&hashed_state_update),
+            "XXX multiproof received hashed state update",
+        );
+
         // Update removed keys based on the state update.
         self.multi_added_removed_keys.update_with_state(&hashed_state_update);
 

@@ -2,11 +2,74 @@
 
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_eip7928::BlockAccessList;
-use alloy_primitives::{keccak256, Address, StorageKey, U256};
+use alloy_primitives::{keccak256, Address, StorageKey, B256, U256};
 use reth_primitives_traits::Account;
 use reth_provider::{AccountReader, ProviderError};
 use reth_trie::{HashedPostState, HashedStorage};
 use std::ops::Range;
+
+/// Computes a deterministic 32-byte digest of a [`HashedPostState`] for diagnostic comparison.
+///
+/// Hashes account entries and storage entries separately (sorted by key for determinism),
+/// then keccak256s the concatenation. Two equal `HashedPostState`s produce the same digest
+/// regardless of underlying `HashMap` iteration order.
+///
+/// Layout:
+///   keccak256(  accounts_root_keccak  ||  storages_root_keccak  )
+/// where each *_root_keccak is keccak256 of sorted(key || encoded(value)) entries concatenated.
+pub fn hashed_post_state_digest(state: &HashedPostState) -> B256 {
+    use alloy_rlp::Encodable;
+
+    // accounts: sorted by hashed_address; encode address || rlp(Option<TrieAccount-shape>).
+    let mut acct_entries: Vec<(B256, Option<&Account>)> =
+        state.accounts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+    acct_entries.sort_unstable_by_key(|(k, _)| *k);
+    let mut acct_buf = Vec::with_capacity(acct_entries.len() * 64);
+    for (hashed_addr, account) in acct_entries {
+        acct_buf.extend_from_slice(hashed_addr.as_slice());
+        match account {
+            None => acct_buf.push(0u8),
+            Some(a) => {
+                acct_buf.push(1u8);
+                a.nonce.encode(&mut acct_buf);
+                a.balance.encode(&mut acct_buf);
+                // bytecode_hash: distinguish None vs Some(KECCAK_EMPTY) explicitly so the
+                // digest surfaces representation differences (even if the trie flattens them).
+                match a.bytecode_hash {
+                    None => acct_buf.push(0u8),
+                    Some(h) => {
+                        acct_buf.push(1u8);
+                        acct_buf.extend_from_slice(h.as_slice());
+                    }
+                }
+            }
+        }
+    }
+    let accounts_digest = keccak256(&acct_buf);
+
+    // storages: sorted by hashed_address; per-storage, sort by hashed_slot.
+    let mut storage_entries: Vec<(B256, &HashedStorage)> =
+        state.storages.iter().map(|(k, v)| (*k, v)).collect();
+    storage_entries.sort_unstable_by_key(|(k, _)| *k);
+    let mut storage_buf = Vec::with_capacity(storage_entries.len() * 96);
+    for (hashed_addr, storage) in storage_entries {
+        storage_buf.extend_from_slice(hashed_addr.as_slice());
+        storage_buf.push(if storage.wiped { 1u8 } else { 0u8 });
+        let mut slot_entries: Vec<(B256, U256)> =
+            storage.storage.iter().map(|(k, v)| (*k, *v)).collect();
+        slot_entries.sort_unstable_by_key(|(k, _)| *k);
+        for (hashed_slot, value) in slot_entries {
+            storage_buf.extend_from_slice(hashed_slot.as_slice());
+            value.encode(&mut storage_buf);
+        }
+    }
+    let storages_digest = keccak256(&storage_buf);
+
+    let mut combined = [0u8; 64];
+    combined[..32].copy_from_slice(accounts_digest.as_slice());
+    combined[32..].copy_from_slice(storages_digest.as_slice());
+    keccak256(combined)
+}
 
 /// Returns the total number of storage slots (both changed and read-only) across all accounts in
 /// the BAL.
@@ -115,7 +178,7 @@ impl<'a> Iterator for BALSlotIter<'a> {
 
 /// Converts a Block Access List into a [`HashedPostState`] by extracting the final state
 /// of modified accounts and storage slots.
-pub(crate) fn bal_to_hashed_post_state<P>(
+pub fn bal_to_hashed_post_state<P>(
     bal: &BlockAccessList,
     provider: P,
 ) -> Result<HashedPostState, ProviderError>
@@ -188,6 +251,17 @@ where
             hashed_state.storages.insert(hashed_address, storage_map);
         }
     }
+
+    // DEBUG: surface the BAL-derived hashed state digest for SR-divergence investigation.
+    // The diagnostic log is gated by tracing's level filter, so it costs the digest hash only
+    // when `engine::bal_diff` is enabled (e.g. via RUST_LOG).
+    tracing::info!(
+        target: "engine::bal_diff",
+        accounts = hashed_state.accounts.len(),
+        storages = hashed_state.storages.len(),
+        digest = ?hashed_post_state_digest(&hashed_state),
+        "XXX bal_to_hashed_post_state produced",
+    );
 
     Ok(hashed_state)
 }
