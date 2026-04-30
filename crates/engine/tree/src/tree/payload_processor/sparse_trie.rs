@@ -334,18 +334,45 @@ where
                 MultiProofMessage::PrefetchProofs(targets) => {
                     SparseTrieTaskMessage::PrefetchProofs(targets)
                 }
-                MultiProofMessage::StateUpdate(_, state) => {
+                MultiProofMessage::StateUpdate(source, state) => {
                     let _span = debug_span!(target: "engine::tree::payload_processor::sparse_trie", "hashing state update", update_len = state.len()).entered();
                     let hashed = evm_state_to_hashed_post_state(state);
+                    // DEBUG: surface what the sparse-trie pipeline actually consumes.
+                    // This is the real funnel when `disable_trie_cache=false` (default),
+                    // since MultiProofTask is not spawned in that path and our
+                    // multiproof.rs::on_hashed_state_update log never fires.
+                    tracing::info!(
+                        target: "engine::bal_diff",
+                        ?source,
+                        accounts = hashed.accounts.len(),
+                        storages = hashed.storages.len(),
+                        digest = ?crate::tree::payload_processor::bal::hashed_post_state_digest(&hashed),
+                        "XXX sparse_trie hashing task received StateUpdate",
+                    );
                     SparseTrieTaskMessage::HashedState(hashed)
                 }
                 MultiProofMessage::FinishedStateUpdates => {
+                    tracing::info!(
+                        target: "engine::bal_diff",
+                        "XXX sparse_trie hashing task received FinishedStateUpdates",
+                    );
                     SparseTrieTaskMessage::FinishedStateUpdates
                 }
                 MultiProofMessage::EmptyProof { .. } | MultiProofMessage::BlockAccessList(_) => {
+                    tracing::info!(
+                        target: "engine::bal_diff",
+                        "XXX sparse_trie hashing task skipping EmptyProof/BlockAccessList",
+                    );
                     continue
                 }
                 MultiProofMessage::HashedStateUpdate(state) => {
+                    tracing::info!(
+                        target: "engine::bal_diff",
+                        accounts = state.accounts.len(),
+                        storages = state.storages.len(),
+                        digest = ?crate::tree::payload_processor::bal::hashed_post_state_digest(&state),
+                        "XXX sparse_trie hashing task received HashedStateUpdate (BAL-derived)",
+                    );
                     SparseTrieTaskMessage::HashedState(state)
                 }
             };
