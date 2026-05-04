@@ -1,0 +1,3 @@
+[submodule "deps/salt"]
+	path = deps/salt
+	url = https://github.com/megaeth-labs/salt
