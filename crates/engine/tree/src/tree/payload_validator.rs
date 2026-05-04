@@ -1475,6 +1475,7 @@ where
                     overlay_factory,
                     &self.config,
                     block_access_list,
+                    None,
                 );
 
                 // record prewarming initialization duration
