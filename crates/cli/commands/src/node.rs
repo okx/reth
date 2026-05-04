@@ -10,7 +10,7 @@ use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, MetricArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs,
+        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs,
         TransactionTraceArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
@@ -119,18 +119,22 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "Static Files")]
     pub static_files: StaticFilesArgs,
 
+    /// All storage related arguments with --storage prefix
+    #[command(flatten, next_help_heading = "Storage")]
+    pub storage: StorageArgs,
+
     /// Additional cli arguments
     #[command(flatten, next_help_heading = "Extension")]
     pub ext: Ext,
 }
 
 impl<C: ChainSpecParser> NodeCommand<C> {
-    /// Parsers only the default CLI arguments
+    /// Parses only the default CLI arguments
     pub fn parse_args() -> Self {
         Self::parse()
     }
 
-    /// Parsers only the default [`NodeCommand`] arguments from the given iterator
+    /// Parses only the default [`NodeCommand`] arguments from the given iterator
     pub fn try_parse_args_from<I, T>(itr: I) -> Result<Self, clap::error::Error>
     where
         I: IntoIterator<Item = T>,
@@ -175,6 +179,7 @@ where
             era,
             tx_trace,
             static_files,
+            storage,
             ext,
         } = self;
 
@@ -197,6 +202,8 @@ where
             }
         }
 
+        engine.validate()?;
+
         // set up node config
         let mut node_config = NodeConfig {
             datadir,
@@ -216,13 +223,14 @@ where
             era,
             tx_trace,
             static_files,
+            storage,
         };
 
         let data_dir = node_config.datadir();
         let db_path = data_dir.db();
 
         tracing::info!(target: "reth::cli", path = ?db_path, "Opening database");
-        let database = Arc::new(init_db(db_path.clone(), self.db.database_args())?.with_metrics());
+        let database = init_db(db_path.clone(), self.db.database_args())?.with_metrics();
 
         if with_unused_ports {
             node_config = node_config.with_unused_ports();

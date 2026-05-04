@@ -46,33 +46,6 @@ impl HashedPostState {
     /// Hashes all changed accounts and storage entries that are currently stored in the bundle
     /// state.
     #[inline]
-    #[cfg(feature = "rayon")]
-    pub fn from_bundle_state<'a, KH: KeyHasher>(
-        state: impl IntoParallelIterator<Item = (&'a Address, &'a BundleAccount)>,
-    ) -> Self {
-        state
-            .into_par_iter()
-            .map(|(address, account)| {
-                let hashed_address = KH::hash_key(address);
-                let hashed_account = account.info.as_ref().map(Into::into);
-                let hashed_storage = HashedStorage::from_plain_storage(
-                    account.status,
-                    account.storage.iter().map(|(slot, value)| (slot, &value.present_value)),
-                );
-
-                (
-                    hashed_address,
-                    hashed_account,
-                    (!hashed_storage.is_empty()).then_some(hashed_storage),
-                )
-            })
-            .collect()
-    }
-
-    /// Initialize [`HashedPostState`] from bundle state.
-    /// Hashes all changed accounts and storage entries that are currently stored in the bundle
-    /// state.
-    #[cfg(not(feature = "rayon"))]
     pub fn from_bundle_state<'a, KH: KeyHasher>(
         state: impl IntoIterator<Item = (&'a Address, &'a BundleAccount)>,
     ) -> Self {
@@ -638,31 +611,57 @@ impl HashedPostStateSorted {
 
     /// Batch-merge sorted hashed post states. Iterator yields **newest to oldest**.
     ///
-    /// Uses k-way merge for O(n log k) complexity and one-pass accumulation for storages.
-    pub fn merge_batch<'a>(states: impl IntoIterator<Item = &'a Self>) -> Self {
-        let states: Vec<_> = states.into_iter().collect();
-        if states.is_empty() {
+    /// For small batches, uses `extend_ref_and_sort` loop.
+    /// For large batches, uses k-way merge for O(n log k) complexity.
+    pub fn merge_batch<T: AsRef<Self> + From<Self>>(iter: impl IntoIterator<Item = T>) -> T {
+        let items: alloc::vec::Vec<_> = iter.into_iter().collect();
+        match items.len() {
+            0 => Self::default().into(),
+            1 => items.into_iter().next().expect("len == 1"),
+            _ => Self::merge_slice(&items).into(),
+        }
+    }
+
+    /// Batch-merge sorted hashed post states from a slice. Slice is **newest to oldest**.
+    ///
+    /// This variant takes a slice reference directly, avoiding iterator collection overhead.
+    /// For small batches, uses `extend_ref_and_sort` loop.
+    /// For large batches, uses k-way merge for O(n log k) complexity.
+    pub fn merge_slice<T: AsRef<Self>>(items: &[T]) -> Self {
+        const THRESHOLD: usize = 30;
+
+        let k = items.len();
+
+        if k == 0 {
             return Self::default();
         }
+        if k == 1 {
+            return items[0].as_ref().clone();
+        }
 
-        let accounts = kway_merge_sorted(states.iter().map(|s| s.accounts.as_slice()));
+        if k < THRESHOLD {
+            // Small k: extend loop, oldest-to-newest so newer overrides older.
+            let mut iter = items.iter().rev();
+            let mut acc = iter.next().expect("k > 0").as_ref().clone();
+            for next in iter {
+                acc.extend_ref_and_sort(next.as_ref());
+            }
+            return acc;
+        }
+
+        // Large k: k-way merge.
+        let accounts = kway_merge_sorted(items.iter().map(|i| i.as_ref().accounts.as_slice()));
 
         struct StorageAcc<'a> {
-            /// Account storage was cleared (e.g., SELFDESTRUCT).
             wiped: bool,
-            /// Stop collecting older slices after seeing a wipe.
             sealed: bool,
-            /// Storage slot slices to merge, ordered newest to oldest.
             slices: Vec<&'a [(B256, U256)]>,
         }
 
         let mut acc: B256Map<StorageAcc<'_>> = B256Map::default();
 
-        // Accumulate storage slices per address from newest to oldest state.
-        // Once we see a `wiped` flag, the account was cleared at that point,
-        // so older storage slots are irrelevant - we "seal" and stop collecting.
-        for state in &states {
-            for (addr, storage) in &state.storages {
+        for item in items {
+            for (addr, storage) in &item.as_ref().storages {
                 let entry = acc.entry(*addr).or_insert_with(|| StorageAcc {
                     wiped: false,
                     sealed: false,

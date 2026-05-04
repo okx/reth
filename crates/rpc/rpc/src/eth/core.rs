@@ -21,13 +21,13 @@ use reth_rpc_eth_api::{
     EthApiTypes, RpcNodeCore,
 };
 use reth_rpc_eth_types::{
-    builder::config::PendingBlockKind, receipt::EthReceiptConverter, tx_forward::ForwardConfig,
-    EthApiError, EthStateCache, FeeHistoryCache, GasCap, GasPriceOracle, PendingBlock,
+    builder::config::PendingBlockKind, receipt::EthReceiptConverter, EthApiError, EthStateCache,
+    FeeHistoryCache, GasCap, GasPriceOracle, PendingBlock,
 };
 use reth_storage_api::{noop::NoopProvider, BlockReaderIdExt, ProviderHeader};
 use reth_tasks::{
     pool::{BlockingTaskGuard, BlockingTaskPool},
-    TaskSpawner, TokioTaskExecutor,
+    Runtime,
 };
 use reth_transaction_pool::{
     blobstore::BlobSidecarConverter, noop::NoopTransactionPool, AddedTransactionOutcome,
@@ -254,7 +254,7 @@ where
     Rpc: RpcConvert<Error = EthApiError>,
 {
     #[inline]
-    fn io_task_spawner(&self) -> impl TaskSpawner {
+    fn io_task_spawner(&self) -> &Runtime {
         self.inner.task_spawner()
     }
 
@@ -294,7 +294,7 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     /// The block number at which the node started
     starting_block: U256,
     /// The type that can spawn tasks which would otherwise block.
-    task_spawner: Box<dyn TaskSpawner>,
+    task_spawner: Runtime,
     /// Cached pending block if any
     pending_block: Mutex<Option<PendingBlock<N::Primitives>>>,
     /// A pool dedicated to CPU heavy blocking tasks.
@@ -338,6 +338,9 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
 
     /// `XLayer`: Optional legacy RPC client for routing historical data.
     pub(crate) legacy_rpc_client: Option<Arc<reth_rpc_eth_types::LegacyRpcClient>>,
+
+    /// Whether to force upcasting EIP-4844 blob sidecars to EIP-7594 format when Osaka is active.
+    force_blob_sidecar_upcasting: bool,
 }
 
 impl<N, Rpc> EthApiInner<N, Rpc>
@@ -356,7 +359,7 @@ where
         eth_proof_window: u64,
         blocking_task_pool: BlockingTaskPool,
         fee_history_cache: FeeHistoryCache<ProviderHeader<N::Provider>>,
-        task_spawner: Box<dyn TaskSpawner + 'static>,
+        task_spawner: Runtime,
         proof_permits: usize,
         converter: Rpc,
         next_env: impl PendingEnvBuilder<N::Evm>,
@@ -367,6 +370,7 @@ where
         legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
         send_raw_transaction_sync_timeout: Duration,
         evm_memory_limit: u64,
+        force_blob_sidecar_upcasting: bool,
     ) -> Self {
         let signers = parking_lot::RwLock::new(Default::default());
         // get the block number of the latest block
@@ -385,7 +389,7 @@ where
         // Create tx pool insertion batcher
         let (processor, tx_batch_sender) =
             BatchTxProcessor::new(components.pool().clone(), max_batch_size);
-        task_spawner.spawn_critical("tx-batcher", Box::pin(processor));
+        task_spawner.spawn_critical_task("tx-batcher", processor);
 
         // XLayer: Initialize legacy RPC client if configured
         let legacy_rpc_client = legacy_rpc_config.and_then(|config| {
@@ -426,6 +430,7 @@ where
             send_raw_transaction_sync_timeout,
             blob_sidecar_converter: BlobSidecarConverter::new(),
             evm_memory_limit,
+            force_blob_sidecar_upcasting,
         }
     }
 }
@@ -468,8 +473,8 @@ where
 
     /// Returns a handle to the task spawner.
     #[inline]
-    pub const fn task_spawner(&self) -> &dyn TaskSpawner {
-        &*self.task_spawner
+    pub const fn task_spawner(&self) -> &Runtime {
+        &self.task_spawner
     }
 
     /// Returns a handle to the blocking thread pool.
@@ -570,10 +575,11 @@ where
     #[inline]
     pub async fn add_pool_transaction(
         &self,
+        origin: reth_transaction_pool::TransactionOrigin,
         transaction: <N::Pool as TransactionPool>::Transaction,
     ) -> Result<AddedTransactionOutcome, EthApiError> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let request = reth_transaction_pool::BatchTxRequest::new(transaction, response_tx);
+        let request = reth_transaction_pool::BatchTxRequest::new(origin, transaction, response_tx);
 
         self.tx_batch_sender()
             .send(request)
@@ -617,6 +623,12 @@ where
     pub const fn blocking_io_request_semaphore(&self) -> &Arc<Semaphore> {
         &self.blocking_io_request_semaphore
     }
+
+    /// Returns whether to force upcasting EIP-4844 blob sidecars to EIP-7594 format.
+    #[inline]
+    pub const fn force_blob_sidecar_upcasting(&self) -> bool {
+        self.force_blob_sidecar_upcasting
+    }
 }
 
 #[cfg(test)]
@@ -626,6 +638,7 @@ mod tests {
     use alloy_eips::BlockNumberOrTag;
     use alloy_primitives::{Signature, B256, U64};
     use alloy_rpc_types::FeeHistory;
+    use alloy_rpc_types_eth::{Bundle, TransactionRequest};
     use jsonrpsee_types::error::INVALID_PARAMS_CODE;
     use rand::Rng;
     use reth_chain_state::CanonStateSubscriptions;
@@ -821,6 +834,53 @@ mod tests {
         assert!(response.is_err());
         let error_object = response.unwrap_err();
         assert_eq!(error_object.code(), INVALID_PARAMS_CODE);
+    }
+
+    #[tokio::test]
+    async fn test_call_many_maps_provider_block_lookup_error_with_eth_api_conversion() {
+        let eth_api = build_test_eth_api(MockEthProvider::default());
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default()],
+            block_override: None,
+        }];
+
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::call_many(
+            &eth_api, bundles, None, None,
+        )
+        .await;
+
+        let err = response.expect_err("call_many should fail when latest block lookup errors");
+        let message = err.message().to_ascii_lowercase();
+        assert!(
+            message.contains("block not found"),
+            "best block lookup should map via EthApiError::from(ProviderError): {message}"
+        );
+        assert!(
+            !message.contains("best block does not exist"),
+            "provider implementation detail should not leak from converted error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_many_keeps_header_not_found_when_block_hash_absent() {
+        let eth_api = build_test_eth_api(NoopProvider::default());
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default()],
+            block_override: None,
+        }];
+
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::call_many(
+            &eth_api, bundles, None, None,
+        )
+        .await;
+
+        let err =
+            response.expect_err("call_many should fail when latest block hash is unavailable");
+        let message = err.message().to_ascii_lowercase();
+        assert!(
+            message.contains("block not found"),
+            "missing block hash should still map to block-not-found: {message}"
+        );
     }
 
     #[tokio::test]

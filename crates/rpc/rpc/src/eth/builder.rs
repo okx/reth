@@ -18,7 +18,7 @@ use reth_rpc_server_types::constants::{
     DEFAULT_ETH_PROOF_WINDOW, DEFAULT_MAX_BLOCKING_IO_REQUEST, DEFAULT_MAX_SIMULATE_BLOCKS,
     DEFAULT_PROOF_PERMITS,
 };
-use reth_tasks::{pool::BlockingTaskPool, TaskSpawner, TokioTaskExecutor};
+use reth_tasks::{pool::BlockingTaskPool, Runtime};
 use std::{sync::Arc, time::Duration};
 
 /// A helper to build the `EthApi` handler instance.
@@ -39,7 +39,7 @@ pub struct EthApiBuilder<N: RpcNodeCore, Rpc, NextEnv = ()> {
     gas_oracle_config: GasPriceOracleConfig,
     gas_oracle: Option<GasPriceOracle<N::Provider>>,
     blocking_task_pool: Option<BlockingTaskPool>,
-    task_spawner: Box<dyn TaskSpawner + 'static>,
+    task_spawner: Runtime,
     next_env: NextEnv,
     max_batch_size: usize,
     max_blocking_io_requests: usize,
@@ -48,6 +48,7 @@ pub struct EthApiBuilder<N: RpcNodeCore, Rpc, NextEnv = ()> {
     legacy_rpc_config: Option<reth_rpc_eth_types::LegacyRpcConfig>,
     send_raw_transaction_sync_timeout: Duration,
     evm_memory_limit: u64,
+    force_blob_sidecar_upcasting: bool,
 }
 
 impl<Provider, Pool, Network, EvmConfig, ChainSpec>
@@ -101,6 +102,7 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             legacy_rpc_config,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
+            force_blob_sidecar_upcasting,
         } = self;
         EthApiBuilder {
             components,
@@ -124,6 +126,7 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             legacy_rpc_config,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
+            force_blob_sidecar_upcasting,
         }
     }
 }
@@ -147,7 +150,7 @@ where
             blocking_task_pool: None,
             fee_history_cache_config: FeeHistoryCacheConfig::default(),
             proof_permits: DEFAULT_PROOF_PERMITS,
-            task_spawner: TokioTaskExecutor::default().boxed(),
+            task_spawner: Runtime::test(),
             gas_oracle_config: Default::default(),
             eth_state_cache_config: Default::default(),
             next_env: Default::default(),
@@ -158,6 +161,7 @@ where
             legacy_rpc_config: None,
             send_raw_transaction_sync_timeout: Duration::from_secs(30),
             evm_memory_limit: (1 << 32) - 1,
+            force_blob_sidecar_upcasting: false,
         }
     }
 }
@@ -167,8 +171,8 @@ where
     N: RpcNodeCore,
 {
     /// Configures the task spawner used to spawn additional tasks.
-    pub fn task_spawner(mut self, spawner: impl TaskSpawner + 'static) -> Self {
-        self.task_spawner = Box::new(spawner);
+    pub fn task_spawner(mut self, spawner: Runtime) -> Self {
+        self.task_spawner = spawner;
         self
     }
 
@@ -208,6 +212,7 @@ where
             legacy_rpc_config,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
+            force_blob_sidecar_upcasting,
         } = self;
         EthApiBuilder {
             components,
@@ -231,6 +236,7 @@ where
             legacy_rpc_config,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
+            force_blob_sidecar_upcasting,
         }
     }
 
@@ -261,6 +267,7 @@ where
             legacy_rpc_config,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
+            force_blob_sidecar_upcasting,
         } = self;
         EthApiBuilder {
             components,
@@ -284,6 +291,7 @@ where
             legacy_rpc_config,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
+            force_blob_sidecar_upcasting,
         }
     }
 
@@ -487,7 +495,7 @@ where
 
     /// Builds the [`EthApiInner`] instance.
     ///
-    /// If not configured, this will spawn the cache backend: [`EthStateCache::spawn`].
+    /// If not configured, this will spawn the cache backend: [`EthStateCache::spawn_with`].
     ///
     /// # Panics
     ///
@@ -520,12 +528,18 @@ where
             legacy_rpc_config,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
+            force_blob_sidecar_upcasting,
         } = self;
 
         let provider = components.provider().clone();
 
-        let eth_cache = eth_cache
-            .unwrap_or_else(|| EthStateCache::spawn(provider.clone(), eth_state_cache_config));
+        let eth_cache = eth_cache.unwrap_or_else(|| {
+            EthStateCache::spawn_with(
+                provider.clone(),
+                eth_state_cache_config,
+                task_spawner.clone(),
+            )
+        });
         let gas_oracle = gas_oracle.unwrap_or_else(|| {
             GasPriceOracle::new(provider.clone(), gas_oracle_config, eth_cache.clone())
         });
@@ -534,11 +548,11 @@ where
         let new_canonical_blocks = provider.canonical_state_stream();
         let fhc = fee_history_cache.clone();
         let cache = eth_cache.clone();
-        task_spawner.spawn_critical(
+        task_spawner.spawn_critical_task(
             "cache canonical blocks for fee history task",
-            Box::pin(async move {
+            async move {
                 fee_history_cache_new_blocks_task(fhc, new_canonical_blocks, provider, cache).await;
-            }),
+            },
         );
 
         EthApiInner::new(
@@ -549,7 +563,11 @@ where
             max_simulate_blocks,
             eth_proof_window,
             blocking_task_pool.unwrap_or_else(|| {
-                BlockingTaskPool::build().expect("failed to build blocking task pool")
+                BlockingTaskPool::builder()
+                    .thread_name(|i| format!("blocking-{i:02}"))
+                    .build()
+                    .map(BlockingTaskPool::new)
+                    .expect("failed to build blocking task pool")
             }),
             fee_history_cache,
             task_spawner,
@@ -563,12 +581,13 @@ where
             legacy_rpc_config,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
+            force_blob_sidecar_upcasting,
         )
     }
 
     /// Builds the [`EthApi`] instance.
     ///
-    /// If not configured, this will spawn the cache backend: [`EthStateCache::spawn`].
+    /// If not configured, this will spawn the cache backend: [`EthStateCache::spawn_with`].
     ///
     /// # Panics
     ///
@@ -591,6 +610,12 @@ where
     /// Sets the maximum memory the EVM can allocate per RPC request.
     pub const fn evm_memory_limit(mut self, memory_limit: u64) -> Self {
         self.evm_memory_limit = memory_limit;
+        self
+    }
+
+    /// Sets whether to force upcasting EIP-4844 blob sidecars to EIP-7594 format.
+    pub const fn force_blob_sidecar_upcasting(mut self, force: bool) -> Self {
+        self.force_blob_sidecar_upcasting = force;
         self
     }
 }

@@ -14,6 +14,7 @@
 //! [`EthApiServer`](crate::EthApiServer), is implemented for any type that implements
 //! all the `Eth` traits, e.g. `reth_rpc::EthApi`.
 
+pub mod bal;
 pub mod block;
 pub mod blocking_task;
 pub mod call;
@@ -29,6 +30,7 @@ pub mod state;
 pub mod trace;
 pub mod transaction;
 
+pub use bal::GetBlockAccessList;
 pub use block::{EthBlocks, LoadBlock};
 pub use blocking_task::SpawnBlocking;
 pub use call::{Call, EthCall};
@@ -48,9 +50,12 @@ pub use transaction::{EthTransactions, LoadTransaction};
 use crate::FullEthApiTypes;
 
 /// Extension trait that bundles traits needed for tracing transactions.
-pub trait TraceExt: LoadTransaction + LoadBlock + SpawnBlocking + Trace + Call {}
+pub trait TraceExt:
+    LoadTransaction + LoadBlock + SpawnBlocking + Trace + Call + GetBlockAccessList
+{
+}
 
-impl<T> TraceExt for T where T: LoadTransaction + LoadBlock + Trace + Call {}
+impl<T> TraceExt for T where T: LoadTransaction + LoadBlock + Trace + Call + GetBlockAccessList {}
 
 /// Helper trait to unify all `eth` rpc server building block traits, for simplicity.
 ///
@@ -65,6 +70,7 @@ pub trait FullEthApi:
     + EthFees
     + Trace
     + LoadReceipt
+    + GetBlockAccessList
 {
 }
 
@@ -78,5 +84,6 @@ impl<T> FullEthApi for T where
         + EthFees
         + Trace
         + LoadReceipt
+        + GetBlockAccessList
 {
 }

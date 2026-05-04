@@ -18,7 +18,10 @@ pub struct InitCommand<C: ChainSpecParser> {
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> InitCommand<C> {
     /// Execute the `init` command
-    pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec>>(self) -> eyre::Result<()> {
+    pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec>>(
+        self,
+        runtime: reth_tasks::Runtime,
+    ) -> eyre::Result<()> {
         info!(target: "reth::cli", "reth init starting");
 
         // X Layer, check if using xlayer-mainnet or xlayer-testnet via --chain parameter - only
@@ -27,7 +30,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> InitComman
         let has_empty_alloc = self.env.chain.genesis().alloc.is_empty();
         crate::xlayer_init_check::check_xlayer_init(chain_id, has_empty_alloc)?;
 
-        let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RW)?;
+        let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RW, runtime)?;
 
         // X Layer, get the actual genesis block number from the chain spec
         let genesis_block_number = provider_factory.chain_spec().genesis_header().number();
