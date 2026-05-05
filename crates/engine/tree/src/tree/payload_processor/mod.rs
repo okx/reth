@@ -360,7 +360,8 @@ where
         mpsc::Receiver<Result<WithTxEnv<TxEnvFor<Evm>, I::Tx>, I::Error>>,
         usize,
     ) {
-        let (transactions, convert) = transactions.into();
+        let (transactions, convert) =
+            reth_evm::ExecutableTxTuple::into_parts(transactions);
         let transactions = transactions.into_par_iter();
         let transaction_count_hint = transactions.len();
 
@@ -371,8 +372,12 @@ where
         // Spawn a task that `convert`s all transactions in parallel and sends them out-of-order.
         self.executor.spawn_blocking(move || {
             transactions.enumerate().for_each_with(ooo_tx, |ooo_tx, (idx, tx)| {
-                let tx = convert(tx);
-                let tx = tx.map(|tx| WithTxEnv { tx_env: tx.to_tx_env(), tx: Arc::new(tx) });
+                let tx = reth_evm::ConvertTx::convert(&convert, tx);
+                let tx = tx.map(|tx: I::Tx| {
+                    let (tx_env, _recovered) =
+                        alloy_evm::block::ExecutableTxParts::into_parts(tx.clone());
+                    WithTxEnv { tx_env, tx: Arc::new(tx) }
+                });
                 // Only send Ok(_) variants to prewarming task.
                 if let Ok(tx) = &tx {
                     let _ = prewarm_tx.send(tx.clone());
@@ -407,10 +412,10 @@ where
     }
 
     /// Spawn prewarming optionally wired to the multiproof task for target updates.
-    fn spawn_caching_with<P>(
+    fn spawn_caching_with<P, T>(
         &self,
         env: ExecutionEnv<Evm>,
-        mut transactions: mpsc::Receiver<impl ExecutableTxFor<Evm> + Clone + Send + 'static>,
+        mut transactions: mpsc::Receiver<T>,
         transaction_count_hint: usize,
         provider_builder: StateProviderBuilder<N, P>,
         to_multi_proof: Option<CrossbeamSender<MultiProofMessage>>,
@@ -418,6 +423,11 @@ where
     ) -> CacheTaskHandle<N::Receipt>
     where
         P: BlockReader + StateProviderFactory + StateReader + Clone + 'static,
+        T: ExecutableTxFor<Evm>
+            + Clone
+            + Send
+            + 'static
+            + alloy_evm::tx::ToTxEnv<<<<Evm as reth_evm::ConfigureEvm>::BlockExecutorFactory as alloy_evm::block::BlockExecutorFactory>::EvmFactory as alloy_evm::EvmFactory>::Tx>,
     {
         if self.disable_transaction_prewarming {
             // if no transactions should be executed we clear them but still spawn the task for

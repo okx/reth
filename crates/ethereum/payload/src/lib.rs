@@ -175,6 +175,7 @@ where
                 parent_beacon_block_root: attributes.parent_beacon_block_root(),
                 withdrawals: Some(attributes.withdrawals().clone()),
                 extra_data: builder_config.extra_data,
+                slot_number: None,
             },
         )
         .map_err(PayloadBuilderError::other)?;
@@ -385,8 +386,9 @@ where
                         let miner_fee = tx
                             .effective_tip_per_gas(base_fee)
                             .expect("fee is always valid; execution succeeded");
-                        total_fees += U256::from(miner_fee) * U256::from(gas_used);
-                        cumulative_gas_used += gas_used;
+                        let tx_gas_used = gas_used.tx_gas_used();
+                        total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
+                        cumulative_gas_used += tx_gas_used;
 
                         if let Some(sidecar) = blob_tx_sidecar {
                             blob_sidecars.push_sidecar_variant(sidecar.as_ref().clone());
@@ -541,8 +543,9 @@ where
                 let miner_fee = tx
                     .effective_tip_per_gas(base_fee)
                     .expect("fee is always valid; execution succeeded");
-                total_fees += U256::from(miner_fee) * U256::from(gas_used);
-                cumulative_gas_used += gas_used;
+                let tx_gas_used = gas_used.tx_gas_used();
+                total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
+                cumulative_gas_used += tx_gas_used;
 
                 if let Some(sidecar) = blob_tx_sidecar {
                     blob_sidecars.push_sidecar_variant(sidecar.as_ref().clone());
@@ -561,7 +564,7 @@ where
 
     let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = {
         let _guard = timing_ctx.time_calc_state_root();
-        builder.finish(state_provider.as_ref())?
+        builder.finish(state_provider.as_ref(), None)?
     };
 
     // Extract BundleState from the execution database for InsertExecutedBlock fast path.

@@ -869,7 +869,11 @@ where
             //
             // NOTE: This also applies to cancun/shanghai-specific payload attributes.
             if let Err(err) = attr_validation_res {
-                let fcu_res = self.inner.beacon_consensus.fork_choice_updated(state, None).await?;
+                let fcu_res = self
+                    .inner
+                    .beacon_consensus
+                    .fork_choice_updated(state, None, version)
+                    .await?;
                 if fcu_res.is_invalid() || fcu_res.payload_status.is_syncing() {
                     return Ok(fcu_res)
                 }
@@ -877,7 +881,11 @@ where
             }
         }
 
-        Ok(self.inner.beacon_consensus.fork_choice_updated(state, payload_attrs).await?)
+        Ok(self
+            .inner
+            .beacon_consensus
+            .fork_choice_updated(state, payload_attrs, version)
+            .await?)
     }
 
     /// Returns reference to supported capabilities.

@@ -13,9 +13,10 @@ extern crate alloc;
 
 use alloy_consensus::BlockHeader;
 use reth_errors::ConsensusError;
+pub use reth_payload_primitives::EngineApiMessageVersion;
 use reth_payload_primitives::{
-    EngineApiMessageVersion, EngineObjectValidationError, InvalidPayloadAttributesError,
-    NewPayloadError, PayloadAttributes, PayloadOrAttributes, PayloadTypes,
+    EngineObjectValidationError, InvalidPayloadAttributesError, NewPayloadError, PayloadAttributes,
+    PayloadOrAttributes, PayloadTypes,
 };
 use reth_primitives_traits::{Block, RecoveredBlock, SealedBlock};
 use reth_trie_common::HashedPostState;

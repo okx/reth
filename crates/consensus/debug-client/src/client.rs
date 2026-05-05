@@ -130,7 +130,14 @@ where
                 safe_block_hash,
                 finalized_block_hash,
             };
-            let _ = self.engine_handle.fork_choice_updated(state, None).await;
+            let _ = self
+                .engine_handle
+                .fork_choice_updated(
+                    state,
+                    None,
+                    reth_node_api::EngineApiMessageVersion::default(),
+                )
+                .await;
         }
     }
 }

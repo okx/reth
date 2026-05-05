@@ -1,19 +1,19 @@
 use crate::{
-    BuildArguments, BuildOutcome, HeaderForPayload, PayloadBuilder, PayloadBuilderError,
-    PayloadConfig,
+    BuildArguments, BuildOutcome, HeaderForPayload, PayloadBuilder, PayloadBuilderAttributes,
+    PayloadBuilderError, PayloadConfig,
 };
 
-use alloy_primitives::{B256, U256};
+use alloy_eips::eip4895::Withdrawals;
+use alloy_primitives::{Address, B256, U256};
 use reth_payload_builder::PayloadId;
-use reth_payload_primitives::{BuiltPayload, PayloadAttributes};
+use reth_payload_primitives::BuiltPayload;
 use reth_primitives_traits::{NodePrimitives, SealedBlock};
 
 use alloy_eips::eip7685::Requests;
 use std::{error::Error, fmt};
 
 /// hand rolled Either enum to handle two builder types
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum Either<L, R> {
     /// left variant
     Left(L),
@@ -47,15 +47,42 @@ where
     }
 }
 
-impl<L, R> PayloadAttributes for Either<L, R>
+impl<L, R> PayloadBuilderAttributes for Either<L, R>
 where
-    L: PayloadAttributes,
-    R: PayloadAttributes,
+    L: PayloadBuilderAttributes,
+    R: PayloadBuilderAttributes,
+    L::Error: Error + 'static,
+    R::Error: Error + 'static,
 {
-    fn payload_id(&self, parent_hash: &B256) -> PayloadId {
+    type RpcPayloadAttributes = Either<L::RpcPayloadAttributes, R::RpcPayloadAttributes>;
+    type Error = Either<L::Error, R::Error>;
+
+    fn try_new(
+        parent: B256,
+        rpc_payload_attributes: Self::RpcPayloadAttributes,
+        version: u8,
+    ) -> Result<Self, Self::Error> {
+        match rpc_payload_attributes {
+            Either::Left(attr) => {
+                L::try_new(parent, attr, version).map(Either::Left).map_err(Either::Left)
+            }
+            Either::Right(attr) => {
+                R::try_new(parent, attr, version).map(Either::Right).map_err(Either::Right)
+            }
+        }
+    }
+
+    fn payload_id(&self) -> PayloadId {
         match self {
-            Self::Left(l) => l.payload_id(parent_hash),
-            Self::Right(r) => r.payload_id(parent_hash),
+            Self::Left(l) => l.payload_id(),
+            Self::Right(r) => r.payload_id(),
+        }
+    }
+
+    fn parent(&self) -> B256 {
+        match self {
+            Self::Left(l) => l.parent(),
+            Self::Right(r) => r.parent(),
         }
     }
 
@@ -73,17 +100,24 @@ where
         }
     }
 
-    fn withdrawals(&self) -> Option<&Vec<alloy_eips::eip4895::Withdrawal>> {
+    fn suggested_fee_recipient(&self) -> Address {
         match self {
-            Self::Left(l) => l.withdrawals(),
-            Self::Right(r) => r.withdrawals(),
+            Self::Left(l) => l.suggested_fee_recipient(),
+            Self::Right(r) => r.suggested_fee_recipient(),
         }
     }
 
-    fn slot_number(&self) -> Option<u64> {
+    fn prev_randao(&self) -> B256 {
         match self {
-            Self::Left(l) => l.slot_number(),
-            Self::Right(r) => r.slot_number(),
+            Self::Left(l) => l.prev_randao(),
+            Self::Right(r) => r.prev_randao(),
+        }
+    }
+
+    fn withdrawals(&self) -> &Withdrawals {
+        match self {
+            Self::Left(l) => l.withdrawals(),
+            Self::Right(r) => r.withdrawals(),
         }
     }
 }
@@ -160,23 +194,14 @@ where
         &self,
         args: BuildArguments<Self::Attributes, Self::BuiltPayload>,
     ) -> Result<BuildOutcome<Self::BuiltPayload>, PayloadBuilderError> {
-        let BuildArguments {
-            cached_reads,
-            execution_cache,
-            trie_handle,
-            config,
-            cancel,
-            best_payload,
-        } = args;
-        let PayloadConfig { parent_header, attributes, payload_id } = config;
+        let BuildArguments { cached_reads, config, cancel, best_payload } = args;
+        let PayloadConfig { parent_header, attributes } = config;
 
         match attributes {
             Either::Left(left_attr) => {
                 let left_args: BuildArguments<L::Attributes, L::BuiltPayload> = BuildArguments {
                     cached_reads,
-                    execution_cache,
-                    trie_handle,
-                    config: PayloadConfig { parent_header, attributes: left_attr, payload_id },
+                    config: PayloadConfig { parent_header, attributes: left_attr },
                     cancel,
                     best_payload: best_payload.and_then(|payload| {
                         if let Either::Left(p) = payload {
@@ -191,9 +216,7 @@ where
             Either::Right(right_attr) => {
                 let right_args = BuildArguments {
                     cached_reads,
-                    execution_cache,
-                    trie_handle,
-                    config: PayloadConfig { parent_header, attributes: right_attr, payload_id },
+                    config: PayloadConfig { parent_header, attributes: right_attr },
                     cancel,
                     best_payload: best_payload.and_then(|payload| {
                         if let Either::Right(p) = payload {
@@ -213,14 +236,12 @@ where
         config: PayloadConfig<Self::Attributes, HeaderForPayload<Self::BuiltPayload>>,
     ) -> Result<Self::BuiltPayload, PayloadBuilderError> {
         match config {
-            PayloadConfig { parent_header, attributes: Either::Left(left_attr), payload_id } => {
-                let left_config =
-                    PayloadConfig { parent_header, attributes: left_attr, payload_id };
+            PayloadConfig { parent_header, attributes: Either::Left(left_attr) } => {
+                let left_config = PayloadConfig { parent_header, attributes: left_attr };
                 self.left.build_empty_payload(left_config).map(Either::Left)
             }
-            PayloadConfig { parent_header, attributes: Either::Right(right_attr), payload_id } => {
-                let right_config =
-                    PayloadConfig { parent_header, attributes: right_attr, payload_id };
+            PayloadConfig { parent_header, attributes: Either::Right(right_attr) } => {
+                let right_config = PayloadConfig { parent_header, attributes: right_attr };
                 self.right.build_empty_payload(right_config).map(Either::Right)
             }
         }

@@ -14,7 +14,7 @@ use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome},
     ConfigureEvm,
 };
-use reth_payload_primitives::{BuiltPayload, PayloadTypes};
+use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
 use reth_primitives_traits::{
     block::Block as _, BlockBody as _, BlockTy, HeaderTy, SealedBlock, SignedTransaction,
 };
@@ -202,18 +202,32 @@ where
                             state: reorg_forkchoice_state,
                             payload_attrs: None,
                             tx: reorg_fcu_tx,
+                            version: EngineApiMessageVersion::default(),
                         },
                     ]);
                     *this.state = EngineReorgState::Reorg { queue };
                     continue
                 }
-                (Some(BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs, tx }), _) => {
+                (
+                    Some(BeaconEngineMessage::ForkchoiceUpdated {
+                        state,
+                        payload_attrs,
+                        tx,
+                        version,
+                    }),
+                    _,
+                ) => {
                     // Record last forkchoice state forwarded to the engine.
                     // We do not care if it's valid since engine should be able to handle
                     // reorgs that rely on invalid forkchoice state.
                     *this.last_forkchoice_state = Some(state);
                     *this.forkchoice_states_forwarded += 1;
-                    Some(BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs, tx })
+                    Some(BeaconEngineMessage::ForkchoiceUpdated {
+                        state,
+                        payload_attrs,
+                        tx,
+                        version,
+                    })
                 }
                 (item, _) => item,
             };
@@ -287,7 +301,7 @@ where
         let tx_recovered =
             tx.try_into_recovered().map_err(|_| ProviderError::SenderRecoveryError)?;
         let gas_used = match builder.execute_transaction(tx_recovered) {
-            Ok(gas_used) => gas_used.tx_gas_used(),
+            Ok(gas_used) => gas_used,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                 hash,
                 error,
@@ -299,7 +313,7 @@ where
             Err(error) => return Err(RethError::Execution(error)),
         };
 
-        cumulative_gas_used += gas_used;
+        cumulative_gas_used += gas_used.tx_gas_used();
     }
 
     let BlockBuilderOutcome { block, .. } = builder.finish(&state_provider, None)?;

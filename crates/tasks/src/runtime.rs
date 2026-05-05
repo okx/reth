@@ -593,6 +593,30 @@ impl Runtime {
         self.spawn_critical_as(name, fut, TaskKind::Blocking)
     }
 
+    /// Backwards-compatibility alias for [`Self::spawn_critical_task`].
+    pub fn spawn_critical<F>(&self, name: &'static str, fut: F) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_critical_task(name, fut)
+    }
+
+    /// Backwards-compatibility alias for [`Self::spawn_task`].
+    pub fn spawn<F>(&self, fut: F) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_task(fut)
+    }
+
+    /// Backwards-compatibility alias for [`Self::spawn_critical_blocking_task`].
+    pub fn spawn_critical_blocking<F>(&self, name: &'static str, fut: F) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_critical_blocking_task(name, fut)
+    }
+
     /// This spawns a critical task onto the runtime.
     ///
     /// If this task panics, the [`TaskManager`] is notified.

@@ -145,7 +145,7 @@ impl<N: NodePrimitives> EngineApiTreeState<N> {
         engine_kind: EngineApiKind,
     ) -> Self {
         Self {
-            invalid_headers: InvalidHeaderCache::new(max_invalid_header_cache_length),
+            invalid_headers: InvalidHeaderCache::new(max_invalid_header_cache_length, 0),
             buffer: BlockBuffer::new(block_buffer_limit),
             tree_state: TreeState::new(canonical_block, engine_kind),
             forkchoice_state_tracker: ForkchoiceStateTracker::default(),
@@ -321,7 +321,9 @@ where
     <P as DatabaseProviderFactory>::Provider: BlockReader<Block = N::Block, Header = N::BlockHeader>
         + StageCheckpointReader
         + ChangeSetReader
-        + BlockNumReader,
+        + BlockNumReader
+        + reth_storage_api::StorageChangeSetReader
+        + reth_storage_api::StorageSettingsCache,
     C: ConfigureEvm<Primitives = N> + 'static,
     T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
     V: EngineValidator<T>,
@@ -487,7 +489,7 @@ where
                     // Don't put it back - consumed (oneshot-like behavior)
                     match result {
                         Ok(value) => LoopEvent::PersistenceComplete {
-                            result: value,
+                            result: value.last_block,
                             start_time,
                         },
                         Err(_) => LoopEvent::Disconnected,
@@ -1332,7 +1334,7 @@ where
             // Wait for any in-progress persistence to complete (blocking)
             if let Some((rx, start_time, _action)) = self.persistence_state.rx.take() {
                 let result = rx.recv().map_err(|_| AdvancePersistenceError::ChannelClosed)?;
-                self.on_persistence_complete(result, start_time)?;
+                self.on_persistence_complete(result.last_block, start_time)?;
             }
 
             let blocks_to_persist = self.get_canonical_blocks_to_persist(PersistTarget::Head)?;
@@ -1358,7 +1360,7 @@ where
 
         match rx.try_recv() {
             Ok(result) => {
-                self.on_persistence_complete(result, start_time)?;
+                self.on_persistence_complete(result.last_block, start_time)?;
                 Ok(true)
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -1376,7 +1378,7 @@ where
     fn on_persistence_complete(
         &mut self,
         last_persisted_hash_num: Option<BlockNumHash>,
-        start_time: Instant,
+        start_time: reth_primitives_traits::FastInstant,
     ) -> Result<(), AdvancePersistenceError> {
         self.metrics.engine.persistence_duration.record(start_time.elapsed());
 
@@ -3022,7 +3024,7 @@ where
         /// The result of the persistence operation.
         result: Option<BlockNumHash>,
         /// When the persistence operation started.
-        start_time: Instant,
+        start_time: reth_primitives_traits::FastInstant,
     },
     /// A channel was disconnected.
     Disconnected,

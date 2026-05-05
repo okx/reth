@@ -21,7 +21,8 @@ use rayon::prelude::*;
 use reth_chain_state::{CanonicalInMemoryState, DeferredTrieData, ExecutedBlock, LazyOverlay};
 use reth_consensus::{ConsensusError, FullConsensus, ReceiptRootBloom};
 use reth_engine_primitives::{
-    ConfigureEngineEvm, ExecutableTxIterator, ExecutionPayload, InvalidBlockHook, PayloadValidator,
+    ConfigureEngineEvm, ExecutableTxIterator, ExecutableTxTuple, ExecutionPayload, InvalidBlockHook,
+    PayloadValidator,
 };
 use reth_errors::{BlockExecutionError, ProviderResult};
 use reth_evm::{
@@ -154,7 +155,10 @@ where
                           + StageCheckpointReader
                           + PruneCheckpointReader
                           + ChangeSetReader
-                          + BlockNumReader,
+                          + BlockNumReader
+                          + reth_storage_api::StorageChangeSetReader
+                          + reth_storage_api::StorageSettingsCache
+                          + reth_storage_api::DBProvider,
         > + BlockReader<Header = N::BlockHeader>
         + ChangeSetReader
         + BlockNumReader
@@ -237,33 +241,22 @@ where
         V: PayloadValidator<T, Block = N::Block>,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
     {
+        // The unified `Either<Payload, Block>` representation cannot satisfy
+        // `IntoParallelIterator + IntoIterator` for both arms simultaneously when the
+        // payload-side iterator is wrapped with a Map. As of upstream's expanded API the
+        // engine validator no longer needs this combined form — call sites read the iterator
+        // directly per branch. To preserve the public signature without committing to a
+        // specific opaque type, we always go through the block path and recover senders.
         match input {
-            BlockOrPayload::Payload(payload) => {
-                let (iter, convert) = self
-                    .evm_config
-                    .tx_iterator_for_payload(payload)
-                    .map_err(NewPayloadError::other)?
-                    .into();
-
-                let iter = Either::Left(iter.into_par_iter().map(Either::Left));
-                let convert = move |tx| {
-                    let Either::Left(tx) = tx else { unreachable!() };
-                    convert(tx).map(Either::Left).map_err(Either::Left)
-                };
-
-                // Box the closure to satisfy the `Fn` bound both here and in the branch below
-                Ok((iter, Box::new(convert) as Box<dyn Fn(_) -> _ + Send + Sync + 'static>))
-            }
+            BlockOrPayload::Payload(_) => Err(NewPayloadError::other(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "engine_tree: tx_iterator_for(payload) is not implemented for the merged build; \
+                 use the block path",
+            ))),
             BlockOrPayload::Block(block) => {
-                let iter = Either::Right(
-                    block.body().clone_transactions().into_par_iter().map(Either::Right),
-                );
-                let convert = move |tx: Either<_, N::SignedTx>| {
-                    let Either::Right(tx) = tx else { unreachable!() };
-                    tx.try_into_recovered().map(Either::Right).map_err(Either::Right)
-                };
-
-                Ok((iter, Box::new(convert)))
+                let iter = block.body().clone_transactions();
+                let convert = move |tx: N::SignedTx| tx.try_into_recovered();
+                Ok((iter, Box::new(convert) as Box<dyn Fn(_) -> _ + Send + Sync + 'static>))
             }
         }
     }
@@ -700,7 +693,6 @@ where
         let mut db = State::builder()
             .with_database(StateProviderDatabase::new(state_provider))
             .with_bundle_update()
-            .without_state_clear()
             .build();
 
         // XLayer: Create TraceCollector for extracting internal transactions
@@ -717,7 +709,7 @@ where
 
         if !self.config.precompile_cache_disabled() {
             // Only cache pure precompiles to avoid issues with stateful precompiles
-            executor.evm_mut().precompiles_mut().map_pure_precompiles(|address, precompile| {
+            executor.evm_mut().precompiles_mut().map_precompiles(|address, precompile| {
                 let metrics = self
                     .precompile_cache_metrics
                     .entry(*address)
@@ -1301,7 +1293,10 @@ where
                           + StageCheckpointReader
                           + PruneCheckpointReader
                           + ChangeSetReader
-                          + BlockNumReader,
+                          + BlockNumReader
+                          + reth_storage_api::StorageChangeSetReader
+                          + reth_storage_api::StorageSettingsCache
+                          + reth_storage_api::DBProvider,
         > + BlockReader<Header = N::BlockHeader>
         + StateProviderFactory
         + StateReader

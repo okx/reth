@@ -30,6 +30,7 @@ members = [
     "crates/engine/local",
     "crates/engine/primitives/",
     "crates/engine/execution-cache/",
+    "crates/engine/service",
     "crates/engine/tree/",
     "crates/engine/util/",
     "crates/era",
@@ -365,6 +366,7 @@ reth-engine-local = { path = "crates/engine/local" }
 reth-execution-cache = { path = "crates/engine/execution-cache" }
 reth-engine-primitives = { path = "crates/engine/primitives", default-features = false }
 reth-engine-tree = { path = "crates/engine/tree" }
+reth-engine-service = { path = "crates/engine/service" }
 reth-engine-util = { path = "crates/engine/util" }
 reth-era = { path = "crates/era" }
 reth-era-downloader = { path = "crates/era-downloader" }

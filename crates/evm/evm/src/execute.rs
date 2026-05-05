@@ -639,6 +639,12 @@ impl<TxEnv, T: RecoveredTx<Tx>, Tx> ExecutableTxParts<TxEnv, Tx> for WithTxEnv<T
     }
 }
 
+impl<TxEnv: Clone, T> alloy_evm::tx::ToTxEnv<TxEnv> for WithTxEnv<TxEnv, T> {
+    fn to_tx_env(&self) -> TxEnv {
+        self.tx_env.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,9 +20,14 @@ pub use error::*;
 use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload};
 pub use alloy_rpc_types_engine::{
     ExecutionPayloadEnvelopeV2, ExecutionPayloadEnvelopeV3, ExecutionPayloadEnvelopeV4,
-    ExecutionPayloadEnvelopeV5, ExecutionPayloadEnvelopeV6, ExecutionPayloadV1,
+    ExecutionPayloadEnvelopeV5, ExecutionPayloadV1,
     PayloadAttributes as EthPayloadAttributes,
 };
+
+/// Stub V6 envelope (alias to V5) — upstream merged a V6 type that doesn't yet exist in
+/// alloy-rpc-types-engine 2.0.4. We alias it to V5 so the existing TryInto impl satisfies the
+/// `EngineTypes` trait bound.
+pub type ExecutionPayloadEnvelopeV6 = ExecutionPayloadEnvelopeV5;
 use reth_engine_primitives::EngineTypes;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 use reth_primitives_traits::{NodePrimitives, SealedBlock};

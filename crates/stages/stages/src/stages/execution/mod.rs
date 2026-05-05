@@ -1489,12 +1489,11 @@ where
         + BlockReader<
             Block = <<E as ConfigureEvm>::Primitives as NodePrimitives>::Block,
             Header = <<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader,
-        >,
+        > + reth_storage_api::StorageSettingsCache,
 {
     let mut replay_db = State::builder()
         .with_database(StateProviderDatabase::new(LatestStateProviderRef::new(provider)))
         .with_bundle_update()
-        .without_state_clear()
         .build();
 
     let mut inspector = TraceCollector::default();

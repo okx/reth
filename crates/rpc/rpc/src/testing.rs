@@ -213,10 +213,15 @@ where
 
                 let requests = has_requests.then_some(outcome.execution_result.requests);
 
-                EthBuiltPayload::new(sealed_block, total_fees, requests, None)
-                    .try_into_v5()
-                    .map_err(RethError::other)
-                    .map_err(Eth::Error::from_eth_err)
+                EthBuiltPayload::new(
+                    alloy_rpc_types::engine::PayloadId::new([0u8; 8]),
+                    sealed_block,
+                    total_fees,
+                    requests,
+                )
+                .try_into_v5()
+                .map_err(RethError::other)
+                .map_err(Eth::Error::from_eth_err)
             })
             .await
     }

@@ -2,6 +2,7 @@ use crate::tree::{error::InsertBlockFatalError, MeteredStateHook, TreeOutcome};
 use alloy_consensus::transaction::TxHashRef;
 use alloy_evm::{
     block::{BlockExecutor, ExecutableTx},
+    tx::RecoveredTx,
     Evm,
 };
 use alloy_rpc_types_engine::{PayloadStatus, PayloadStatusEnum};
@@ -64,10 +65,10 @@ impl EngineApiMetrics {
     /// The optional `on_receipt` callback is invoked after each transaction with the receipt
     /// index and a reference to all receipts collected so far. This allows callers to stream
     /// receipts to a background task for incremental receipt root computation.
-    pub(crate) fn execute_metered<E, DB, F>(
+    pub(crate) fn execute_metered<E, DB, T, F>(
         &self,
         executor: E,
-        mut transactions: impl Iterator<Item = Result<impl ExecutableTx<E>, BlockExecutionError>>,
+        mut transactions: impl Iterator<Item = Result<T, BlockExecutionError>>,
         transaction_count: usize,
         state_hook: Box<dyn OnStateHook>,
         mut on_receipt: F,
@@ -75,6 +76,7 @@ impl EngineApiMetrics {
     where
         DB: alloy_evm::Database,
         E: BlockExecutor<Evm: Evm<DB: BorrowMut<State<DB>>>, Transaction: SignedTransaction>,
+        T: ExecutableTx<E> + RecoveredTx<E::Transaction>,
         F: FnMut(&[E::Receipt]),
     {
         // clone here is cheap, all the metrics are Option<Arc<_>>. additionally
@@ -111,14 +113,14 @@ impl EngineApiMetrics {
                 let enter = span.entered();
                 trace!(target: "engine::tree", "Executing transaction");
                 let start = Instant::now();
-                let gas_used = executor.execute_transaction(&tx)?;
+                let gas_used = executor.execute_transaction(tx)?;
                 self.executor.transaction_execution_histogram.record(start.elapsed());
 
                 // Invoke callback with the latest receipt
                 on_receipt(executor.receipts());
 
                 // record the tx gas used
-                enter.record("gas_used", gas_used);
+                enter.record("gas_used", gas_used.tx_gas_used());
             }
             drop(exec_span);
 

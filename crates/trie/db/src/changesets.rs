@@ -389,7 +389,7 @@ impl ChangesetCache {
     /// * `block_hash` - Hash of the block
     /// * `block_number` - Block number for tracking and eviction
     /// * `changesets` - Trie changesets to cache
-    fn insert(&self, block_hash: B256, block_number: u64, changesets: Arc<TrieUpdatesSorted>) {
+    pub fn insert(&self, block_hash: B256, block_number: u64, changesets: Arc<TrieUpdatesSorted>) {
         let pending = {
             let mut cache = self.inner.write();
             cache.insert(block_hash, block_number, Arc::clone(&changesets));

@@ -69,10 +69,22 @@ pub trait HeaderConverter<Consensus, Rpc>: Send + Sync + Unpin + Clone + 'static
     ) -> Result<Rpc, Self::Err>;
 }
 
-// Default impl of HeaderConverter that uses FromConsensusHeader is disabled because
-// reth-rpc-traits comes from crates.io 0.3.1 with a different reth-primitives-traits
-// version (and thus a different SealedHeader type) than our local primitives-traits.
-// Closure-based HeaderConverter impl below covers all real call sites.
+/// Default implementation of [`HeaderConverter`] that uses [`FromConsensusHeader`] to convert
+/// headers.
+impl<Consensus, Rpc> HeaderConverter<Consensus, Rpc> for ()
+where
+    Rpc: FromConsensusHeader<Consensus>,
+{
+    type Err = Infallible;
+
+    fn convert_header(
+        &self,
+        header: SealedHeader<Consensus>,
+        block_size: usize,
+    ) -> Result<Rpc, Self::Err> {
+        Ok(Rpc::from_consensus_header(header, block_size))
+    }
+}
 
 impl<Consensus, Rpc, F> HeaderConverter<Consensus, Rpc> for F
 where

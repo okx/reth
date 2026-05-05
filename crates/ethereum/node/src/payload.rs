@@ -1,7 +1,9 @@
 //! Payload component configuration for the Ethereum node.
 
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
+use reth_ethereum_engine_primitives::{
+    EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
+};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::ConfigureEvm;
@@ -27,8 +29,11 @@ where
             Primitives = PrimitivesTy<Types>,
             NextBlockEnvCtx = reth_evm::NextBlockEnvAttributes,
         > + 'static,
-    Types::Payload:
-        PayloadTypes<BuiltPayload = EthBuiltPayload, PayloadAttributes = EthPayloadAttributes>,
+    Types::Payload: PayloadTypes<
+        BuiltPayload = EthBuiltPayload,
+        PayloadAttributes = EthPayloadAttributes,
+        PayloadBuilderAttributes = EthPayloadBuilderAttributes,
+    >,
 {
     type PayloadBuilder =
         reth_ethereum_payload_builder::EthereumPayloadBuilder<Pool, Node::Provider, Evm>;

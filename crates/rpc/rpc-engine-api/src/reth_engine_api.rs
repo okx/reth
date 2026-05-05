@@ -30,35 +30,17 @@ impl<Payload: PayloadTypes> RethEngineApi<Payload> {
 impl<Payload: PayloadTypes> RethEngineApiServer<Payload::ExecutionData> for RethEngineApi<Payload> {
     async fn reth_new_payload(
         &self,
-        input: RethNewPayloadInput<Payload::ExecutionData>,
-        wait_for_persistence: Option<bool>,
-        wait_for_caches: Option<bool>,
+        _input: RethNewPayloadInput<Payload::ExecutionData>,
+        _wait_for_persistence: Option<bool>,
+        _wait_for_caches: Option<bool>,
     ) -> RpcResult<RethPayloadStatus> {
-        let wait_for_persistence = wait_for_persistence.unwrap_or(true);
-        let wait_for_caches = wait_for_caches.unwrap_or(true);
-        trace!(target: "rpc::engine", wait_for_persistence, wait_for_caches, "Serving reth_newPayload");
-
-        let payload = match input {
-            RethNewPayloadInput::ExecutionData(data) => data,
-            RethNewPayloadInput::BlockRlp(rlp) => {
-                let block = Decodable::decode(&mut rlp.as_ref())
-                    .map_err(|err| EngineApiError::Internal(Box::new(err)))?;
-                Payload::block_to_payload(SealedBlock::new_unhashed(block))
-            }
-        };
-
-        let (status, timings) = self
-            .beacon_engine_handle
-            .reth_new_payload(payload, wait_for_persistence, wait_for_caches)
-            .await
-            .map_err(EngineApiError::from)?;
-        Ok(RethPayloadStatus {
-            status,
-            latency_us: timings.latency.as_micros() as u64,
-            persistence_wait_us: timings.persistence_wait.as_micros() as u64,
-            execution_cache_wait_us: timings.execution_cache_wait.map(|d| d.as_micros() as u64),
-            sparse_trie_wait_us: timings.sparse_trie_wait.map(|d| d.as_micros() as u64),
-        })
+        // Stubbed during the upstream merge — the underlying
+        // BeaconEngineMessage::RethNewPayload variant was removed and is not yet ported.
+        Err(EngineApiError::Internal(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "reth_newPayload is not implemented in this build",
+        )))
+        .into())
     }
 
     async fn reth_forkchoice_updated(
@@ -67,7 +49,11 @@ impl<Payload: PayloadTypes> RethEngineApiServer<Payload::ExecutionData> for Reth
     ) -> RpcResult<ForkchoiceUpdated> {
         trace!(target: "rpc::engine", "Serving reth_forkchoiceUpdated");
         self.beacon_engine_handle
-            .fork_choice_updated(forkchoice_state, None)
+            .fork_choice_updated(
+                forkchoice_state,
+                None,
+                reth_engine_primitives::EngineApiMessageVersion::default(),
+            )
             .await
             .map_err(|e| EngineApiError::from(e).into())
     }

@@ -645,7 +645,7 @@ impl EngineArgs {
             .without_prewarming(self.prewarming_disabled)
             .with_state_provider_metrics(self.state_provider_metrics)
             .with_always_compare_trie_updates(self.state_root_task_compare_updates)
-            .with_cross_block_cache_size(self.cross_block_cache_size * 1024 * 1024)
+            .with_cross_block_cache_size(self.cross_block_cache_size as u64 * 1024 * 1024)
             .with_multiproof_chunk_size(self.multiproof_chunk_size)
             .with_reserved_cpu_cores(self.reserved_cpu_cores)
             .without_precompile_cache(self.precompile_cache_disabled)

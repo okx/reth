@@ -120,9 +120,11 @@ impl<N: NodePrimitives> TreeState<N> {
         };
 
         let num_blocks = blocks.len();
+        let trie_data: Vec<_> = blocks.iter().map(|b| b.trie_data_handle()).collect();
         let prepared = PreparedCanonicalOverlay {
+            _phantom: core::marker::PhantomData,
             parent_hash: canonical_hash,
-            overlay: LazyOverlay::new(blocks),
+            overlay: LazyOverlay::new(anchor_hash, trie_data),
             anchor_hash,
         };
         self.cached_canonical_overlay = Some(prepared.clone());
@@ -439,6 +441,8 @@ impl<N: NodePrimitives> TreeState<N> {
 /// - The canonical head changes to a different block
 #[derive(Debug, Clone)]
 pub struct PreparedCanonicalOverlay<N: NodePrimitives = EthPrimitives> {
+    /// Phantom for `N` to keep the previous generic API.
+    pub _phantom: core::marker::PhantomData<N>,
     /// The block hash for which this overlay is prepared as a parent.
     ///
     /// When a payload arrives with this parent hash, the overlay can be reused.
@@ -447,7 +451,7 @@ pub struct PreparedCanonicalOverlay<N: NodePrimitives = EthPrimitives> {
     ///
     /// This is computed optimistically after `set_canonical_head` so subsequent payloads don't
     /// need to walk the in-memory chain again.
-    pub overlay: LazyOverlay<N>,
+    pub overlay: LazyOverlay,
     /// The anchor hash (persisted ancestor) this overlay is based on.
     ///
     /// Used to verify the overlay is still valid (anchor hasn't changed due to persistence).

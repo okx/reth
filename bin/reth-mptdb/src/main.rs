@@ -24,7 +24,7 @@
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
 use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::map::HashMap;
+use alloy_primitives::map::{AddressMap, B256Map};
 use clap::{Args, Parser};
 use mptdb_provider::{MptDbStateProvider, MptDbStateWriter, ScPrewarmDispatcher, SyncProvider};
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter as _};
@@ -93,9 +93,8 @@ fn main() {
             if sc.lock().version() == 0 {
                 let chain_spec = builder.config().chain.clone();
                 let genesis = chain_spec.genesis();
-                let mut state: HashMap<_, _> = HashMap::default();
-                let mut contracts: HashMap<alloy_primitives::B256, revm_state::Bytecode> =
-                    HashMap::default();
+                let mut state: AddressMap<BundleAccount> = AddressMap::default();
+                let mut contracts: B256Map<revm_state::Bytecode> = B256Map::default();
                 for (addr, account) in &genesis.alloc {
                     // Compute real code_hash for accounts that have code.
                     // Using KECCAK_EMPTY for all accounts (including contracts) would
@@ -418,6 +417,7 @@ fn main() {
                                                     write_receipts: false,
                                                     // Keep account changesets so async rollback can unwind.
                                                     write_account_changesets: true,
+                                                    write_storage_changesets: true,
                                                 },
                                             )
                                             .unwrap_or_else(|e| {

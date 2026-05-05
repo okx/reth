@@ -155,7 +155,11 @@ where
         pending: mpsc::Receiver<Tx>,
         actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>,
     ) where
-        Tx: ExecutableTxFor<Evm> + Clone + Send + 'static,
+        Tx: ExecutableTxFor<Evm>
+            + Clone
+            + Send
+            + 'static
+            + alloy_evm::tx::ToTxEnv<<<<Evm as reth_evm::ConfigureEvm>::BlockExecutorFactory as alloy_evm::block::BlockExecutorFactory>::EvmFactory as alloy_evm::EvmFactory>::Tx>,
     {
         let executor = self.executor.clone();
         let ctx = self.ctx.clone();
@@ -407,7 +411,11 @@ where
         mode: PrewarmMode<Tx>,
         actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>,
     ) where
-        Tx: ExecutableTxFor<Evm> + Clone + Send + 'static,
+        Tx: ExecutableTxFor<Evm>
+            + Clone
+            + Send
+            + 'static
+            + alloy_evm::tx::ToTxEnv<<<<Evm as reth_evm::ConfigureEvm>::BlockExecutorFactory as alloy_evm::block::BlockExecutorFactory>::EvmFactory as alloy_evm::EvmFactory>::Tx>,
     {
         // Spawn execution tasks based on mode
         match mode {
@@ -543,7 +551,7 @@ where
 
         if !precompile_cache_disabled {
             // Only cache pure precompiles to avoid issues with stateful precompiles
-            evm.precompiles_mut().map_pure_precompiles(|address, precompile| {
+            evm.precompiles_mut().map_precompiles(|address, precompile| {
                 CachedPrecompile::wrap(
                     precompile,
                     precompile_cache_map.cache_for_address(*address),
@@ -572,7 +580,9 @@ where
         sender: Sender<PrewarmTaskEvent<N::Receipt>>,
         done_tx: Sender<()>,
     ) where
-        Tx: ExecutableTxFor<Evm>,
+        Tx: ExecutableTxFor<Evm>
+            + Clone
+            + alloy_evm::tx::ToTxEnv<<<<Evm as reth_evm::ConfigureEvm>::BlockExecutorFactory as alloy_evm::block::BlockExecutorFactory>::EvmFactory as alloy_evm::EvmFactory>::Tx>,
     {
         let Some((mut evm, metrics, terminate_execution)) = self.evm_for_ctx() else { return };
 
@@ -600,7 +610,7 @@ where
                 break
             }
 
-            let res = match evm.transact(&tx) {
+            let res = match evm.transact(tx.clone()) {
                 Ok(res) => res,
                 Err(err) => {
                     trace!(
@@ -659,7 +669,11 @@ where
         done_tx: Sender<()>,
     ) -> Vec<mpsc::Sender<IndexedTransaction<Tx>>>
     where
-        Tx: ExecutableTxFor<Evm> + Send + 'static,
+        Tx: ExecutableTxFor<Evm>
+            + Clone
+            + Send
+            + 'static
+            + alloy_evm::tx::ToTxEnv<<<<Evm as reth_evm::ConfigureEvm>::BlockExecutorFactory as alloy_evm::block::BlockExecutorFactory>::EvmFactory as alloy_evm::EvmFactory>::Tx>,
     {
         let mut handles = Vec::with_capacity(workers_needed);
         let mut receivers = Vec::with_capacity(workers_needed);

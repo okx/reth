@@ -22,7 +22,7 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{
     builder::config::PendingBlockKind, receipt::EthReceiptConverter, EthApiError, EthStateCache,
-    FeeHistoryCache, GasCap, GasPriceOracle, PendingBlock,
+    FeeHistoryCache, ForwardConfig, GasCap, GasPriceOracle, PendingBlock,
 };
 use reth_storage_api::{noop::NoopProvider, BlockReaderIdExt, ProviderHeader};
 use reth_tasks::{
@@ -168,7 +168,7 @@ where
             eth_proof_window,
             blocking_task_pool,
             fee_history_cache,
-            TokioTaskExecutor::default().boxed(),
+            Runtime::test(),
             proof_permits,
             rpc_converter,
             (),
@@ -179,6 +179,7 @@ where
             legacy_rpc_config,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
+            false,
         );
 
         Self { inner: Arc::new(inner) }

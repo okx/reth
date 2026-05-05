@@ -56,6 +56,57 @@ pub use runtime::{Runtime, RuntimeBuildError, RuntimeBuilder, RuntimeConfig, Tok
 /// A [`TaskExecutor`] is now an alias for [`Runtime`].
 pub type TaskExecutor = Runtime;
 
+/// Backwards-compatibility marker trait for the legacy `TaskSpawner` trait. The trait was replaced
+/// in upstream commit 57148eac9 by the concrete [`Runtime`] type. This re-implements it as an
+/// auto-trait so existing bounds continue to compile.
+pub trait TaskSpawner: Send + Sync + Unpin + std::fmt::Debug + 'static {
+    /// Spawns the task onto the runtime.
+    fn spawn(&self, fut: futures_util::future::BoxFuture<'static, ()>) -> tokio::task::JoinHandle<()>;
+    /// Spawns a critical task; same as `spawn` for the runtime.
+    fn spawn_critical(
+        &self,
+        name: &'static str,
+        fut: futures_util::future::BoxFuture<'static, ()>,
+    ) -> tokio::task::JoinHandle<()>;
+    /// Spawns a blocking task.
+    fn spawn_blocking(
+        &self,
+        fut: futures_util::future::BoxFuture<'static, ()>,
+    ) -> tokio::task::JoinHandle<()>;
+    /// Spawns a critical blocking task.
+    fn spawn_critical_blocking(
+        &self,
+        name: &'static str,
+        fut: futures_util::future::BoxFuture<'static, ()>,
+    ) -> tokio::task::JoinHandle<()>;
+}
+
+impl TaskSpawner for Runtime {
+    fn spawn(&self, fut: futures_util::future::BoxFuture<'static, ()>) -> tokio::task::JoinHandle<()> {
+        Self::spawn_task(self, fut)
+    }
+    fn spawn_critical(
+        &self,
+        name: &'static str,
+        fut: futures_util::future::BoxFuture<'static, ()>,
+    ) -> tokio::task::JoinHandle<()> {
+        Self::spawn_critical_task(self, name, fut)
+    }
+    fn spawn_blocking(
+        &self,
+        fut: futures_util::future::BoxFuture<'static, ()>,
+    ) -> tokio::task::JoinHandle<()> {
+        Self::spawn_blocking_task(self, fut)
+    }
+    fn spawn_critical_blocking(
+        &self,
+        name: &'static str,
+        fut: futures_util::future::BoxFuture<'static, ()>,
+    ) -> tokio::task::JoinHandle<()> {
+        Self::spawn_critical_blocking_task(self, name, fut)
+    }
+}
+
 /// Spawns an OS thread with the current tokio runtime context propagated.
 ///
 /// This function captures the current tokio runtime handle (if available) and enters it
