@@ -718,7 +718,7 @@ hash-db = "=0.15.2"
 hickory-resolver = "0.25.0"
 hmac = "0.12.1"
 human_bytes = "0.4.1"
-indexmap = "2"
+indexmap = { version = "2", default-features = true }
 interprocess = "2.2.0"
 lz4_flex = { version = "0.12", default-features = false }
 memmap2 = "0.9.4"
