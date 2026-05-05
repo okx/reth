@@ -2,7 +2,7 @@
 use crate::debug_recorder::{LeafUpdateRecord, ProofTrieNodeRecord, RecordedOp, TrieDebugRecorder};
 use crate::{
     lower::LowerSparseSubtrie, LeafLookup, LeafLookupError, RlpNodeStackItem, SparseNode,
-    SparseNodeState, SparseNodeType, SparseTrie, SparseTrieUpdates,
+    SparseNodeState, SparseNodeType, SparseTrieInterface, SparseTrieUpdates,
 };
 use alloc::{borrow::Cow, boxed::Box, vec, vec::Vec};
 use alloy_primitives::{
@@ -156,7 +156,7 @@ impl Default for ParallelSparseTrie {
     }
 }
 
-impl SparseTrie for ParallelSparseTrie {
+impl SparseTrieInterface for ParallelSparseTrie {
     fn set_root(
         &mut self,
         root: TrieNodeV2,

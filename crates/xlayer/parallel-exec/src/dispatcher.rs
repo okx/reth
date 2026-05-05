@@ -149,7 +149,8 @@ impl Dispatcher {
                     .with_block(evm_env.block_env)
                     .build_mainnet_with_inspector(NoOpInspector {})
                     .with_precompiles(PrecompilesMap::from_static(
-                        EthPrecompiles::default().precompiles,
+                        EthPrecompiles::new(revm::primitives::hardfork::SpecId::default())
+                            .precompiles,
                     ));
 
                 let mut evm = alloy_evm::EthEvm::new(inner, false);
@@ -176,7 +177,8 @@ impl Dispatcher {
                             original_index: sim_result.original_index,
                             result: revm::context::result::ExecutionResult::Halt {
                                 reason: revm::context::result::HaltReason::NotActivated,
-                                gas_used: 0,
+                                gas: revm::context::result::ResultGas::new(0, 0, 0),
+                    logs: std::vec::Vec::new(),
                             },
                             state: Default::default(),
                             gas_used: 0,
@@ -253,7 +255,8 @@ mod tests {
             original_index: 42,
             result: revm::context::result::ExecutionResult::Halt {
                 reason: revm::context::result::HaltReason::NotActivated,
-                gas_used: 0,
+                gas: revm::context::result::ResultGas::new(0, 0, 0),
+                    logs: std::vec::Vec::new(),
             },
             state: Default::default(),
             gas_used: 0,
@@ -311,7 +314,8 @@ mod tests {
                 original_index: 3,
                 result: revm::context::result::ExecutionResult::Halt {
                     reason: revm::context::result::HaltReason::NotActivated,
-                    gas_used: 0,
+                    gas: revm::context::result::ResultGas::new(0, 0, 0),
+                    logs: std::vec::Vec::new(),
                 },
                 state: Default::default(),
                 gas_used: 0,
@@ -320,7 +324,8 @@ mod tests {
                 original_index: 1,
                 result: revm::context::result::ExecutionResult::Halt {
                     reason: revm::context::result::HaltReason::NotActivated,
-                    gas_used: 0,
+                    gas: revm::context::result::ResultGas::new(0, 0, 0),
+                    logs: std::vec::Vec::new(),
                 },
                 state: Default::default(),
                 gas_used: 0,
@@ -329,7 +334,8 @@ mod tests {
                 original_index: 2,
                 result: revm::context::result::ExecutionResult::Halt {
                     reason: revm::context::result::HaltReason::NotActivated,
-                    gas_used: 0,
+                    gas: revm::context::result::ResultGas::new(0, 0, 0),
+                    logs: std::vec::Vec::new(),
                 },
                 state: Default::default(),
                 gas_used: 0,

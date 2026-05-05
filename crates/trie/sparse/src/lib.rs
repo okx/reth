@@ -13,18 +13,10 @@ mod lfu;
 mod trie;
 pub use trie::*;
 
+pub mod provider;
+
 mod traits;
 pub use traits::*;
-
-#[cfg(feature = "std")]
-mod arena;
-#[cfg(feature = "std")]
-pub use arena::*;
-
-mod parallel;
-pub use parallel::*;
-
-mod lower;
 
 #[cfg(feature = "metrics")]
 mod metrics;

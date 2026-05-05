@@ -529,7 +529,8 @@ impl ParallelExecutionPipeline {
                         original_index: i,
                         result: revm::context::result::ExecutionResult::Halt {
                             reason: revm::context::result::HaltReason::NotActivated,
-                            gas_used: 0,
+                            gas: revm::context::result::ResultGas::new(0, 0, 0),
+                    logs: std::vec::Vec::new(),
                         },
                         state: Default::default(),
                         gas_used: 0,

@@ -68,7 +68,8 @@ mod tests {
             original_index: index,
             result: revm::context::result::ExecutionResult::Halt {
                 reason: revm::context::result::HaltReason::NotActivated,
-                gas_used: gas,
+                gas: revm::context::result::ResultGas::new(gas, 0, 0),
+                    logs: std::vec::Vec::new(),
             },
             state: Default::default(),
             gas_used: gas,
@@ -84,7 +85,8 @@ mod tests {
             original_index: index,
             result: revm::context::result::ExecutionResult::Halt {
                 reason: revm::context::result::HaltReason::NotActivated,
-                gas_used: gas,
+                gas: revm::context::result::ResultGas::new(gas, 0, 0),
+                    logs: std::vec::Vec::new(),
             },
             state,
             gas_used: gas,

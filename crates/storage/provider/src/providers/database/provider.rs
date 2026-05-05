@@ -871,7 +871,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             PruneMode::Distance(self.minimum_pruning_distance).should_prune(first_block, tip);
 
         // Prepare set of addresses which logs should not be pruned.
-        let mut allowed_addresses: HashSet<Address, _> = HashSet::new();
+        let mut allowed_addresses: std::collections::HashSet<Address> = std::collections::HashSet::new();
         for (_, addresses) in contract_log_pruner.range(..first_block) {
             allowed_addresses.extend(addresses.iter().copied());
         }

@@ -8,7 +8,7 @@ use nodes::{
     ArenaSparseNode, ArenaSparseNodeBranch, ArenaSparseNodeBranchChild, ArenaSparseNodeState,
 };
 
-use crate::{LeafLookup, LeafLookupError, LeafUpdate, SparseTrie, SparseTrieUpdates};
+use crate::{LeafLookup, LeafLookupError, SparseTrieInterface, SparseTrieUpdates};
 use alloc::{borrow::Cow, boxed::Box, collections::VecDeque, vec::Vec};
 use alloy_primitives::{
     keccak256,
@@ -2213,7 +2213,7 @@ impl ArenaParallelSparseTrie {
     }
 }
 
-impl SparseTrie for ArenaParallelSparseTrie {
+impl SparseTrieInterface for ArenaParallelSparseTrie {
     #[instrument(level = "trace", target = TRACE_TARGET, skip_all)]
     fn set_root(
         &mut self,
@@ -2562,6 +2562,12 @@ impl SparseTrie for ArenaParallelSparseTrie {
 
     fn updates_ref(&self) -> Cow<'_, SparseTrieUpdates> {
         self.updates.as_ref().map_or(Cow::Owned(SparseTrieUpdates::default()), Cow::Borrowed)
+    }
+
+    fn reinit_updates(&mut self) {
+        if self.updates.is_none() {
+            self.updates = Some(SparseTrieUpdates::default());
+        }
     }
 
     fn take_updates(&mut self) -> SparseTrieUpdates {

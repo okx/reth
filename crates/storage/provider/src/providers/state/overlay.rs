@@ -113,8 +113,6 @@ impl<N: NodePrimitives> OverlayBuilder<N> {
             self.assert_lazy_overlay_anchor(lazy_overlay);
         }
         self.overlay_source = source;
-        // Clear the overlay cache since we've updated the source.
-        self.overlay_cache = Default::default();
         self
     }
 
@@ -136,8 +134,6 @@ impl<N: NodePrimitives> OverlayBuilder<N> {
             self.assert_lazy_overlay_anchor(lazy_overlay);
         }
         self.overlay_source = lazy_overlay.map(OverlaySource::Lazy);
-        // Clear the overlay cache since we've updated the source.
-        self.overlay_cache = Default::default();
         self
     }
 
@@ -151,8 +147,6 @@ impl<N: NodePrimitives> OverlayBuilder<N> {
                 trie: Arc::new(TrieUpdatesSorted::default()),
                 state,
             });
-            // Clear the overlay cache since we've updated the source.
-            self.overlay_cache = Default::default();
         }
         self
     }
@@ -179,8 +173,6 @@ impl<N: NodePrimitives> OverlayBuilder<N> {
                 });
             }
         }
-        // Clear the overlay cache since we've updated the source.
-        self.overlay_cache = Default::default();
         self
     }
 
@@ -457,7 +449,6 @@ impl<F, N: NodePrimitives> OverlayStateProviderFactory<F, N> {
     /// Set a lazy overlay that will be computed on first access.
     pub fn with_lazy_overlay(mut self, lazy_overlay: Option<LazyOverlay<N>>) -> Self {
         self.overlay_builder = self.overlay_builder.with_lazy_overlay(lazy_overlay);
-        self.overlay_cache = Default::default();
         self
     }
 
@@ -467,14 +458,12 @@ impl<F, N: NodePrimitives> OverlayStateProviderFactory<F, N> {
         hashed_state_overlay: Option<Arc<HashedPostStateSorted>>,
     ) -> Self {
         self.overlay_builder = self.overlay_builder.with_hashed_state_overlay(hashed_state_overlay);
-        self.overlay_cache = Default::default();
         self
     }
 
     /// Extends the existing hashed state overlay with the given [`HashedPostStateSorted`].
     pub fn with_extended_hashed_state_overlay(mut self, other: HashedPostStateSorted) -> Self {
         self.overlay_builder = self.overlay_builder.with_extended_hashed_state_overlay(other);
-        self.overlay_cache = Default::default();
         self
     }
 

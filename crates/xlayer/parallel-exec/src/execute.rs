@@ -19,7 +19,11 @@ pub use alloy_evm::EthEvm;
 /// Cached precompiles map — built once and reused for all executions.
 /// Avoids the overhead of recreating `PrecompilesMap::from_static(...)` per transaction.
 pub static PRECOMPILES: std::sync::LazyLock<PrecompilesMap> =
-    std::sync::LazyLock::new(|| PrecompilesMap::from_static(EthPrecompiles::default().precompiles));
+    std::sync::LazyLock::new(|| {
+        PrecompilesMap::from_static(
+            EthPrecompiles::new(revm::primitives::hardfork::SpecId::default()).precompiles,
+        )
+    });
 
 /// Result of executing a single transaction in parallel.
 #[derive(Debug)]
@@ -89,7 +93,8 @@ where
             ParallelTxResult {
                 result: revm::context::result::ExecutionResult::Halt {
                     reason: revm::context::result::HaltReason::NotActivated,
-                    gas_used: 0,
+                    gas: revm::context::result::ResultGas::new(0, 0, 0),
+                    logs: std::vec::Vec::new(),
                 },
                 state: Default::default(),
                 gas_used: 0,
@@ -165,7 +170,8 @@ where
                 ParallelTxResult {
                     result: revm::context::result::ExecutionResult::Halt {
                         reason: revm::context::result::HaltReason::NotActivated,
-                        gas_used: 0,
+                        gas: revm::context::result::ResultGas::new(0, 0, 0),
+                    logs: std::vec::Vec::new(),
                     },
                     state: Default::default(),
                     gas_used: 0,
@@ -257,7 +263,8 @@ mod tests {
         let result = ParallelTxResult {
             result: revm::context::result::ExecutionResult::Halt {
                 reason: revm::context::result::HaltReason::NotActivated,
-                gas_used: 0,
+                gas: revm::context::result::ResultGas::new(0, 0, 0),
+                    logs: std::vec::Vec::new(),
             },
             state: Default::default(),
             gas_used: 0,

@@ -163,7 +163,12 @@ impl StateProofProvider for QmdbStateProvider {
         Err(ProviderError::UnsupportedProvider)
     }
 
-    fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
+    fn witness(
+        &self,
+        _input: TrieInput,
+        _target: HashedPostState,
+        _mode: reth_trie_common::ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
         Err(ProviderError::UnsupportedProvider)
     }
 }

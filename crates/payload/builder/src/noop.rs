@@ -2,7 +2,7 @@
 
 use crate::{service::PayloadServiceCommand, PayloadBuilderHandle};
 use futures_util::{ready, StreamExt};
-use reth_payload_primitives::PayloadTypes;
+use reth_payload_primitives::{PayloadBuilderAttributes, PayloadTypes};
 use std::{
     future::Future,
     pin::Pin,
@@ -45,8 +45,9 @@ where
                 return Poll::Ready(())
             };
             match cmd {
-                PayloadServiceCommand::BuildNewPayload(input, _, tx) => {
-                    tx.send(Ok(input.payload_id())).ok()
+                PayloadServiceCommand::BuildNewPayload(attr, tx) => {
+                    let id = attr.payload_id();
+                    tx.send(Ok(id)).ok()
                 }
                 PayloadServiceCommand::BestPayload(_, tx) => tx.send(None).ok(),
                 PayloadServiceCommand::PayloadTimestamp(_, tx) => tx.send(None).ok(),

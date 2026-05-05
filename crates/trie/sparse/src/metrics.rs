@@ -34,6 +34,16 @@ impl SparseStateTrieMetrics {
     pub(crate) const fn increment_total_storage_nodes(&mut self, count: u64) {
         self.multiproof_total_storage_nodes += count;
     }
+
+    /// Increment the skipped account nodes counter by the given count
+    pub(crate) const fn increment_skipped_account_nodes(&mut self, _count: u64) {
+        // No-op; skipped counts not tracked separately.
+    }
+
+    /// Increment the skipped storage nodes counter by the given count
+    pub(crate) const fn increment_skipped_storage_nodes(&mut self, _count: u64) {
+        // No-op; skipped counts not tracked separately.
+    }
 }
 
 /// Metrics for the sparse state trie

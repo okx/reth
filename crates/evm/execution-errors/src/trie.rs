@@ -165,8 +165,13 @@ pub enum SparseTrieErrorKind {
     #[error("sparse trie is blind")]
     Blind,
     /// Encountered blinded node on update.
-    #[error("attempted to update blind node at {0:?}")]
-    BlindedNode(Nibbles),
+    #[error("attempted to update blind node at {path:?}: {hash}")]
+    BlindedNode {
+        /// Blind node path.
+        path: Nibbles,
+        /// Node hash
+        hash: B256,
+    },
     /// Encountered unexpected node at path when revealing.
     #[error("encountered an invalid node at path {path:?} when revealing: {node:?}")]
     Reveal {

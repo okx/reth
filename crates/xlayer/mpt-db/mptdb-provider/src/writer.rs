@@ -3,7 +3,7 @@
 //! EVM reads are served by reth's PlainState (MDBX) via `StateProviderOverride`.
 //! This writer only commits to SC (MPT state root) — SS writes are removed.
 
-use alloy_primitives::{map::HashMap as PrimitivesHashMap, Address, B256};
+use alloy_primitives::{map::AddressMap, Address, B256};
 use mptdb_common::error::MptDbError;
 use mptdb_sc::mpt::{MptCommitStore, MptCommitter};
 use parking_lot::Mutex;
@@ -48,8 +48,7 @@ impl<R> MptDbStateWriter<R> {
 
         let mut sc = self.sc.lock();
         for chunk in ordered_accounts.chunks(PREPOP_CHUNK_SIZE) {
-            let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
-                PrimitivesHashMap::default();
+            let mut state: AddressMap<revm_database::BundleAccount> = AddressMap::default();
             for (addr, account) in chunk {
                 state.insert(*addr, (*account).clone());
             }

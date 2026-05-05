@@ -2052,6 +2052,51 @@ impl SerialSparseTrie {
     }
 }
 
+/// State of a sparse trie node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SparseNodeState {
+    /// The node has been updated and its new `RlpNode` has not yet been calculated.
+    ///
+    /// If a node is dirty and has children (branches or extensions) then at least once child must
+    /// also be dirty.
+    Dirty,
+    /// The node has a cached `RlpNode`, either from being revealed or computed after an update.
+    Cached {
+        /// The RLP node which is used to represent this node in its parent. Usually this is the
+        /// RLP encoding of the node's hash, except for when the node RLP encodes to <32
+        /// bytes.
+        rlp_node: RlpNode,
+        /// Flag indicating if this node is cached in the database.
+        ///
+        /// NOTE for extension nodes this actually indicates the node's child branch is in the
+        /// database, not the extension itself.
+        store_in_db_trie: Option<bool>,
+    },
+}
+
+impl SparseNodeState {
+    /// Returns the cached [`RlpNode`] of the node, if it's available.
+    pub const fn cached_rlp_node(&self) -> Option<&RlpNode> {
+        match self {
+            Self::Cached { rlp_node, .. } => Some(rlp_node),
+            Self::Dirty => None,
+        }
+    }
+
+    /// Returns the cached hash of the node, if it's available.
+    pub fn cached_hash(&self) -> Option<B256> {
+        self.cached_rlp_node().and_then(|n| n.as_hash())
+    }
+
+    /// Returns whether or not this node is stored in the db, or None if it's not known.
+    pub const fn store_in_db_trie(&self) -> Option<bool> {
+        match self {
+            Self::Cached { store_in_db_trie, .. } => *store_in_db_trie,
+            Self::Dirty => None,
+        }
+    }
+}
+
 /// Enum representing sparse trie node type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseNodeType {

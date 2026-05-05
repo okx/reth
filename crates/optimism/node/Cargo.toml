@@ -73,7 +73,7 @@ serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 reth-optimism-node = { workspace = true, features = ["test-utils"] }
-reth-db = { workspace = true, features = ["op", "test-utils"] }
+reth-db = { workspace = true, features = ["test-utils"] }
 reth-node-builder = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-tasks.workspace = true

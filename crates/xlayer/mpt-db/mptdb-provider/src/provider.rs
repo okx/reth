@@ -416,7 +416,12 @@ impl StateProofProvider for MptDbStateProvider {
         ))
     }
 
-    fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
+    fn witness(
+        &self,
+        _input: TrieInput,
+        _target: HashedPostState,
+        _mode: reth_trie_common::ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
         // Witness generation requires full trie traversal; not implemented.
         // Callers that need witness (e.g. zkEVM) should use reth's MDBX provider.
         Err(prov_err("mpt-db: witness not yet implemented"))
@@ -541,8 +546,13 @@ impl StateProofProvider for SyncProvider {
     fn multiproof(&self, i: TrieInput, t: MultiProofTargets) -> ProviderResult<MultiProof> {
         self.0.lock().multiproof(i, t)
     }
-    fn witness(&self, i: TrieInput, t: HashedPostState) -> ProviderResult<Vec<Bytes>> {
-        self.0.lock().witness(i, t)
+    fn witness(
+        &self,
+        i: TrieInput,
+        t: HashedPostState,
+        m: reth_trie_common::ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
+        self.0.lock().witness(i, t, m)
     }
 }
 impl HashedPostStateProvider for SyncProvider {
