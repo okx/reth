@@ -1,5 +1,5 @@
 use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{keccak256, map::HashMap as PrimitivesHashMap, Address, B256, U256};
+use alloy_primitives::{keccak256, map::AddressMap, Address, B256, U256};
 use mptdb_sc::mpt::{CommitProfile, MptCommitStore, MptCommitter};
 use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use reth_provider::{
@@ -7,7 +7,9 @@ use reth_provider::{
     ProviderFactory, StateWriter, TrieWriter,
 };
 use reth_trie::{updates::TrieUpdates, HashedPostState, KeccakKeyHasher, StateRoot};
-use reth_trie_db::DatabaseStateRoot;
+use reth_trie_db::{
+    DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
+};
 use revm_database::{states::StorageSlot, AccountStatus, StorageWithOriginalValues};
 use revm_state::AccountInfo;
 use std::{
@@ -195,8 +197,8 @@ fn generate_account_chunk(
     start_index: usize,
     slots_per: usize,
 ) -> revm_database::BundleState {
-    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
-        PrimitivesHashMap::default();
+    let mut state: AddressMap<revm_database::BundleAccount> =
+        AddressMap::default();
 
     for (offset, &addr) in addresses.iter().enumerate() {
         let i = start_index + offset;
@@ -245,8 +247,8 @@ fn generate_updates(
     block_idx: usize,
     rng: &mut StdRng,
 ) -> revm_database::BundleState {
-    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
-        PrimitivesHashMap::default();
+    let mut state: AddressMap<revm_database::BundleAccount> =
+        AddressMap::default();
 
     let indices: Vec<usize> = (0..count).map(|_| rng.random_range(0..addresses.len())).collect();
 
@@ -295,8 +297,8 @@ fn generate_account_chunk_mixed(
     contract_ratio: f64,
 ) -> revm_database::BundleState {
     let contract_boundary = (total_accounts as f64 * contract_ratio) as usize;
-    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
-        PrimitivesHashMap::default();
+    let mut state: AddressMap<revm_database::BundleAccount> =
+        AddressMap::default();
 
     for (offset, &addr) in addresses.iter().enumerate() {
         let global_idx = global_start + offset;
@@ -349,8 +351,8 @@ fn generate_updates_mixed(
     rng: &mut StdRng,
 ) -> revm_database::BundleState {
     let contract_boundary = (addresses.len() as f64 * contract_ratio) as usize;
-    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
-        PrimitivesHashMap::default();
+    let mut state: AddressMap<revm_database::BundleAccount> =
+        AddressMap::default();
 
     let indices: Vec<usize> = (0..count).map(|_| rng.random_range(0..addresses.len())).collect();
 
@@ -480,8 +482,8 @@ fn generate_account_chunk_erc20_pool_like(
     global_end: usize,
     layout: PoolLayout,
 ) -> revm_database::BundleState {
-    let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
-        PrimitivesHashMap::default();
+    let mut state: AddressMap<revm_database::BundleAccount> =
+        AddressMap::default();
     let contract_code_hash = erc20_runtime_code_hash();
 
     for global_idx in global_start..global_end {
@@ -605,8 +607,8 @@ fn generate_updates_erc20_pool_like(
             );
         }
 
-        let mut state: PrimitivesHashMap<Address, revm_database::BundleAccount> =
-            PrimitivesHashMap::default();
+        let mut state: AddressMap<revm_database::BundleAccount> =
+            AddressMap::default();
         for (eoa_local_idx, nonce) in sender_nonce_updates {
             let addr = addresses[layout.eoa_offset + eoa_local_idx];
             state.insert(
@@ -974,8 +976,11 @@ pub fn prepopulate_reth_profile(
         let sorted = hashed.into_sorted();
         let rw = factory.provider_rw().unwrap();
         rw.write_hashed_state(&sorted).unwrap();
-        let (_, updates): (B256, TrieUpdates) =
-            StateRoot::from_tx(rw.tx_ref()).root_with_updates().unwrap();
+        let state_root: StateRoot<
+            DatabaseTrieCursorFactory<_, LegacyKeyAdapter>,
+            DatabaseHashedCursorFactory<_>,
+        > = StateRoot::from_tx(rw.tx_ref());
+        let (_, updates): (B256, TrieUpdates) = state_root.root_with_updates().unwrap();
         rw.write_trie_updates(updates).unwrap();
         rw.commit().unwrap();
     }
@@ -1073,7 +1078,13 @@ pub fn run_reth_only_profile(scenario: ProfileScenario) -> RethRun {
         let rw = factory.provider_rw().unwrap();
 
         let root_start = Instant::now();
-        let (_, updates) = StateRoot::overlay_root_with_updates(rw.tx_ref(), &sorted).unwrap();
+        let (_, updates) = <StateRoot<
+            DatabaseTrieCursorFactory<_, LegacyKeyAdapter>,
+            DatabaseHashedCursorFactory<_>,
+        > as DatabaseStateRoot<'_, _>>::overlay_root_with_updates(
+            rw.tx_ref(), &sorted
+        )
+        .unwrap();
         reth_totals.root_updates += root_start.elapsed();
 
         let write_hashed_start = Instant::now();

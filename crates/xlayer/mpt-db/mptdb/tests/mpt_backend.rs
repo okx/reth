@@ -20,8 +20,8 @@ fn make_bundle(
         Vec<(U256, U256, U256)>,
     )>,
 ) -> BundleState {
-    let mut state: alloy_primitives::map::HashMap<alloy_primitives::Address, BundleAccount> =
-        alloy_primitives::map::HashMap::default();
+    let mut state: alloy_primitives::map::AddressMap<BundleAccount> =
+        alloy_primitives::map::AddressMap::default();
     for (address, info, status, storage) in accounts {
         let storage_map: revm_database::StorageWithOriginalValues = storage
             .into_iter()

@@ -2921,11 +2921,11 @@ impl MptCommitStore {
             match Self::load_account_trie_snapshot(&self.dir, &self.persisted, target_version, root)
             {
                 Ok((account_trie, loaded_from_checkpoint)) => {
-                    let durable_version = if true {
-                        self.wal_recovery_base_version(manifest.latest_version)
-                    } else {
-                        manifest.latest_version
-                    };
+                    // Cap durable to the target we just loaded — after a
+                    // historical load, in-memory committed/version is at
+                    // target_version, and any higher on-disk version is
+                    // logically truncated (manifest is rebuilt on next commit).
+                    let durable_version = self.wal_recovery_base_version(target_version);
                     Ok((account_trie, loaded_from_checkpoint, durable_version))
                 }
                 Err(e) if true => {
@@ -2961,7 +2961,10 @@ impl MptCommitStore {
                         replay_base,
                     )?;
                     shadow.replay_wal_catchup_to(manifest, target_version)?;
-                    Ok((shadow.account_trie.committed().clone(), false, replay_base))
+                    // Replay materializes target_version in memory; durable on
+                    // disk is whatever the WAL has reached (capped at target).
+                    let durable_version = self.wal_recovery_base_version(target_version);
+                    Ok((shadow.account_trie.committed().clone(), false, durable_version))
                 }
                 Err(e) => Err(e),
             }
