@@ -142,15 +142,6 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn default_ss_config(dir: &std::path::Path) -> StateStoreConfig {
-        StateStoreConfig {
-            enable: true,
-            db_directory: dir.join("evm_ss").to_string_lossy().to_string(),
-            keep_last_version: true,
-            ..Default::default()
-        }
-    }
-
     /// T2.1: MptDb::build(default config) -> sc is MptCommitStore
     #[test]
     fn t2_1_build_default_config() {

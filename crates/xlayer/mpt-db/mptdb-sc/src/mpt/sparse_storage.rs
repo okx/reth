@@ -267,23 +267,7 @@ impl TrieNodeProviderFactory for SegmentTrieNodeProviderFactory {
 /// Builds `(DecodedProofNodes, BranchNodeMasksMap)` for the ACCOUNT trie from
 /// a previously-committed `SparseStateTrie`.
 ///
-/// Called at the start of each block's sparse apply to reveal the committed
-/// account trie structure.  Uses `state_trie_ref().nodes_ref()` +
-/// `values_ref()` — all hashes are correct after `root_with_updates`.
-///
-/// Falls back to `(EmptyRoot proof, empty masks)` when the trie is not yet
-/// revealed (first block or after restart).
-pub(crate) fn extract_account_proof_from_sparse_trie(
-    sparse_trie: &SparseStateTrie,
-) -> MptResult<(DecodedProofNodes, BranchNodeMasksMap)> {
-    let Some(account_trie) = sparse_trie.state_trie_ref() else {
-        let subtree = DecodedProofNodes::from_iter([(Nibbles::default(), TrieNode::EmptyRoot)]);
-        return Ok((subtree, BranchNodeMasksMap::default()));
-    };
-    sparse_nodes_to_account_proof_nodes(account_trie)
-}
-
-/// Path-limited variant of `extract_account_proof_from_sparse_trie`.
+/// Path-limited account-proof extractor.
 ///
 /// Exports only account-trie nodes along `keys` paths (plus required branch
 /// sibling hashes) so sparse apply can reveal just the dirty-account subset.

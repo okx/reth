@@ -203,10 +203,6 @@ impl FreqAwareCache {
         self.sketch = CountMinSketch::default();
     }
 
-    fn is_empty(&self) -> bool {
-        self.lru.is_empty()
-    }
-
     fn observe(&mut self, key: &B256) {
         if self.admission_enabled {
             self.sketch.observe(key);
@@ -1763,22 +1759,6 @@ impl MptCommitStore {
         Ok(deferred_roots)
     }
 
-    fn should_rewrite_published_snapshot(
-        config: &MptConfig,
-        published_version: i64,
-        durable_version: i64,
-    ) -> bool {
-        if durable_version <= 0 {
-            return false;
-        }
-        if published_version <= 0 {
-            true
-        } else {
-            durable_version.saturating_sub(published_version) >=
-                config.published_snapshot_interval as i64
-        }
-    }
-
     fn rewrite_published_snapshot_at_version(
         persisted: &Arc<PersistedTrieStore>,
         published_baseline: &Arc<PublishedBaselineManager>,
@@ -1805,30 +1785,6 @@ impl MptCommitStore {
             floor = floor.min(snapshot_floor);
         }
         Ok(floor)
-    }
-
-    /// Schedule a published rewrite job.  Returns `true` if the job was
-    /// enqueued, `false` if the queue was full (a rewrite is in progress).
-    /// The caller should track the `false` case and retry on the next commit.
-    fn schedule_published_rewrite(
-        rewrite_tx: &crossbeam_channel::Sender<PublishedRewriteJob>,
-        target_version: i64,
-        state_root: B256,
-        segments: Option<Vec<(B256, StorageTrieSegment)>>,
-    ) -> Result<bool> {
-        match rewrite_tx.try_send(PublishedRewriteJob {
-            barrier_only: false,
-            target_version,
-            state_root,
-            segments,
-            done: None,
-        }) {
-            Ok(()) => Ok(true),
-            Err(crossbeam_channel::TrySendError::Full(_)) => Ok(false),
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                Err(MptDbError::Other("published rewrite worker disconnected".to_string()))
-            }
-        }
     }
 
     fn spawn_published_rewrite_worker(

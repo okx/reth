@@ -1,3 +1,7 @@
+// Test scaffolding: each test binary that includes `mod common` only uses a
+// subset of these helpers, so dead-code warnings are noisy and not actionable.
+#![allow(dead_code)]
+
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{keccak256, map::AddressMap, Address, B256, U256};
 use mptdb_sc::mpt::{CommitProfile, MptCommitStore, MptCommitter};

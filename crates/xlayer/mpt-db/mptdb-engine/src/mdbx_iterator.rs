@@ -78,59 +78,6 @@ impl MdbxIterator {
         }
     }
 
-    /// Read current key/value from cursor into cache.
-    fn cache_current(&mut self) -> bool {
-        let cursor_ptr = match self.cursor {
-            Some(ptr) => ptr,
-            None => return false,
-        };
-
-        unsafe {
-            let mut key_val =
-                reth_libmdbx::ffi::MDBX_val { iov_base: std::ptr::null_mut(), iov_len: 0 };
-            let mut data_val =
-                reth_libmdbx::ffi::MDBX_val { iov_base: std::ptr::null_mut(), iov_len: 0 };
-
-            let rc = reth_libmdbx::ffi::mdbx_cursor_get(
-                cursor_ptr,
-                &mut key_val,
-                &mut data_val,
-                reth_libmdbx::ffi::MDBX_GET_CURRENT,
-            );
-
-            if rc == 0 {
-                let key_slice =
-                    std::slice::from_raw_parts(key_val.iov_base as *const u8, key_val.iov_len);
-                let val_slice =
-                    std::slice::from_raw_parts(data_val.iov_base as *const u8, data_val.iov_len);
-
-                // Check bounds.
-                if let Some(ref ub) = self.upper_bound {
-                    if key_slice >= ub.as_slice() {
-                        self.is_valid = false;
-                        return false;
-                    }
-                }
-                if let Some(ref lb) = self.lower_bound {
-                    if key_slice < lb.as_slice() {
-                        self.is_valid = false;
-                        return false;
-                    }
-                }
-
-                self.current_key.clear();
-                self.current_key.extend_from_slice(key_slice);
-                self.current_value.clear();
-                self.current_value.extend_from_slice(val_slice);
-                self.is_valid = true;
-                true
-            } else {
-                self.is_valid = false;
-                false
-            }
-        }
-    }
-
     /// Position cursor using a raw MDBX operation.
     fn cursor_op(&mut self, op: u32) -> bool {
         if !self.ensure_cursor() {

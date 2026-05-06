@@ -663,11 +663,6 @@ impl MptTree {
         Self { arena: MutableTrieArena::from_lean(nodes, hash_cache), root }
     }
 
-    /// Clear all dirty flags in the arena. Call after successful persist.
-    pub(crate) fn clear_dirty(&mut self) {
-        self.arena.clear_all_dirty();
-    }
-
     pub(crate) fn ensure_path_loaded(
         &mut self,
         store: &PersistedTrieStore,
