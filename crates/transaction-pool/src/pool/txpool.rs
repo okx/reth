@@ -132,7 +132,8 @@ impl<T: TransactionOrdering> TxPool<T> {
             pending_pool: PendingPool::with_buffer(
                 ordering,
                 config.max_new_pending_txs_notifications,
-            ),
+            )
+            .with_gasless_enabled(config.gasless_enabled),
             queued_pool: Default::default(),
             basefee_pool: Default::default(),
             blob_pool: Default::default(),
@@ -1392,6 +1393,10 @@ pub(crate) struct AllTransactions<T: PoolTransaction> {
     ///
     /// Transactions with a lower base fee will never be included by the chain
     minimal_protocol_basefee: u64,
+    /// When enabled, treat `max_fee_per_gas == 0` (gasless) transactions as satisfying the
+    /// protocol minimum base fee and the per-block base fee. See
+    /// [`PoolConfig::gasless_enabled`].
+    gasless_enabled: bool,
     /// The max gas limit of the block
     block_gas_limit: u64,
     /// Max number of executable transaction slots guaranteed per account
@@ -1428,6 +1433,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             price_bumps: config.price_bumps,
             local_transactions_config: config.local_transactions_config.clone(),
             minimal_protocol_basefee: config.minimal_protocol_basefee,
+            gasless_enabled: config.gasless_enabled,
             block_gas_limit: config.gas_limit,
             ..Default::default()
         }
@@ -1595,7 +1601,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             tx.state.insert(TxState::NO_PARKED_ANCESTORS);
 
             // Update the first transaction of this sender.
-            Self::update_tx_base_fee(self.pending_fees.base_fee, tx);
+            Self::update_tx_base_fee(self.pending_fees.base_fee, self.gasless_enabled, tx);
             // Track if the transaction's sub-pool changed.
             Self::record_subpool_update(&mut updates, tx);
 
@@ -1650,7 +1656,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 has_parked_ancestor = !tx.state.is_pending();
 
                 // Update and record sub-pool changes.
-                Self::update_tx_base_fee(self.pending_fees.base_fee, tx);
+                Self::update_tx_base_fee(self.pending_fees.base_fee, self.gasless_enabled, tx);
                 Self::record_subpool_update(&mut updates, tx);
 
                 // Advance iterator
@@ -1678,15 +1684,18 @@ impl<T: PoolTransaction> AllTransactions<T> {
     }
 
     /// Rechecks the transaction's dynamic fee condition.
-    fn update_tx_base_fee(pending_block_base_fee: u64, tx: &mut PoolInternalTransaction<T>) {
-        // Recheck dynamic fee condition.
-        match tx.transaction.max_fee_per_gas().cmp(&(pending_block_base_fee as u128)) {
-            Ordering::Greater | Ordering::Equal => {
-                tx.state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
-            }
-            Ordering::Less => {
-                tx.state.remove(TxState::ENOUGH_FEE_CAP_BLOCK);
-            }
+    fn update_tx_base_fee(
+        pending_block_base_fee: u64,
+        gasless_enabled: bool,
+        tx: &mut PoolInternalTransaction<T>,
+    ) {
+        // Recheck dynamic fee condition. Gasless (zero fee-cap) txs are treated as satisfying the
+        // base fee so they stay in the pending sub-pool across base-fee changes.
+        let fee_cap = tx.transaction.max_fee_per_gas();
+        if fee_cap >= pending_block_base_fee as u128 || (gasless_enabled && fee_cap == 0) {
+            tx.state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
+        } else {
+            tx.state.remove(TxState::ENOUGH_FEE_CAP_BLOCK);
         }
     }
 
@@ -2038,10 +2047,16 @@ impl<T: PoolTransaction> AllTransactions<T> {
         // Check dynamic fee
         let fee_cap = transaction.max_fee_per_gas();
 
-        if fee_cap < self.minimal_protocol_basefee as u128 {
+        // Gasless: a zero fee-cap tx is exempt from the protocol minimum base fee floor (admission
+        // is gated upstream by the validator's on-chain whitelist). The floor still rejects all
+        // other sub-minimum fees (e.g. 1..MIN_PROTOCOL_BASE_FEE), so it does not widen spam.
+        let is_gasless = self.gasless_enabled && fee_cap == 0;
+        if fee_cap < self.minimal_protocol_basefee as u128 && !is_gasless {
             return Err(InsertErr::FeeCapBelowMinimumProtocolFeeCap { transaction, fee_cap })
         }
-        if fee_cap >= self.pending_fees.base_fee as u128 {
+        // Gasless txs are treated as satisfying the per-block base fee so they land in the pending
+        // sub-pool and compete by their ordering priority (mock price) like normal transactions.
+        if fee_cap >= self.pending_fees.base_fee as u128 || is_gasless {
             state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
         }
 
@@ -2204,6 +2219,7 @@ impl<T: PoolTransaction> Default for AllTransactions<T> {
         Self {
             max_account_slots: TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
             minimal_protocol_basefee: MIN_PROTOCOL_BASE_FEE,
+            gasless_enabled: false,
             block_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
             by_hash: Default::default(),
             txs: Default::default(),

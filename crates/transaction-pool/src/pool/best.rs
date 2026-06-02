@@ -29,6 +29,9 @@ pub(crate) struct BestTransactionsWithFees<T: TransactionOrdering> {
     pub(crate) best: BestTransactions<T>,
     pub(crate) base_fee: u64,
     pub(crate) base_fee_per_blob_gas: u64,
+    /// When enabled, `max_fee_per_gas == 0` (gasless) transactions are treated as satisfying the
+    /// base fee and are yielded. See `PoolConfig::gasless_enabled`.
+    pub(crate) gasless_enabled: bool,
 }
 
 impl<T: TransactionOrdering> crate::traits::BestTransactions for BestTransactionsWithFees<T> {
@@ -57,8 +60,11 @@ impl<T: TransactionOrdering> Iterator for BestTransactionsWithFees<T> {
         loop {
             let best = Iterator::next(&mut self.best)?;
             // If both the base fee and blob fee (if applicable for EIP-4844) are satisfied, return
-            // the transaction
-            if best.transaction.max_fee_per_gas() >= self.base_fee as u128 &&
+            // the transaction. Gasless (zero fee-cap) txs are treated as satisfying the base fee.
+            let fee_cap = best.transaction.max_fee_per_gas();
+            let base_fee_satisfied =
+                fee_cap >= self.base_fee as u128 || (self.gasless_enabled && fee_cap == 0);
+            if base_fee_satisfied &&
                 best.transaction
                     .max_fee_per_blob_gas()
                     .is_none_or(|fee| fee >= self.base_fee_per_blob_gas as u128)

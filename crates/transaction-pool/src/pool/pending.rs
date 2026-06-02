@@ -46,6 +46,10 @@ pub struct PendingPool<T: TransactionOrdering> {
     /// Used to broadcast new transactions that have been added to the `PendingPool` to existing
     /// `static_files` of this pool.
     new_transaction_notifier: broadcast::Sender<PendingTransaction<T>>,
+    /// When enabled, treat `max_fee_per_gas == 0` (gasless) transactions as satisfying the base
+    /// fee, so they are kept in / yielded from the pending pool. See
+    /// `PoolConfig::gasless_enabled`.
+    gasless_enabled: bool,
 }
 
 // === impl PendingPool ===
@@ -67,7 +71,15 @@ impl<T: TransactionOrdering> PendingPool<T> {
             highest_nonces: Default::default(),
             size_of: Default::default(),
             new_transaction_notifier,
+            gasless_enabled: false,
         }
+    }
+
+    /// Enables or disables gasless support for this pool (treating `max_fee_per_gas == 0`
+    /// transactions as base-fee-satisfying). See `PoolConfig::gasless_enabled`.
+    pub(crate) const fn with_gasless_enabled(mut self, enabled: bool) -> Self {
+        self.gasless_enabled = enabled;
+        self
     }
 
     /// Clear all transactions from the pool without resetting other values.
@@ -118,7 +130,12 @@ impl<T: TransactionOrdering> PendingPool<T> {
         base_fee: u64,
         base_fee_per_blob_gas: u64,
     ) -> BestTransactionsWithFees<T> {
-        BestTransactionsWithFees { best: self.best(), base_fee, base_fee_per_blob_gas }
+        BestTransactionsWithFees {
+            best: self.best(),
+            base_fee,
+            base_fee_per_blob_gas,
+            gasless_enabled: self.gasless_enabled,
+        }
     }
 
     /// Same as `best` but also includes the given unlocked transactions.
@@ -149,7 +166,12 @@ impl<T: TransactionOrdering> PendingPool<T> {
             best.all.insert(tx_id, transaction);
         }
 
-        BestTransactionsWithFees { best, base_fee, base_fee_per_blob_gas }
+        BestTransactionsWithFees {
+            best,
+            base_fee,
+            base_fee_per_blob_gas,
+            gasless_enabled: self.gasless_enabled,
+        }
     }
 
     /// Returns an iterator over all transactions in the pool
@@ -221,7 +243,10 @@ impl<T: TransactionOrdering> PendingPool<T> {
         // Drain and iterate over all transactions.
         let mut transactions_iter = self.clear_transactions().into_iter().peekable();
         while let Some((id, mut tx)) = transactions_iter.next() {
-            if tx.transaction.max_fee_per_gas() < base_fee as u128 {
+            let fee_cap = tx.transaction.max_fee_per_gas();
+            // Gasless (zero fee-cap) txs are kept in the pending pool regardless of base fee.
+            let is_gasless = self.gasless_enabled && fee_cap == 0;
+            if fee_cap < base_fee as u128 && !is_gasless {
                 // Add this tx to the removed collection since it no longer satisfies the base fee
                 // condition. Decrease the total pool size.
                 removed.push(Arc::clone(&tx.transaction));

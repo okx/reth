@@ -533,6 +533,7 @@ impl RethTransactionPoolConfig for TxPoolArgs {
                 replace_blob_tx_price_bump: self.blob_transaction_price_bump,
             },
             minimal_protocol_basefee: self.minimal_protocol_basefee,
+            gasless_enabled: default_config.gasless_enabled,
             minimum_priority_fee: self.minimum_priority_fee,
             gas_limit: self.enforced_gas_limit,
             pending_tx_listener_buffer_size: self.pending_tx_listener_buffer_size,
