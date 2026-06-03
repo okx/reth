@@ -13,6 +13,11 @@ pub use validator::{OpL1BlockInfo, OpTransactionValidator};
 
 pub mod conditional;
 pub mod supervisor;
+pub mod xlayer_gasless;
+pub use xlayer_gasless::{
+    maintain_gasless_mock_price, percentile_gas_price, GaslessMockPrice, XLayerGaslessOrdering,
+    GASLESS_DEFAULT_MOCK_PRICE_WEI,
+};
 mod transaction;
 pub use transaction::{OpPooledTransaction, OpPooledTx};
 mod error;
@@ -21,11 +26,16 @@ pub mod maintain;
 pub use error::InvalidCrossTx;
 pub mod estimated_da_size;
 
-use reth_transaction_pool::{CoinbaseTipOrdering, Pool, TransactionValidationTaskExecutor};
+use reth_transaction_pool::{Pool, TransactionValidationTaskExecutor};
 
 /// Type alias for default optimism transaction pool
+///
+/// Uses [`XLayerGaslessOrdering`] (instead of the upstream `CoinbaseTipOrdering`) so that
+/// zero-priced gasless transactions can be assigned a mock gas price for ordering. With an empty
+/// (default) mock price and the default protocol base-fee floor, this behaves identically to
+/// `CoinbaseTipOrdering` for all non-gasless transactions.
 pub type OpTransactionPool<Client, S, T = OpPooledTransaction> = Pool<
     TransactionValidationTaskExecutor<OpTransactionValidator<Client, T>>,
-    CoinbaseTipOrdering<T>,
+    XLayerGaslessOrdering<T>,
     S,
 >;
