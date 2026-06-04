@@ -125,7 +125,8 @@ impl<T: TransactionOrdering> TxPool<T> {
             pending_pool: PendingPool::with_buffer(
                 ordering,
                 config.max_new_pending_txs_notifications,
-            ),
+            )
+            .with_allow_gasless(config.allow_gasless),
             queued_pool: Default::default(),
             basefee_pool: Default::default(),
             blob_pool: Default::default(),
@@ -169,7 +170,7 @@ impl<T: TransactionOrdering> TxPool<T> {
         let mut next_expected_nonce = on_chain.nonce;
         for (id, tx) in self.all().descendant_txs_inclusive(&on_chain) {
             if next_expected_nonce != id.nonce {
-                break
+                break;
             }
             next_expected_nonce = id.next_nonce();
             last_consecutive_tx = Some(tx);
@@ -734,7 +735,7 @@ impl<T: TransactionOrdering> TxPool<T> {
         on_chain_code_hash: Option<B256>,
     ) -> PoolResult<AddedTransaction<T::Transaction>> {
         if self.contains(tx.hash()) {
-            return Err(PoolError::new(*tx.hash(), PoolErrorKind::AlreadyImported))
+            return Err(PoolError::new(*tx.hash(), PoolErrorKind::AlreadyImported));
         }
 
         self.validate_auth(&tx, on_chain_nonce, on_chain_code_hash)?;
@@ -851,7 +852,7 @@ impl<T: TransactionOrdering> TxPool<T> {
         if (on_chain_code_hash.is_none() || on_chain_code_hash == Some(KECCAK_EMPTY)) &&
             !self.all_transactions.auths.contains_key(&transaction.sender_id())
         {
-            return Ok(())
+            return Ok(());
         }
 
         let mut txs_by_sender =
@@ -869,23 +870,23 @@ impl<T: TransactionOrdering> TxPool<T> {
                     PoolErrorKind::InvalidTransaction(InvalidPoolTransactionError::Eip7702(
                         Eip7702PoolTransactionError::OutOfOrderTxFromDelegated,
                     )),
-                ))
+                ));
             }
-            return Ok(())
+            return Ok(());
         }
 
         let mut count = 0;
         for id in txs_by_sender {
             if id == &transaction.transaction_id {
                 // Transaction replacement is supported
-                return Ok(())
+                return Ok(());
             }
             count += 1;
         }
 
         if count < self.config.max_inflight_delegated_slot_limit {
             // account still has an available slot
-            return Ok(())
+            return Ok(());
         }
 
         Err(PoolError::new(
@@ -923,7 +924,7 @@ impl<T: TransactionOrdering> TxPool<T> {
                         PoolErrorKind::InvalidTransaction(InvalidPoolTransactionError::Eip7702(
                             Eip7702PoolTransactionError::AuthorityReserved,
                         )),
-                    ))
+                    ));
                 }
             }
         }
@@ -1125,7 +1126,7 @@ impl<T: TransactionOrdering> TxPool<T> {
                 }
                 id = descendant;
             } else {
-                return
+                return;
             }
         }
     }
@@ -1319,6 +1320,10 @@ pub(crate) struct AllTransactions<T: PoolTransaction> {
     ///
     /// Transactions with a lower base fee will never be included by the chain
     minimal_protocol_basefee: u64,
+    /// When enabled, treat `max_fee_per_gas == 0` (gasless) transactions as satisfying the
+    /// protocol minimum base fee and the per-block base fee. See
+    /// [`PoolConfig::allow_gasless`].
+    allow_gasless: bool,
     /// The max gas limit of the block
     block_gas_limit: u64,
     /// Max number of executable transaction slots guaranteed per account
@@ -1355,6 +1360,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             price_bumps: config.price_bumps,
             local_transactions_config: config.local_transactions_config.clone(),
             minimal_protocol_basefee: config.minimal_protocol_basefee,
+            allow_gasless: config.allow_gasless,
             block_gas_limit: config.gas_limit,
             ..Default::default()
         }
@@ -1398,7 +1404,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 entry.remove();
                 self.sender_info.remove(&sender);
                 self.metrics.all_transactions_by_all_senders.decrement(1.0);
-                return
+                return;
             }
             *count -= 1;
             self.metrics.all_transactions_by_all_senders.decrement(1.0);
@@ -1473,7 +1479,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 ($iter:ident) => {
                     'this: while let Some((peek, _)) = iter.peek() {
                         if peek.sender != id.sender {
-                            break 'this
+                            break 'this;
                         }
                         iter.next();
                     }
@@ -1490,7 +1496,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
                         current: tx.subpool,
                         destination: Destination::Discard,
                     });
-                    continue 'transactions
+                    continue 'transactions;
                 }
 
                 let ancestor = TransactionId::ancestor(id.nonce, info.state_nonce, id.sender);
@@ -1515,14 +1521,14 @@ impl<T: PoolTransaction> AllTransactions<T> {
             // If there's a nonce gap, we can shortcircuit, because there's nothing to update yet.
             if tx.state.has_nonce_gap() {
                 next_sender!(iter);
-                continue 'transactions
+                continue 'transactions;
             }
 
             // Since this is the first transaction of the sender, it has no parked ancestors
             tx.state.insert(TxState::NO_PARKED_ANCESTORS);
 
             // Update the first transaction of this sender.
-            Self::update_tx_base_fee(self.pending_fees.base_fee, tx);
+            Self::update_tx_base_fee(self.pending_fees.base_fee, self.allow_gasless, tx);
             // Track if the transaction's sub-pool changed.
             Self::record_subpool_update(&mut updates, tx);
 
@@ -1538,7 +1544,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             while let Some((peek, tx)) = iter.peek_mut() {
                 if peek.sender != id.sender {
                     // Found the next sender we need to check
-                    continue 'transactions
+                    continue 'transactions;
                 }
 
                 if tx.transaction.nonce() == next_nonce_in_line {
@@ -1547,7 +1553,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 } else {
                     // can short circuit if there's still a nonce gap
                     next_sender!(iter);
-                    continue 'transactions
+                    continue 'transactions;
                 }
 
                 // update for next iteration of this sender's loop
@@ -1577,7 +1583,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 has_parked_ancestor = !tx.state.is_pending();
 
                 // Update and record sub-pool changes.
-                Self::update_tx_base_fee(self.pending_fees.base_fee, tx);
+                Self::update_tx_base_fee(self.pending_fees.base_fee, self.allow_gasless, tx);
                 Self::record_subpool_update(&mut updates, tx);
 
                 // Advance iterator
@@ -1605,15 +1611,19 @@ impl<T: PoolTransaction> AllTransactions<T> {
     }
 
     /// Rechecks the transaction's dynamic fee condition.
-    fn update_tx_base_fee(pending_block_base_fee: u64, tx: &mut PoolInternalTransaction<T>) {
-        // Recheck dynamic fee condition.
-        match tx.transaction.max_fee_per_gas().cmp(&(pending_block_base_fee as u128)) {
-            Ordering::Greater | Ordering::Equal => {
-                tx.state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
-            }
-            Ordering::Less => {
-                tx.state.remove(TxState::ENOUGH_FEE_CAP_BLOCK);
-            }
+    #[inline]
+    fn update_tx_base_fee(
+        pending_block_base_fee: u64,
+        allow_gasless: bool,
+        tx: &mut PoolInternalTransaction<T>,
+    ) {
+        // Recheck dynamic fee condition. Gasless (zero fee-cap) txs are treated as satisfying the
+        // base fee so they stay in the pending sub-pool across base-fee changes.
+        let fee_cap = tx.transaction.max_fee_per_gas();
+        if fee_cap >= pending_block_base_fee as u128 || (allow_gasless && fee_cap == 0) {
+            tx.state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
+        } else {
+            tx.state.remove(TxState::ENOUGH_FEE_CAP_BLOCK);
         }
     }
 
@@ -1802,7 +1812,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             if current_txs >= self.max_account_slots && transaction.nonce() > on_chain_nonce {
                 return Err(InsertErr::ExceededSenderTransactionsCapacity {
                     transaction: Arc::new(transaction),
-                })
+                });
             }
         }
         if transaction.gas_limit() > self.block_gas_limit {
@@ -1810,12 +1820,12 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 block_gas_limit: self.block_gas_limit,
                 tx_gas_limit: transaction.gas_limit(),
                 transaction: Arc::new(transaction),
-            })
+            });
         }
 
         if self.contains_conflicting_transaction(&transaction) {
             // blob vs non blob transactions are mutually exclusive for the same sender
-            return Err(InsertErr::TxTypeConflict { transaction: Arc::new(transaction) })
+            return Err(InsertErr::TxTypeConflict { transaction: Arc::new(transaction) });
         }
 
         Ok(transaction)
@@ -1836,13 +1846,13 @@ impl<T: PoolTransaction> AllTransactions<T> {
             let Some(ancestor_tx) = self.txs.get(&ancestor) else {
                 // ancestor tx is missing, so we can't insert the new blob
                 self.metrics.blob_transactions_nonce_gaps.increment(1);
-                return Err(InsertErr::BlobTxHasNonceGap { transaction: Arc::new(new_blob_tx) })
+                return Err(InsertErr::BlobTxHasNonceGap { transaction: Arc::new(new_blob_tx) });
             };
             if ancestor_tx.state.has_nonce_gap() {
                 // the ancestor transaction already has a nonce gap, so we can't insert the new
                 // blob
                 self.metrics.blob_transactions_nonce_gaps.increment(1);
-                return Err(InsertErr::BlobTxHasNonceGap { transaction: Arc::new(new_blob_tx) })
+                return Err(InsertErr::BlobTxHasNonceGap { transaction: Arc::new(new_blob_tx) });
             }
 
             // the max cost executing this transaction requires
@@ -1851,7 +1861,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             // check if the new blob would go into overdraft
             if cumulative_cost > on_chain_balance {
                 // the transaction would go into overdraft
-                return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
+                return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) });
             }
 
             // ensure that a replacement would not shift already propagated blob transactions into
@@ -1869,13 +1879,13 @@ impl<T: PoolTransaction> AllTransactions<T> {
                     cumulative_cost += tx.transaction.cost();
                     if tx.transaction.is_eip4844() && cumulative_cost > on_chain_balance {
                         // the transaction would shift
-                        return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
+                        return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) });
                     }
                 }
             }
         } else if new_blob_tx.cost() > &on_chain_balance {
             // the transaction would go into overdraft
-            return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
+            return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) });
         }
 
         Ok(new_blob_tx)
@@ -1965,10 +1975,16 @@ impl<T: PoolTransaction> AllTransactions<T> {
         // Check dynamic fee
         let fee_cap = transaction.max_fee_per_gas();
 
-        if fee_cap < self.minimal_protocol_basefee as u128 {
-            return Err(InsertErr::FeeCapBelowMinimumProtocolFeeCap { transaction, fee_cap })
+        // Gasless: a zero fee-cap tx is exempt from the protocol minimum base fee floor (admission
+        // is gated upstream by the validator's on-chain whitelist). The floor still rejects all
+        // other sub-minimum fees (e.g. 1..MIN_PROTOCOL_BASE_FEE), so it does not widen spam.
+        let is_gasless = self.allow_gasless && fee_cap == 0;
+        if fee_cap < self.minimal_protocol_basefee as u128 && !is_gasless {
+            return Err(InsertErr::FeeCapBelowMinimumProtocolFeeCap { transaction, fee_cap });
         }
-        if fee_cap >= self.pending_fees.base_fee as u128 {
+        // Gasless txs are treated as satisfying the per-block base fee so they land in the pending
+        // sub-pool and compete by their ordering priority (mock price) like normal transactions.
+        if fee_cap >= self.pending_fees.base_fee as u128 || is_gasless {
             state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
         }
 
@@ -1999,7 +2015,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
                     return Err(InsertErr::Underpriced {
                         transaction: pool_tx.transaction,
                         existing: *entry.get().transaction.hash(),
-                    })
+                    });
                 }
                 let new_hash = *pool_tx.transaction.hash();
                 let new_transaction = pool_tx.transaction.clone();
@@ -2039,7 +2055,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
                 // If there's a nonce gap, we can shortcircuit
                 if next_nonce != id.nonce {
-                    break
+                    break;
                 }
 
                 // close the nonce gap
@@ -2131,6 +2147,7 @@ impl<T: PoolTransaction> Default for AllTransactions<T> {
         Self {
             max_account_slots: TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
             minimal_protocol_basefee: MIN_PROTOCOL_BASE_FEE,
+            allow_gasless: false,
             block_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
             by_hash: Default::default(),
             txs: Default::default(),
@@ -4531,5 +4548,75 @@ mod tests {
             tx_meta.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK),
             "Non-4844 tx should gain ENOUGH_FEE_CAP_BLOCK bit after basefee decrease"
         );
+    }
+
+    #[test]
+    fn gasless_zero_price_is_pending_and_best_with_nonzero_basefee() {
+        let mut f = MockTransactionFactory::default();
+        // Gasless enabled. The protocol floor is disabled so this test isolates the per-block
+        // base-fee relaxation (zero-price admission is gated upstream by the validator).
+        let config = PoolConfig::default().with_disabled_protocol_base_fee().with_gasless(true);
+        let mut pool = TxPool::new(MockOrdering::default(), config);
+
+        // Set a non-zero base fee.
+        let mut block_info = pool.block_info();
+        block_info.pending_basefee = 100;
+        pool.set_block_info(block_info);
+
+        // A zero gas-price ("gasless") transaction.
+        let tx = MockTransaction::eip1559().with_gas_price(0).with_gas_limit(21_000);
+        let valid_tx = f.validated(tx);
+        pool.add_transaction(valid_tx.clone(), U256::from(10_000_000), 0, None).unwrap();
+
+        // It must be in the pending sub-pool.
+        let pending: Vec<_> =
+            pool.pending_transactions().into_iter().map(|tx| *tx.hash()).collect();
+        assert_eq!(pending, vec![*valid_tx.hash()], "gasless tx should be pending");
+
+        // It must be produced by the best-transactions iterator at the current base fee.
+        let mut best =
+            pool.best_transactions_with_attributes(BestTransactionsAttributes::base_fee(100));
+        let first = best.next().expect("gasless tx should be yielded by best iterator");
+        assert_eq!(*first.hash(), *valid_tx.hash());
+        assert!(best.next().is_none());
+
+        // After a base-fee increase it must stay pending (not be demoted).
+        let mut block_info = pool.block_info();
+        block_info.pending_basefee = 1_000;
+        pool.set_block_info(block_info);
+
+        let pending: Vec<_> =
+            pool.pending_transactions().into_iter().map(|tx| *tx.hash()).collect();
+        assert_eq!(
+            pending,
+            vec![*valid_tx.hash()],
+            "gasless tx should stay pending after base-fee increase"
+        );
+    }
+
+    #[test]
+    fn gasless_disabled_zero_price_is_parked_and_not_best() {
+        let mut f = MockTransactionFactory::default();
+        // Gasless OFF. Protocol floor disabled so the zero-price tx is admitted but parked by the
+        // per-block base-fee gate rather than rejected outright.
+        let config = PoolConfig::default().with_disabled_protocol_base_fee();
+        let mut pool = TxPool::new(MockOrdering::default(), config);
+
+        let mut block_info = pool.block_info();
+        block_info.pending_basefee = 100;
+        pool.set_block_info(block_info);
+
+        let tx = MockTransaction::eip1559().with_gas_price(0).with_gas_limit(21_000);
+        let valid_tx = f.validated(tx);
+        pool.add_transaction(valid_tx.clone(), U256::from(10_000_000), 0, None).unwrap();
+
+        // It must NOT be pending (parked in the basefee sub-pool).
+        assert!(pool.pending_transactions().is_empty(), "zero-price tx should be parked");
+        assert_eq!(pool.basefee_pool.len(), 1, "zero-price tx should be in basefee sub-pool");
+
+        // It must NOT be produced by the best-transactions iterator.
+        let mut best =
+            pool.best_transactions_with_attributes(BestTransactionsAttributes::base_fee(100));
+        assert!(best.next().is_none(), "parked zero-price tx must not be yielded as best");
     }
 }

@@ -53,6 +53,13 @@ pub struct PoolConfig {
     pub price_bumps: PriceBumpConfig,
     /// Minimum base fee required by the protocol.
     pub minimal_protocol_basefee: u64,
+    /// When enabled, zero gas-price ("gasless") transactions (`max_fee_per_gas == 0`) are treated
+    /// as satisfying both the protocol minimum base fee and the per-block base fee, so they enter
+    /// the pending sub-pool and are yielded by the best-transactions iterator like any other
+    /// includable transaction. Non-zero fees are unaffected. This is an XLayer-specific extension;
+    /// admission of zero-priced txs is gated upstream by the transaction validator (on-chain
+    /// whitelist), so only validated gasless txs ever reach the pool with a zero fee.
+    pub allow_gasless: bool,
     /// Minimum priority fee required for transaction acceptance into the pool.
     pub minimum_priority_fee: Option<u128>,
     /// The max gas limit for transactions in the pool
@@ -91,6 +98,13 @@ impl PoolConfig {
         self
     }
 
+    /// Enables or disables gasless support (treating `max_fee_per_gas == 0` transactions as
+    /// base-fee-satisfying). See [`PoolConfig::allow_gasless`].
+    pub const fn with_gasless(mut self, enabled: bool) -> Self {
+        self.allow_gasless = enabled;
+        self
+    }
+
     /// Configures how many slots are available for a delegated sender.
     pub const fn with_max_inflight_delegated_slots(
         mut self,
@@ -121,6 +135,7 @@ impl Default for PoolConfig {
             max_account_slots: TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
             price_bumps: Default::default(),
             minimal_protocol_basefee: MIN_PROTOCOL_BASE_FEE,
+            allow_gasless: false,
             minimum_priority_fee: None,
             gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
             local_transactions_config: Default::default(),
@@ -198,7 +213,7 @@ impl PriceBumpConfig {
     #[inline]
     pub const fn price_bump(&self, tx_type: u8) -> u128 {
         if tx_type == EIP4844_TX_TYPE_ID {
-            return self.replace_blob_tx_price_bump
+            return self.replace_blob_tx_price_bump;
         }
         self.default_price_bump
     }
@@ -259,7 +274,7 @@ impl LocalTransactionConfig {
     #[inline]
     pub fn is_local(&self, origin: TransactionOrigin, sender: &Address) -> bool {
         if self.no_local_exemptions() {
-            return false
+            return false;
         }
         origin.is_local() || self.contains_local_address(sender)
     }

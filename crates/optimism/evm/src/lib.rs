@@ -14,7 +14,8 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloy_consensus::{BlockHeader, Header};
 use alloy_evm::{EvmFactory, FromRecoveredTx, FromTxWithEncoded};
-use alloy_op_evm::block::{receipt_builder::OpReceiptBuilder, OpTxEnv};
+use alloy_op_evm::block::receipt_builder::OpReceiptBuilder;
+pub use alloy_op_evm::block::OpTxEnv;
 use core::fmt::Debug;
 use op_alloy_consensus::EIP1559ParamError;
 use op_revm::{OpSpecId, OpTransaction};
@@ -59,7 +60,12 @@ pub use build::OpBlockAssembler;
 mod error;
 pub use error::OpBlockExecutionError;
 
-pub use alloy_op_evm::{OpBlockExecutionCtx, OpBlockExecutorFactory, OpEvm, OpEvmFactory};
+pub use alloy_op_evm::{
+    xlayer_gasless_contract, GaslessContract, GaslessFeeHook, OpBlockExecutionCtx,
+    OpBlockExecutorFactory, OpEvm, OpEvmFactory, XLayerGaslessFeeHook, XLayerGaslessFeeHookFactory,
+    XLAYER_DEVNET_GASLESS_CONTRACT, XLAYER_MAINNET_GASLESS_CONTRACT,
+    XLAYER_TESTNET_GASLESS_CONTRACT,
+};
 
 /// Optimism-related EVM configuration.
 #[derive(Debug)]
@@ -89,23 +95,31 @@ impl<ChainSpec, N: NodePrimitives, R: Clone, EvmFactory: Clone> Clone
     }
 }
 
-impl<ChainSpec: OpHardforks> OpEvmConfig<ChainSpec> {
+impl<ChainSpec: OpHardforks + EthChainSpec> OpEvmConfig<ChainSpec> {
     /// Creates a new [`OpEvmConfig`] with the given chain spec for OP chains.
     pub fn optimism(chain_spec: Arc<ChainSpec>) -> Self {
         Self::new(chain_spec, OpRethReceiptBuilder::default())
     }
 }
 
-impl<ChainSpec: OpHardforks, N: NodePrimitives, R> OpEvmConfig<ChainSpec, N, R> {
+impl<ChainSpec: OpHardforks + EthChainSpec, N: NodePrimitives, R> OpEvmConfig<ChainSpec, N, R> {
     /// Creates a new [`OpEvmConfig`] with the given chain spec.
+    ///
+    /// The gasless whitelist contract is derived from the chain id (see
+    /// [`xlayer_gasless_contract`]) so every config is gasless-aware by construction, keeping
+    /// gasless detection consensus-uniform across building and validation. Use
+    /// [`Self::with_gasless_contract`] to override (e.g. in tests).
     pub fn new(chain_spec: Arc<ChainSpec>, receipt_builder: R) -> Self {
+        let gasless_contract =
+            xlayer_gasless_contract(chain_spec.chain().id()).map(GaslessContract::new);
         Self {
             block_assembler: OpBlockAssembler::new(chain_spec.clone()),
             executor_factory: OpBlockExecutorFactory::new(
                 receipt_builder,
                 chain_spec,
                 OpEvmFactory::default(),
-            ),
+            )
+            .with_gasless_contract(gasless_contract),
             _pd: core::marker::PhantomData,
         }
     }
@@ -119,6 +133,26 @@ where
     /// Returns the chain spec associated with this configuration.
     pub const fn chain_spec(&self) -> &Arc<ChainSpec> {
         self.executor_factory.spec()
+    }
+
+    /// Enables the gasless fee hook. Each call tx execution checks `isGaslessEnabled()` and
+    /// `isWhitelisted(tx.to, tx.input)` on the gasless contract; when both return `true`, the
+    /// executor bypasses fee-related validation and fee charging for that single tx. Passing `None`
+    /// disables the hook.
+    ///
+    /// Deposit and create transactions are never affected.
+    pub fn with_gasless_contract(mut self, gasless_contract: Option<GaslessContract>) -> Self {
+        self.executor_factory = self.executor_factory.with_gasless_contract(gasless_contract);
+        self
+    }
+
+    /// Returns the gasless whitelist contract this config will apply, if any. Derived from the
+    /// chain id at construction (see [`Self::new`]); consumers that perform their own gasless
+    /// detection (e.g. the flashblocks builder) should read it from here so they stay
+    /// consensus-uniform with the block executor.
+    #[inline]
+    pub const fn gasless_contract(&self) -> Option<GaslessContract> {
+        self.executor_factory.gasless_contract()
     }
 }
 
@@ -142,7 +176,8 @@ where
             Precompiles = PrecompilesMap,
             Spec = OpSpecId,
             BlockEnv = BlockEnv,
-        > + Debug,
+        > + alloy_op_evm::XLayerGaslessFeeHookFactory
+        + Debug,
     Self: Send + Sync + Unpin + Clone + 'static,
 {
     type Primitives = N;

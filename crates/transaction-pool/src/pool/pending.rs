@@ -50,6 +50,10 @@ pub struct PendingPool<T: TransactionOrdering> {
     /// Used to broadcast new transactions that have been added to the `PendingPool` to existing
     /// `static_files` of this pool.
     new_transaction_notifier: broadcast::Sender<PendingTransaction<T>>,
+    /// When enabled, treat `max_fee_per_gas == 0` (gasless) transactions as satisfying the base
+    /// fee, so they are kept in / yielded from the pending pool. See
+    /// `PoolConfig::allow_gasless`.
+    allow_gasless: bool,
 }
 
 // === impl PendingPool ===
@@ -71,7 +75,15 @@ impl<T: TransactionOrdering> PendingPool<T> {
             highest_nonces: Default::default(),
             size_of: Default::default(),
             new_transaction_notifier,
+            allow_gasless: false,
         }
+    }
+
+    /// Enables or disables gasless support for this pool (treating `max_fee_per_gas == 0`
+    /// transactions as base-fee-satisfying). See `PoolConfig::allow_gasless`.
+    pub(crate) const fn with_allow_gasless(mut self, enabled: bool) -> Self {
+        self.allow_gasless = enabled;
+        self
     }
 
     /// Clear all transactions from the pool without resetting other values.
@@ -122,7 +134,12 @@ impl<T: TransactionOrdering> PendingPool<T> {
         base_fee: u64,
         base_fee_per_blob_gas: u64,
     ) -> BestTransactionsWithFees<T> {
-        BestTransactionsWithFees { best: self.best(), base_fee, base_fee_per_blob_gas }
+        BestTransactionsWithFees {
+            best: self.best(),
+            base_fee,
+            base_fee_per_blob_gas,
+            allow_gasless: self.allow_gasless,
+        }
     }
 
     /// Same as `best` but also includes the given unlocked transactions.
@@ -155,7 +172,12 @@ impl<T: TransactionOrdering> PendingPool<T> {
             best.all.insert(tx_id, transaction);
         }
 
-        BestTransactionsWithFees { best, base_fee, base_fee_per_blob_gas }
+        BestTransactionsWithFees {
+            best,
+            base_fee,
+            base_fee_per_blob_gas,
+            allow_gasless: self.allow_gasless,
+        }
     }
 
     /// Returns an iterator over all transactions in the pool
@@ -193,7 +215,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
                 // Remove all dependent transactions.
                 'this: while let Some((next_id, next_tx)) = transactions_iter.peek() {
                     if next_id.sender != id.sender {
-                        break 'this
+                        break 'this;
                     }
                     removed.push(Arc::clone(&next_tx.transaction));
                     transactions_iter.next();
@@ -227,7 +249,10 @@ impl<T: TransactionOrdering> PendingPool<T> {
         // Drain and iterate over all transactions.
         let mut transactions_iter = self.clear_transactions().into_iter().peekable();
         while let Some((id, mut tx)) = transactions_iter.next() {
-            if tx.transaction.max_fee_per_gas() < base_fee as u128 {
+            let fee_cap = tx.transaction.max_fee_per_gas();
+            // Gasless (zero fee-cap) txs are kept in the pending pool regardless of base fee.
+            let is_gasless = self.allow_gasless && fee_cap == 0;
+            if fee_cap < base_fee as u128 && !is_gasless {
                 // Add this tx to the removed collection since it no longer satisfies the base fee
                 // condition. Decrease the total pool size.
                 removed.push(Arc::clone(&tx.transaction));
@@ -235,7 +260,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
                 // Remove all dependent transactions.
                 'this: while let Some((next_id, next_tx)) = transactions_iter.peek() {
                     if next_id.sender != id.sender {
-                        break 'this
+                        break 'this;
                     }
                     removed.push(Arc::clone(&next_tx.transaction));
                     transactions_iter.next();
@@ -446,7 +471,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
                         }
                     }
 
-                    return
+                    return;
                 }
 
                 if !remove_locals && tx.transaction.is_local() {
@@ -454,7 +479,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
                     if local_senders.insert(sender_id) {
                         non_local_senders -= 1;
                     }
-                    continue
+                    continue;
                 }
 
                 total_size += tx.transaction.size();
@@ -472,7 +497,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
             // return if either the pool is under limits or there are no more _eligible_
             // transactions to remove
             if !self.exceeds(limit) || non_local_senders == 0 {
-                return
+                return;
             }
         }
     }
@@ -494,13 +519,13 @@ impl<T: TransactionOrdering> PendingPool<T> {
         let mut removed = Vec::new();
         // return early if the pool is already under the limits
         if !self.exceeds(&limit) {
-            return removed
+            return removed;
         }
 
         // first truncate only non-local transactions, returning if the pool end up under the limit
         self.remove_to_limit(&limit, false, &mut removed);
         if !self.exceeds(&limit) {
-            return removed
+            return removed;
         }
 
         // now repeat for local transactions, since local transactions must be removed now for the
