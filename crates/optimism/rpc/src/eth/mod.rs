@@ -6,6 +6,7 @@ pub mod transaction;
 
 mod block;
 mod call;
+mod gasless;
 mod pending_block;
 
 use crate::{
@@ -20,18 +21,21 @@ use eyre::WrapErr;
 use futures::StreamExt;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
+use op_revm::transaction::OpTxTr;
 pub use receipt::{OpReceiptBuilder, OpReceiptFieldsBuilder};
 use reqwest::Url;
 use reth_chainspec::{EthereumHardforks, Hardforks};
-use reth_evm::ConfigureEvm;
+use reth_evm::{ConfigureEvm, Database, Evm, EvmEnvFor, HaltReasonFor, InspectorFor, TxEnvFor};
 use reth_node_api::{FullNodeComponents, FullNodeTypes, HeaderTy, NodeTypes};
 use reth_node_builder::rpc::{EthApiBuilder, EthApiCtx};
+use reth_optimism_evm::OpTxEnv;
 use reth_optimism_flashblocks::{
     FlashBlockBuildInfo, FlashBlockCompleteSequence, FlashBlockCompleteSequenceRx,
     FlashBlockConsensusClient, FlashBlockRx, FlashBlockService, FlashblocksListeners,
     PendingBlockRx, PendingFlashBlock, WsFlashBlockStream,
 };
 use reth_primitives_traits::NodePrimitives;
+use reth_revm::db::bal::EvmDatabaseError;
 use reth_rpc::eth::core::EthApiInner;
 use reth_rpc_eth_api::{
     helpers::{
@@ -45,11 +49,12 @@ use reth_rpc_eth_types::{
     logs_utils::matching_block_logs_with_tx_hashes, EthStateCache, FeeHistoryCache, GasPriceOracle,
     PendingBlock,
 };
-use reth_storage_api::{BlockReaderIdExt, ProviderHeader};
+use reth_storage_api::{errors::ProviderError, BlockReaderIdExt, ProviderHeader};
 use reth_tasks::{
     pool::{BlockingTaskGuard, BlockingTaskPool},
     TaskSpawner,
 };
+use revm::context_interface::result::ResultAndState;
 use std::{
     fmt::{self, Formatter},
     marker::PhantomData,
@@ -392,7 +397,46 @@ where
     N: RpcNodeCore,
     OpEthApiError: FromEvmError<N::Evm>,
     Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError, Evm = N::Evm>,
+    TxEnvFor<N::Evm>: OpTxTr + OpTxEnv,
 {
+    /// Gasless-aware override of the default [`Trace::inspect`].
+    ///
+    /// `debug_traceTransaction` re-executes the target tx via this method. For a zero-priced
+    /// gasless tx, the default builds a normal-cfg EVM and the base-fee check rejects it. This
+    /// detects gasless first on a **non-inspector** EVM (so the whitelist system call never enters
+    /// the trace), then relaxes `disable_base_fee` on the local `evm_env` clone and marks the
+    /// `tx_env` gasless before inspecting — exactly the relaxation block execution applies. The
+    /// non-gasless path is byte-for-byte the default.
+    fn inspect<DB, I>(
+        &self,
+        mut db: DB,
+        mut evm_env: EvmEnvFor<Self::Evm>,
+        mut tx_env: TxEnvFor<Self::Evm>,
+        inspector: I,
+    ) -> Result<ResultAndState<HaltReasonFor<Self::Evm>>, Self::Error>
+    where
+        DB: Database<Error = EvmDatabaseError<ProviderError>>,
+        I: InspectorFor<Self::Evm, DB>,
+    {
+        // Detect on a plain EVM over `&mut db` (uncommitted system call leaves db untouched), so
+        // the whitelist call never pollutes the inspector trace below.
+        if self.detect_gasless(&mut db, evm_env.clone(), &tx_env)? {
+            // Local clone: relaxing the cfg here mirrors the hook's `disable_base_fee = true`
+            // without needing a restore (the env is discarded after this call).
+            evm_env.cfg_env.disable_base_fee = true;
+            tx_env.set_gasless(true);
+        }
+
+        let mut evm = self.evm_config().evm_with_env_and_inspector(db, evm_env, inspector);
+        evm.transact(tx_env).map_err(Self::Error::from_evm_err)
+    }
+
+    // Block-level `trace_*` (trace_block/filter/replayBlockTransactions/opcode_gas/storage_access)
+    // are NOT gasless-aware: they trace via `try_trace_many`, which builds each tx_env with
+    // `is_gasless == false` and has no per-tx hook; relaxing `disable_base_fee` alone still hits
+    // the handler's L1-fee charge for `!is_gasless`. Would need op-revm to treat zero-priced
+    // txs as gasless intrinsically. Single-tx debug/trace paths are covered via `inspect`
+    // above.
 }
 
 impl<N: RpcNodeCore, Rpc: RpcConvert> fmt::Debug for OpEthApi<N, Rpc> {

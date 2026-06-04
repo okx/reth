@@ -14,7 +14,8 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloy_consensus::{BlockHeader, Header};
 use alloy_evm::{EvmFactory, FromRecoveredTx, FromTxWithEncoded};
-use alloy_op_evm::block::{receipt_builder::OpReceiptBuilder, OpTxEnv};
+use alloy_op_evm::block::receipt_builder::OpReceiptBuilder;
+pub use alloy_op_evm::block::OpTxEnv;
 use core::fmt::Debug;
 use op_alloy_consensus::EIP1559ParamError;
 use op_revm::{OpSpecId, OpTransaction};
@@ -60,8 +61,8 @@ mod error;
 pub use error::OpBlockExecutionError;
 
 pub use alloy_op_evm::{
-    xlayer_gasless_contract, GaslessContract, OpBlockExecutionCtx, OpBlockExecutorFactory, OpEvm,
-    OpEvmFactory, XLayerGaslessFeeHook, XLayerGaslessFeeHookFactory,
+    xlayer_gasless_contract, GaslessContract, GaslessFeeHook, OpBlockExecutionCtx,
+    OpBlockExecutorFactory, OpEvm, OpEvmFactory, XLayerGaslessFeeHook, XLayerGaslessFeeHookFactory,
     XLAYER_DEVNET_GASLESS_CONTRACT, XLAYER_MAINNET_GASLESS_CONTRACT,
     XLAYER_TESTNET_GASLESS_CONTRACT,
 };

@@ -97,8 +97,8 @@ pub fn percentile_gas_price(mut prices: Vec<u128>, percentile: f64) -> Option<u1
 ///
 /// Gasless txs land in canonical blocks with `effective_gas_price == 0`. If they were left in the
 /// sample, even a small share would drag `mock_price` toward 0 at low percentiles, creating a
-/// positive-feedback trap (mock_price=0 → all gasless ordered at priority 0 → next block samples 0
-/// again). Returns `None` when no paid tx remains so the caller keeps the previous mock price.
+/// positive-feedback trap (`mock_price=0` → all gasless ordered at priority 0 → next block samples
+/// 0 again). Returns `None` when no paid tx remains so the caller keeps the previous mock price.
 fn percentile_paid_gas_price(prices: Vec<u128>, percentile: f64) -> Option<u128> {
     let paid: Vec<u128> = prices.into_iter().filter(|p| *p > 0).collect();
     percentile_gas_price(paid, percentile)
@@ -118,7 +118,7 @@ pub struct XLayerGaslessOrdering<T> {
 
 impl<T> XLayerGaslessOrdering<T> {
     /// Creates a new ordering backed by the shared `mock_price`.
-    pub fn new(mock_price: GaslessMockPrice) -> Self {
+    pub const fn new(mock_price: GaslessMockPrice) -> Self {
         Self { mock_price, _pd: PhantomData }
     }
 }
