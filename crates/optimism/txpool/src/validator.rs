@@ -139,7 +139,7 @@ where
         self
     }
 
-    /// Enables the XLayer gasless admission gate: zero-priced transactions are accepted only when
+    /// Enables the `XLayer` gasless admission gate: zero-priced transactions are accepted only when
     /// the on-chain gasless contract approves them.
     pub const fn with_gasless(mut self, allow_gasless: bool) -> Self {
         self.allow_gasless = allow_gasless;
@@ -228,7 +228,7 @@ where
         self.apply_xlayer_gasless_check(self.apply_op_checks(outcome))
     }
 
-    /// XLayer gasless admission gate.
+    /// `XLayer` gasless admission gate.
     ///
     /// A zero-priced transaction (`max_fee_per_gas == 0`) is only admissible when the on-chain
     /// gasless contract approves it: `getGaslessAllowance(to, input)` must return `allowed == true`
