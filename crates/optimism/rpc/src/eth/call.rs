@@ -1,17 +1,14 @@
 use crate::{eth::RpcNodeCore, OpEthApi, OpEthApiError};
-use alloy_consensus::transaction::TxHashRef;
-use alloy_primitives::B256;
 use op_revm::transaction::OpTxTr;
 use reth_evm::{ConfigureEvm, Evm, EvmEnvFor, HaltReasonFor, TxEnvFor};
 use reth_optimism_evm::OpTxEnv;
-use reth_primitives_traits::Recovered;
 use reth_revm::db::bal::EvmDatabaseError;
 use reth_rpc_eth_api::{
     helpers::{estimate::EstimateCall, Call, EthCall},
     FromEvmError, RpcConvert,
 };
-use reth_storage_api::{errors::ProviderError, ProviderTx};
-use revm::{context_interface::result::ResultAndState, Database, DatabaseCommit};
+use reth_storage_api::errors::ProviderError;
+use revm::{context_interface::result::ResultAndState, Database};
 
 impl<N, Rpc> EthCall for OpEthApi<N, Rpc>
 where
@@ -76,42 +73,5 @@ where
 
         let mut evm = self.evm_config().evm_with_env(db, evm_env);
         evm.transact(tx_env).map_err(Self::Error::from_evm_err)
-    }
-
-    /// Gasless-aware override of the default [`Call::replay_transactions_until`].
-    ///
-    /// Replays the block's txs preceding the target to rebuild state. A zero-priced gasless tx in
-    /// the block would be rejected here by the base-fee check — it only executed during block
-    /// production because the gasless hook relaxed that check — so this disables the check for the
-    /// whole replay. Doing so is a no-op for normal txs (the check only rejects underpriced txs,
-    /// and every tx in the block already passed block execution), and a gasless tx moves zero fees
-    /// regardless of the gasless flag (`effective_gas_price == 0`), so the rebuilt state is
-    /// identical to block execution. Otherwise byte-for-byte the default.
-    fn replay_transactions_until<'a, DB, I>(
-        &self,
-        db: &mut DB,
-        mut evm_env: EvmEnvFor<Self::Evm>,
-        transactions: I,
-        target_tx_hash: B256,
-    ) -> Result<usize, Self::Error>
-    where
-        DB: Database<Error = EvmDatabaseError<ProviderError>> + DatabaseCommit + core::fmt::Debug,
-        I: IntoIterator<Item = Recovered<&'a ProviderTx<Self::Provider>>>,
-    {
-        evm_env.cfg_env.disable_base_fee = true;
-
-        let mut evm = self.evm_config().evm_with_env(db, evm_env);
-        let mut index = 0;
-        for tx in transactions {
-            if *tx.tx_hash() == target_tx_hash {
-                // reached the target transaction
-                break
-            }
-
-            let tx_env = self.evm_config().tx_env(tx);
-            evm.transact_commit(tx_env).map_err(Self::Error::from_evm_err)?;
-            index += 1;
-        }
-        Ok(index)
     }
 }

@@ -2,9 +2,9 @@
 //!
 //! Block execution relaxes the base-fee check for zero-priced "gasless" transactions (see
 //! `alloy_op_evm`'s `XLayerGaslessFeeHook` and the OP block executor). The default RPC
-//! re-execution helpers (`Trace::inspect`, `Call::transact`, `Call::replay_transactions_until`)
-//! build a fresh EVM with the standard cfg (`disable_base_fee == false`), so re-running a gasless
-//! tx — e.g. via `debug_traceTransaction` — fails with `max fee per gas less than block base fee`.
+//! re-execution helpers (`Trace::inspect`, `Call::transact`) build a fresh EVM with the standard
+//! cfg (`disable_base_fee == false`), so re-running a gasless tx — e.g. via
+//! `debug_traceTransaction` — fails with `max fee per gas less than block base fee`.
 //!
 //! This module mirrors the *exact* gasless detection the executor and the txpool validator use:
 //!
