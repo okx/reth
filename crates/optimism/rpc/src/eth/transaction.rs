@@ -1,6 +1,8 @@
 //! Loads and formats OP transaction RPC response.
 
 use crate::{OpEthApi, OpEthApiError, SequencerClient};
+// Brings `max_fee_per_gas()` into scope for the gasless (zero-priced) broadcast trace below.
+use alloy_consensus::Transaction as _;
 use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_eth::TransactionInfo;
 use futures::StreamExt;
@@ -50,13 +52,30 @@ where
 
         let pool_transaction = <Self::Pool as TransactionPool>::Transaction::from_pooled(recovered);
 
+        // XLayer: trace zero-priced (gasless) txs through the submission path. A gasless tx that
+        // never reaches the sequencer won't be included on-chain, so log each hop explicitly.
+        // `max_fee_per_gas() == 0` covers both a legacy `gas_price == 0` and a 1559 `max_fee == 0`.
+        let is_zero_priced = pool_transaction.max_fee_per_gas() == 0;
+        let forwarder = self.raw_tx_forwarder();
+        if is_zero_priced {
+            tracing::info!(target: "xlayer::gasless::broadcast", hash=%pool_transaction.hash(), has_sequencer=forwarder.is_some(), "eth_sendRawTransaction received zero-priced tx");
+        }
+
         // On optimism, transactions are forwarded directly to the sequencer to be included in
         // blocks that it builds.
-        if let Some(client) = self.raw_tx_forwarder().as_ref() {
+        if let Some(client) = forwarder.as_ref() {
             tracing::debug!(target: "rpc::eth", hash = %pool_transaction.hash(), "forwarding raw transaction to sequencer");
             let hash = client.forward_raw_transaction(&tx).await.inspect_err(|err| {
-                    tracing::debug!(target: "rpc::eth", %err, hash=% *pool_transaction.hash(), "failed to forward raw transaction");
+                    if is_zero_priced {
+                        tracing::warn!(target: "xlayer::gasless::broadcast", hash=%*pool_transaction.hash(), %err, "failed to forward zero-priced tx to sequencer");
+                    } else {
+                        tracing::debug!(target: "rpc::eth", %err, hash=% *pool_transaction.hash(), "failed to forward raw transaction");
+                    }
                 })?;
+
+            if is_zero_priced {
+                tracing::info!(target: "xlayer::gasless::broadcast", hash=%hash, "zero-priced tx forwarded to sequencer");
+            }
 
             // Retain tx in local tx pool after forwarding, for local RPC usage.
             let _ = self.inner.eth_api.add_pool_transaction(pool_transaction).await.inspect_err(|err| {
@@ -64,6 +83,10 @@ where
             });
 
             return Ok(hash)
+        }
+
+        if is_zero_priced {
+            tracing::info!(target: "xlayer::gasless::broadcast", hash=%pool_transaction.hash(), "no sequencer configured; zero-priced tx added to local pool only, relies on P2P gossip");
         }
 
         // submit the transaction to the pool with a `Local` origin

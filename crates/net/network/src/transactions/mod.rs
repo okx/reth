@@ -79,7 +79,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, oneshot::error::RecvError};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace, warn};
 
 /// The future for importing transactions into the pool.
 ///
@@ -1004,6 +1004,11 @@ where
             return propagated
         }
 
+        // XLayer: hashes of zero-priced (gasless) txs in this batch, so we can trace exactly which
+        // peers they are (or are not) propagated to. Empty on the normal priced path.
+        let zero_priced: HashSet<TxHash> =
+            to_propagate.iter().filter(|tx| tx.is_zero_priced()).map(|tx| *tx.tx_hash()).collect();
+
         // send full transactions to a set of the connected peers based on the configured mode
         let max_num_full = self.config.propagation_mode.full_peer_count(self.peers.len());
 
@@ -1057,6 +1062,17 @@ where
 
                 trace!(target: "net::tx", ?peer_id, num_txs=?new_pooled_hashes.len(), "Propagating tx hashes to peer");
 
+                // XLayer: trace zero-priced (gasless) txs announced as hashes to this peer.
+                if !zero_priced.is_empty() {
+                    let gasless = new_pooled_hashes
+                        .iter_hashes()
+                        .filter(|h| zero_priced.contains(*h))
+                        .collect::<Vec<_>>();
+                    if !gasless.is_empty() {
+                        info!(target: "xlayer::gasless::broadcast", ?peer_id, ?gasless, "Announcing zero-priced tx hashes to peer");
+                    }
+                }
+
                 // send hashes of transactions
                 self.network.send_transactions_hashes(*peer_id, new_pooled_hashes);
             }
@@ -1075,6 +1091,18 @@ where
 
                 trace!(target: "net::tx", ?peer_id, num_txs=?new_full_transactions.len(), "Propagating full transactions to peer");
 
+                // XLayer: trace zero-priced (gasless) txs sent in full to this peer.
+                if !zero_priced.is_empty() {
+                    let gasless = new_full_transactions
+                        .iter()
+                        .map(|tx| *tx.tx_hash())
+                        .filter(|h| zero_priced.contains(h))
+                        .collect::<Vec<_>>();
+                    if !gasless.is_empty() {
+                        info!(target: "xlayer::gasless::broadcast", ?peer_id, ?gasless, "Sending zero-priced full txs to peer");
+                    }
+                }
+
                 // send full transactions
                 self.network.send_transactions(*peer_id, new_full_transactions);
             }
@@ -1082,6 +1110,15 @@ where
 
         // Update propagated transactions metrics
         self.metrics.propagated_transactions.increment(propagated.0.len() as u64);
+
+        // XLayer: a zero-priced (gasless) tx that was propagated to no peer (all peers had already
+        // seen it, or none passed the propagation policy) is a likely reason it never reaches the
+        // sequencer over P2P. Surface it explicitly.
+        for hash in &zero_priced {
+            if !propagated.0.contains_key(hash) {
+                warn!(target: "xlayer::gasless::broadcast", hash=%hash, peers=self.peers.len(), "Zero-priced tx was NOT propagated to any peer");
+            }
+        }
 
         propagated
     }
@@ -1095,10 +1132,16 @@ where
             // nothing to propagate
             return
         }
-        let propagated = self.propagate_transactions(
-            self.pool.get_all(hashes).into_iter().map(PropagateTransaction::pool_tx).collect(),
-            PropagationMode::Basic,
-        );
+        let to_propagate: Vec<_> =
+            self.pool.get_all(hashes).into_iter().map(PropagateTransaction::pool_tx).collect();
+
+        // XLayer: trace zero-priced (gasless) txs entering the P2P broadcast path, to diagnose
+        // gasless txs that never reach the sequencer.
+        for tx in to_propagate.iter().filter(|tx| tx.is_zero_priced()) {
+            info!(target: "xlayer::gasless::broadcast", hash=%tx.tx_hash(), peers=self.peers.len(), "propagate_all: zero-priced tx entering P2P propagation");
+        }
+
+        let propagated = self.propagate_transactions(to_propagate, PropagationMode::Basic);
 
         // notify pool so events get fired
         self.pool.on_propagated(propagated);
@@ -1719,6 +1762,15 @@ impl<T: SignedTransaction> PropagateTransaction<T> {
 
     fn tx_hash(&self) -> &TxHash {
         self.transaction.tx_hash()
+    }
+
+    /// Returns true if this is a zero-priced ("gasless") transaction.
+    ///
+    /// Mirrors the gasless definition used by the OP txpool/validator: a legacy `gas_price == 0`
+    /// or a 1559 `max_fee_per_gas == 0` both surface as `max_fee_per_gas() == 0`. Used purely to
+    /// trace gasless txs through the broadcast path; empty/false on the normal priced path.
+    fn is_zero_priced(&self) -> bool {
+        self.transaction.max_fee_per_gas() == 0
     }
 }
 
