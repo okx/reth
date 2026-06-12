@@ -1085,6 +1085,7 @@ where
                 maintain_gasless_mock_price(
                     gasless_mock_price,
                     gasless_mock_gas_price_percentile,
+                    transaction_pool.clone(),
                     chain_events,
                 ),
             );

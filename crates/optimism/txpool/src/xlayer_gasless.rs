@@ -11,20 +11,20 @@
 //!   txs and otherwise behaves exactly like
 //!   [`CoinbaseTipOrdering`](reth_transaction_pool::CoinbaseTipOrdering).
 //! - [`maintain_gasless_mock_price`]: a maintenance task that, on every new canonical block,
-//!   records a gas-price metric and recomputes the mock price as a configured percentile of the
-//!   block's transaction gas prices.
+//!   records gasless observability metrics and recomputes the mock price as a configured percentile
+//!   of the block's transaction gas prices.
 //!
 //! The (gas price, enqueue time) total order is completed by the pending sub-pool's existing
 //! `submission_id` tiebreak (priority first, earlier submission second) — see
 //! `reth_transaction_pool`'s `PendingTransaction` ordering — so no change to that logic is needed.
 
-use alloy_consensus::{BlockHeader, Transaction};
+use alloy_consensus::{BlockHeader, Transaction, TxReceipt};
 use futures_util::{Stream, StreamExt};
-use metrics::Histogram;
+use metrics::{Gauge, Histogram};
 use reth_chain_state::CanonStateNotification;
 use reth_metrics::Metrics;
 use reth_primitives_traits::{BlockBody, NodePrimitives};
-use reth_transaction_pool::{PoolTransaction, Priority, TransactionOrdering};
+use reth_transaction_pool::{PoolTransaction, Priority, TransactionOrdering, TransactionPool};
 use std::{
     fmt,
     marker::PhantomData,
@@ -168,21 +168,34 @@ where
 struct GaslessBlockMetrics {
     /// Effective gas price (wei) of each transaction in the latest canonical block.
     block_tx_gas_price: Histogram,
+    /// Current mock gas price (wei) the gasless ordering assigns to zero-priced txs.
+    mock_price_wei: Gauge,
+    /// Number of gasless (zero effective-gas-price) transactions per canonical block.
+    ///
+    /// A histogram, not a gauge: blocks arrive faster than Prometheus scrapes, so a gauge would
+    /// only sample one block per scrape interval and drop the rest.
+    gasless_txs_per_block: Histogram,
+    /// Gas used by gasless transactions per canonical block, in millions of gas (Mgas) — i.e. how
+    /// much block space gasless traffic occupies. Histogram for the same reason as above.
+    gasless_mgas_per_block: Histogram,
+    /// Number of gasless transactions currently sitting in the pending sub-pool.
+    pending_pool_gasless_transactions: Gauge,
 }
 
-/// Maintenance task: on each new canonical block, record a gas-price metric for every transaction
-/// and update `mock_price` to the configured `percentile` of the block's paid transaction gas
-/// prices (ascending). Zero-priced (gasless) txs are excluded from the percentile sample so that
-/// blocks carrying gasless traffic don't drag `mock_price` toward 0 (see
-/// [`percentile_paid_gas_price`]). Empty blocks, or blocks with only gasless txs, leave the
-/// previous mock price unchanged.
-pub async fn maintain_gasless_mock_price<N, St>(
+/// Maintenance task: on each new canonical block, record gasless observability metrics and update
+/// `mock_price` to the configured `percentile` of the block's paid transaction gas prices
+/// (ascending). Zero-priced (gasless) txs are excluded from the percentile sample so that blocks
+/// carrying gasless traffic don't drag `mock_price` toward 0 (see [`percentile_paid_gas_price`]).
+/// Empty blocks, or blocks with only gasless txs, leave the previous mock price unchanged.
+pub async fn maintain_gasless_mock_price<N, St, P>(
     mock_price: GaslessMockPrice,
     percentile: f64,
+    pool: P,
     mut events: St,
 ) where
     N: NodePrimitives,
     St: Stream<Item = CanonStateNotification<N>> + Send + Unpin + 'static,
+    P: TransactionPool,
 {
     let metrics = GaslessBlockMetrics::default();
     loop {
@@ -190,16 +203,46 @@ pub async fn maintain_gasless_mock_price<N, St>(
         if let CanonStateNotification::Commit { new } = event {
             let block = new.tip().sealed_block();
             let base_fee = block.header().base_fee_per_gas();
+            // Receipts are index-aligned with the block body's transactions; we diff successive
+            // `cumulative_gas_used` to recover each tx's own gas used (for the Mgas metric).
+            let receipts = new.execution_outcome().receipts_by_block(block.header().number());
+
             let mut prices: Vec<u128> = Vec::new();
-            for tx in block.body().transactions() {
+            let mut gasless_txs: u64 = 0;
+            let mut gasless_gas_used: u64 = 0;
+            let mut prev_cumulative: u64 = 0;
+            for (idx, tx) in block.body().transactions().iter().enumerate() {
                 let price = tx.effective_gas_price(base_fee);
                 metrics.block_tx_gas_price.record(price as f64);
                 prices.push(price);
+
+                let cumulative =
+                    receipts.get(idx).map(|r| r.cumulative_gas_used()).unwrap_or(prev_cumulative);
+                let gas_used = cumulative.saturating_sub(prev_cumulative);
+                prev_cumulative = cumulative;
+
+                // Gasless txs land in canonical blocks with `effective_gas_price == 0` (same
+                // criterion the percentile sample treats as unpaid).
+                if price == 0 {
+                    gasless_txs += 1;
+                    gasless_gas_used = gasless_gas_used.saturating_add(gas_used);
+                }
             }
+            metrics.gasless_txs_per_block.record(gasless_txs as f64);
+            metrics.gasless_mgas_per_block.record(gasless_gas_used as f64 / 1_000_000.0);
+
             if let Some(price) = percentile_paid_gas_price(prices, percentile) {
                 // Clamp into u64 (wei mock price); real gas prices never approach u64::MAX.
                 mock_price.set(price.min(u128::from(u64::MAX)) as u64);
             }
+            metrics.mock_price_wei.set(mock_price.get() as f64);
+
+            // Snapshot how many gasless txs are waiting in the pending sub-pool. The predicate-
+            // filtered query only materializes the (typically small) gasless set, not all pending.
+            let pending_gasless = pool
+                .get_pending_transactions_with_predicate(|tx| tx.transaction.max_fee_per_gas() == 0)
+                .len();
+            metrics.pending_pool_gasless_transactions.set(pending_gasless as f64);
         }
     }
 }
