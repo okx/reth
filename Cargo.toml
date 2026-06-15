@@ -783,8 +783,8 @@ revm-precompile = { git = "https://github.com/okx/revm", rev = "544a2ad5de83ae0d
 revm-primitives = { git = "https://github.com/okx/revm", rev = "544a2ad5de83ae0dd9e2ae6ceea095017f34ce13" }
 revm-state = { git = "https://github.com/okx/revm", rev = "544a2ad5de83ae0dd9e2ae6ceea095017f34ce13" }
 
-alloy-evm = { git = "https://github.com/okx/evm", rev = "8a22f7426196ec268c5204141bef119cb01b17df" }
-alloy-op-evm = { git = "https://github.com/okx/evm", rev = "8a22f7426196ec268c5204141bef119cb01b17df" }
+alloy-evm = { git = "https://github.com/okx/evm", rev = "856dc29bc27edeb369fabcc142e14b1c69e2c7fc" }
+alloy-op-evm = { git = "https://github.com/okx/evm", rev = "856dc29bc27edeb369fabcc142e14b1c69e2c7fc" }
 
 # alloy-consensus = { git = "https://github.com/alloy-rs/alloy", rev = "3049f232fbb44d1909883e154eb38ec5962f53a3" }
 # alloy-contract = { git = "https://github.com/alloy-rs/alloy", rev = "3049f232fbb44d1909883e154eb38ec5962f53a3" }
