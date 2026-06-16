@@ -18,9 +18,10 @@
 //! `submission_id` tiebreak (priority first, earlier submission second) — see
 //! `reth_transaction_pool`'s `PendingTransaction` ordering — so no change to that logic is needed.
 
-use alloy_consensus::{BlockHeader, Transaction, TxReceipt};
+use alloy_consensus::{BlockHeader, Transaction, TxReceipt, Typed2718};
 use futures_util::{Stream, StreamExt};
 use metrics::{Gauge, Histogram};
+use op_alloy_consensus::DEPOSIT_TX_TYPE_ID;
 use reth_chain_state::CanonStateNotification;
 use reth_metrics::Metrics;
 use reth_primitives_traits::{BlockBody, NodePrimitives};
@@ -164,8 +165,7 @@ where
         // pending pool's `submission_id` tiebreak. `max_fee_per_gas() == 0` covers both a legacy
         // `gas_price == 0` and a 1559 `max_fee == 0 && max_priority == 0`.
         if transaction.max_fee_per_gas() == 0 {
-            // `mock_tip` is maintained on the *tip* scale (a percentile of paid txs'
-            // `effective_tip_per_gas`.
+            // `mock_tip` is maintained on the tip scale, so use it directly.
             return Priority::Value(u128::from(self.mock_tip.get()));
         }
         // Identical to `CoinbaseTipOrdering`.
@@ -264,8 +264,11 @@ pub async fn maintain_gasless_mock_tip<N, St, P>(
                 let gas_used = cumulative.saturating_sub(prev_cumulative);
                 prev_cumulative = cumulative;
 
-                // Gasless txs land in canonical blocks with `effective_gas_price == 0`.
-                if price == 0 {
+                // Gasless txs land in canonical blocks with `effective_gas_price == 0`. Deposit
+                // (system/L1) txs are also zero-priced but
+                // are not gasless pool txs, so exclude them.
+                let is_deposit = tx.ty() == DEPOSIT_TX_TYPE_ID;
+                if price == 0 && !is_deposit {
                     gasless_txs += 1;
                     gasless_gas_used = gasless_gas_used.saturating_add(gas_used);
                 }
