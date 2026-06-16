@@ -11,7 +11,7 @@ use alloy_rpc_types_engine::PayloadId;
 use reth_basic_payload_builder::*;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_evm::{
-    block::BlockExecutorFor,
+    block::{BlockExecutorFor, CommitChanges},
     execute::{
         BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockExecutor, BlockValidationError,
     },
@@ -485,6 +485,11 @@ pub struct ExecutedPayload<N: NodePrimitives> {
 pub struct ExecutionInfo {
     /// All gas used so far
     pub cumulative_gas_used: u64,
+    /// Gas used so far by gasless (zero-priced, whitelisted) transactions in this block.
+    ///
+    /// Used to enforce the per-block gasless gas budget. Resets each block since `ExecutionInfo`
+    /// is created fresh per block build.
+    pub cumulative_gasless_gas_used: u64,
     /// Estimated DA size
     pub cumulative_da_bytes_used: u64,
     /// Tracks fees from executed mempool transactions
@@ -494,7 +499,12 @@ pub struct ExecutionInfo {
 impl ExecutionInfo {
     /// Create a new instance with allocated slots.
     pub const fn new() -> Self {
-        Self { cumulative_gas_used: 0, cumulative_da_bytes_used: 0, total_fees: U256::ZERO }
+        Self {
+            cumulative_gas_used: 0,
+            cumulative_gasless_gas_used: 0,
+            cumulative_da_bytes_used: 0,
+            total_fees: U256::ZERO,
+        }
     }
 
     /// Returns true if the transaction would exceed the block limits:
@@ -687,6 +697,8 @@ where
         let block_da_limit = self.builder_config.da_config.max_da_block_size();
         let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
         let base_fee = builder.evm_mut().block().basefee();
+        let gasless_block_gas_limit =
+            self.builder_config.gas_limit_config.gasless_block_gas_limit();
 
         while let Some(tx) = best_txs.next(()) {
             let interop = tx.interop_deadline();
@@ -725,8 +737,8 @@ where
 
             // We skip invalid cross chain txs, they would be removed on the next block update in
             // the maintenance job
-            if let Some(interop) = interop
-                && !is_valid_interop(interop, self.config.attributes.timestamp())
+            if let Some(interop) = interop &&
+                !is_valid_interop(interop, self.config.attributes.timestamp())
             {
                 best_txs.mark_invalid(tx.signer(), tx.nonce());
                 continue;
@@ -736,8 +748,37 @@ where
                 return Ok(Some(()));
             }
 
-            let gas_used = match builder.execute_transaction(tx.clone()) {
-                Ok(gas_used) => gas_used,
+            // A zero fee-cap tx that executes successfully here is gasless: a non-whitelisted
+            // zero-priced tx is rejected by the base-fee check inside the block executor (when the
+            // block base fee is non-zero, the regime gasless targets), so it never produces a
+            // successful result. This lets us enforce a per-block gasless gas budget without
+            // re-querying the whitelist contract.
+            let is_gasless = tx.max_fee_per_gas() == 0;
+            let cumulative_gasless_gas_used = info.cumulative_gasless_gas_used;
+
+            let gas_used = match builder.execute_transaction_with_commit_condition(
+                tx.clone(),
+                |res| {
+                    // Don't commit a gasless tx that would push this block's gasless gas over the
+                    // budget; the rest of that sender's txs are dropped via `mark_invalid` below.
+                    // Uses the real `gas_used`, matching the flashblocks builder.
+                    if is_gasless &&
+                        let Some(limit) = gasless_block_gas_limit &&
+                        cumulative_gasless_gas_used + res.gas_used() > limit
+                    {
+                        CommitChanges::No
+                    } else {
+                        CommitChanges::Yes
+                    }
+                },
+            ) {
+                Ok(Some(gas_used)) => gas_used,
+                Ok(None) => {
+                    // gasless budget exceeded: the tx executed but was not committed; skip it and
+                    // its descendants.
+                    best_txs.mark_invalid(tx.signer(), tx.nonce());
+                    continue;
+                }
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
                     ..
@@ -762,6 +803,9 @@ where
             // add gas used by the transaction to cumulative gas used, before creating the
             // receipt
             info.cumulative_gas_used += gas_used;
+            if is_gasless {
+                info.cumulative_gasless_gas_used += gas_used;
+            }
             info.cumulative_da_bytes_used += tx_da_size;
 
             // update and add to total fees

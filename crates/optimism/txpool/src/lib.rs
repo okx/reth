@@ -15,8 +15,8 @@ pub mod conditional;
 pub mod supervisor;
 pub mod xlayer_gasless;
 pub use xlayer_gasless::{
-    maintain_gasless_mock_price, percentile_gas_price, GaslessMockPrice, XLayerGaslessOrdering,
-    GASLESS_DEFAULT_MOCK_PRICE_WEI,
+    maintain_gasless_mock_tip, percentile_gas_price, GaslessMockTip, XLayerGaslessOrdering,
+    GASLESS_DEFAULT_MOCK_TIP_WEI,
 };
 mod transaction;
 pub use transaction::{OpPooledTransaction, OpPooledTx};
