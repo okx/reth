@@ -51,9 +51,9 @@ use reth_optimism_rpc::{
 };
 use reth_optimism_storage::OpStorage;
 use reth_optimism_txpool::{
-    maintain_gasless_mock_price,
+    maintain_gasless_mock_tip,
     supervisor::{SupervisorClient, DEFAULT_SUPERVISOR_URL},
-    GaslessMockPrice, OpPooledTx, XLayerGaslessOrdering, GASLESS_DEFAULT_MOCK_PRICE_WEI,
+    GaslessMockTip, OpPooledTx, XLayerGaslessOrdering, GASLESS_DEFAULT_MOCK_TIP_WEI,
 };
 use reth_provider::{providers::ProviderFactoryBuilder, CanonStateSubscriptions};
 use reth_rpc_api::{eth::RpcTypes, DebugApiServer, L2EthApiExtServer};
@@ -1033,6 +1033,7 @@ where
             .set_tx_fee_cap(ctx.config().rpc.rpc_tx_fee_cap)
             .with_max_tx_gas_limit(ctx.config().txpool.max_tx_gas_limit)
             .with_minimum_priority_fee(ctx.config().txpool.minimum_priority_fee)
+            .with_gasless(allow_gasless)
             .with_additional_tasks(
                 pool_config_overrides
                     .additional_validation_tasks
@@ -1060,10 +1061,10 @@ where
         // is identical to the upstream `CoinbaseTipOrdering`, so the rest of the pool ordering is
         // unchanged. Start at a non-zero floor (0.02 GWEI) so gasless txs never order at price 0
         // before the first block establishes a real percentile.
-        let gasless_mock_price = GaslessMockPrice::new(GASLESS_DEFAULT_MOCK_PRICE_WEI);
+        let gasless_mock_tip = GaslessMockTip::new(GASLESS_DEFAULT_MOCK_TIP_WEI);
         let transaction_pool = Pool::new(
             validator,
-            XLayerGaslessOrdering::new(gasless_mock_price.clone()),
+            XLayerGaslessOrdering::new(gasless_mock_tip.clone()),
             blob_store,
             final_pool_config.clone(),
         );
@@ -1082,8 +1083,8 @@ where
             let chain_events = ctx.provider().canonical_state_stream();
             ctx.task_executor().spawn_critical(
                 "Gasless mock-price maintenance task",
-                maintain_gasless_mock_price(
-                    gasless_mock_price,
+                maintain_gasless_mock_tip(
+                    gasless_mock_tip,
                     gasless_mock_gas_price_percentile,
                     transaction_pool.clone(),
                     chain_events,

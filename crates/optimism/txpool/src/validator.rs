@@ -1,5 +1,6 @@
 use crate::{supervisor::SupervisorClient, InvalidCrossTx, OpPooledTx};
 use alloy_consensus::{BlockHeader, Header, Transaction};
+use alloy_primitives::U256;
 use op_revm::L1BlockInfo;
 use parking_lot::RwLock;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
@@ -345,19 +346,26 @@ where
             authorities,
         } = outcome
         {
-            let mut l1_block_info = self.block_info.l1_block_info.read().clone();
-
-            let encoded = valid_tx.transaction().encoded_2718();
-
-            let cost_addition = match l1_block_info.l1_tx_data_fee(
-                self.chain_spec(),
-                self.block_timestamp(),
-                &encoded,
-                false,
-            ) {
-                Ok(cost) => cost,
-                Err(err) => {
-                    return TransactionValidationOutcome::Error(*valid_tx.hash(), Box::new(err))
+            // Gasless (zero fee-cap) candidates pay no L1 data fee or L2 execution fee when
+            // executed gaslessly, so their admission must not require ETH to cover the
+            // L1 data fee.
+            let cost_addition = if self.allow_gasless &&
+                valid_tx.transaction().max_fee_per_gas() == 0
+            {
+                U256::ZERO
+            } else {
+                let mut l1_block_info = self.block_info.l1_block_info.read().clone();
+                let encoded = valid_tx.transaction().encoded_2718();
+                match l1_block_info.l1_tx_data_fee(
+                    self.chain_spec(),
+                    self.block_timestamp(),
+                    &encoded,
+                    false,
+                ) {
+                    Ok(cost) => cost,
+                    Err(err) => {
+                        return TransactionValidationOutcome::Error(*valid_tx.hash(), Box::new(err))
+                    }
                 }
             };
             let cost = valid_tx.transaction().cost().saturating_add(cost_addition);
