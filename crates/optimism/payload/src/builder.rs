@@ -699,6 +699,8 @@ where
         let base_fee = builder.evm_mut().block().basefee();
         let gasless_block_gas_limit =
             self.builder_config.gas_limit_config.gasless_block_gas_limit();
+        // Set once a gasless tx is rejected for exceeding the per-block gasless budget.
+        let mut gasless_budget_exhausted = false;
 
         while let Some(tx) = best_txs.next(()) {
             let interop = tx.interop_deadline();
@@ -737,8 +739,8 @@ where
 
             // We skip invalid cross chain txs, they would be removed on the next block update in
             // the maintenance job
-            if let Some(interop) = interop &&
-                !is_valid_interop(interop, self.config.attributes.timestamp())
+            if let Some(interop) = interop
+                && !is_valid_interop(interop, self.config.attributes.timestamp())
             {
                 best_txs.mark_invalid(tx.signer(), tx.nonce());
                 continue;
@@ -754,6 +756,13 @@ where
             // successful result. This lets us enforce a per-block gasless gas budget without
             // re-querying the whitelist contract.
             let is_gasless = tx.max_fee_per_gas() == 0;
+
+            // Once the per-block gasless budget is spent, skip further gasless txs WITHOUT
+            // executing them.
+            if is_gasless && gasless_budget_exhausted {
+                best_txs.mark_invalid(tx.signer(), tx.nonce());
+                continue;
+            }
             let cumulative_gasless_gas_used = info.cumulative_gasless_gas_used;
 
             let gas_used = match builder.execute_transaction_with_commit_condition(
@@ -762,9 +771,9 @@ where
                     // Don't commit a gasless tx that would push this block's gasless gas over the
                     // budget; the rest of that sender's txs are dropped via `mark_invalid` below.
                     // Uses the real `gas_used`, matching the flashblocks builder.
-                    if is_gasless &&
-                        let Some(limit) = gasless_block_gas_limit &&
-                        cumulative_gasless_gas_used + res.gas_used() > limit
+                    if is_gasless
+                        && let Some(limit) = gasless_block_gas_limit
+                        && cumulative_gasless_gas_used + res.gas_used() > limit
                     {
                         CommitChanges::No
                     } else {
@@ -774,8 +783,7 @@ where
             ) {
                 Ok(Some(gas_used)) => gas_used,
                 Ok(None) => {
-                    // gasless budget exceeded: the tx executed but was not committed; skip it and
-                    // its descendants.
+                    gasless_budget_exhausted = true;
                     best_txs.mark_invalid(tx.signer(), tx.nonce());
                     continue;
                 }

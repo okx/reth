@@ -56,6 +56,14 @@ pub struct RollupArgs {
     )]
     pub gasless_mock_gas_price_percentile_bps: u16,
 
+    /// Maximum time (in seconds) a gasless (zero-priced) transaction may sit in the *pending*
+    /// sub-pool before the gasless maintenance task evicts it as stale. Defaults to 600s.
+    #[arg(
+        long = "rollup.gasless-pending-lifetime",
+        default_value_t = GASLESS_DEFAULT_PENDING_LIFETIME_SECS,
+    )]
+    pub gasless_pending_lifetime_secs: u64,
+
     /// HTTP endpoint for the supervisor
     #[arg(
         long = "rollup.supervisor-http",
@@ -109,6 +117,10 @@ pub struct RollupArgs {
 /// by `test_parse_optimism_default_args`.
 pub const GASLESS_DEFAULT_MOCK_PRICE_PERCENTILE: f64 = 0.1;
 
+/// Default maximum lifetime (in seconds) of a pending gasless transaction before it is evicted as
+/// stale.
+pub const GASLESS_DEFAULT_PENDING_LIFETIME_SECS: u64 = 600;
+
 /// Converts a `[0.0, 1.0]` percentile fraction into basis points (`0..=10000`).
 pub(crate) fn percentile_to_bps(value: f64) -> u16 {
     (value.clamp(0.0, 1.0) * 10_000.0).round() as u16
@@ -135,6 +147,7 @@ impl Default for RollupArgs {
             gasless_mock_gas_price_percentile_bps: percentile_to_bps(
                 GASLESS_DEFAULT_MOCK_PRICE_PERCENTILE,
             ),
+            gasless_pending_lifetime_secs: GASLESS_DEFAULT_PENDING_LIFETIME_SECS,
             supervisor_http: DEFAULT_SUPERVISOR_URL.to_string(),
             supervisor_safety_level: SafetyLevel::CrossUnsafe,
             sequencer_headers: Vec::new(),
@@ -238,6 +251,7 @@ mod tests {
         let expected_args = RollupArgs {
             allow_gasless: true,
             gasless_mock_gas_price_percentile_bps: 9000,
+            gasless_pending_lifetime_secs: 120,
             ..Default::default()
         };
         let args = CommandParser::<RollupArgs>::parse_from([
@@ -245,6 +259,8 @@ mod tests {
             "--rollup.allow-gasless",
             "--rollup.gasless-mock-gas-price-percentile",
             "0.9",
+            "--rollup.gasless-pending-lifetime",
+            "120",
         ])
         .args;
         assert_eq!(args, expected_args);

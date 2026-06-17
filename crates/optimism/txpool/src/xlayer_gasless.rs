@@ -36,23 +36,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Maximum time a gasless (zero-priced) transaction may sit in the *pending* sub-pool before the
-/// gasless maintenance task evicts it.
+/// Default maximum time a gasless (zero-priced) transaction may sit in the *pending* sub-pool
+/// before the gasless maintenance task evicts it. Overridable via the `--rollup.gasless-pending-
+/// lifetime` CLI flag (plumbed through [`maintain_gasless_mock_tip`]'s `pending_lifetime`).
 ///
 /// Under normal load any pending tx is included within seconds (pending-pool cap / chain TPS — e.g.
 /// ~50k cap at ~2k TPS drains in ~25s), so a gasless tx still pending after this long is
 /// effectively stale.
-const GASLESS_PENDING_MAX_LIFETIME: Duration = Duration::from_secs(10 * 60);
-
-/// Default mock tip (wei) assigned to gasless (zero-priced) transactions before the first
-/// canonical block establishes a real percentile: 0.02 GWEI (`20_000_000` wei).
-///
-/// Acts as the startup floor so gasless txs never order at priority 0 — a mock tip of 0 would order
-/// every gasless tx at priority 0, and the percentile sample (which excludes zero-tip txs) could
-/// never lift it back up. After the first block with paid txs, [`maintain_gasless_mock_tip`]
-/// tracks the last non-zero percentile and only overrides it when a newer one is available, so the
-/// value behaves as a persisted "last non-zero tip".
-pub const GASLESS_DEFAULT_MOCK_TIP_WEI: u64 = 20_000_000;
+pub const GASLESS_DEFAULT_PENDING_MAX_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 /// Shared mock tip (in wei) assigned to gasless (zero-priced) transactions for pool ordering.
 ///
@@ -224,11 +215,12 @@ where
 /// from the sample so they don't drag `mock_tip` toward 0 (see [`percentile_paid_gas_price`]).
 /// Empty blocks, or blocks with no paid-tip txs, leave the previous mock tip unchanged.
 ///
-/// It also evicts gasless txs that have sat in the pending sub-pool longer than
-/// [`GASLESS_PENDING_MAX_LIFETIME`] (the generic stale sweep only scans the queued sub-pool).
+/// It also evicts gasless txs that have sat in the pending sub-pool longer than `pending_lifetime`
+/// (the generic stale sweep only scans the queued sub-pool).
 pub async fn maintain_gasless_mock_tip<N, St, P>(
     mock_tip: GaslessMockTip,
     percentile: f64,
+    pending_lifetime: Duration,
     pool: P,
     mut events: St,
 ) where
@@ -285,7 +277,7 @@ pub async fn maintain_gasless_mock_tip<N, St, P>(
             // Snapshot how many gasless txs are in the pending sub-pool, and evict any that have
             // lingered past the max lifetime (stale, e.g. de-whitelisted).
             let pending_gasless =
-                evict_stale_pending_gasless(&pool, Instant::now(), GASLESS_PENDING_MAX_LIFETIME);
+                evict_stale_pending_gasless(&pool, Instant::now(), pending_lifetime);
             metrics.pending_pool_gasless_transactions.set(pending_gasless as f64);
         }
     }
@@ -472,9 +464,9 @@ mod xlayer_test {
 
     // Stale-pending gasless eviction: a pending gasless tx is removed once it has sat in pending
     // longer than the max lifetime, but kept while fresh. `now` is advanced past the threshold to
-    // exercise `GASLESS_PENDING_MAX_LIFETIME` deterministically (the insert timestamp can't be aged
-    // in a unit test). Non-gasless txs are structurally untouched — the helper only queries
-    // `max_fee_per_gas == 0`.
+    // exercise `GASLESS_DEFAULT_PENDING_MAX_LIFETIME` deterministically (the insert timestamp can't
+    // be aged in a unit test). Non-gasless txs are structurally untouched — the helper only
+    // queries `max_fee_per_gas == 0`.
     #[tokio::test]
     async fn evict_stale_pending_gasless_respects_lifetime() {
         use reth_transaction_pool::{
@@ -496,14 +488,17 @@ mod xlayer_test {
         assert_eq!(pool.pending_transactions().len(), 1, "gasless tx should be pending");
 
         // Fresh: within the lifetime, so kept. The return value is the pending gasless count.
-        let total =
-            evict_stale_pending_gasless(&pool, Instant::now(), GASLESS_PENDING_MAX_LIFETIME);
+        let total = evict_stale_pending_gasless(
+            &pool,
+            Instant::now(),
+            GASLESS_DEFAULT_PENDING_MAX_LIFETIME,
+        );
         assert_eq!(total, 1);
         assert_eq!(pool.pending_transactions().len(), 1, "fresh gasless tx must not be evicted");
 
         // Past the lifetime (simulated via a future `now`): evicted.
-        let later = Instant::now() + GASLESS_PENDING_MAX_LIFETIME + Duration::from_secs(1);
-        let total = evict_stale_pending_gasless(&pool, later, GASLESS_PENDING_MAX_LIFETIME);
+        let later = Instant::now() + GASLESS_DEFAULT_PENDING_MAX_LIFETIME + Duration::from_secs(1);
+        let total = evict_stale_pending_gasless(&pool, later, GASLESS_DEFAULT_PENDING_MAX_LIFETIME);
         assert_eq!(total, 1, "still counted before eviction");
         assert!(pool.pending_transactions().is_empty(), "stale gasless tx must be evicted");
     }

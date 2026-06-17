@@ -53,7 +53,7 @@ use reth_optimism_storage::OpStorage;
 use reth_optimism_txpool::{
     maintain_gasless_mock_tip,
     supervisor::{SupervisorClient, DEFAULT_SUPERVISOR_URL},
-    GaslessMockTip, OpPooledTx, XLayerGaslessOrdering, GASLESS_DEFAULT_MOCK_TIP_WEI,
+    GaslessMockTip, OpPooledTx, XLayerGaslessOrdering,
 };
 use reth_provider::{providers::ProviderFactoryBuilder, CanonStateSubscriptions};
 use reth_rpc_api::{eth::RpcTypes, DebugApiServer, L2EthApiExtServer};
@@ -175,6 +175,7 @@ impl OpNode {
                     .with_gasless(
                         self.args.allow_gasless,
                         f64::from(self.args.gasless_mock_gas_price_percentile_bps) / 10_000.0,
+                        core::time::Duration::from_secs(self.args.gasless_pending_lifetime_secs),
                     ),
             )
             .executor(OpExecutorBuilder::default())
@@ -911,6 +912,9 @@ pub struct OpPoolBuilder<T = crate::txpool::OpPooledTransaction> {
     /// Percentile (fraction in `0.0..=1.0`) of the previous block's transaction gas prices used as
     /// the mock gas price assigned to gasless transactions for pool ordering.
     pub gasless_mock_gas_price_percentile: f64,
+    /// Maximum time a pending gasless transaction may linger before the gasless maintenance task
+    /// evicts it as stale.
+    pub gasless_pending_lifetime: core::time::Duration,
     /// Marker for the pooled transaction type.
     _pd: core::marker::PhantomData<T>,
 }
@@ -924,6 +928,9 @@ impl<T> Default for OpPoolBuilder<T> {
             supervisor_safety_level: SafetyLevel::CrossUnsafe,
             allow_gasless: false,
             gasless_mock_gas_price_percentile: crate::args::GASLESS_DEFAULT_MOCK_PRICE_PERCENTILE,
+            gasless_pending_lifetime: core::time::Duration::from_secs(
+                crate::args::GASLESS_DEFAULT_PENDING_LIFETIME_SECS,
+            ),
             _pd: Default::default(),
         }
     }
@@ -938,6 +945,7 @@ impl<T> Clone for OpPoolBuilder<T> {
             supervisor_safety_level: self.supervisor_safety_level,
             allow_gasless: self.allow_gasless,
             gasless_mock_gas_price_percentile: self.gasless_mock_gas_price_percentile,
+            gasless_pending_lifetime: self.gasless_pending_lifetime,
             _pd: core::marker::PhantomData,
         }
     }
@@ -956,9 +964,11 @@ impl<T> OpPoolBuilder<T> {
         mut self,
         allow_gasless: bool,
         gasless_mock_gas_price_percentile: f64,
+        gasless_pending_lifetime: core::time::Duration,
     ) -> Self {
         self.allow_gasless = allow_gasless;
         self.gasless_mock_gas_price_percentile = gasless_mock_gas_price_percentile;
+        self.gasless_pending_lifetime = gasless_pending_lifetime;
         self
     }
 
@@ -1000,7 +1010,11 @@ where
 
     async fn build_pool(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Pool> {
         let Self {
-            pool_config_overrides, allow_gasless, gasless_mock_gas_price_percentile, ..
+            pool_config_overrides,
+            allow_gasless,
+            gasless_mock_gas_price_percentile,
+            gasless_pending_lifetime,
+            ..
         } = self;
 
         // Gasless mempool acceptance/ordering is gated by `PoolConfig::allow_gasless` (set on
@@ -1011,8 +1025,8 @@ where
         }
 
         // supervisor used for interop
-        if ctx.chain_spec().is_interop_active_at_timestamp(ctx.head().timestamp) &&
-            self.supervisor_http == DEFAULT_SUPERVISOR_URL
+        if ctx.chain_spec().is_interop_active_at_timestamp(ctx.head().timestamp)
+            && self.supervisor_http == DEFAULT_SUPERVISOR_URL
         {
             info!(target: "reth::cli",
                 url=%DEFAULT_SUPERVISOR_URL,
@@ -1059,9 +1073,9 @@ where
         // Gasless ordering assigns zero-priced txs the shared mock price (recomputed each block by
         // the maintenance task spawned below when gasless is enabled); for all non-gasless txs it
         // is identical to the upstream `CoinbaseTipOrdering`, so the rest of the pool ordering is
-        // unchanged. Start at a non-zero floor (0.02 GWEI) so gasless txs never order at price 0
-        // before the first block establishes a real percentile.
-        let gasless_mock_tip = GaslessMockTip::new(GASLESS_DEFAULT_MOCK_TIP_WEI);
+        // unchanged. Starts at 0 (gasless ordered below paid txs) until the first canonical block
+        // with paid txs establishes a real percentile via `maintain_gasless_mock_tip`.
+        let gasless_mock_tip = GaslessMockTip::default();
         let transaction_pool = Pool::new(
             validator,
             XLayerGaslessOrdering::new(gasless_mock_tip.clone()),
@@ -1086,6 +1100,7 @@ where
                 maintain_gasless_mock_tip(
                     gasless_mock_tip,
                     gasless_mock_gas_price_percentile,
+                    gasless_pending_lifetime,
                     transaction_pool.clone(),
                     chain_events,
                 ),
