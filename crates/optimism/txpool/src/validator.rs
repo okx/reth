@@ -1,4 +1,6 @@
-use crate::{supervisor::SupervisorClient, InvalidCrossTx, OpPooledTx};
+use crate::{
+    supervisor::SupervisorClient, xlayer_gasless::GaslessBlockMetrics, InvalidCrossTx, OpPooledTx,
+};
 use alloy_consensus::{BlockHeader, Header, Transaction};
 use alloy_primitives::U256;
 use op_revm::L1BlockInfo;
@@ -20,6 +22,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
+use tracing::warn;
 
 /// The interval for which we check transaction against supervisor, 1 hour.
 const TRANSACTION_VALIDITY_WINDOW_SECS: u64 = 3600;
@@ -58,6 +61,9 @@ pub struct OpTransactionValidator<Client, Tx> {
     /// When true, zero-priced ("gasless") transactions are admitted only if the on-chain gasless
     /// contract approves them (see `apply_xlayer_gasless_check`).
     allow_gasless: bool,
+    /// Counters for gasless admission rejections. Shares the `optimism_transaction_pool.gasless`
+    /// metrics scope with the block-level gasless metrics.
+    gasless_metrics: GaslessBlockMetrics,
 }
 
 impl<Client, Tx> OpTransactionValidator<Client, Tx> {
@@ -131,6 +137,7 @@ where
             supervisor_client: None,
             fork_tracker: Arc::new(OpForkTracker { interop: AtomicBool::from(false) }),
             allow_gasless: false,
+            gasless_metrics: GaslessBlockMetrics::default(),
         }
     }
 
@@ -276,11 +283,15 @@ where
         // limit exceeds the contract's per-tx allowance, and surface an error if the state read /
         // EVM call fails.
         match self.gasless_allowance(valid_tx.transaction()) {
-            Ok((false, _)) => TransactionValidationOutcome::Invalid(
-                valid_tx.into_transaction(),
-                InvalidPoolTransactionError::Underpriced,
-            ),
+            Ok((false, _)) => {
+                self.gasless_metrics.gasless_rejected_not_whitelisted.increment(1);
+                TransactionValidationOutcome::Invalid(
+                    valid_tx.into_transaction(),
+                    InvalidPoolTransactionError::Underpriced,
+                )
+            }
             Ok((true, gas_limit)) if valid_tx.transaction().gas_limit() > gas_limit => {
+                self.gasless_metrics.gasless_rejected_gas_limit_exceeded.increment(1);
                 let tx_gas_limit = valid_tx.transaction().gas_limit();
                 TransactionValidationOutcome::Invalid(
                     valid_tx.into_transaction(),
@@ -295,7 +306,15 @@ where
                 bytecode_hash,
                 authorities,
             },
-            Err(err) => TransactionValidationOutcome::Error(*valid_tx.hash(), Box::new(err)),
+            Err(err) => {
+                warn!(
+                    target: "txpool::gasless",
+                    tx = %valid_tx.hash(),
+                    %err,
+                    "gasless allowance check failed; rejecting zero-priced tx",
+                );
+                TransactionValidationOutcome::Error(*valid_tx.hash(), Box::new(err))
+            }
         }
     }
 
@@ -313,6 +332,12 @@ where
         };
         let Some(header) = self.client().latest_header().map_err(BlockExecutionError::other)?
         else {
+            // Abnormal: we have a gasless contract for this chain but no latest header to read
+            // state against.
+            warn!(
+                target: "txpool::gasless",
+                "latest header unavailable during gasless allowance check; treating tx as non-gasless",
+            );
             return Ok((false, 0));
         };
         let state = self.client().latest().map_err(BlockExecutionError::other)?;
@@ -349,8 +374,8 @@ where
             // Gasless (zero fee-cap) candidates pay no L1 data fee or L2 execution fee when
             // executed gaslessly, so their admission must not require ETH to cover the
             // L1 data fee.
-            let cost_addition = if self.allow_gasless &&
-                valid_tx.transaction().max_fee_per_gas() == 0
+            let cost_addition = if self.allow_gasless
+                && valid_tx.transaction().max_fee_per_gas() == 0
             {
                 U256::ZERO
             } else {

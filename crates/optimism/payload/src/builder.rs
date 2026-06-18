@@ -783,6 +783,14 @@ where
             ) {
                 Ok(Some(gas_used)) => gas_used,
                 Ok(None) => {
+                    if !gasless_budget_exhausted {
+                        debug!(
+                            target: "payload_builder",
+                            gasless_gas_used = cumulative_gasless_gas_used,
+                            limit = ?gasless_block_gas_limit,
+                            "gasless block gas budget exhausted; skipping remaining gasless txs",
+                        );
+                    }
                     gasless_budget_exhausted = true;
                     best_txs.mark_invalid(tx.signer(), tx.nonce());
                     continue;

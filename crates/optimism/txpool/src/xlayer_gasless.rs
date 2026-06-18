@@ -20,7 +20,7 @@
 
 use alloy_consensus::{BlockHeader, Transaction, TxReceipt, Typed2718};
 use futures_util::{Stream, StreamExt};
-use metrics::{Gauge, Histogram};
+use metrics::{Counter, Gauge, Histogram};
 use op_alloy_consensus::DEPOSIT_TX_TYPE_ID;
 use reth_chain_state::CanonStateNotification;
 use reth_metrics::Metrics;
@@ -35,6 +35,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tracing::{debug, warn};
 
 /// Default maximum time a gasless (zero-priced) transaction may sit in the *pending* sub-pool
 /// before the gasless maintenance task evicts it. Overridable via the `--rollup.gasless-pending-
@@ -165,9 +166,9 @@ where
 }
 
 /// Metrics recorded for each new canonical block's transactions.
-#[derive(Metrics)]
+#[derive(Metrics, Clone)]
 #[metrics(scope = "optimism_transaction_pool.gasless")]
-struct GaslessBlockMetrics {
+pub(crate) struct GaslessBlockMetrics {
     /// Effective gas price (wei) of each transaction in the latest canonical block.
     block_tx_gas_price: Histogram,
     /// Current mock tip (wei) the gasless ordering assigns to zero-priced txs.
@@ -182,6 +183,12 @@ struct GaslessBlockMetrics {
     gasless_mgas_per_block: Histogram,
     /// Number of gasless transactions currently sitting in the pending sub-pool.
     pending_pool_gasless_transactions: Gauge,
+    /// Number of zero-priced txs rejected at admission because the on-chain gasless contract did
+    /// not whitelist them.
+    pub(crate) gasless_rejected_not_whitelisted: Counter,
+    /// Number of zero-priced txs rejected at admission because their gas limit exceeded the
+    /// contract's per-tx allowance.
+    pub(crate) gasless_rejected_gas_limit_exceeded: Counter,
 }
 
 /// Evicts gasless transactions that have sat in the pending sub-pool longer than `max_lifetime`,
@@ -201,6 +208,13 @@ where
     if !stale.is_empty() {
         // `remove_transactions` drops them from the pool entirely; they can be re-submitted if they
         // become valid again.
+        debug!(
+            target: "txpool::gasless",
+            evicted = stale.len(),
+            pending_before = total,
+            ?max_lifetime,
+            "evicting stale pending gasless transactions",
+        );
         pool.remove_transactions(stale);
     }
     total
@@ -230,7 +244,13 @@ pub async fn maintain_gasless_mock_tip<N, St, P>(
 {
     let metrics = GaslessBlockMetrics::default();
     loop {
-        let Some(event) = events.next().await else { break };
+        let Some(event) = events.next().await else {
+            warn!(
+                target: "txpool::gasless",
+                "canonical state stream closed; gasless mock-tip maintenance task exiting",
+            );
+            break;
+        };
         if let CanonStateNotification::Commit { new } = event {
             let block = new.tip().sealed_block();
             let base_fee = block.header().base_fee_per_gas();
