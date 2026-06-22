@@ -52,14 +52,15 @@ where
 
     /// Gasless-aware override of the default [`Call::transact`].
     ///
-    /// Builds a fresh EVM per call, so (like `inspect`) it detects gasless on this same plain EVM
-    /// and, when gasless, relaxes `disable_base_fee` on the local `evm_env` clone before building
-    /// the EVM and marks the `tx_env` gasless. There is no inspector here, so detection cannot
-    /// pollute a trace. The non-gasless path is byte-for-byte the default.
+    /// Builds a fresh EVM per call, so (like `inspect`) it detects gasless on this same plain
+    /// EVM and, when gasless, marks the `tx_env` gasless before building the EVM. The flagged tx
+    /// then runs through `OpEvm::transact_raw`, which zeroes the base fee for it. There is no
+    /// inspector here, so detection cannot pollute a trace. The non-gasless path is byte-for-byte
+    /// the default.
     fn transact<DB>(
         &self,
         mut db: DB,
-        mut evm_env: EvmEnvFor<Self::Evm>,
+        evm_env: EvmEnvFor<Self::Evm>,
         mut tx_env: TxEnvFor<Self::Evm>,
     ) -> Result<ResultAndState<HaltReasonFor<Self::Evm>>, Self::Error>
     where
@@ -67,7 +68,6 @@ where
     {
         // `&mut DB: Database`, so detection borrows the db and leaves it for the real execution.
         if self.detect_gasless(&mut db, evm_env.clone(), &tx_env)? {
-            evm_env.cfg_env.disable_base_fee = true;
             tx_env.set_gasless(true);
         }
 

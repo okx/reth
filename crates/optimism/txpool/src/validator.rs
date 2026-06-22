@@ -341,7 +341,7 @@ where
             return Ok((false, 0));
         };
         let state = self.client().latest().map_err(BlockExecutionError::other)?;
-        // 1.10.2: the inner `EthTransactionValidator` does not carry an EVM config, so build a
+        // The inner `EthTransactionValidator` does not carry an EVM config, so build a
         // gasless-aware `OpEvmConfig` from the chain spec. It derives the same gasless contract by
         // chain id, keeping the validation view consensus-uniform with the block executor.
         let evm_config = OpEvmConfig::optimism(self.chain_spec());
