@@ -163,7 +163,7 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
                         let Some((block_number, timestamp)) = *state else {
                             // we haven't received a new flashblock sequence yet, so we can skip
                             // until we receive the first index 0 (base)
-                            return futures::future::ready(Some(Vec::new()))
+                            return futures::future::ready(Some(Vec::new()));
                         };
 
                         let receipts =
@@ -204,7 +204,7 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
         parent_hash: B256,
     ) -> eyre::Result<Option<PendingBlock<N::Primitives>>> {
         let Some(rx) = self.inner.flashblocks.as_ref().map(|f| &f.pending_block_rx) else {
-            return Ok(None)
+            return Ok(None);
         };
 
         // Check if a flashblock is being built
@@ -404,13 +404,13 @@ where
     /// `debug_traceTransaction` re-executes the target tx via this method. For a zero-priced
     /// gasless tx, the default builds a normal-cfg EVM and the base-fee check rejects it. This
     /// detects gasless first on a **non-inspector** EVM (so the whitelist system call never enters
-    /// the trace), then relaxes `disable_base_fee` on the local `evm_env` clone and marks the
-    /// `tx_env` gasless before inspecting — exactly the relaxation block execution applies. The
-    /// non-gasless path is byte-for-byte the default.
+    /// the trace), then marks the `tx_env` gasless before inspecting — `OpEvm::transact_raw` zeroes
+    /// the base fee for that flagged tx, exactly as block execution does. The non-gasless path is
+    /// byte-for-byte the default.
     fn inspect<DB, I>(
         &self,
         mut db: DB,
-        mut evm_env: EvmEnvFor<Self::Evm>,
+        evm_env: EvmEnvFor<Self::Evm>,
         mut tx_env: TxEnvFor<Self::Evm>,
         inspector: I,
     ) -> Result<ResultAndState<HaltReasonFor<Self::Evm>>, Self::Error>
@@ -421,9 +421,6 @@ where
         // Detect on a plain EVM over `&mut db` (uncommitted system call leaves db untouched), so
         // the whitelist call never pollutes the inspector trace below.
         if self.detect_gasless(&mut db, evm_env.clone(), &tx_env)? {
-            // Local clone: relaxing the cfg here mirrors the hook's `disable_base_fee = true`
-            // without needing a restore (the env is discarded after this call).
-            evm_env.cfg_env.disable_base_fee = true;
             tx_env.set_gasless(true);
         }
 
@@ -433,10 +430,9 @@ where
 
     // Block-level `trace_*` (trace_block/filter/replayBlockTransactions/opcode_gas/storage_access)
     // are NOT gasless-aware: they trace via `try_trace_many`, which builds each tx_env with
-    // `is_gasless == false` and has no per-tx hook; relaxing `disable_base_fee` alone still hits
-    // the handler's L1-fee charge for `!is_gasless`. Would need op-revm to treat zero-priced
-    // txs as gasless intrinsically. Single-tx debug/trace paths are covered via `inspect`
-    // above.
+    // `is_gasless == false`, and the handler still
+    // applies the L1-fee charge. Would need op-revm to treat zero-priced txs as gasless
+    // intrinsically. Single-tx debug/trace paths are covered via `inspect` above.
 }
 
 impl<N: RpcNodeCore, Rpc: RpcConvert> fmt::Debug for OpEthApi<N, Rpc> {

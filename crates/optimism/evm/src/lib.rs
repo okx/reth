@@ -61,9 +61,8 @@ mod error;
 pub use error::OpBlockExecutionError;
 
 pub use alloy_op_evm::{
-    xlayer_gasless_contract, GaslessContract, GaslessFeeHook, OpBlockExecutionCtx,
-    OpBlockExecutorFactory, OpEvm, OpEvmFactory, XLayerGaslessFeeHook, XLayerGaslessFeeHookFactory,
-    XLAYER_DEVNET_GASLESS_CONTRACT, XLAYER_MAINNET_GASLESS_CONTRACT,
+    xlayer_gasless_contract, GaslessContract, OpBlockExecutionCtx, OpBlockExecutorFactory, OpEvm,
+    OpEvmFactory, XLAYER_DEVNET_GASLESS_CONTRACT, XLAYER_MAINNET_GASLESS_CONTRACT,
     XLAYER_TESTNET_GASLESS_CONTRACT,
 };
 
@@ -176,8 +175,7 @@ where
             Precompiles = PrecompilesMap,
             Spec = OpSpecId,
             BlockEnv = BlockEnv,
-        > + alloy_op_evm::XLayerGaslessFeeHookFactory
-        + Debug,
+        > + Debug,
     Self: Send + Sync + Unpin + Clone + 'static,
 {
     type Primitives = N;

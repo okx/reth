@@ -14,10 +14,7 @@ use reth_node_builder::{
     NodeTypes,
 };
 use reth_optimism_chainspec::{OpChainSpec, BASE_MAINNET, OP_SEPOLIA};
-use reth_optimism_evm::{
-    OpBlockExecutorFactory, OpEvm, OpEvmFactory, OpRethReceiptBuilder, XLayerGaslessFeeHook,
-    XLayerGaslessFeeHookFactory,
-};
+use reth_optimism_evm::{OpBlockExecutorFactory, OpEvm, OpEvmFactory, OpRethReceiptBuilder};
 use reth_optimism_node::{args::RollupArgs, OpEvmConfig, OpExecutorBuilder, OpNode};
 use reth_optimism_primitives::OpPrimitives;
 use reth_provider::providers::BlockchainProvider;
@@ -126,13 +123,6 @@ fn test_setup_custom_precompiles() {
 
             op_evm
         }
-    }
-
-    // The gasless-patched `OpBlockExecutorFactory` requires its EVM factory to be a
-    // `XLayerGaslessFeeHookFactory`. `UniEvmFactory` produces a standard `OpEvm`, so it reuses the
-    // default `XLayerGaslessFeeHook`.
-    impl XLayerGaslessFeeHookFactory for UniEvmFactory {
-        type Hook<DB: Database, I: Inspector<OpContext<DB>>> = XLayerGaslessFeeHook;
     }
 
     /// Unichain executor builder.

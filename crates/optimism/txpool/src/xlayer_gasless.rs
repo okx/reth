@@ -522,11 +522,4 @@ mod xlayer_test {
         assert_eq!(total, 1, "still counted before eviction");
         assert!(pool.pending_transactions().is_empty(), "stale gasless tx must be evicted");
     }
-
-    // NOTE: the source (op-reth 1.11.3) also carries on-chain `OpTransactionValidator` gasless gate
-    // tests (`validate_zero_priced_tx` + accept/reject/over-gas-limit cases). They rely on
-    // `MockEthProvider::with_genesis_block` and on `EthTransactionValidatorBuilder::new(client,
-    // evm_config)` carrying an EVM config — neither of which exists in the 1.10.2 test_utils /
-    // validator API. The validator gate logic itself is ported (see `apply_xlayer_gasless_check` /
-    // `gasless_allowance` in `validator.rs`); only these provider-mock-dependent tests are omitted.
 }
