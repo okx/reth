@@ -29,6 +29,9 @@ pub(crate) struct BestTransactionsWithFees<T: TransactionOrdering> {
     pub(crate) best: BestTransactions<T>,
     pub(crate) base_fee: u64,
     pub(crate) base_fee_per_blob_gas: u64,
+    /// When enabled, `max_fee_per_gas == 0` (gasless) transactions are treated as satisfying the
+    /// base fee and are yielded. See `PoolConfig::allow_gasless`.
+    pub(crate) allow_gasless: bool,
 }
 
 impl<T: TransactionOrdering> crate::traits::BestTransactions for BestTransactionsWithFees<T> {
@@ -57,8 +60,11 @@ impl<T: TransactionOrdering> Iterator for BestTransactionsWithFees<T> {
         loop {
             let best = Iterator::next(&mut self.best)?;
             // If both the base fee and blob fee (if applicable for EIP-4844) are satisfied, return
-            // the transaction
-            if best.transaction.max_fee_per_gas() >= self.base_fee as u128 &&
+            // the transaction. Gasless (zero fee-cap) txs are treated as satisfying the base fee.
+            let fee_cap = best.transaction.max_fee_per_gas();
+            let base_fee_satisfied =
+                fee_cap >= self.base_fee as u128 || (self.allow_gasless && fee_cap == 0);
+            if base_fee_satisfied &&
                 best.transaction
                     .max_fee_per_blob_gas()
                     .is_none_or(|fee| fee >= self.base_fee_per_blob_gas as u128)
@@ -135,9 +141,9 @@ impl<T: TransactionOrdering> BestTransactions<T> {
                     {
                         // we skip transactions if we already yielded a transaction with lower
                         // priority
-                        return Some(IncomingTransaction::Stash(tx))
+                        return Some(IncomingTransaction::Stash(tx));
                     }
-                    return Some(IncomingTransaction::Process(tx))
+                    return Some(IncomingTransaction::Process(tx));
                 }
                 // note TryRecvError::Lagged can be returned here, which is an error that attempts
                 // to correct itself on consecutive try_recv() attempts
@@ -208,7 +214,7 @@ impl<T: TransactionOrdering> BestTransactions<T> {
                     "[{:?}] skipping invalid transaction",
                     best.transaction.hash()
                 );
-                continue
+                continue;
             }
 
             // Insert transactions that just got unlocked.
@@ -229,7 +235,7 @@ impl<T: TransactionOrdering> BestTransactions<T> {
                 if self.new_transaction_receiver.is_some() {
                     self.last_priority = Some(best.priority.clone())
                 }
-                return Some((best.transaction, best.priority))
+                return Some((best.transaction, best.priority));
             }
         }
     }
@@ -317,7 +323,7 @@ where
         loop {
             let best = self.best.next()?;
             if (self.predicate)(&best) {
-                return Some(best)
+                return Some(best);
             }
             self.best.mark_invalid(
                 &best,
@@ -404,7 +410,7 @@ where
                         self.max_prioritized_gas
                 {
                     self.prioritized_gas += item.transaction.gas_limit();
-                    return Some(item)
+                    return Some(item);
                 }
                 self.buffer.push_back(item);
             }
