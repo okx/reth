@@ -97,6 +97,8 @@ pub struct EthTransactionValidator<Client, T, Evm> {
     tx_fee_cap: Option<u128>,
     /// Minimum priority fee to enforce for acceptance into the pool.
     minimum_priority_fee: Option<u128>,
+    /// When true, gasless transactions are exempt from the minimum_priority_fee check.
+    allow_gasless: bool,
     /// Stores the setup and parameters needed for validating KZG proofs.
     kzg_settings: EnvKzgSettings,
     /// How to handle [`TransactionOrigin::Local`](TransactionOrigin) transactions.
@@ -520,7 +522,8 @@ where
         // the pool.
         if !is_local &&
             transaction.is_dynamic_fee() &&
-            transaction.max_priority_fee_per_gas() < self.minimum_priority_fee
+            transaction.max_priority_fee_per_gas() < self.minimum_priority_fee &&
+            !(self.allow_gasless && transaction.max_fee_per_gas() == 0)
         {
             return Err(InvalidPoolTransactionError::PriorityFeeBelowMinimum {
                 minimum_priority_fee: self
@@ -982,6 +985,8 @@ pub struct EthTransactionValidatorBuilder<Client, Evm> {
     tx_fee_cap: Option<u128>,
     /// Minimum priority fee to enforce for acceptance into the pool.
     minimum_priority_fee: Option<u128>,
+    /// When true, gasless transactions are exempt from the `minimum_priority_fee` filter.
+    allow_gasless: bool,
     /// Determines how many additional tasks to spawn
     ///
     /// Default is 1
@@ -1038,6 +1043,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
             client,
             evm_config,
             minimum_priority_fee: None,
+            allow_gasless: false,
             additional_tasks: 1,
             kzg_settings: EnvKzgSettings::Default,
             local_transactions_config: Default::default(),
@@ -1203,6 +1209,12 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
         self
     }
 
+    /// Exempts gasless transactions from the minimum_priority_fee filter.
+    pub const fn with_gasless(mut self, allow_gasless: bool) -> Self {
+        self.allow_gasless = allow_gasless;
+        self
+    }
+
     /// Sets a minimum priority fee that's enforced for acceptance into the pool.
     pub const fn with_minimum_priority_fee(mut self, minimum_priority_fee: Option<u128>) -> Self {
         self.minimum_priority_fee = minimum_priority_fee;
@@ -1275,6 +1287,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
             block_gas_limit,
             tx_fee_cap,
             minimum_priority_fee,
+            allow_gasless,
             kzg_settings,
             local_transactions_config,
             max_tx_input_bytes,
@@ -1309,6 +1322,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
             block_gas_limit,
             tx_fee_cap,
             minimum_priority_fee,
+            allow_gasless,
             blob_store: Box::new(blob_store),
             kzg_settings,
             local_transactions_config,
