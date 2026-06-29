@@ -12,7 +12,9 @@ mod tests {
     use alloy_primitives::{Address, U256};
     use reth_db::{models::AccountBeforeTx, test_utils::create_test_static_files_dir};
     use reth_primitives_traits::Account;
-    use reth_static_file_types::{ChangesetOffset, ChangesetOffsetReader, StaticFileSegment};
+    use reth_static_file_types::{
+        ChangesetOffset, ChangesetOffsetReader, SegmentRangeInclusive, StaticFileSegment,
+    };
     use std::{fs::OpenOptions, io::Write as _, path::PathBuf};
 
     use crate::providers::{
@@ -882,5 +884,58 @@ mod tests {
         );
 
         drop(writer);
+    }
+
+    /// Regression: with genesis at block 250 (bucket floor 200), a legacy file
+    /// named `..._200_299` must still open. `update_index` used to bump the start
+    /// to genesis and load `..._250_299`, which doesn't exist, failing startup.
+    #[test]
+    fn test_update_index_keeps_legacy_bucket_floor_name() {
+        let (static_dir, _) = create_test_static_files_dir();
+        let segment = StaticFileSegment::AccountChangeSets;
+
+        // Phase 1: write a legacy file with a genesis-unaware provider, so the
+        // genesis bucket is named by its floor (`..._200_299`).
+        {
+            let provider: StaticFileProvider<EthPrimitives> =
+                StaticFileProviderBuilder::read_write(&static_dir)
+                    .with_blocks_per_file(100)
+                    .build()
+                    .unwrap();
+            let mut writer = provider.latest_writer(segment).unwrap();
+            for block in 0..=250 {
+                writer.append_account_changeset(generate_test_changeset(block, 1), block).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+
+        // The bucket-floor file must exist and the genesis-aligned one must not.
+        assert!(
+            static_dir.path().join(segment.filename(&SegmentRangeInclusive::new(200, 299))).exists(),
+            "legacy bucket-floor file should exist"
+        );
+        assert!(
+            !static_dir.path().join(segment.filename(&SegmentRangeInclusive::new(250, 299))).exists(),
+            "genesis-aligned file should NOT exist for legacy data"
+        );
+
+        // Phase 2: reopen with a non-zero genesis and refresh the index; must
+        // resolve the legacy bucket-floor file, not a bumped name.
+        let provider: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir)
+                .with_blocks_per_file(100)
+                .with_genesis_block_number(250)
+                .build()
+                .unwrap();
+
+        provider
+            .update_index(segment, Some(250))
+            .expect("update_index must open the legacy bucket-floor file");
+
+        assert_eq!(
+            provider.get_highest_static_file_block(segment).unwrap(),
+            250,
+            "highest block should be resolved from the legacy file"
+        );
     }
 }
