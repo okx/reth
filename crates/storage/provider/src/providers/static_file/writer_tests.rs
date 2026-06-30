@@ -911,11 +911,17 @@ mod tests {
 
         // The bucket-floor file must exist and the genesis-aligned one must not.
         assert!(
-            static_dir.path().join(segment.filename(&SegmentRangeInclusive::new(200, 299))).exists(),
+            static_dir
+                .path()
+                .join(segment.filename(&SegmentRangeInclusive::new(200, 299)))
+                .exists(),
             "legacy bucket-floor file should exist"
         );
         assert!(
-            !static_dir.path().join(segment.filename(&SegmentRangeInclusive::new(250, 299))).exists(),
+            !static_dir
+                .path()
+                .join(segment.filename(&SegmentRangeInclusive::new(250, 299)))
+                .exists(),
             "genesis-aligned file should NOT exist for legacy data"
         );
 

@@ -997,7 +997,7 @@ impl<Tx, Err, R: Send + Sync + 'static> PayloadHandle<Tx, Err, R> {
     ///
     /// Returns `None` when this handle was created without a state root pipeline (e.g. via
     /// [`PayloadProcessor::spawn_cache_exclusive`]) or when the handle has already been taken.
-    pub fn take_state_root_handle(&mut self) -> Option<StateRootHandle> {
+    pub const fn take_state_root_handle(&mut self) -> Option<StateRootHandle> {
         self.state_root_handle.take()
     }
 

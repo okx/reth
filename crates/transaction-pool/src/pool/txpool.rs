@@ -4866,7 +4866,7 @@ mod tests {
 
         let tx = MockTransaction::eip1559().with_gas_price(0).with_gas_limit(21_000);
         let valid_tx = f.validated(tx);
-        pool.add_transaction(valid_tx.clone(), U256::from(10_000_000), 0, None).unwrap();
+        pool.add_transaction(valid_tx, U256::from(10_000_000), 0, None).unwrap();
 
         // It must NOT be pending (parked in the basefee sub-pool).
         assert!(pool.pending_transactions().is_empty(), "zero-price tx should be parked");

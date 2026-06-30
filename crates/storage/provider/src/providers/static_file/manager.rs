@@ -1062,7 +1062,10 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 // True when `fixed_range` came from an existing on-disk file (vs. a
                 // freshly derived range that has no file yet).
                 let from_existing_file = indexes.get(segment).is_some_and(|index| {
-                    index.expected_block_ranges_by_max_block.values().any(|range| *range == fixed_range)
+                    index
+                        .expected_block_ranges_by_max_block
+                        .values()
+                        .any(|range| *range == fixed_range)
                 });
 
                 // Genesis-align only when creating a new first-segment file. Legacy data
