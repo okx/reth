@@ -97,7 +97,7 @@ pub struct EthTransactionValidator<Client, T, Evm> {
     tx_fee_cap: Option<u128>,
     /// Minimum priority fee to enforce for acceptance into the pool.
     minimum_priority_fee: Option<u128>,
-    /// When true, gasless transactions are exempt from the minimum_priority_fee check.
+    /// When true, gasless transactions are exempt from the `minimum_priority_fee` check.
     allow_gasless: bool,
     /// Stores the setup and parameters needed for validating KZG proofs.
     kzg_settings: EnvKzgSettings,
@@ -1209,7 +1209,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
         self
     }
 
-    /// Exempts gasless transactions from the minimum_priority_fee filter.
+    /// Exempts gasless transactions from the `minimum_priority_fee` filter.
     pub const fn with_gasless(mut self, allow_gasless: bool) -> Self {
         self.allow_gasless = allow_gasless;
         self
