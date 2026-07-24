@@ -1371,7 +1371,7 @@ mod tests {
 
     #[test]
     fn on_inserted_executed_block_does_not_mutate_checked_out_parent_cache() {
-        let payload_processor = PayloadProcessor::new(
+        let payload_processor = PayloadProcessorInner::new(
             reth_tasks::Runtime::test(),
             EthEvmConfig::new(Arc::new(ChainSpec::default())),
             &TreeConfig::default(),
