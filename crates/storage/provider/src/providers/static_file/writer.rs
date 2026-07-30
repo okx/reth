@@ -753,8 +753,27 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         let current_block = if let Some(current_block_number) = self.current_block_number() {
             current_block_number
         } else {
-            self.increment_block(0)?;
-            0
+            // Empty segment: the next appendable block is `expected_block_start`, which is
+            // genesis-aligned and not necessarily 0. The writer is logically positioned one
+            // block before it, so advance from there without materializing block 0.
+            let next_block = self.next_block_number();
+            if advance_to.checked_add(1) == Some(next_block) {
+                // Already positioned: the next append will be at `advance_to + 1`.
+                return Ok(());
+            }
+            if advance_to < next_block {
+                return Err(ProviderError::UnexpectedStaticFileBlockNumber(
+                    self.writer.user_header().segment(),
+                    next_block,
+                    advance_to,
+                ));
+            }
+            // Register the gap as empty blocks (e.g. data pruned below `advance_to`) —
+            // block coverage must stay contiguous for later appends to line up.
+            for block in next_block..=advance_to {
+                self.increment_block(block)?;
+            }
+            return Ok(());
         };
 
         match current_block.cmp(&advance_to) {

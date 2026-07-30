@@ -944,4 +944,47 @@ mod tests {
             "highest block should be resolved from the legacy file"
         );
     }
+
+    /// Regression: with a non-zero genesis (e.g. 250), an empty segment's first
+    /// appendable block is the genesis block, not 0. `ensure_at_block` used to
+    /// call `increment_block(0)` on empty segments, failing with
+    /// "trying to append data to ... as block #0 but expected block #250".
+    #[test]
+    fn test_ensure_at_block_with_non_zero_genesis() {
+        let (static_dir, _) = create_test_static_files_dir();
+        let segment = StaticFileSegment::AccountChangeSets;
+
+        let provider: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir)
+                .with_blocks_per_file(100)
+                .with_genesis_block_number(250)
+                .build()
+                .unwrap();
+
+        {
+            let mut writer = provider.latest_writer(segment).unwrap();
+
+            // Positioning at genesis - 1 on an empty segment is a no-op: the next
+            // append is already expected at the genesis block.
+            writer.ensure_at_block(249).unwrap();
+
+            // Positioning before that is impossible.
+            assert!(writer.ensure_at_block(248).is_err());
+
+            // Appending the genesis block right after must succeed.
+            writer.append_account_changeset(generate_test_changeset(250, 1), 250).unwrap();
+            writer.commit().unwrap();
+        }
+
+        assert_eq!(provider.get_highest_static_file_block(segment), Some(250));
+
+        // Advancing an empty segment past genesis fills empty blocks from genesis.
+        let segment = StaticFileSegment::StorageChangeSets;
+        let mut writer = provider.latest_writer(segment).unwrap();
+        writer.ensure_at_block(260).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+
+        assert_eq!(provider.get_highest_static_file_block(segment), Some(260));
+    }
 }

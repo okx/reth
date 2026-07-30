@@ -130,15 +130,20 @@ impl Command {
 
         let mut cursor = provider.tx_ref().cursor_read::<tables::AccountChangeSets>()?;
 
+        // Static file segments are genesis-aligned: on chains with a non-zero genesis
+        // (e.g. 42810021) there is no data before the genesis block and the segment's
+        // `expected_block_start` is the genesis block, so migration must not start at 0.
+        let genesis = sf_provider.genesis_block_number();
         let first_block = provider
             .get_prune_checkpoint(PruneSegment::AccountHistory)?
             .and_then(|cp| cp.block_number)
-            .map_or(0, |b| b + 1);
+            .map_or(genesis, |b| b + 1)
+            .max(genesis);
 
         // The writer always starts at the fixed range boundary (e.g. 2500000) which may be
         // earlier than first_block (e.g. 2603897 from prune checkpoint).
         let mut writer = sf_provider.latest_writer(StaticFileSegment::AccountChangeSets)?;
-        if first_block > 0 {
+        if first_block > genesis {
             writer.ensure_at_block(first_block - 1)?;
         }
 
@@ -176,15 +181,18 @@ impl Command {
 
         let mut cursor = provider.tx_ref().cursor_read::<tables::StorageChangeSets>()?;
 
+        // See `migrate_account_changesets`: never start before the genesis block.
+        let genesis = sf_provider.genesis_block_number();
         let first_block = provider
             .get_prune_checkpoint(PruneSegment::StorageHistory)?
             .and_then(|cp| cp.block_number)
-            .map_or(0, |b| b + 1);
+            .map_or(genesis, |b| b + 1)
+            .max(genesis);
 
         // The writer always starts at the fixed range boundary (e.g. 2500000) which may be
         // earlier than first_block (e.g. 2603897 from prune checkpoint).
         let mut writer = sf_provider.latest_writer(StaticFileSegment::StorageChangeSets)?;
-        if first_block > 0 {
+        if first_block > genesis {
             writer.ensure_at_block(first_block - 1)?;
         }
 
@@ -243,15 +251,17 @@ impl Command {
         info!(target: "reth::cli", "Migrating Receipts → static files");
 
         let provider = factory.provider()?.disable_long_read_transaction_safety();
+        // See `migrate_account_changesets`: never start before the genesis block.
+        let genesis = sf_provider.genesis_block_number();
         let prune_start = provider
             .get_prune_checkpoint(PruneSegment::Receipts)?
             .and_then(|cp| cp.block_number)
-            .map_or(0, |b| b + 1);
-        let first_block = prune_start.max(existing.map_or(0, |b| b + 1));
+            .map_or(genesis, |b| b + 1);
+        let first_block = prune_start.max(existing.map_or(genesis, |b| b + 1)).max(genesis);
 
         // The writer always starts at the fixed range boundary (e.g. 2500000) which may be
         // earlier than first_block (e.g. 2603897 from prune checkpoint).
-        if first_block > 0 {
+        if first_block > genesis {
             let mut writer = sf_provider.latest_writer(StaticFileSegment::Receipts)?;
             writer.ensure_at_block(first_block - 1)?;
             writer.commit()?;
