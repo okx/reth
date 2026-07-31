@@ -1344,7 +1344,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     unwind_target = highest_block,
                     "Setting unwind target."
                 );
-                update_unwind_target(highest_block.unwrap_or_default());
+                update_unwind_target(highest_block.unwrap_or(self.genesis_block_number()));
             }
 
             // Only applies to transaction-based static files. (Receipts & Transactions)
@@ -1357,7 +1357,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             debug!(target: "reth::providers::static_file", "Checking tx index segment");
 
             if let Some(highest_tx) = highest_tx {
-                let mut last_block = highest_block.unwrap_or_default();
+                let mut last_block = highest_block.unwrap_or(self.genesis_block_number());
                 debug!(target: "reth::providers::static_file", last_block, highest_tx, "Verifying last transaction matches last block indices");
                 loop {
                     let Some(indices) = provider.block_body_indices(last_block)? else {
@@ -1374,8 +1374,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                         break
                     }
 
-                    if last_block == 0 {
-                        debug!(target: "reth::providers::static_file", "Reached block 0 in verification loop");
+                    // Never walk (or publish an unwind target) below the genesis block.
+                    if last_block <= self.genesis_block_number() {
+                        debug!(target: "reth::providers::static_file", "Reached genesis block in verification loop");
                         break
                     }
 
@@ -1700,13 +1701,19 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         }
 
         let highest_static_file_entry = highest_static_file_entry.unwrap_or_default();
-        let highest_static_file_block = highest_static_file_block.unwrap_or_default();
+        // Missing data or checkpoints floor at the genesis block: no data exists below it on
+        // chains with a non-zero genesis, so 0 would produce a pre-genesis unwind/prune target.
+        let highest_static_file_block =
+            highest_static_file_block.unwrap_or(self.genesis_block_number());
 
         // If static file entry is ahead of the database entries, then ensure the checkpoint block
         // number matches.
         let stage_id = segment.to_stage_id();
-        let checkpoint_block_number =
-            provider.get_stage_checkpoint(stage_id)?.unwrap_or_default().block_number;
+        let checkpoint_block_number = provider
+            .get_stage_checkpoint(stage_id)?
+            .unwrap_or_default()
+            .block_number
+            .max(self.genesis_block_number());
         debug!(target: "reth::providers::static_file", ?stage_id, checkpoint_block_number, "Retrieved stage checkpoint");
 
         // If the checkpoint is ahead, then we lost static file data. May be data corruption.
@@ -1840,11 +1847,16 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             debug!(target: "reth::providers::static_file", ?segment, "No database entries found");
         }
 
-        let highest_static_file_block = highest_static_file_block.unwrap_or_default();
+        // See `ensure_invariants`: missing data or checkpoints floor at the genesis block.
+        let highest_static_file_block =
+            highest_static_file_block.unwrap_or(self.genesis_block_number());
 
         let stage_id = segment.to_stage_id();
-        let checkpoint_block_number =
-            provider.get_stage_checkpoint(stage_id)?.unwrap_or_default().block_number;
+        let checkpoint_block_number = provider
+            .get_stage_checkpoint(stage_id)?
+            .unwrap_or_default()
+            .block_number
+            .max(self.genesis_block_number());
 
         if checkpoint_block_number > highest_static_file_block {
             info!(
