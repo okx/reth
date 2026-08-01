@@ -3,9 +3,10 @@ use crate::{
     segments::{PruneInput, Segment, SegmentOutput},
     PrunerError,
 };
-use alloy_eips::eip2718::Encodable2718;
+use alloy_consensus::transaction::TxHashRef;
 use rayon::prelude::*;
 use reth_db_api::{tables, transaction::DbTxMut};
+use reth_primitives_traits::SignedTransaction;
 use reth_provider::{
     BlockReader, DBProvider, PruneCheckpointReader, RocksDBProviderFactory,
     StaticFileProviderFactory,
@@ -31,7 +32,7 @@ impl TransactionLookup {
 impl<Provider> Segment<Provider> for TransactionLookup
 where
     Provider: DBProvider<Tx: DbTxMut>
-        + BlockReader<Transaction: Encodable2718>
+        + BlockReader<Transaction: SignedTransaction>
         + PruneCheckpointReader
         + StaticFileProviderFactory
         + StorageSettingsCache
@@ -131,11 +132,11 @@ where
                 .unwrap();
         let tx_range_end = *tx_range.end();
 
-        // Retrieve transactions in the range and calculate their hashes in parallel
+        // Retrieve transactions in the range and collect their hashes in parallel.
         let mut hashes = provider
             .transactions_by_tx_range(tx_range.clone())?
             .into_par_iter()
-            .map(|transaction| transaction.trie_hash())
+            .map(|transaction| *transaction.tx_hash())
             .collect::<Vec<_>>();
 
         // Sort hashes to enable efficient cursor traversal through the TransactionHashNumbers
@@ -204,7 +205,7 @@ impl TransactionLookup {
     ) -> Result<SegmentOutput, PrunerError>
     where
         Provider: DBProvider
-            + BlockReader<Transaction: Encodable2718>
+            + BlockReader<Transaction: SignedTransaction>
             + StaticFileProviderFactory
             + RocksDBProviderFactory,
     {
@@ -235,11 +236,11 @@ impl TransactionLookup {
             .map_or(end, |limited| limited.min(end));
         let tx_range = start..=tx_range_end;
 
-        // Retrieve transactions in the range and calculate their hashes in parallel
+        // Retrieve transactions in the range and collect their hashes in parallel.
         let hashes: Vec<_> = provider
             .transactions_by_tx_range(tx_range.clone())?
             .into_par_iter()
-            .map(|transaction| transaction.trie_hash())
+            .map(|transaction| *transaction.tx_hash())
             .collect();
 
         // Number of transactions retrieved from the database should match the tx range count
@@ -344,6 +345,7 @@ mod tests {
             let segment = TransactionLookup::new(prune_mode);
             let mut limiter = PruneLimiter::default().set_deleted_entries_limit(10);
             let input = PruneInput {
+                genesis_block_number: 0,
                 previous_checkpoint: db
                     .factory
                     .provider()
@@ -483,8 +485,12 @@ mod tests {
 
         let to_block: BlockNumber = 6;
         let prune_mode = PruneMode::Before(to_block);
-        let input =
-            PruneInput { previous_checkpoint: None, to_block, limiter: PruneLimiter::default() };
+        let input = PruneInput {
+            previous_checkpoint: None,
+            to_block,
+            limiter: PruneLimiter::default(),
+            genesis_block_number: 0,
+        };
         let segment = TransactionLookup::new(prune_mode);
 
         // Enable RocksDB storage for transaction hash numbers
@@ -586,7 +592,7 @@ mod tests {
         let mut limiter = PruneLimiter::default().set_deleted_entries_limit(1);
         limiter.increment_deleted_entries_count(); // Exhaust the limit
 
-        let input = PruneInput { previous_checkpoint, to_block, limiter };
+        let input = PruneInput { previous_checkpoint, to_block, limiter, genesis_block_number: 0 };
         let segment = TransactionLookup::new(prune_mode);
 
         let provider = db.factory.database_provider_rw().unwrap();

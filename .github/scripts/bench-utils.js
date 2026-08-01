@@ -17,12 +17,17 @@ function fmtChange(ch) {
   const details = [];
   if (ch.ci_pct) details.push(`±${ch.ci_pct.toFixed(2)}%`);
   if (ch.floor_pct) details.push(`floor ${ch.floor_pct.toFixed(2)}%`);
+  if (ch.materiality?.threshold_ms) {
+    details.push(`materiality ${ch.materiality.threshold_ms.toFixed(2)}ms`);
+  }
+  if (ch.informational) details.push('informational');
   const detailStr = details.length ? ` (${details.join(', ')})` : '';
-  return `${pctStr}${detailStr} ${SIG_EMOJI[ch.sig]}`;
+  const sig = ch.informational ? 'neutral' : ch.sig;
+  return `${pctStr}${detailStr} ${SIG_EMOJI[sig]}`;
 }
 
 function verdict(changes) {
-  const vals = Object.values(changes);
+  const vals = Object.values(changes).filter(v => !v.informational);
   const hasBad = vals.some(v => v.sig === 'bad');
   const hasGood = vals.some(v => v.sig === 'good');
   if (hasBad && hasGood) return { emoji: '⚠️', label: 'Mixed Results' };
@@ -31,7 +36,20 @@ function verdict(changes) {
   return { emoji: '⚪', label: 'No Difference' };
 }
 
+function isWin(changes) {
+  const vals = Object.values(changes || {}).filter(v => !v.informational);
+  return vals.some(v => v.sig === 'good') && !vals.some(v => v.sig === 'bad');
+}
+
 function loadSamplyUrls(workDir) {
+  return loadProfileUrls(workDir, 'samply-profile-url.txt');
+}
+
+function loadTracingChromeUrls(workDir) {
+  return loadProfileUrls(workDir, 'tracing-chrome-profile-url.txt');
+}
+
+function loadProfileUrls(workDir, fileName) {
   const urls = {};
   let runs = [];
   try {
@@ -43,7 +61,7 @@ function loadSamplyUrls(workDir) {
   }
   for (const run of runs) {
     try {
-      const url = fs.readFileSync(path.join(workDir, run, 'samply-profile-url.txt'), 'utf8').trim();
+      const url = fs.readFileSync(path.join(workDir, run, fileName), 'utf8').trim();
       if (url) urls[run] = url;
     } catch {}
   }
@@ -120,7 +138,9 @@ module.exports = {
   fmtS,
   fmtChange,
   verdict,
+  isWin,
   loadSamplyUrls,
+  loadTracingChromeUrls,
   blocksLabel,
   metricRows,
   waitTimeRows,

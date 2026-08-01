@@ -8,9 +8,12 @@ use crate::{
     EitherWriterDestination, HeaderProvider, ReceiptProvider, StageCheckpointReader, StatsReader,
     TransactionVariant, TransactionsProvider, TransactionsProviderExt,
 };
-use alloy_consensus::{transaction::TransactionMeta, Header};
-use alloy_eips::{eip2718::Encodable2718, BlockHashOrNumber};
-use alloy_primitives::{b256, keccak256, Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
+use alloy_consensus::{
+    transaction::{TransactionMeta, TxHashRef},
+    Header,
+};
+use alloy_eips::BlockHashOrNumber;
+use alloy_primitives::{b256, Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
 
 use parking_lot::RwLock;
 use reth_chain_state::ExecutedBlock;
@@ -1341,7 +1344,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     unwind_target = highest_block,
                     "Setting unwind target."
                 );
-                update_unwind_target(highest_block.unwrap_or_default());
+                update_unwind_target(highest_block.unwrap_or(self.genesis_block_number()));
             }
 
             // Only applies to transaction-based static files. (Receipts & Transactions)
@@ -1354,7 +1357,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             debug!(target: "reth::providers::static_file", "Checking tx index segment");
 
             if let Some(highest_tx) = highest_tx {
-                let mut last_block = highest_block.unwrap_or_default();
+                let mut last_block = highest_block.unwrap_or(self.genesis_block_number());
                 debug!(target: "reth::providers::static_file", last_block, highest_tx, "Verifying last transaction matches last block indices");
                 loop {
                     let Some(indices) = provider.block_body_indices(last_block)? else {
@@ -1371,8 +1374,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                         break
                     }
 
-                    if last_block == 0 {
-                        debug!(target: "reth::providers::static_file", "Reached block 0 in verification loop");
+                    // Never walk (or publish an unwind target) below the genesis block.
+                    if last_block <= self.genesis_block_number() {
+                        debug!(target: "reth::providers::static_file", "Reached genesis block in verification loop");
                         break
                     }
 
@@ -1697,13 +1701,19 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         }
 
         let highest_static_file_entry = highest_static_file_entry.unwrap_or_default();
-        let highest_static_file_block = highest_static_file_block.unwrap_or_default();
+        // Missing data or checkpoints floor at the genesis block: no data exists below it on
+        // chains with a non-zero genesis, so 0 would produce a pre-genesis unwind/prune target.
+        let highest_static_file_block =
+            highest_static_file_block.unwrap_or(self.genesis_block_number());
 
         // If static file entry is ahead of the database entries, then ensure the checkpoint block
         // number matches.
         let stage_id = segment.to_stage_id();
-        let checkpoint_block_number =
-            provider.get_stage_checkpoint(stage_id)?.unwrap_or_default().block_number;
+        let checkpoint_block_number = provider
+            .get_stage_checkpoint(stage_id)?
+            .unwrap_or_default()
+            .block_number
+            .max(self.genesis_block_number());
         debug!(target: "reth::providers::static_file", ?stage_id, checkpoint_block_number, "Retrieved stage checkpoint");
 
         // If the checkpoint is ahead, then we lost static file data. May be data corruption.
@@ -1837,11 +1847,16 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             debug!(target: "reth::providers::static_file", ?segment, "No database entries found");
         }
 
-        let highest_static_file_block = highest_static_file_block.unwrap_or_default();
+        // See `ensure_invariants`: missing data or checkpoints floor at the genesis block.
+        let highest_static_file_block =
+            highest_static_file_block.unwrap_or(self.genesis_block_number());
 
         let stage_id = segment.to_stage_id();
-        let checkpoint_block_number =
-            provider.get_stage_checkpoint(stage_id)?.unwrap_or_default().block_number;
+        let checkpoint_block_number = provider
+            .get_stage_checkpoint(stage_id)?
+            .unwrap_or_default()
+            .block_number
+            .max(self.genesis_block_number());
 
         if checkpoint_block_number > highest_static_file_block {
             info!(
@@ -2733,10 +2748,8 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
             let manager = self.clone();
 
             // Spawn the task onto the global rayon pool
-            // This task will send the results through the channel after it has calculated
-            // the hash.
+            // This task will send the cached transaction hash through the channel.
             rayon::spawn(move || {
-                let mut rlp_buf = Vec::with_capacity(128);
                 let _ = manager.fetch_range_with_predicate(
                     StaticFileSegment::Transactions,
                     chunk_range,
@@ -2744,9 +2757,7 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
                         Ok(cursor
                             .get_one::<TransactionMask<Self::Transaction>>(number.into())?
                             .map(|transaction| {
-                                rlp_buf.clear();
-                                let _ = channel_tx
-                                    .send(calculate_hash((number, transaction), &mut rlp_buf));
+                                let _ = channel_tx.send(transaction_hash((number, transaction)));
                             }))
                     },
                     |_| true,
@@ -2778,7 +2789,7 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
             let mut cursor = jar_provider.cursor()?;
             if cursor
                 .get_one::<TransactionMask<Self::Transaction>>((&tx_hash).into())?
-                .and_then(|tx| (tx.trie_hash() == tx_hash).then_some(tx))
+                .and_then(|tx| (*tx.tx_hash() == tx_hash).then_some(tx))
                 .is_some()
             {
                 Ok(cursor.number())
@@ -2820,7 +2831,7 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
             Ok(jar_provider
                 .cursor()?
                 .get_one::<TransactionMask<Self::Transaction>>((&hash).into())?
-                .and_then(|tx| (tx.trie_hash() == hash).then_some(tx)))
+                .and_then(|tx| (*tx.tx_hash() == hash).then_some(tx)))
         })
     }
 
@@ -3022,18 +3033,14 @@ impl<N: NodePrimitives> StatsReader for StaticFileProvider<N> {
     }
 }
 
-/// Calculates the tx hash for the given transaction and its id.
+/// Returns the tx hash for the given transaction and its id.
 #[inline]
-fn calculate_hash<T>(
-    entry: (TxNumber, T),
-    rlp_buf: &mut Vec<u8>,
-) -> Result<(B256, TxNumber), Box<ProviderError>>
+fn transaction_hash<T>(entry: (TxNumber, T)) -> Result<(B256, TxNumber), Box<ProviderError>>
 where
-    T: Encodable2718,
+    T: TxHashRef,
 {
     let (tx_id, tx) = entry;
-    tx.encode_2718(rlp_buf);
-    Ok((keccak256(rlp_buf), tx_id))
+    Ok((*tx.tx_hash(), tx_id))
 }
 
 #[cfg(test)]

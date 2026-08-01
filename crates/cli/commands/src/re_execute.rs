@@ -93,7 +93,10 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
 
         let components = components(provider_factory.chain_spec());
 
-        let min_block = self.from;
+        // Blocks at or below the genesis block (non-zero on some chains) cannot be
+        // re-executed; the default `--from 1` means "from the start of the chain".
+        let min_block =
+            self.from.max(provider_factory.static_file_provider().genesis_block_number() + 1);
         let best_block = DatabaseProviderFactory::database_provider_ro(&provider_factory)?
             .best_block_number()?;
         let mut max_block = best_block;
@@ -257,7 +260,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
 
                             return Err(err);
                         }
-                        let _ = stats_tx.send(block.gas_used());
+                        let _ = stats_tx.send((block.number(), block.gas_used()));
 
                         // Reset DB once in a while to avoid OOM or read tx timeouts
                         if executor.size_hint() > 5_000_000 ||
@@ -294,6 +297,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
         let instant = Instant::now();
         let mut total_executed_blocks = 0;
         let mut total_executed_gas = 0;
+        let mut latest_executed_block = None;
 
         let mut last_logged_gas = 0;
         let mut last_logged_blocks = 0;
@@ -304,9 +308,11 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
 
         loop {
             tokio::select! {
-                Some(gas_used) = stats_rx.recv() => {
+                Some((block_number, gas_used)) = stats_rx.recv() => {
                     total_executed_blocks += 1;
                     total_executed_gas += gas_used;
+                    latest_executed_block =
+                        Some(latest_executed_block.unwrap_or(block_number).max(block_number));
                 }
                 Some((block, err)) = info_rx.recv() => {
                     error!(?err, block=?block.num_hash(), "Invalid block");
@@ -331,6 +337,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                         info!(
                             throughput=?format_gas_throughput(gas_executed, last_logged_time.elapsed()),
                             progress=format!("{progress:.2}%"),
+                            ?latest_executed_block,
                             "Executed {blocks_executed} blocks"
                         );
                     }
@@ -347,6 +354,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                 start_block = min_block,
                 end_block = max_block,
                 %total_executed_blocks,
+                ?latest_executed_block,
                 throughput=?format_gas_throughput(total_executed_gas, instant.elapsed()),
                 "Re-executed successfully"
             );
@@ -355,6 +363,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                 start_block = min_block,
                 end_block = max_block,
                 %total_executed_blocks,
+                ?latest_executed_block,
                 invalid_block_count = invalid_blocks.len(),
                 ?invalid_blocks,
                 throughput=?format_gas_throughput(total_executed_gas, instant.elapsed()),

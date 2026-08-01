@@ -391,6 +391,7 @@ mod tests {
                 let mut limiter =
                     PruneLimiter::default().set_deleted_entries_limit(deleted_entries_limit);
                 let input = PruneInput {
+                    genesis_block_number: 0,
                     previous_checkpoint: db
                         .factory
                         .provider()
@@ -557,8 +558,12 @@ mod tests {
 
         let to_block: BlockNumber = 50;
         let prune_mode = PruneMode::Before(to_block);
-        let input =
-            PruneInput { previous_checkpoint: None, to_block, limiter: PruneLimiter::default() };
+        let input = PruneInput {
+            previous_checkpoint: None,
+            to_block,
+            limiter: PruneLimiter::default(),
+            genesis_block_number: 0,
+        };
         let segment = AccountHistory::new(prune_mode);
 
         db.factory.set_storage_settings_cache(StorageSettings::v2());
@@ -671,7 +676,12 @@ mod tests {
         let deleted_entries_limit = 14; // 14/2 = 7 changeset entries before limit
         let limiter = PruneLimiter::default().set_deleted_entries_limit(deleted_entries_limit);
 
-        let input = PruneInput { previous_checkpoint: None, to_block: 10, limiter };
+        let input = PruneInput {
+            previous_checkpoint: None,
+            to_block: 10,
+            limiter,
+            genesis_block_number: 0,
+        };
         let segment = AccountHistory::new(prune_mode);
 
         let provider = db.factory.database_provider_rw().unwrap();
@@ -727,6 +737,7 @@ mod tests {
 
         // Run prune again to complete - should finish processing block 5 and 6
         let input2 = PruneInput {
+            genesis_block_number: 0,
             previous_checkpoint: Some(checkpoint),
             to_block: 10,
             limiter: PruneLimiter::default().set_deleted_entries_limit(100), // high limit

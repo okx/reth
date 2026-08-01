@@ -6,7 +6,7 @@
 
 use super::RocksDBProvider;
 use crate::StaticFileProviderFactory;
-use alloy_eips::eip2718::Encodable2718;
+use alloy_consensus::transaction::TxHashRef;
 use alloy_primitives::BlockNumber;
 use rayon::prelude::*;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
@@ -45,7 +45,7 @@ impl RocksDBProvider {
     /// # Requirements
     ///
     /// For pruning `TransactionHashNumbers`, the provider must be able to supply transaction
-    /// data (typically from static files) so that transaction hashes can be computed. This
+    /// data (typically from static files) so that transaction hashes can be read. This
     /// implies that static files should be ahead of or in sync with `RocksDB`.
     pub fn check_consistency<Provider>(
         &self,
@@ -59,7 +59,7 @@ impl RocksDBProvider {
             + BlockBodyIndicesProvider
             + StorageChangeSetReader
             + ChangeSetReader
-            + TransactionsProvider<Transaction: Encodable2718>
+            + TransactionsProvider
             + ChainSpecProvider,
     {
         let mut unwind_target: Option<BlockNumber> = None;
@@ -90,7 +90,7 @@ impl RocksDBProvider {
 
     /// Heals the `TransactionHashNumbers` table.
     ///
-    /// - Fast path: if checkpoint == 0, clear any stale data and return
+    /// - Fast path: if checkpoint is at the genesis block, clear any stale data and return
     /// - If `sf_tip` < checkpoint, return unwind target (static files behind)
     /// - If `sf_tip` == checkpoint, nothing to do
     /// - If `sf_tip` > checkpoint, heal via transaction ranges in batches
@@ -103,24 +103,29 @@ impl RocksDBProvider {
             + StageCheckpointReader
             + StaticFileProviderFactory
             + BlockBodyIndicesProvider
-            + TransactionsProvider<Transaction: Encodable2718>,
+            + TransactionsProvider,
     {
+        // The chain starts at the genesis block, which is non-zero on some chains: it is both
+        // the "nothing indexed yet" checkpoint value and the floor for static file tips.
+        let genesis_block = provider.static_file_provider().genesis_block_number();
+
         let checkpoint = provider
             .get_stage_checkpoint(StageId::TransactionLookup)?
             .map(|cp| cp.block_number)
-            .unwrap_or(0);
+            .unwrap_or(genesis_block);
 
         let sf_tip = provider
             .static_file_provider()
             .get_highest_static_file_block(StaticFileSegment::Transactions)
-            .unwrap_or(0);
+            .unwrap_or(genesis_block);
 
-        // Fast path: clear any stale data and return.
-        if checkpoint == 0 {
+        // Fast path: nothing indexed yet (genesis has no transactions) — clear any stale data
+        // and return.
+        if checkpoint == genesis_block {
             if self.first::<tables::TransactionHashNumbers>()?.is_some() {
                 tracing::info!(
                     target: "reth::providers::rocksdb",
-                    "TransactionHashNumbers: checkpoint is 0, clearing stale data"
+                    "TransactionHashNumbers: checkpoint is at genesis, clearing stale data"
                 );
                 self.clear::<tables::TransactionHashNumbers>()?;
             }
@@ -205,7 +210,7 @@ impl RocksDBProvider {
 
     /// Prunes `TransactionHashNumbers` entries for transactions in the given range.
     ///
-    /// This fetches transactions from the provider, computes their hashes in parallel,
+    /// This fetches transactions from the provider, reads their hashes in parallel,
     /// and deletes the corresponding entries from `RocksDB` by key. This approach is more
     /// scalable than iterating all rows because it only processes the transactions that
     /// need to be pruned.
@@ -213,7 +218,7 @@ impl RocksDBProvider {
     /// # Requirements
     ///
     /// The provider must be able to supply transaction data (typically from static files)
-    /// so that transaction hashes can be computed. This implies that static files should
+    /// so that transaction hashes can be read. This implies that static files should
     /// be ahead of or in sync with `RocksDB`.
     fn prune_transaction_hash_numbers_in_range<Provider>(
         &self,
@@ -221,17 +226,17 @@ impl RocksDBProvider {
         tx_range: std::ops::RangeInclusive<u64>,
     ) -> ProviderResult<()>
     where
-        Provider: TransactionsProvider<Transaction: Encodable2718>,
+        Provider: TransactionsProvider,
     {
         if tx_range.is_empty() {
             return Ok(());
         }
 
-        // Fetch transactions in the range and compute their hashes in parallel
+        // Fetch transactions in the range and read their hashes in parallel.
         let hashes: Vec<_> = provider
             .transactions_by_tx_range(tx_range.clone())?
             .into_par_iter()
-            .map(|tx| tx.trie_hash())
+            .map(|tx| *tx.tx_hash())
             .collect();
 
         if !hashes.is_empty() {
@@ -268,40 +273,20 @@ impl RocksDBProvider {
             + StorageChangeSetReader
             + ChainSpecProvider,
     {
+        // See `heal_transaction_hash_numbers`: the genesis block (non-zero on some chains) is
+        // the "nothing indexed yet" checkpoint value and the floor for static file tips —
+        // defaulting the tip to 0 would produce a spurious unwind-to-0 signal below.
+        let genesis_block = provider.static_file_provider().genesis_block_number();
+
         let checkpoint = provider
             .get_stage_checkpoint(StageId::IndexStorageHistory)?
             .map(|cp| cp.block_number)
-            .unwrap_or(0);
-
-        // Fast path: clear and re-insert genesis history.
-        if checkpoint == 0 {
-            tracing::info!(
-                target: "reth::providers::rocksdb",
-                "StoragesHistory: checkpoint is 0, clearing stale data"
-            );
-            self.clear::<tables::StoragesHistory>()?;
-
-            let chain_spec = provider.chain_spec();
-            let genesis = chain_spec.genesis();
-            let list = tables::BlockNumberList::new([0]).expect("single block always fits");
-            for (addr, account) in &genesis.alloc {
-                if let Some(storage) = &account.storage {
-                    for key in storage.keys() {
-                        self.put::<tables::StoragesHistory>(
-                            StorageShardedKey::last(*addr, *key),
-                            &list,
-                        )?;
-                    }
-                }
-            }
-
-            return Ok(None);
-        }
+            .unwrap_or(genesis_block);
 
         let sf_tip = provider
             .static_file_provider()
             .get_highest_static_file_block(StaticFileSegment::StorageChangeSets)
-            .unwrap_or(0);
+            .unwrap_or(genesis_block);
 
         if sf_tip < checkpoint {
             // This should never happen in normal operation - static files are always
@@ -317,6 +302,32 @@ impl RocksDBProvider {
         }
 
         if sf_tip == checkpoint {
+            return Ok(None);
+        }
+
+        // Fast path: clear and re-insert genesis history.
+        if checkpoint == genesis_block {
+            tracing::info!(
+                target: "reth::providers::rocksdb",
+                "StoragesHistory: checkpoint is at genesis, clearing stale data"
+            );
+            self.clear::<tables::StoragesHistory>()?;
+
+            let chain_spec = provider.chain_spec();
+            let genesis = chain_spec.genesis();
+            let list =
+                tables::BlockNumberList::new([genesis_block]).expect("single block always fits");
+            for (addr, account) in &genesis.alloc {
+                if let Some(storage) = &account.storage {
+                    for key in storage.keys() {
+                        self.put::<tables::StoragesHistory>(
+                            StorageShardedKey::last(*addr, *key),
+                            &list,
+                        )?;
+                    }
+                }
+            }
+
             return Ok(None);
         }
 
@@ -381,33 +392,18 @@ impl RocksDBProvider {
             + ChangeSetReader
             + ChainSpecProvider,
     {
+        // See `heal_storages_history` for why these default to the genesis block.
+        let genesis_block = provider.static_file_provider().genesis_block_number();
+
         let checkpoint = provider
             .get_stage_checkpoint(StageId::IndexAccountHistory)?
             .map(|cp| cp.block_number)
-            .unwrap_or(0);
-
-        // Fast path: clear and re-insert genesis history.
-        if checkpoint == 0 {
-            tracing::info!(
-                target: "reth::providers::rocksdb",
-                "AccountsHistory: checkpoint is 0, clearing stale data"
-            );
-            self.clear::<tables::AccountsHistory>()?;
-
-            let chain_spec = provider.chain_spec();
-            let genesis = chain_spec.genesis();
-            let list = tables::BlockNumberList::new([0]).expect("single block always fits");
-            for addr in genesis.alloc.keys() {
-                self.put::<tables::AccountsHistory>(ShardedKey::last(*addr), &list)?;
-            }
-
-            return Ok(None);
-        }
+            .unwrap_or(genesis_block);
 
         let sf_tip = provider
             .static_file_provider()
             .get_highest_static_file_block(StaticFileSegment::AccountChangeSets)
-            .unwrap_or(0);
+            .unwrap_or(genesis_block);
 
         if sf_tip < checkpoint {
             // This should never happen in normal operation - static files are always
@@ -423,6 +419,25 @@ impl RocksDBProvider {
         }
 
         if sf_tip == checkpoint {
+            return Ok(None);
+        }
+
+        // Fast path: clear and re-insert genesis history.
+        if checkpoint == genesis_block {
+            tracing::info!(
+                target: "reth::providers::rocksdb",
+                "AccountsHistory: checkpoint is at genesis, clearing stale data"
+            );
+            self.clear::<tables::AccountsHistory>()?;
+
+            let chain_spec = provider.chain_spec();
+            let genesis = chain_spec.genesis();
+            let list =
+                tables::BlockNumberList::new([genesis_block]).expect("single block always fits");
+            for addr in genesis.alloc.keys() {
+                self.put::<tables::AccountsHistory>(ShardedKey::last(*addr), &list)?;
+            }
+
             return Ok(None);
         }
 
@@ -572,11 +587,7 @@ mod tests {
 
         let result = rocksdb.heal_accounts_history(&provider).unwrap();
         assert_eq!(result, None, "AccountsHistory should return early at checkpoint 0");
-        // Genesis account history entries are re-inserted
-        assert_eq!(
-            rocksdb.iter::<tables::AccountsHistory>().unwrap().count(),
-            factory.chain_spec().genesis().alloc.len()
-        );
+        assert_eq!(rocksdb.iter::<tables::AccountsHistory>().unwrap().count(), 0);
     }
 
     #[test]
@@ -632,7 +643,7 @@ mod tests {
                     .insert_block(&block.clone().try_recover().expect("recover block"))
                     .unwrap();
                 for tx in &block.body().transactions {
-                    let hash = tx.trie_hash();
+                    let hash = *tx.tx_hash();
                     tx_hashes.push(hash);
                     rocksdb.put::<tables::TransactionHashNumbers>(hash, &tx_count).unwrap();
                     tx_count += 1;
@@ -759,7 +770,7 @@ mod tests {
                     .insert_block(&block.clone().try_recover().expect("recover block"))
                     .unwrap();
                 for tx in &block.body().transactions {
-                    let hash = tx.trie_hash();
+                    let hash = *tx.tx_hash();
                     rocksdb.put::<tables::TransactionHashNumbers>(hash, &tx_count).unwrap();
                     tx_count += 1;
                 }
@@ -821,7 +832,7 @@ mod tests {
                     .insert_block(&block.clone().try_recover().expect("recover block"))
                     .unwrap();
                 for tx in &block.body().transactions {
-                    let hash = tx.trie_hash();
+                    let hash = *tx.tx_hash();
                     tx_hashes.push(hash);
                     rocksdb.put::<tables::TransactionHashNumbers>(hash, &tx_count).unwrap();
                     tx_count += 1;
@@ -972,7 +983,7 @@ mod tests {
         assert_eq!(result, Some(0), "sf_tip=0 < checkpoint=100 returns unwind target");
     }
 
-    /// Test that pruning works by fetching transactions and computing their hashes,
+    /// Test that pruning works by fetching transactions and reading their hashes,
     /// rather than iterating all rows. This test uses random blocks with unique
     /// transactions so we can verify the correct entries are pruned.
     #[test]
@@ -1010,7 +1021,7 @@ mod tests {
 
                 // Store transaction hash -> tx_number mappings in RocksDB
                 for tx in &block.body().transactions {
-                    let hash = tx.trie_hash();
+                    let hash = *tx.tx_hash();
                     tx_hashes.push(hash);
                     rocksdb.put::<tables::TransactionHashNumbers>(hash, &tx_count).unwrap();
                     tx_count += 1;
@@ -1045,13 +1056,13 @@ mod tests {
         let all_txs = provider.transactions_by_tx_range(0..tx_count).unwrap();
         assert_eq!(all_txs.len(), tx_count as usize, "Should be able to fetch all transactions");
 
-        // Verify the hashes match between what we stored and what we compute from fetched txs
+        // Verify the hashes match between what we stored and what we read from fetched txs.
         for (i, tx) in all_txs.iter().enumerate() {
-            let computed_hash = tx.trie_hash();
+            let fetched_hash = *tx.tx_hash();
             assert_eq!(
-                computed_hash, tx_hashes[i],
-                "Hash mismatch for tx {}: stored {:?} vs computed {:?}",
-                i, tx_hashes[i], computed_hash
+                fetched_hash, tx_hashes[i],
+                "Hash mismatch for tx {}: stored {:?} vs fetched {:?}",
+                i, tx_hashes[i], fetched_hash
             );
         }
 

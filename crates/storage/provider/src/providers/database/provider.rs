@@ -1099,6 +1099,10 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         BF: FnOnce(H, BodyTy<N>, Vec<Address>) -> ProviderResult<Option<B>>,
     {
         let Some(block_number) = self.convert_hash_or_number(id)? else { return Ok(None) };
+        let earliest_available = self.static_file_provider.earliest_history_height();
+        if block_number < earliest_available {
+            return Err(ProviderError::BlockExpired { requested: block_number, earliest_available })
+        }
         let Some(header) = header_by_number(block_number)? else { return Ok(None) };
 
         // Get the block body
@@ -1803,6 +1807,12 @@ impl<TX: DbTx + 'static, N: NodeTypes> BlockNumReader for DatabaseProvider<TX, N
 
     fn last_block_number(&self) -> ProviderResult<BlockNumber> {
         self.static_file_provider.last_block_number()
+    }
+
+    fn earliest_block_number(&self) -> ProviderResult<BlockNumber> {
+        // The trait default returns 0, which does not exist on chains with a non-zero
+        // genesis; the earliest available block is the lowest non-expired one.
+        Ok(self.static_file_provider.earliest_history_height())
     }
 
     fn block_number(&self, hash: B256) -> ProviderResult<Option<BlockNumber>> {
